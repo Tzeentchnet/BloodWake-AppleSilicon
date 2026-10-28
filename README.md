@@ -44,6 +44,8 @@ The build also needs these free tools. The installer fetches any that are missin
 
 ## Install
 ### With the installer (recommended)
+> **The first release is being prepared.** Until `BloodWakeRecomp-Setup-<version>.exe` appears on the [Releases](https://github.com/minimalice92/bloodwake-recomp/releases) page, use [By hand](#by-hand) below, or build the installer yourself with `python installer/build_installer.py --source . --out <folder>` (it needs Inno Setup 6.7.3).
+
 > **Windows may warn you:** the installer isn't code-signed, so SmartScreen can show "Windows protected your PC". Choose **More info**, then **Run anyway**. Each release lists the installer's SHA-256, so you can check you have the real file. The build takes about 15 minutes and can't be cancelled once it starts.
 
 1. Download `BloodWakeRecomp-Setup-<version>.exe` from this repository's [Releases](https://github.com/minimalice92/bloodwake-recomp/releases) page.
