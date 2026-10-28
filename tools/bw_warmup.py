@@ -21,14 +21,25 @@ does. Saved games go to the scene's own folder, deleted afterwards, so the
 player's saves, settings and progress are never touched. (Original, like any
 Original play, opens the console disk images and utility-drive caches in
 %LOCALAPPDATA%/xboxrecomp; the toolkit keeps them there whatever the save
-folder.) Besides those it writes only the shader cache. Nothing it makes
-comes from the game: the launch pages are built from the fields below.
+folder.) Only one game at a time opens those images for writing, so two
+Original scenes never run at once. Besides those it writes only the shader
+cache. Nothing it makes comes from the game: the launch pages are built from
+the fields below.
 
 Settings: the shader text depends on some settings (anti-aliasing, the
-Remastered sharpening of text and HUD edges...). If the player's settings
-file exists, the scenes use it; otherwise they use what a fresh launcher
-starts with (the default preset's values, else each setting's default),
-written to the work folder.
+Remastered sharpening of text and HUD edges...). The scenes play with a copy
+in the work folder: of the player's settings file if it exists (where the
+game itself looks: the "file" of --settings-schema) without its [advanced]
+raw switches, else of what a fresh launcher starts with (the default preset's
+values, else each setting's default). BASE_ENV below pins the window, pads
+and sound and wins over the file (fullscreen included, so the scenes stay
+hidden).
+
+Counts: the headline numbers come from the shader cache folder itself (its
+ps_*.bin files before and after), so they count distinct shaders and include
+a scene stopped for running over time. The per-scene counts come from each
+boot's log and are only a guide (the game stops logging every shader after
+its first 200).
 
 --progress json prints {"step": "warmup", "pct": 0-100, "msg": ...} lines
 (pct of the warm-up). It never fails a build: errors are reported and the
@@ -145,10 +156,11 @@ def launch_file(page, path):
 # Chosen from per-scene shader sets measured with an empty cache: every
 # mission, the Battle games, 2- and 4-player split screen and the menus, in
 # both editions, 60 s each (68 boots, 44 different shaders, 25 of them the
-# same in both editions, so Original only has to add its own 4). These seven
-# scenes compile 43 of the 44 (plus one of the title's that no 60 s scene
-# showed) in the least play time; the 44th came once, from enemy action
-# against an idle boat, and the first play compiles it if it ever comes.
+# same in both editions, so Original only has to add its own 4). Counting one
+# more of the title's that no 60 s scene showed, 45 have ever been seen; these
+# seven scenes compile 44 of the 45 in the least play time (docs/day1/W2.md).
+# The missing one came once, from enemy action against an idle boat, and the
+# first play compiles it if it ever comes.
 # `seconds` is the scene's limit from its first boot's start (so it includes
 # the loads), with room for a slower PC: the last needed shader came at
 # 3-17 s (title, menus, split), 33-38 s (missions 27 and 23) and, in
@@ -167,25 +179,79 @@ SCENES = [
 
 
 def scene_list():
-    """The scenes, longest first (so two workers finish together)."""
+    """The scenes, longest first (so two workers finish together; warmup()
+    never runs two Original scenes at once)."""
     return [dict(zip(("name", "edition", "page", "pads", "script", "seconds", "follow"), s))
             for s in sorted(SCENES, key=lambda s: -s[5])]
 
 
 # ── Settings ──────────────────────────────────────────────────────────────
 
-def player_settings():
-    base = os.environ.get("LOCALAPPDATA")
-    p = os.path.join(base, "BloodWake", "settings.ini") if base else None
-    return p if p and os.path.isfile(p) else None
+def local_appdata():
+    """The folder the game keeps its files in (SHGetFolderPath CSIDL_LOCAL_APPDATA),
+    else the environment's LOCALAPPDATA."""
+    try:
+        import ctypes
+        buf = ctypes.create_unicode_buffer(260)
+        if ctypes.windll.shell32.SHGetFolderPathW(None, 0x1C, None, 0, buf) == 0 and buf.value:
+            return buf.value
+    except (ImportError, AttributeError, OSError):
+        pass
+    return os.environ.get("LOCALAPPDATA")
 
 
-def default_settings(exe, out):
+def read_schema(exe, cwd):
+    """The game's settings list (bloodwake.exe --settings-schema)."""
+    r = subprocess.run([exe, "--settings-schema"], capture_output=True, timeout=30,
+                       cwd=cwd, creationflags=_NO_WINDOW)
+    return json.loads(r.stdout.decode("utf-8", "replace"))
+
+
+def without_advanced(src, out):
+    """Copy the settings file `src` to `out` without its [advanced] section: raw
+    switches, any of which could show a window or change a scene. Sections are
+    found as the game finds them (bw_settings.c read_file); bytes kept as they are."""
+    with open(src, encoding="latin-1", newline="") as f:
+        lines = f.read().splitlines(True)
+    keep, sec = [], ""
+    for ln in lines:
+        t = ln.strip()
+        if t.startswith("[") and "]" in t:
+            sec = t[1:t.index("]")].lower()
+        if sec != "advanced":
+            keep.append(ln)
+    with open(out, "w", encoding="latin-1", newline="") as f:
+        f.write("; Blood Wake settings for the graphics warm-up (tools/bw_warmup.py):\n"
+                "; the player's file without [advanced]. Not the player's file.\n\n")
+        f.writelines(keep)
+    return out
+
+
+def scene_settings(exe, out):
+    """Write the settings file the scenes play with to `out`. Returns (its path,
+    or None for the game's own defaults; what it is)."""
+    schema = None
+    try:
+        schema = read_schema(exe, os.path.dirname(out))
+    except (OSError, ValueError, subprocess.SubprocessError):
+        pass
+    player = (schema or {}).get("file")
+    if not player:
+        base = local_appdata()
+        player = os.path.join(base, "BloodWake", "settings.ini") if base else None
+    if player and os.path.isfile(player):
+        return without_advanced(player, out), "the player's settings, without [advanced]"
+    if schema:
+        try:
+            return default_settings(schema, out), "a new launcher's settings"
+        except (KeyError, TypeError, ValueError):
+            pass
+    return None, "the game's defaults (its settings list couldn't be read)"
+
+
+def default_settings(schema, out):
     """What tools/launcher.pyw starts a new install with: the default preset's
     value for each setting, else the setting's default."""
-    r = subprocess.run([exe, "--settings-schema"], capture_output=True, timeout=30,
-                       cwd=os.path.dirname(out), creationflags=_NO_WINDOW)
-    schema = json.loads(r.stdout.decode("utf-8", "replace"))
     pst = next((s for s in schema["settings"] if s["section"] == "edition" and s["key"] == "preset"), None)
     first = next((p for p in schema.get("presets", []) if pst and p["value"] == pst["default"]), None)
     first = dict(first["settings"]) if first else {}
@@ -202,6 +268,28 @@ def default_settings(exe, out):
     return out
 
 
+# ── The shader cache ──────────────────────────────────────────────────────
+
+def cache_dir(cache=None):
+    """The folder the game keeps its shaders in (bw_pscache.c); None when off."""
+    if cache:
+        return None if cache == "0" else cache
+    base = local_appdata()
+    return os.path.join(base, "xboxrecomp", "shadercache") if base else None
+
+
+def cache_files(folder):
+    """The shader files in `folder`, as a set of names; None if it can't be read."""
+    if not folder:
+        return None
+    if not os.path.exists(folder):
+        return set()
+    try:
+        return {n.lower() for n in os.listdir(folder) if re.match(r"(?i)ps_[0-9a-f]+\.bin$", n)}
+    except OSError:
+        return None
+
+
 # ── Running a scene ───────────────────────────────────────────────────────
 
 _NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
@@ -210,6 +298,7 @@ BASE_ENV = {                            # as tools/play.py plays
     "RECOMP_TITLE_KEVENTS": "1", "RECOMP_AC97_READY": "1", "RECOMP_TRACE_BUDGET": "0",
     "BW_STDERR_BUFFER": "1048576",
     "BW_GPU": "d3d11", "RECOMP_DISPATCH_GATE": "1", "RECOMP_FLIP_PACING": "1",
+    "RECOMP_FULLSCREEN": "0",           # never fullscreen: that would show the hidden window
 }
 PS_LINE = re.compile(r"this run: (\d+) compiled in game \((\d+) ms\), (\d+) from the cache")
 BOOT_MARK = "\n==== warm-up boot %d (%d s left)\n"
@@ -266,7 +355,8 @@ def run_scene(sc, exe, game_dir, work, settings, cache, log_dir):
                     p.kill()
                     p.wait()
                     code = None
-                    res["error"] = "stopped after %d s" % (left + 45)
+                    res["error"] = "ran over time (stopped after %d s; its shaders so far are kept)" % (
+                        left + 45)
                 res["boots"] += 1
                 lf.flush()
                 if code not in (0, 124, None) and not res["error"]:   # 124: the run limit (main.c)
@@ -296,53 +386,80 @@ def run_scene(sc, exe, game_dir, work, settings, cache, log_dir):
 
 
 def warmup(exe, game_dir, work, parallel=2, only=None, cache=None, prog=None):
-    """Run the scenes, `parallel` at a time. prog(frac, msg). Returns the results."""
+    """Run the scenes, `parallel` at a time but never two Original scenes at
+    once (they share the Original disk images). prog(frac, msg). Returns
+    {"results": [...], "settings": what the scenes played with, "cache": the
+    folder, "new": distinct shaders added to it, "total": shaders in it after}
+    ("new" and "total" are None if the folder can't be read)."""
     prog = prog or (lambda f, m: None)
     scenes = [s for s in scene_list() if not only or s["name"] in only]
+    folder = cache_dir(cache)
+    out = {"results": [], "settings": None, "cache": folder, "new": None, "total": None}
     if not scenes:
-        return []
+        return out
     os.makedirs(work, exist_ok=True)
     log_dir = os.path.join(work, "logs")
     os.makedirs(log_dir, exist_ok=True)
-    settings = None
-    if not player_settings():
-        try:
-            settings = default_settings(exe, os.path.join(work, "warmup_settings.ini"))
-        except (OSError, ValueError, KeyError, subprocess.SubprocessError) as e:
-            prog(0, "the default settings couldn't be read (%s); using the game's own" % e)
-    total = float(sum(s["seconds"] for s in scenes)) / max(1, parallel)
+    settings, out["settings"] = scene_settings(exe, os.path.join(work, "warmup_settings.ini"))
+    if not settings:
+        prog(0, "the settings couldn't be read; the scenes use the game's defaults")
+    before = cache_files(folder)
+    workers = max(1, parallel)
+    total = max(float(sum(s["seconds"] for s in scenes)) / workers,
+                sum(s["seconds"] for s in scenes if s["edition"] == "original"))
     t0 = time.time()
-    results, lock, todo = [], threading.Lock(), list(scenes)
+    results, cond, todo = out["results"], threading.Condition(), list(scenes)
+    original_running = [False]
 
     def worker():
         while True:
-            with lock:
-                if not todo:
+            with cond:
+                sc = None
+                while todo:
+                    sc = next((s for s in todo
+                               if s["edition"] != "original" or not original_running[0]), None)
+                    if sc:
+                        break
+                    cond.wait()
+                if not sc:
                     return
-                sc = todo.pop(0)
-            r = run_scene(sc, exe, game_dir, work, settings, cache, log_dir)
-            with lock:
+                todo.remove(sc)
+                if sc["edition"] == "original":
+                    original_running[0] = True
+            try:
+                r = run_scene(sc, exe, game_dir, work, settings, cache, log_dir)
+            finally:
+                with cond:
+                    if sc["edition"] == "original":
+                        original_running[0] = False
+                    cond.notify_all()
+            with cond:
                 results.append(r)
 
-    threads = [threading.Thread(target=worker, daemon=True) for _ in range(max(1, parallel))]
+    threads = [threading.Thread(target=worker, daemon=True) for _ in range(workers)]
     for t in threads:
         t.start()
     while any(t.is_alive() for t in threads):
         for t in threads:
             t.join(timeout=5)
-        with lock:
+        with cond:
             done = len(results)
         prog(min(0.97, (time.time() - t0) / (total + 20)),
              "preparing graphics: %d of %d scenes (%d s)" % (done, len(scenes), time.time() - t0))
-    return results
+    after = cache_files(folder)
+    if before is not None and after is not None:
+        out["new"], out["total"] = len(after - before), len(after)
+    return out
 
 
-def summary(results):
-    """(shaders compiled, shader loads from the cache, the results with a problem)"""
-    n = sum(r["compiled"] or 0 for r in results)
-    c = sum(r["cached"] or 0 for r in results)
-    bad = [r for r in results if r["error"] or r["compiled"] is None]
-    return n, c, bad
+def summary(w):
+    """(new shaders, shaders in the cache or None, the results with a problem),
+    from warmup()'s result. If the cache folder couldn't be read, "new" is the
+    logs' count instead."""
+    res = w["results"]
+    n = w["new"] if w["new"] is not None else sum(r["compiled"] or 0 for r in res)
+    bad = [r for r in res if r["error"] or r["compiled"] is None]
+    return n, w["total"], bad
 
 
 def main(argv=None):
@@ -373,15 +490,17 @@ def main(argv=None):
 
     work = os.path.abspath(a.work_dir or os.path.join(os.path.dirname(os.path.abspath(a.exe)), "warmup"))
     t0 = time.time()
-    res = warmup(os.path.abspath(a.exe), os.path.abspath(a.game_dir), work, a.parallel,
-                 set(a.only.split(",")) if a.only else None, a.cache, say)
-    n, c, bad = summary(res)
-    for r in sorted(res, key=lambda r: (r["edition"], r["scene"])):
-        say(1, "%s %s: %s compiled, %s from the cache, %d s%s" % (
+    w = warmup(os.path.abspath(a.exe), os.path.abspath(a.game_dir), work, a.parallel,
+               set(a.only.split(",")) if a.only else None, a.cache, say)
+    n, total, bad = summary(w)
+    say(1, "settings: %s" % w["settings"])
+    for r in sorted(w["results"], key=lambda r: (r["edition"], r["scene"])):
+        say(1, "%s %s: %s compiled, %s loads from the cache (from its log), %d s%s" % (
             r["edition"], r["scene"], r["compiled"], r["cached"], r["seconds"],
             " (%s)" % r["error"] if r["error"] else ""))
-    say(1, "graphics ready: %d shaders compiled, %d loads from the cache, in %d s%s" % (
-        n, c, time.time() - t0, "; %d scene(s) had a problem (skipped)" % len(bad) if bad else ""))
+    say(1, "graphics ready: %d new shaders prepared%s, in %d s%s" % (
+        n, "" if total is None else " (%d in the shader cache)" % total, time.time() - t0,
+        "; %d scene(s) had a problem (logs: %s)" % (len(bad), os.path.join(work, "logs")) if bad else ""))
     return 0
 
 

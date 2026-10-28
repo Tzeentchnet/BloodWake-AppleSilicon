@@ -26,7 +26,7 @@ Steps (each prints one progress line with --progress json):
   warmup       "Preparing graphics (one time)": a few short scenes of the built
                game, hidden and silent, so its pixel shaders are compiled into
                the shader cache before the first play (tools/bw_warmup.py; about
-               2-4 minutes). --no-warmup skips it. It never fails the build: a
+               2 minutes). --no-warmup skips it. It never fails the build: a
                problem is reported and the step skipped.
   done
 
@@ -45,7 +45,7 @@ capstone 5.0.9, CMake 3.20+ (Visual Studio's own is fine) and Visual Studio
 2022 or its Build Tools with the C++ workload; about 2.6 GB free, and an
 internet connection for the toolkit unless --toolkit is given. No admin
 rights, no `py` launcher, paths with spaces are fine. About 15 minutes on a
-recent desktop (most of it the translation), plus 2-4 for the warm-up.
+recent desktop (most of it the translation), plus about 2 for the warm-up.
 Stdlib only.
 """
 import argparse
@@ -748,23 +748,23 @@ def warmup(exe, game_dir, work, prog):
     """tools/bw_warmup.py's scenes with the installed exe. Never raises: the game
     works without it (its first play just compiles the shaders as it goes)."""
     t0 = time.time()
-    out = {"seconds": 0, "compiled": 0, "scenes": 0, "problems": []}
+    out = {"seconds": 0, "new_shaders": 0, "in_cache": None, "scenes": 0, "problems": []}
     try:
-        sys.path.insert(0, os.path.join(REPO, "tools"))
-        import bw_warmup
-        prog("warmup", 0, "preparing graphics (one time, about 2-4 minutes): short scenes of the "
+        import bw_warmup                    # tools/, this script's own folder
+        prog("warmup", 0, "preparing graphics (one time, about 2 minutes): short scenes of the "
              "game, hidden and silent")
-        res = bw_warmup.warmup(exe, game_dir, os.path.join(work, "warmup"),
-                               prog=lambda f, m: prog("warmup", f, m))
-        n, cached, bad = bw_warmup.summary(res)
-        out.update(compiled=n, from_cache=cached, scenes=len(res),
+        w = bw_warmup.warmup(exe, game_dir, os.path.join(work, "warmup"),
+                             prog=lambda f, m: prog("warmup", f, m))
+        n, total, bad = bw_warmup.summary(w)
+        out.update(new_shaders=n, in_cache=total, scenes=len(w["results"]), settings=w["settings"],
                    problems=["%s %s: %s" % (r["edition"], r["scene"], r["error"] or "no shader report")
                              for r in bad])
-        msg = "graphics ready: %d shaders compiled (%d already prepared) in %d s" % (
-            n, cached, time.time() - t0)
+        msg = "graphics ready: %d new shaders prepared%s in %d s" % (
+            n, "" if total is None else " (%d in the shader cache)" % total, time.time() - t0)
         if bad:
-            msg += " (%d of %d scenes skipped: %s; log: %s)" % (
-                len(bad), len(res), "; ".join(out["problems"][:2]), os.path.join(work, "warmup", "logs"))
+            msg += " (%d of %d scenes had a problem: %s; log: %s)" % (
+                len(bad), len(w["results"]), "; ".join(out["problems"][:2]),
+                os.path.join(work, "warmup", "logs"))
         prog("warmup", 1, msg)
     except Exception as e:                  # report and go on: never fail the install here
         out["problems"].append("%s: %s" % (type(e).__name__, e))
@@ -856,8 +856,12 @@ def main(argv=None):
         if not a.no_warmup:
             record["warmup"] = warmup(record["paths"]["exe"], game_dir, work, prog)
             record["seconds"]["warmup"] = record["warmup"]["seconds"]
-            with open(os.path.join(inst, "install.json"), "w", encoding="utf-8") as f:
-                json.dump(record, f, indent=2)
+            try:                            # the game is installed: never fail it here
+                with open(os.path.join(inst, "install.json"), "w", encoding="utf-8") as f:
+                    json.dump(record, f, indent=2)
+            except OSError as e:
+                prog("warmup", 1, "the warm-up's results weren't added to install.json (%s); "
+                     "the game is installed and works" % e)
         prog("done", 1, "Blood Wake is built. Start it with \"Blood Wake.cmd\" in %s (%d min)."
              % (inst, (time.time() - t_start) / 60))
         return EXIT_OK
