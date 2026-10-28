@@ -1,0 +1,19 @@
+# Normalise text in the repo; check out with the platform's endings...
+* text=auto
+
+# ...except scripts that break with CRLF. Git Bash runs the hook and run_ghidra.sh,
+# and a CRLF shebang fails with "bad interpreter".
+*.sh            text eol=lf
+tools/git-hooks/* text eol=lf
+*.py            text eol=lf
+
+# Windows-only scripts keep CRLF.
+*.bat           text eol=crlf
+*.cmd           text eol=crlf
+*.ps1           text eol=crlf
+
+# Never diff or merge these as text (they should never be committed anyway).
+*.iso  binary
+*.xiso binary
+*.xbe  binary
+*.pdf  binary

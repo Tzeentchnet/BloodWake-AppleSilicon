@@ -1,0 +1,62 @@
+# Never commit anything from the game. The commit guard (tools/git-hooks/pre-commit,
+# enable it with `git config core.hooksPath tools/git-hooks`) is the first line of
+# defence; this file is the second.
+
+# --- Your disc and anything made from it ---
+/game/
+*.iso
+*.xiso
+*.img
+*.gdf
+*.xbe
+*.pak
+*.toc
+*.bik
+*.xmv
+*.wma
+*.wav
+*.xwb
+*.xpr
+xbe_flat.bin
+*.dds
+*.tga
+*.pdf
+
+# The generated C is a translation of the game's code: it stays on your PC.
+src/recomp/gen/
+gen/
+
+# Logs, captures and dumps the game writes while it runs
+runs/
+analysis/
+icall_*.dump
+xbox_kernel.log
+bw_relaunch.bin
+bw_launch_next.bin
+play.log
+*.dmp
+
+# Archives (an image inside a zip is still an image)
+*.zip
+*.7z
+*.rar
+
+# Build output
+build/
+build-*/
+bin/
+install/
+*.obj
+*.lib
+*.exe
+*.pdb
+*.ilk
+*.map
+
+# Tooling
+__pycache__/
+*.pyc
+.vs/
+.vscode/
+Thumbs.db
+.DS_Store

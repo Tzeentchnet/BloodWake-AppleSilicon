@@ -1,0 +1,189 @@
+/* bw_fixes.def - the registry of edition changes (D-007, D-015).
+ *
+ * One line per change that makes the port behave differently from the game as
+ * shipped: Original-game bug fixes and later editions' enhancements alike.
+ * Original never turns any of them on. Port-introduced bugs (TK-n fixes,
+ * BW_MAP_MB, the D-013 frame cap, the D-011 waits) are NOT listed here: they
+ * apply to every edition (D-007), unconditionally.
+ *
+ * Rule of thumb: if the change makes the port match the console, it is a port
+ * fix (all editions, not here). If it changes what the console did, it is an
+ * edition change (here).
+ *
+ * Default rule (lead, 2026-10-27, under D-014): a fix is ON by default only
+ * when the intended behaviour is seen in the code or data. When the intent is
+ * inferred, it is registered OFF and the maintainer decides after an A/B.
+ *
+ *   BW_FIX(ID, editions, default, kind, log reference, description)
+ *
+ *   ID          short upper-case name; the code says BW_FIX_<ID>, logs and
+ *               BW_FIX=+ID/-ID use the bare name. Never reuse or renumber an ID
+ *               that has shipped in a log or a test: add new ones at the end.
+ *   editions    BW_ED_RX: Remastered and every edition after it (each one
+ *               includes every Remastered change; lead, 2026-10-27). Never
+ *               Original.
+ *   default     1 = on in those editions unless BW_FIX turns it off; 0 = off
+ *               unless turned on (BW_FIX=+ID).
+ *   kind        BW_FIXKIND_IMAGE    bytes of the loaded XBE image, patched once
+ *                                   at boot (bw_edition_apply_image_fixes),
+ *                                   each guarded by the bytes it expects;
+ *               BW_FIXKIND_HOOK     a D-011 wrapper (src/bw_remaster_hooks.c)
+ *                                   that tests bw_fix_enabled() first;
+ *               BW_FIXKIND_PAK      bytes of a loaded .pak, patched after the
+ *                                   game parses it (needs the pak hook; later);
+ *               BW_FIXKIND_RUNTIME  a parameter our runtime code reads (back end,
+ *                                   carried patches via main.c setters).
+ *   log ref     where the evidence is (REMASTER_LOG date and area, spec file).
+ *   description one line: what changes, and where.
+ */
+
+BW_FIX(BOAT_SPLASH_RANGE, BW_ED_RX, 1, BW_FIXKIND_IMAGE,
+       "REMASTER_LOG 2026-10-26 'sound (bug, confirmed)'; ANALYSIS 'Naming batch 3'; docs/remaster/editions.md",
+       "Boat landings can play WaterSplash: BoatSound_ShouldPlaySplash (0x13180) tests v >= 0.7071 && v <= [0x174944] (-0.7071), never true; the bound becomes FLT_MAX, so a landing within 45 degrees of level splashes and a steeper one plunges (v is the cos of the boat's pitch, seen, F2). ON by default since 2026-10-27 (the maintainer's call), together with BOAT_LANDING_WEIGHT; it was OFF while the intended direction was only inferred")
+
+BW_FIX(SOUND_SHIELDHITS_NAME, BW_ED_RX, 1, BW_FIXKIND_IMAGE,
+       "REMASTER_LOG 2026-10-26 'sound (bug)'; docs/formats/sound.md Findings 1; FV5 row 35",
+       "The Dragon's 'ShieldHitsDreadnought' request (string 0x174B34, Audio_WeaponSoundsAndDragonClawInit) is spelt as the bank spells it, 'ShieldHitsDreadnaught' (hash 0x1DDB31CE), so the sound is found. ON by default: the request and the bank's wave are both seen")
+
+BW_FIX(WIDESCREEN, BW_ED_RX, 1, BW_FIXKIND_RUNTIME,
+       "D-015, D-016 (16:9 first, 21:9 second); docs/remaster/widescreen.md (R3 option C)",
+       "Widescreen at the display's aspect (BW_ASPECT overrides; capped at 21:9): gameplay views Hor+ (projection, culling, world grid and projected markers widened), HUD and 2D pillarboxed per view, movies pillarboxed; title/menu boots stay 4:3, pillarboxed in the wide window")
+
+BW_FIX(WS_HUD_EDGES, BW_ED_RX, 1, BW_FIXKIND_HOOK,
+       "D-015/D-016; lead's call 2026-10-27 ('HUD at the screen edges if clean, centred 4:3 as fallback, behind its own switch'); docs/formats/effects_fonts_ui.md section 8",
+       "Widescreen only: the radar, score and hold timer anchor to the wide screen's left edge and the status panel to its right edge (their SetLayout runs with the element's safe rectangle widened about its view's centre, then the rectangle is restored); -WS_HUD_EDGES keeps the whole HUD in the centred 4:3 box")
+/* ---- The visual-enhancement suite (D-016; agent D9, src/gpu/bw_vfx.c) ----
+ * Each one renders the original art better and never replaces it. Values
+ * (resolution, sample counts, strengths) come from BW_VFX_<NAME>, listed in
+ * bw_vfx.c; BW_FIX=-ID turns one off. All RUNTIME: the GPU back end reads
+ * them; Original draws exactly as before (none of this code runs there). */
+BW_FIX(VFX_NATIVE_RES, BW_ED_RX, 1, BW_FIXKIND_RUNTIME,
+       "docs/day1/D9.md 'Native resolution'; D-016 'Modern display support'",
+       "The 3D scene, HUD and menus render at the output resolution (the window or screen, e.g. 1080p/1440p/4K) instead of 640x480 (2x horizontal) scaled up: every render target is sized by one render scale, the guest keeps its 640x480 coordinates")
+BW_FIX(VFX_MSAA, BW_ED_RX, 1, BW_FIXKIND_RUNTIME,
+       "docs/day1/D9.md 'Anti-aliasing'",
+       "Multisample anti-aliasing on every render target (BW_VFX_MSAA=2/4/8, default 4)")
+BW_FIX(VFX_ANISO, BW_ED_RX, 1, BW_FIXKIND_RUNTIME,
+       "docs/day1/D9.md 'Texture filtering'",
+       "Anisotropic filtering on the textures the game samples with mip maps (BW_VFX_AF=2..16, default 16); point-sampled textures stay point-sampled")
+BW_FIX(VFX_PRECISION, BW_ED_RX, 1, BW_FIXKIND_RUNTIME,
+       "docs/day1/D9.md 'Precision and dithering'",
+       "Render targets in 16 bits per channel (same clamping as the game's 8-bit targets, so the same look) and a dithered 8-bit output: no banding in dark gradients, fog and smoke; pure black stays pure black")
+BW_FIX(VFX_TEXT, BW_ED_RX, 1, BW_FIXKIND_RUNTIME,
+       "docs/day1/D9.md 'Text'",
+       "The game's own bitmap glyph sheets (white-on-alpha DXT1) are drawn with a contour filter when magnified: crisp, anti-aliased edges at any resolution, no dark fringe, same glyphs and weight")
+BW_FIX(VFX_FXAA, BW_ED_RX, 0, BW_FIXKIND_RUNTIME,
+       "docs/day1/D9.md 'Anti-aliasing'",
+       "A post-process anti-aliasing pass (FXAA-style) on the final image, for alpha-tested edges MSAA misses. OFF by default: it softens text a little")
+BW_FIX(VFX_SHARPEN, BW_ED_RX, 0, BW_FIXKIND_RUNTIME,
+       "docs/day1/D9.md 'Post-processing'",
+       "Contrast-adaptive sharpening of the final image (BW_VFX_SHARPEN=0..1, default 0.3 when on). OFF by default: it changes the look of the textures")
+BW_FIX(VFX_BLOOM, BW_ED_RX, 0, BW_FIXKIND_RUNTIME,
+       "docs/day1/D9.md 'Post-processing'",
+       "A soft bloom on the brightest highlights (sun, glints, explosions) (BW_VFX_BLOOM=0..1, default 0.25 when on). OFF by default: it adds light the original didn't have")
+BW_FIX(VFX_HDR, BW_ED_RX, 0, BW_FIXKIND_RUNTIME,
+       "docs/day1/D9.md 'HDR output'",
+       "HDR output (scRGB): mid-tones as the original at paper white, highlights (sun, explosions, water glints) get headroom up to the display's peak (BW_VFX_HDR_PAPER, BW_VFX_HDR_PEAK nits). OFF by default: needs Windows HDR on")
+BW_FIX(VFX_OLED_CARE, BW_ED_RX, 0, BW_FIXKIND_RUNTIME,
+       "docs/day1/D9.md 'OLED care'",
+       "Slowly dims bright pixels that have not changed for a while (the HUD, a paused menu), as OLED TVs do, to spare the panel (BW_VFX_OLED_DIM, default 0.25 at most). OFF by default")
+BW_FIX(VFX_DRAW_DISTANCE, BW_ED_RX, 1, BW_FIXKIND_HOOK,
+       "docs/day1/D9.md 'Draw distance'; docs/formats/models.md 'LOD choice'",
+       "Mesh LOD switches and mesh draw distances happen BW_VFX_LOD times further away (default 2: 100/200/300 m become 200/400/600 m): a hook on RenderItem_IsVisible (0x308E0) scales the distance its callers pick LODs by; view culling, far plane and fog unchanged, nothing changes up close")
+BW_FIX(AUDIO_SINC_RESAMPLE, BW_ED_RX, 1, BW_FIXKIND_RUNTIME,
+       "REMASTER_LOG 2026-10-27 audio (D-016 reproduction quality); docs/day1/D2.md",
+       "The voice processor resamples each voice with a windowed sinc (Kaiser, 16 taps, cutoff following the pitch) instead of linear interpolation (carried apu_vp.c). The hardware's method is unknown (xemu uses libsamplerate); Original keeps linear. ON by default: fewer images and less treble loss, same sounds")
+
+BW_FIX(AUDIO_MAKEUP_GAIN, BW_ED_RX, 1, BW_FIXKIND_RUNTIME,
+       "REMASTER_LOG 2026-10-27 audio (clean levels); docs/day1/D2.md",
+       "The final stereo output gets +4 dB (BW_AUDIO_GAIN_DB sets it) with a look-ahead peak limiter at -1 dBFS (carried apu_core.c), after the whole mix, so music, effects and voice keep the game's balance. The game mixes quietly (gameplay -23..-29 dBFS RMS, title music about -39). ON by default")
+
+BW_FIX(AUDIO_HRTF_EARS, BW_ED_RX, 0, BW_FIXKIND_RUNTIME,
+       "TOOLKIT_ISSUES TK-18; docs/day1/D2.md part 3",
+       "RETIRED (kept so no ID moves): TK-18's left/right HRTF ears became a port fix in every edition (carried apu_vp.c, BW_APU_HRTF_EARS=0 switches back), with the ear order measured. This entry changes nothing")
+
+BW_FIX(AUDIO_LOW_LATENCY, BW_ED_RX, 1, BW_FIXKIND_RUNTIME,
+       "REMASTER_LOG 2026-10-27 audio (lower latency); docs/day1/D2.md",
+       "The output queue may come down to 2 device buffers (21 ms) where Original stops at 4 (43 ms): every boot starts at 4 and steps down after 20 s without a dry spell, and grows again on underruns (carried apu_core.c). ON by default")
+BW_FIX(VFX_AO, BW_ED_RX, 0, BW_FIXKIND_RUNTIME,
+       "docs/day1/D9.md 'Ambient occlusion'",
+       "Screen-space ambient occlusion on the 3D scene, per view, before its HUD: contact shadows where geometry meets (boats on water, rocks, buildings), near range only, fading out with distance (BW_VFX_AO=0..1, default 0.5 when on). OFF by default: it adds shading the original didn't have")
+BW_FIX(HIFPS, BW_ED_RX, 1, BW_FIXKIND_HOOK,
+       "docs/remaster/120fps.md (R4, route b); D-016; docs/day1/D7.md",
+       "High frame rate in gameplay: the game's own fixed 30 Hz step (Game+0x18 = 4, the accumulator without its one-step floor), frames drawn up to the display's refresh rate with the camera and scene nodes interpolated between steps, lightning rolled once per step, drawn frames with their own rand() dice; host-paced flips, variable refresh allowed (src/bw_hifps_hooks.c; BW_HIFPS=<fps>|0). ON by default: Remastered's frame-rate headline (D-016); game speed is unchanged by construction")
+
+BW_FIX(AUDIO_SURROUND, BW_ED_RX, 1, BW_FIXKIND_RUNTIME,
+       "REMASTER_LOG 2026-10-27 audio (surround); docs/day1/D2.md part 3",
+       "With a 6-channel or larger audio device: the game is told surround (src/bw_audio_hooks.c, XGetAudioFlags) and the output is 5.1 from the speaker and 3D bins (carried apu_xaudio2.c, apu_dsp.c, apu_core.c); the DSP stage stands down, since DirectSound's Dolby EP path doesn't run here. Stereo devices are unchanged. ON by default (BW_AUDIO_SURROUND=force|off for tests)")
+
+/* ---- Original-game bug fixes (D-016: Remastered fixes the game's own bugs;
+ * agent D11, docs/day1/D11.md). Hooks in src/bw_fix_hooks.c. ON by default
+ * only where the intended behaviour is seen in the code or data. */
+BW_FIX(BOAT_IMPACT_SOUND_SELF, BW_ED_RX, 1, BW_FIXKIND_HOOK,
+       "REMASTER_LOG 2026-10-26 'sound (bug)' (B1.md); docs/day1/D11.md",
+       "Hull impact sounds: BoatSound_PlayWaterSmack/Splash/Plunge (0x12C40, 0x12D30, 0x12E40) pick sound i and test Sound_IsPlaying on WaterLap i (+0x5C) instead of their own (+0x6C/+0x7C/+0x8C), so an impact is dropped while the lap loop with the same index plays and restarts over itself otherwise; the lap slots hold the function's own sounds for the call. ON by default: each function null-tests and plays its own slot, and PlayWaterLap tests the slot it plays (seen)")
+BW_FIX(AI_MOOD_WAVE_PERIOD, BW_ED_RX, 1, BW_FIXKIND_HOOK,
+       "REMASTER_LOG 2026-10-26 'AI (bug)' (C5.md); docs/day1/D11.md",
+       "AI mood wave: RandomWave_Value (0xB73D0) multiplies the clock by the raw period (+4, 600 s) instead of the pi/period that RandomWave_Init stores at +0xC for the sine type, so the 20-minute mood swing is per-sample noise (up to +-25% on attack scores at Ensign); the sine branch reads +0xC. ON by default: the frequency is computed for this branch and read nowhere else (seen)")
+BW_FIX(AI_RULES_AND_AS_OR, BW_ED_RX, 1, BW_FIXKIND_HOOK,
+       "REMASTER_LOG 2026-10-26 'AI target rules (bug, data)'; docs/formats/missions.md finding 5; docs/day1/D11.md",
+       "AI target rules: the 17 shipped rules written 'NAME=X1 AND NAME=X2' (or SQUAD/SIDE) match nothing, so 7 target/follow entries in M09, M10, M14, M24, M26, M27 scripts are dead; before MisAIRules_Load (0xC7AE0) each AND sub-tree of one single-valued kind with different values reads as OR (loaded mission data only). ON by default: every shipped AND is of this unsatisfiable kind, the rule names name the set (BtyKerang, EscortA) and M21 writes it with OR (seen)")
+BW_FIX(M10_SECOND_STRIKE, BW_ED_RX, 1, BW_FIXKIND_HOOK,
+       "REMASTER_LOG G1; ANALYSIS 'Mission 10's soft-lock'; docs/day1/D11.md",
+       "Mission 10 soft-lock (G1): when every first-wave Strike Force boat is sunk before one reaches Kerang, the respawned second force waits north of the map on StrikeNearKerang forever; Objective_EvaluateCondition (0x7F520) counts StrikeNearKerang as met once no Strike Force boat is afloat inside the mission area and one waits north of it, and the game's own second-wave sequence (radio line M10A12, the attack) follows. Acts only in that otherwise unwinnable state. ON by default: the second wave and a finishable mission are seen in the data; the trigger for the stranded state is ours")
+BW_FIX(M17_CRATE_RESPAWN, BW_ED_RX, 1, BW_FIXKIND_HOOK,
+       "REMASTER_LOG G11; docs/formats/missions.md finding 1; docs/day1/D11.md",
+       "Mission 17 endless health crate (G11): crate repair25b has 0 appearances (infinite) and a 0 s respawn delay, the only infinite power-up in the story missions; before World_LoadPlacedObjects (0x73F40) it gets 1, like the mission's other five crates (exact match on name, class, count, delay and position). ON by default: the maintainer's call 2026-10-27 (that it's a slip is inferred)")
+BW_FIX(M21_PATROL_RESPAWN, BW_ED_RX, 1, BW_FIXKIND_HOOK,
+       "REMASTER_LOG G4; docs/formats/missions.md finding 2; docs/day1/D11.md",
+       "Mission 21 endless patrol boat (G4): squad SeahawkE repeats its respawn script forever (repeat 0), the only one of 100 respawning squads that does; before MisAIRules_Load (0xC7AE0) resolves the scripts its repeat count becomes 1, like the others, so it comes back once. ON by default: the maintainer's call 2026-10-27 (that it's a slip is inferred)")
+BW_FIX(AUTOCANNON_HIT_SOUND, BW_ED_RX, 1, BW_FIXKIND_HOOK,
+       "docs/day1/D11.md 'AUTOCANNON_HIT_SOUND' (found by BW_FIX_PROBE)",
+       "Autocannon hits on boats and buildings: the game picks one of three hit sounds with rand() % 3, but the banks have auto_exp1 and auto_exp2 only, so the third sound has no buffer and one hit in three is silent; Audio_PlayObjectSound3D/2D (0x14710, 0x14790) asked for a sound with no recording play one of the lower variants instead, alternating (no new sounds; the game's rand() is untouched). ON by default: every hit path plays a sound and none skips it on purpose (seen); which recording fills in is ours")
+/* ---- Original-game bug fixes, round 2 (agent F2, docs/day1/F2.md). Hooks in
+ * src/bw_fix_hooks.c. Same default rule. */
+BW_FIX(VOICE_PLACEHOLDER_BORROW, BW_ED_RX, 1, BW_FIXKIND_HOOK,
+       "docs/formats/sound.md finding 2; REMASTER_LOG 2026-10-26 'sound (bug)'; docs/day1/F2.md",
+       "Silent voice lines: 15 voice items in the packs of missions 2, 7, 8, 10, 14 and 19 are empty placeholders (size 0) that Audio_LoadPakItem (0x14FA0) skips, so the lines (edge warnings 99G098-103, friendly-fire 99G105/106/108/109, 01G02) show their subtitle in silence; an empty wave item loads the same-named recording from the first mission voice pack that has one (byte-identical in every pack), staged in a game heap block for the call. ON by default: each name pairs with one subtitle in all 28 missions and the recording plays with it elsewhere (seen)")
+BW_FIX(M20_EDGE_GAP, BW_ED_RX, 1, BW_FIXKIND_HOOK,
+       "FIELD_REPORT G6; REMASTER_LOG 2026-10-26 'missions (G4/G5/G6, data)'; docs/formats/missions.md finding 3; docs/day1/F2.md",
+       "Mission 20 map edge (G6): the only edge fail line, EdgeFailSouth (5000 x 5 m, the area's width), sits 4.83 m off centre and ends at x 2495.2, and water reaches the area's east edge just north of it, so the player can sail out east (past x 2500, seen to x 4921) or south through the gap with nothing failing; Objective_EvaluateCondition (0x7F520) also counts that line as met when the player boat is east of x 2500 or past its latitude beyond its east end. ON by default: the maintainer's call 2026-10-27 (off leaves the corner open)")
+
+/* ---- Visual suite additions (agent V1, docs/day1/V1.md) ---- */
+BW_FIX(VFX_HUD_EDGES, BW_ED_RX, 1, BW_FIXKIND_RUNTIME,
+       "docs/day1/V1.md 'Radar ring'; docs/day1/D9.md third task section 5",
+       "Hard-edged HUD art (DXT3/5 overlays whose alpha is opaque shapes with a one-texel anti-aliased rim, decided at upload from the alpha blocks: the radar's compass ring, weapon and bar icons) is drawn, when magnified, with a smooth contour at alpha 0.5 and its colour weighted towards the opaque texels: at 4K the compass ring's rim no longer beads with a dark notch at every texel step (BW_VFX_HUDEDGE=0 restores D9's Catmull-Rom). ON by default: the art is drawn one texel per pixel on the console (seen: a 128-pixel quad for the 128x128 HUD_COMPASS) and its shape is a round anti-aliased ring (seen in the texture); the filter draws that shape at the output resolution")
+BW_FIX(M23_MISSING_TEXTURES, BW_ED_RX, 1, BW_FIXKIND_HOOK,
+       "docs/formats/textures_catalogue.md 'Mission 23 missing textures'; REMASTER_LOG 2026-10-26 'textures (bug)'; docs/day1/V1.md",
+       "Mission 23's two missing textures: missions/23.pak references the common textures Chin_Grate (the grates over the octagonal openings in the arena hallway's ceiling, 4 submeshes) and O_Brass (the rods and finials of the arena's banners, 8 submeshes), which exist in no archive, so Pak_TokenTextures (0x92CC0) leaves them null: the grates draw as black holes, the rods flat white. After the handler, each gets a stand-in from the game's own files, the mission's pak first, else common/BoatText.pak through the game's own lookup Defaults Chin_GirderMetal (the maintainer's pick 2026-10-27: the riveted girder lattice, cut-out by its own flag; V1 first chose Chin_Railing drawn opaque) and pittedcopper (BoatText's brass) (BW_M23_GRATE=<name>, BW_M23_BRASS=<name>, BW_M23_CUTOUT=0|1). ON by default (the maintainer's call, 2026-10-27): the missing names are seen in the data; the stand-ins are our choice")
+/* ---- Original-game bug fixes, round 2 follow-up (agent F2, docs/day1/F2.md section 5) ---- */
+BW_FIX(BATTLE_WATER_SOUNDS, BW_ED_RX, 1, BW_FIXKIND_HOOK,
+       "docs/day1/F2.md sections 4-5; REMASTER_LOG 2026-10-27 'Battle Mode water sounds (F2)'; D11 'Battle Mode has no boat water sounds'",
+       "Battle Mode water sounds: Audio_PlayerBoatInit asks for the player boats' 26 Water* sounds in every game type, but they ship only in the story mission paks' Sound section, which a battle never loads, so battle boats are silent on the water; before Audio_InitBoatAndTurretSounds (0x142E0), when the wave table has no WaterLap1 (never in a story mission), the 26 waves are read from missions/03.pak's Sound section with the game's own zlib (inflate 0xD7FE0, in chunks) and loaded through Audio_LoadPakItem's own body (the canonical set, identical in 27 of 28 story paks; about 1 MB, as every story mission carries). ON by default: the maintainer's call (2026-10-27); the code asks for them in every mode (seen), the omission's intent is inferred")
+BW_FIX(M14_SHIELD_CUTSCENE, BW_ED_RX, 1, BW_FIXKIND_HOOK,
+       "FIELD_REPORT G10; REMASTER_LOG G9/G10/G12; docs/day1/F2.md sections 2 and 7",
+       "Mission 14 shield cutscene (G10): the shield can be collected before the depots, but its objective (PRI_Pickup Talisman, PICKUP, order 3) stays held by the order gate, so its cutscene Pickup_Sheild plays later, when depot A dies, at the shield's empty spot; after Cinematics_Update (0x90D90), an unplayed cutscene whose PICKUP trigger is collected but held by the gate (Objectives_IsPrevStepMet 0x7DB30) is played then (Cinematics_Play 0x909F0), at the pickup; the objective keeps its order and the cutscene isn't shown again. The only PICKUP-triggered cutscene in the game. ON by default: the maintainer's call (2026-10-27); the order is seen in the data, the out-of-order handling is ours")
+BW_FIX(BOAT_LANDING_WEIGHT, BW_ED_RX, 1, BW_FIXKIND_HOOK,
+       "docs/day1/F2.md section 6 (landing measurements); D11 'BOAT_SPLASH_RANGE'",
+       "Boat landings, light vs heavy: BoatSound_UpdateImpacts (0x13210) times each jump in ms (+0xE0) and plays WaterSmack below 400 ms, otherwise BoatSound_ShouldPlaySplash (0x13180) picks splash or plunge by attitude only (v = cos pitch, seen), so with BOAT_SPLASH_RANGE nearly every landing splashed (24 of 26 measured, the biggest ramp jumps included); in its wrapper a level landing after BW_LANDING_HEAVY_MS (default 1000 ms, ours) or more is answered plunge, so light landings splash and heavy ones plunge (11 / 15 of the 26). ON by default: the maintainer's call (2026-10-27); the threshold is ours, the air time is the game's own measure")
+/* ---- Original-game bug fix (lead, 2026-10-27; REMASTER_LOG 'M27 flagship') ---- */
+BW_FIX(M27_SHIELD_HIT_LINE, BW_ED_RX, 1, BW_FIXKIND_HOOK,
+       "REMASTER_LOG 2026-10-27 'original bug candidate (M27...)' and 'M27 shield hit line'; docs/day1/W1.md 'Open question'; docs/formats/boats_objects.md section 4a",
+       "Mission 27's shield-hit radio call (27A24): the objective M27A24_hit flagship is a CONTACT on the Dragon from the Player with weapon mask 0x400, but Projectile_GetWeaponTypeMask (0x62670) has a bit only for types up to the Dragon's Claw (0x200) and gives every other type, TheShield (12) included, 4, so nothing ever reports 0x400 and the line never plays; in its wrapper a TheShield shot reports 4 | 0x400 (the next bit for the next type, inferred), so the shield's returned blast hitting the Dragon plays the line once. Only M27A24 changes of the 119 CONTACT objectives (the three others carrying 0x400 also carry 4). ON by default: the maintainer's call (2026-10-27)")
+/* ---- Texture restoration (agent T1, docs/day1/T1.md) ---- */
+BW_FIX(VFX_TEX_RESTORE, BW_ED_RX, 1, BW_FIXKIND_RUNTIME,
+       "docs/agents/BRIEF_T1T2.md 'The design'; docs/day1/T1.md; docs/remaster/texture_matching.md",
+       "Texture restoration (bw_texrestore.c): the game's DXT textures drawn by 3D draws (boats, weapons, terrain, rocks, props, sky) get the block-compression steps between flat 4x4 blocks smoothed (Plan A deblock, real edges kept, alpha untouched), and two enlarged levels (4x and 2x, Lanczos-2 held within the 2x2 texels around each point, no sharpening; cut-out alpha stays hard) above the game's own level 0 and mips, so they are sampled only where a texture is drawn larger than painted; at or below painted size the game's own levels draw (deblocked). Not touched: overlays (HUD, fonts, menus keep VFX_TEXT/VFX_HUD_EDGES), normal maps, cube maps, 32-bit and linear textures, render targets, movies, the water's textures and every effect sprite (by content key). Menu and title photos (the JPEG screens) and the two boot logo movies (Bink frames) get the same deblock on their 8x8 grid (on the GPU, as each one goes up) and Lanczos-2 instead of Catmull-Rom or point sampling when magnified; at 1:1 the game's own sample. Built off the frame path (worker thread, budgeted finish at the flip). BW_TEXRESTORE=0, BW_TEXRESTORE_DEBLOCK=0, BW_TEXRESTORE_SCALE=2, BW_TEXRESTORE_MENUS=0, BW_TEXRESTORE_MOVIES=0, BW_TEXRESTORE_DEBUG=1 (tint). ON by default: the maintainer's call (2026-10-27) after the previews; nothing is invented, the art is the game's own")
+/* ---- Faithful visual extras on the game side (agent T3, docs/day1/T3.md).
+ * Hooks in src/bw_visextra_hooks.c. ---- */
+BW_FIX(SPLIT_FULL_DETAIL, BW_ED_RX, 1, BW_FIXKIND_HOOK,
+       "docs/day1/T3.md 'Split screen at single-player detail'; REMASTER_LOG 2026-10-27 'split screen (T3)'; docs/formats/animation.md item 9",
+       "Split screen at single-player detail: Ocean_Render (0x38EC0) passes Ocean_CullQuadtree (0x38720) a level-of-detail factor of 1, 2 or 4 by the view count [0x1A9A78], so 2-4 player views get bigger, fewer sea tiles; the wrapper hands that one call a smaller factor of the game's own (the recursion passes it on): BW_SPLIT_WATER=full (default since the native ocean, 2026-10-28) 1 everywhere, =balanced 1 for 2 players and 2 (the game's 2-player sea) for 3-4, =0 the console's. And with 3-4 players AnimLib_CheckSplitScreen (0x26040) disables the animation library and AnimLib_Update (0x26090) skips every instance, so gunners, turrets and props stand still; the flag is put back as before and AnimLib_Update's body sees a player count of 2 for the call (restored at once). Sea and animations the game itself draws, nothing new; 1-player games are untouched (factor already 1, count 1). ON by default (D-016; full is the lead's call under D-014 since the native ocean: 4P at 3440x1440 113 fps full vs 132 balanced, P2a.md; was balanced): T3 measured at 3440x1440 uncapped, 4P 90 -> 80 fps balanced and 40 fps full (the one-player sea is 4x the game thread's vertex work of 1P), 2P 100 -> 75 fps, animations free (T3.md section 1.4)")
+BW_FIX(OCEAN_MIPALPHA_FIX, BW_ED_RX, 1, BW_FIXKIND_HOOK,
+       "docs/day1/T3.md 'Distant water: the ocean frames' mip alpha'; docs/remaster/texture_matching.md section 2 'Original quirk'",
+       "ON by default (the maintainer's call, 2026-10-27; launcher Fixes, 'Distant wake foam': As shipped / Fixed / Smooth): Ocean_MergeFrameAlpha (0x38210) writes each wake mask into its ocean frame's alpha for levels 0-6 with a stride and row skip written for a linear image, but walks the swizzled mask, so levels 1-6 hold a scrambled mask; after the body, levels 1-6 are written again from the frame's own (correct) level-0 alpha: BW_OCEAN_MIPALPHA_FIX=1 (or +OCEAN_MIPALPHA_FIX) the top-left texel of each block, the developers' own sampling in the right order; =2 the block average. The alpha is read by the ocean's third pass only (seen: t1.a, weighted by vertex alpha), so it changes distant foam, not the sea's colour or the sky. The maintainer decides")
+/* ---- The native ocean (agent P2a, docs/day1/P2a.md). src/bw_ocean_native.c;
+ * the translation is tools/bw_ocean_xlate.py's output in src/recomp/gen. ---- */
+BW_FIX(OCEAN_NATIVE, BW_ED_RX, 1, BW_FIXKIND_HOOK,
+       "docs/day1/P2a.md; docs/formats/water.md; REMASTER_LOG 2026-10-27 'native ocean (P2a)'",
+       "Native ocean: the sea's render vertices (WaterWorld_EvaluateVertexBatch 0x98130 for Ocean_FillVertices's call only, mode 0x1D: WaterWorld_VertexHeightNormal 0x961A0, Water_HeightAndSlopeAt 0x94930, Water_GridSlopeAt 0x94CD0, Water_GetBezierPatch 0x94280, WaterWorld_GetCell 0x97870) run as native code translated from the generated C by tools/bw_ocean_xlate.py: the x87 stack and the stack frame resolved at translation time, the same operations in the same order, so bit-identical; compiled for both x87 precisions and run at the one the guest has set (seen: the render runs at the runtime's 0x037F, 64-bit), and thrown away for the game's own function if any result leaves float's range (host overflow/underflow flags) or the x87's trig range. Every other water query (boats, hulls, projectiles, AI, cameras) is the game's own code. BW_OCEAN_NATIVE=0 the game's function again, BW_OCEAN_NATIVE_VERIFY=1 runs both and counts differences, BW_OCEAN_NATIVE_LOG=1 times it. ON by default: exact by construction and checked (P2a.md); speed only")

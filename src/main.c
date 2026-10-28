@@ -1,0 +1,832 @@
+/**
+ * Blood Wake - Recompiled Game Entry Point
+ *
+ * Copied from xboxrecomp v0.16.0 templates/new-game (session 1) and adapted:
+ * the XBE constants below, and the "Blood Wake run control" section for
+ * unattended evidence runs (M0.7, docs/FIRST_RUN_PLAN.md).
+ *
+ * This is the Windows executable that hosts the recompiled game code.
+ * It performs the following initialization sequence:
+ *
+ * 1. Load the original XBE file from disk
+ * 2. Initialize the Xbox memory layout (map data sections to original VAs)
+ * 3. Initialize the Xbox kernel replacement layer
+ * 4. Initialize the kernel bridge (thunk table in Xbox memory)
+ * 5. Set up game file paths for I/O redirection
+ * 6. Initialize the stack pointer
+ * 7. Install VEH crash handler for diagnostics
+ * 8. Call the game's original entry point (recompiled)
+ *
+ * Customize this file for your game:
+ *   - Set YOUR_GAME_ENTRY_POINT to the XBE entry point address
+ *   - Set YOUR_GAME_XBE_PATH to where the XBE file lives
+ *   - Set YOUR_GAME_DIR to the game data directory
+ *   - Add any CRT global pre-initialization your game needs
+ *   - Customize the VEH handler for game-specific crash diagnosis
+ *
+ * XBE Details (xbe_parser, session 1; see docs/ANALYSIS.md):
+ *   Title:       Blood Wake (NA retail, disc 0 v1, built 2001-11-20)
+ *   Title ID:    0x4D530010
+ *   Base addr:   0x00010000
+ *   Entry point: 0x000DE15F
+ *   Code size:   ~931 KB (.text)
+ *   Sections:    24 (.text DSOUND WMADEC D3D D3DX XGRPH 12x BINK* XPP .rdata
+ *                .data DOLBY BINKDATA $$XTIMAGE)
+ *   Kernel imports: 118
+ */
+
+#include <windows.h>
+#include <dbghelp.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <stdbool.h>
+#include <string.h>
+#include <math.h>
+
+/* xboxrecomp runtime headers */
+#include <xbox/xboxrecomp.h>
+
+/*
+ * If xboxrecomp.h is not an umbrella header in your setup, include
+ * the individual headers directly:
+ *
+ * #include "kernel.h"
+ * #include "xbox_memory_layout.h"
+ * #include "d3d8_xbox.h"
+ * #include "dsound_xbox.h"
+ * #include "xinput_xbox.h"
+ */
+
+/* ── Global register state (defined in xbox_memory_layout.c) ── */
+
+/* RECOMP_TLS is not optional here. The runtime defines these thread-local, and
+ * a plain `extern` referencing a __declspec(thread) variable does not resolve
+ * to the calling thread's copy -- it resolves to the image's TLS template. The
+ * host side then writes g_esp somewhere the generated code never reads, so the
+ * guest starts with every register at zero and faults immediately, having
+ * apparently ignored the setup that visibly ran. */
+extern RECOMP_TLS uint32_t g_eax, g_ecx, g_edx, g_esp;
+extern RECOMP_TLS uint32_t g_ebx, g_esi, g_edi;
+extern RECOMP_TLS uint32_t g_seh_ebp;
+/* x87 and SSE state. Global for the same reason the volatile GPRs are: one
+ * guest routine can lift to several C functions, so a value written in one
+ * body is read in the next. Defined in xbox_memory_layout.c like the rest of
+ * the register file. */
+extern RECOMP_TLS double g_fp_stack[8];
+extern RECOMP_TLS int g_fp_top;
+extern RECOMP_TLS uint16_t g_fp_control_word;
+extern RECOMP_TLS uint32_t g_mxcsr;
+extern RECOMP_TLS int g_fp_cmp;
+extern RECOMP_TLS RecompXmm g_xmm0, g_xmm1, g_xmm2, g_xmm3;
+extern RECOMP_TLS RecompXmm g_xmm4, g_xmm5, g_xmm6, g_xmm7;
+extern ptrdiff_t g_xbox_mem_offset;
+
+/* ── XBE Constants ─────────────────────────────────────────── */
+
+/*
+ * TODO: Set these from your xbe_parser output.
+ * Run: py -3 -m tools.xbe_parser game/default.xbe
+ */
+#define YOUR_GAME_ENTRY_POINT   0x000DE15F  /* XBE entry point VA */
+#define YOUR_GAME_XBE_PATH      "game\\disc\\default.xbe"
+#define YOUR_GAME_DIR            "game\\disc"
+
+/* BW_GAME_DIR=<folder>: the disc folder from anywhere, so a run can work in
+ * its own folder (tools/bw_run.py --own-cwd): everything the port writes to
+ * its working folder (bw_relaunch.bin, the indirect-call dumps, the kernel
+ * log) then lands there, and two runs no longer share those files. */
+static const char *bw_game_dir(void)
+{
+    const char *e = getenv("BW_GAME_DIR");
+    return e && *e ? e : YOUR_GAME_DIR;
+}
+
+static const char *bw_game_xbe(void)
+{
+    static char path[MAX_PATH];
+    const char *e = getenv("BW_GAME_DIR");
+    if (!e || !*e)
+        return YOUR_GAME_XBE_PATH;
+    _snprintf(path, sizeof path, "%s\\default.xbe", e);
+    path[sizeof path - 1] = 0;
+    return path;
+}
+
+/* ── Forward declarations ──────────────────────────────────── */
+
+static BOOL load_xbe(const char *path, void **out_data, size_t *out_size);
+
+/* ── Blood Wake run control (M0.7) ─────────────────────────────
+ *
+ * For unattended evidence runs driven by tools/bw_run.py. Everything here is
+ * inert unless its variable is set, so a plain launch behaves as before.
+ *
+ *   BW_UNATTENDED=1          no message boxes and no Windows error dialogs:
+ *                            errors go to stderr, and a crash ends the
+ *                            process at once with the exception code
+ *   BW_RUN_SECONDS=<n>       end the run after n seconds: dump the evidence,
+ *                            print "[BW] run limit", exit with code 124
+ *   BW_ICALL_DUMP_EVERY=<n>  rewrite the indirect-call dump every n seconds
+ *                            (default 5 when it is compiled in; 0 = never).
+ *                            The toolkit's watchdog ends a hung run with
+ *                            _exit(3) and skips atexit, so without this a
+ *                            hang would lose every target it reached.
+ *
+ * The dump (RECOMP_ICALL_FEEDBACK, CMake option BW_ICALL_FEEDBACK) is written
+ * to icall_targets.dump in the working folder; bw_run.py moves it into the
+ * run folder. */
+#include "recomp_icall_feedback.h"
+#include "bw_profile.h"                            /* BW_PROFILE sampler */
+#include "bw_host.h"                               /* BW_HOST: play launcher window */
+#include "gpu/bw_d3d11.h"                          /* BW_GPU=d3d11 back end */
+#include "bw_edition.h"                            /* BW_EDITION: D-007/D-015 */
+#include "bw_widescreen.h"                         /* Remastered widescreen */
+#include "bw_settings.h"                           /* the launcher's settings file */
+extern void xbox_missing_summary(const char *why);  /* kernel_missing.h */
+extern int  apu_wav_close_nowait(int wait_ms);      /* apu_wav.h */
+extern void bw_unimpl_summary(void);                /* recomp_manual.c */
+
+static int s_unattended;
+
+static unsigned env_uint(const char *name, unsigned dflt)
+{
+    const char *v = getenv(name);
+    return (v && *v) ? (unsigned)strtoul(v, NULL, 10) : dflt;
+}
+
+static void bw_fail(const char *msg)
+{
+    fprintf(stderr, "[BW] FATAL: %s\n", msg);
+    fflush(stderr);
+    if (!s_unattended)
+        MessageBoxA(NULL, msg, "Blood Wake", MB_ICONERROR);
+}
+
+/* Everything a run should leave behind when it ends abnormally. Safe to call
+ * more than once. */
+static void bw_dump_evidence(const char *why)
+{
+    fprintf(stderr, "[BW] dumping evidence (%s)\n", why);
+    RECOMP_ICALL_FEEDBACK_DUMP();
+    bw_profile_dump(why);
+    {
+        extern void bw_fl_dump(const char *why);   /* P2b: BW_FRAMELOG */
+        bw_fl_dump(why);
+    }
+    xbox_missing_summary(why);
+    bw_unimpl_summary();
+    bw_edition_summary();
+    apu_wav_close_nowait(500);
+    fflush(stdout);
+    fflush(stderr);
+}
+
+static LONG WINAPI bw_unhandled_filter(PEXCEPTION_POINTERS ep)
+{
+    DWORD code = ep->ExceptionRecord->ExceptionCode;
+    fprintf(stderr, "[BW] unhandled exception 0x%08lX, ending the run\n",
+            (unsigned long)code);
+    bw_dump_evidence("crash");
+    TerminateProcess(GetCurrentProcess(), (UINT)code);
+    return EXCEPTION_EXECUTE_HANDLER;
+}
+
+static DWORD WINAPI bw_run_control_thread(LPVOID arg)
+{
+    unsigned limit = env_uint("BW_RUN_SECONDS", 0);
+#ifdef RECOMP_ICALL_FEEDBACK
+    unsigned every = env_uint("BW_ICALL_DUMP_EVERY", 5);
+#else
+    unsigned every = 0;
+#endif
+    ULONGLONG start = GetTickCount64();
+    ULONGLONG next_dump = every ? start + every * 1000ULL : 0;
+
+    (void)arg;
+    for (;;) {
+        ULONGLONG now;
+        Sleep(250);
+        now = GetTickCount64();
+        if (next_dump && now >= next_dump) {
+            RECOMP_ICALL_FEEDBACK_DUMP();
+            next_dump = now + every * 1000ULL;
+        }
+        if (limit && now - start >= limit * 1000ULL) {
+            fprintf(stderr, "[BW] run limit %u s reached\n", limit);
+            bw_dump_evidence("run limit");
+            TerminateProcess(GetCurrentProcess(), 124);
+        }
+    }
+}
+
+static void bw_run_control_init(void)
+{
+    s_unattended = getenv("BW_UNATTENDED") != NULL;
+    if (s_unattended) {
+        SetErrorMode(SEM_FAILCRITICALERRORS | SEM_NOGPFAULTERRORBOX |
+                     SEM_NOOPENFILEERRORBOX);
+        _set_abort_behavior(0, _WRITE_ABORT_MSG | _CALL_REPORTFAULT);
+        SetUnhandledExceptionFilter(bw_unhandled_filter);
+    }
+    RECOMP_ICALL_FEEDBACK_INIT();   /* atexit dump; no-op when not compiled in */
+
+    {
+        int want = env_uint("BW_RUN_SECONDS", 0) != 0;
+#ifdef RECOMP_ICALL_FEEDBACK
+        want = want || env_uint("BW_ICALL_DUMP_EVERY", 5) != 0;
+#endif
+        if (want) {
+            HANDLE h = CreateThread(NULL, 0, bw_run_control_thread, NULL, 0, NULL);
+            if (h)
+                CloseHandle(h);
+        }
+    }
+    fprintf(stderr, "[BW] run control: unattended=%d run_seconds=%u icall_feedback=%s\n",
+            s_unattended, env_uint("BW_RUN_SECONDS", 0),
+#ifdef RECOMP_ICALL_FEEDBACK
+            "on"
+#else
+            "off"
+#endif
+            );
+}
+
+/* Recompiled entry point (generated by recomp pipeline) */
+extern void xbe_entry_point(void);
+
+/* ── VEH crash handler ─────────────────────────────────────── */
+
+/*
+ * Vectored Exception Handler for crash diagnostics.
+ *
+ * When the recompiled game hits an access violation, this handler prints
+ * the faulting address, all Xbox register values, and a native stack trace.
+ * This is your primary debugging tool during bring-up.
+ *
+ * Customize this for your game:
+ *   - Add game-specific address checks (GPU register probes, etc.)
+ *   - Add dumps of game-specific globals (heap handles, state flags)
+ *   - Add SEH simulation if your game uses __try/__except
+ */
+/* Name the guest function a fault happened in, and recover the call chain.
+ *
+ * Recompiled code faults as ordinary native code, so the exception record
+ * carries a host RIP and nothing else -- there is no guest program counter to
+ * report, and the host address changes every build. Two things recover the
+ * guest view:
+ *
+ *   - every generated function is a real symbol in the image (sub_005A03C0
+ *     and so on), so the linker's PDB already maps host address back to guest
+ *     function. dbghelp turns an anonymous RIP into that name.
+ *
+ *   - every lifted call pushes its guest return address onto the guest stack
+ *     before jumping, so the stack still holds the chain. Scanning up from esp
+ *     for values inside the code sections recovers it.
+ *
+ * ponytail: the stack scan is a scan, not a frame walk -- these are FPO frames
+ * with no reliable ebp chain, so there is nothing to walk. It over-reports,
+ * since addresses from returned-from calls linger below esp, but naming the
+ * guest function is the whole question at a fault.
+ *
+ * Requires linking dbghelp and keeping the .pdb beside the .exe.
+ */
+static void print_guest_context(void *rip)
+{
+    /* SYMBOL_INFO is variable-length: the name is written past the struct, so
+     * it must be over-allocated with MaxNameLen set to the slack. */
+    char buf[sizeof(SYMBOL_INFO) + 256];
+    SYMBOL_INFO *sym = (SYMBOL_INFO *)buf;
+    DWORD64 disp = 0;
+
+    memset(buf, 0, sizeof(buf));
+    sym->SizeOfStruct = sizeof(SYMBOL_INFO);
+    sym->MaxNameLen = 255;
+    if (SymFromAddr(GetCurrentProcess(), (DWORD64)(uintptr_t)rip, &disp, sym))
+        fprintf(stderr, "  in %s+0x%llX\n",
+                sym->Name, (unsigned long long)disp);
+
+    if (g_xbox_mem_offset && g_esp) {
+        const uint32_t *sp =
+            (const uint32_t *)((uintptr_t)g_xbox_mem_offset + g_esp);
+        int shown = 0, i;
+        fprintf(stderr, "  guest stack (return addresses, innermost first):\n");
+        for (i = 0; i < 256 && shown < 24; i++) {
+            uint32_t v = sp[i];
+            if (v > g_xbox_code_lo && v < g_xbox_code_hi) {
+                fprintf(stderr, "    [esp+%-4d] 0x%08X\n", i * 4, v);
+                shown++;
+            }
+        }
+        /* When the frame is gone, say so, and fall back on what is left.
+         *
+         * A fault inside a block copy leaves no return address in range: the
+         * copy is a host memmove and its caller's frame is further up than
+         * this reaches. Worse, a copy that ran past its buffer overwrites the
+         * stack itself, so the list comes out empty exactly when it is most
+         * needed -- and an empty list under a promising heading reads like
+         * "nothing to see" rather than "the evidence is destroyed". */
+        if (!shown)
+            fprintf(stderr, "    (no return addresses in range)\n");
+
+        /* Everything below only pays for itself when the scan came back
+         * empty. A crash where the chain was recovered already says what
+         * happened, and burying that under another twenty lines makes the
+         * common report worse to read. */
+        if (!shown) {
+            uint32_t k;
+
+            /* The indirect-call history, which the stack cannot overwrite.
+             * recomp_manual.c prints this too, but only from
+             * recomp_icall_fail_log -- a page fault inside a block copy
+             * never reaches that path, and this is the same information by
+             * the route the fault actually took.
+             *
+             * Declared here rather than included: main.c does not pull in
+             * recomp_types.h, and recomp_manual.c spells it the same way. */
+            extern volatile uint32_t g_icall_trace[16];
+            extern volatile uint32_t g_icall_trace_idx;
+
+            fprintf(stderr, "  recent ICALL targets:");
+            for (k = 0; k < 16; k++)
+                fprintf(stderr, " %08X",
+                        g_icall_trace[(g_icall_trace_idx + k) & 15]);
+            fprintf(stderr, "\n");
+
+            /* The frame unfiltered. The pointers and lengths handed to
+             * whatever faulted live here and look nothing like code, so the
+             * filter above drops exactly what is wanted. On the crash this
+             * was written for, one of these words was the end of the mapped
+             * RAM mirror -- which is what identified the fault as a copy
+             * running off its buffer rather than a stray pointer. */
+            for (i = 0; i < 20; i++)
+                fprintf(stderr, "    raw[esp+%-4d] 0x%08X\n", i * 4, sp[i]);
+        }
+    }
+}
+
+/* The emulated APU.
+ *
+ * Two entry points that had no callers anywhere in the tree. apu_mmio_hook.c
+ * documents apu_hook_handle_mmio as "called from VEH in main.c" and no main.c
+ * called it; apu_decode_and_handle's first line is `if (!g_apu_state) return
+ * false` and nothing assigned g_apu_state. So with RECOMP_AC97_READY set the
+ * APU's registers were unmapped to be trapped, and every trap was then
+ * declined and surfaced as an access violation on the first register
+ * DirectSound touched. The VEH below now reaches apu_hook_handle_mmio
+ * through the toolkit's xbox_VehMmioFault.
+ *
+ * Declared rather than included so this does not depend on src/apu being on
+ * the include path. */
+typedef struct MCPXAPUState MCPXAPUState;
+extern MCPXAPUState *mcpx_apu_init_standalone(uint8_t *ram_ptr);
+extern MCPXAPUState *g_apu_state;
+
+static LONG CALLBACK veh_handler(PEXCEPTION_POINTERS ep)
+{
+    if (ep->ExceptionRecord->ExceptionCode == EXCEPTION_ACCESS_VIOLATION) {
+        uintptr_t fault_addr = ep->ExceptionRecord->ExceptionInformation[1];
+
+        /*
+         * GPU register probe at 0xFD000000 range.
+         * Some games probe NV2A registers directly. On real hardware this
+         * returns GPU state; here we just skip the instruction.
+         * TODO: Implement mini x86-64 decoder for instruction skipping,
+         * or connect to the xbox_nv2a library for proper handling.
+         */
+        if (fault_addr >= 0xFD000000 && fault_addr < 0xFE000000) {
+            return EXCEPTION_CONTINUE_SEARCH;
+        }
+
+        /* Trapped hardware registers (APU, USB OHCI) -> their models.
+         *
+         * The other half of RECOMP_AC97_READY: reporting the codec ready is
+         * what lets DirectSoundCreate past its first gate, and from there it
+         * drives the APU directly, so the registers have to fault to be seen.
+         * "Handled" means the access was decoded and the instruction stepped
+         * over, so execution resumes instead of unwinding. */
+        if (xbox_VehMmioFault(ep))
+            return EXCEPTION_CONTINUE_EXECUTION;
+
+        fprintf(stderr, "[CRASH] Access violation at RIP=0x%llX, fault addr=0x%llX (%s)\n",
+            (unsigned long long)ep->ContextRecord->Rip,
+            (unsigned long long)fault_addr,
+            ep->ExceptionRecord->ExceptionInformation[0] ? "write" : "read");
+        fprintf(stderr, "  Xbox regs: eax=0x%08X ecx=0x%08X edx=0x%08X esp=0x%08X\n",
+            g_eax, g_ecx, g_edx, g_esp);
+        fprintf(stderr, "  Xbox regs: ebx=0x%08X esi=0x%08X edi=0x%08X\n",
+            g_ebx, g_esi, g_edi);
+        fprintf(stderr, "  Xbox VA of fault: 0x%08X\n",
+            (uint32_t)(fault_addr - (uintptr_t)g_xbox_mem_offset));
+        print_guest_context((void *)ep->ContextRecord->Rip);
+
+        /*
+         * TODO: Add game-specific diagnostics here. Examples:
+         *
+         * Dump CRT heap handle:
+         *   uint32_t heap = *(uint32_t *)((uint8_t *)g_xbox_mem_offset + HEAP_HANDLE_VA);
+         *   fprintf(stderr, "  CRT heap handle: 0x%08X\n", heap);
+         *
+         * Dump game state:
+         *   uint32_t state = *(uint32_t *)((uint8_t *)g_xbox_mem_offset + GAME_STATE_VA);
+         *   fprintf(stderr, "  Game state: %u\n", state);
+         */
+
+        /* Print native stack return addresses for debugging */
+        {
+            uintptr_t *sp = (uintptr_t *)ep->ContextRecord->Rsp;
+            fprintf(stderr, "  Native stack (first 8 return addrs):\n");
+            for (int i = 0; i < 64 && sp[i]; i++) {
+                if (sp[i] >= 0x140000000ULL && sp[i] < 0x150000000ULL) {
+                    fprintf(stderr, "    [%d] 0x%llX\n", i, (unsigned long long)sp[i]);
+                }
+            }
+        }
+        fflush(stderr);
+
+        /* A title that dies mid-boot is the one whose indirect-call targets
+         * are most worth having. No-op unless RECOMP_ICALL_FEEDBACK. */
+        RECOMP_ICALL_FEEDBACK_DUMP();
+    }
+
+    return EXCEPTION_CONTINUE_SEARCH;
+}
+
+/* ── WinMain ───────────────────────────────────────────────── */
+
+int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
+                   LPSTR lpCmdLine, int nCmdShow)
+{
+    void *xbe_data = NULL;
+    size_t xbe_size = 0;
+
+    (void)hInstance;
+    (void)hPrevInstance;
+    (void)lpCmdLine;
+    (void)nCmdShow;
+
+    /* The launcher asks for the settings table (tools/launcher.pyw). The exe
+     * enters here (WinMain), whatever main() below says, so the process's
+     * own command line is checked. */
+    if (strstr(GetCommandLineA(), "--settings-schema")) {
+        bw_settings_print_schema(stdout);
+        fflush(stdout);
+        return 0;
+    }
+
+    /* The settings file (tools/launcher.pyw; bw_settings.h): its choices
+     * become environment defaults before anything reads a switch, in the
+     * host window's process too, whose environment every boot inherits.
+     * The environment wins; no file (or BW_SETTINGS=none) changes nothing. */
+    bw_settings_apply();
+
+    /* BW_HOST=1 (tools/play.py): this process is the play session's window
+     * and runs each boot of the game as a child (bw_host.c). Nothing of the
+     * game starts here. */
+    if (bw_host_wanted())
+        return bw_host_main();
+
+    /* Unbuffered output for immediate visibility during debugging */
+    setvbuf(stdout, NULL, _IONBF, 0);
+    setvbuf(stderr, NULL, _IONBF, 0);
+    /* BW_STDERR_BUFFER=<bytes>: buffer stderr for speed runs. The toolkit logs
+     * every file read and every traced call, and unbuffered each line is a
+     * system call: 15% of the main thread during the logo movies (profile,
+     * 2026-10-26). Off by default, so a diagnostic run never loses its last
+     * lines; the exit paths (crash, run limit, relaunch) flush. */
+    {
+        static char errbuf[1 << 20];
+        unsigned n = env_uint("BW_STDERR_BUFFER", 0);
+        if (n)
+            setvbuf(stderr, errbuf, _IOFBF, n < sizeof(errbuf) ? n : sizeof(errbuf));
+    }
+
+    printf("=== Blood Wake - Static Recompilation ===\n");
+    bw_run_control_init();
+    /* The edition (D-015): read once per boot from BW_EDITION, which every
+     * launcher passes to every boot. Original is the default and the zero
+     * state; a name that isn't an edition refuses to start, so a typo never
+     * quietly gives Original. */
+    {
+        char err[256];
+        if (bw_edition_init(err, sizeof err)) {
+            bw_fail(err);
+            return 1;
+        }
+    }
+    bw_profile_init();
+    {
+        extern void bw_fl_init(void);   /* P2b: BW_FRAMELOG test aid (bw_framelog.c) */
+        bw_fl_init();
+    }
+    bw_d3d11_register();      /* BW_GPU=d3d11: GPU back end (D-003 B prototype) */
+    printf("Loading XBE...\n");
+
+    /* Install VEH handler (first handler in chain) */
+    /* Load symbols up front rather than from inside the handler: at fault
+     * time the process is already in a bad way, and SymInitialize
+     * allocates. Failure is not fatal -- the handler prints no name. */
+    SymSetOptions(SYMOPT_DEFERRED_LOADS | SYMOPT_UNDNAME);
+    SymInitialize(GetCurrentProcess(), NULL, TRUE);
+    AddVectoredExceptionHandler(1, veh_handler);
+
+    /* Step 1: Load XBE */
+    if (!load_xbe(bw_game_xbe(), &xbe_data, &xbe_size)) {
+        bw_fail("Failed to load game\\disc\\default.xbe. Run from the repo root, "
+                "with the disc extracted to game\\disc (SESSION1_RUNBOOK Phase B).");
+        return 1;
+    }
+    printf("XBE loaded: %zu bytes\n", xbe_size);
+
+    /* Step 2: Initialize Xbox memory layout */
+    printf("Initializing Xbox memory layout...\n");
+    {
+        /* BW_MAP_MB=<n>: map n MB of guest address space while the title is
+         * still told it has 64 MB of RAM (the toolkit's xbox_SetMapSize).
+         * The toolkit backs every NtAllocateVirtualMemory reserve with heap
+         * at once, where the console reserves address space only, so mission
+         * 2's 16 MB reserves ran its ~49 MB heap out and it hung loading
+         * (ANALYSIS, "Mission 2: out of memory"). The extra space only gives
+         * the user heap room; the GPU/APU's contiguous window is separate and
+         * unchanged. */
+        extern void xbox_SetMapSize(size_t bytes);
+        const char *e = getenv("BW_MAP_MB");
+        int mb = e && *e ? atoi(e) : 128;   /* BW_MAP_MB=64: the toolkit default */
+        if (mb > 64) {
+            xbox_SetMapSize((size_t)mb << 20);
+            printf("Guest address space: %d MB mapped (RAM stays 64 MB)\n", mb);
+        }
+    }
+    if (!xbox_MemoryLayoutInit(xbe_data, xbe_size)) {
+        bw_fail("Failed to initialize the Xbox memory layout. "
+                "The required virtual address range may be unavailable.");
+        free(xbe_data);
+        return 1;
+    }
+
+    g_xbox_mem_offset = xbox_GetMemoryOffset();
+    printf("Xbox memory mapped. Offset: 0x%llX\n", (unsigned long long)g_xbox_mem_offset);
+    {
+        extern void bw_state_start(void);
+        bw_state_start();                  /* BW_STATE: read-only state file for tests */
+        extern void bw_debugflags_start(void);
+        bw_debugflags_start();             /* BW_DEBUG_BYTES: developers' debug switches, tests only */
+    }
+    /* Edition data fixes (IMAGE kind): none in Original, which only counts
+     * the image bytes that differ from the XBE (0 expected) and logs it. */
+    bw_edition_apply_image_fixes(xbe_data, xbe_size);
+
+    /* Bring up the emulated APU.
+     *
+     * Gated on the same variable that unmaps its registers, because the two
+     * halves are useless apart: a trap with no model declines every access,
+     * and a model nothing traps into never sees a register. The APU walks
+     * Xbox physical RAM to find voice buffers, so it gets the guest RAM
+     * base. */
+    if (getenv("RECOMP_AC97_READY")) {
+        g_apu_state = mcpx_apu_init_standalone((uint8_t *)xbox_GetMemoryBase());
+        fprintf(stderr, "[BOOT] emulated APU %s\n",
+                g_apu_state ? "up" : "FAILED to initialise");
+    }
+
+    /* Blood Wake: the emulated USB host controllers (the toolkit's ohci.c).
+     * The game reaches its gamepad through its own XAPI/XPP USB driver, which
+     * drives the OHCI registers at 0xFED00000 directly; the model answers
+     * them through the VEH above (xbox_VehMmioFault). Nothing in the toolkit
+     * calls this -- the host must, after guest memory is mapped (ohci.h) --
+     * and the template main.c didn't, so RECOMP_USB alone did nothing (run
+     * 20261025-225038-r4-input: no OHCI activity). Inert unless RECOMP_USB. */
+    {
+        extern void xbox_OhciInit(void);
+        xbox_OhciInit();
+    }
+
+    /* Step 3: Initialize Xbox kernel */
+    printf("Initializing Xbox kernel replacement...\n");
+    xbox_kernel_init();
+
+    /* Step 4: Set game directory for file I/O path translation */
+    {
+        extern void xbox_path_init(const char *game_dir, const char *save_dir);
+        /* NULL in Original: the toolkit's default save folder, as before
+         * the edition switch. Other editions get their own (bw_edition.c). */
+        xbox_path_init(bw_game_dir(), bw_edition_prepare_saves());
+    }
+
+    /* Step 5: Initialize kernel bridge (thunk table in Xbox memory) */
+    printf("Initializing kernel bridge...\n");
+    xbox_kernel_bridge_init();
+
+    /* Blood Wake: the game relaunches itself (run 20261025-222206-r2-pixels,
+     * ANALYSIS "First runs"). A console reboots into the title with the
+     * launch data page the old image left; tools/bw_run.py does the reboot
+     * and passes what recomp_manual.c recorded (bw_relaunch.bin) here.
+     * Built after xbox_kernel_bridge_init, which zeroes the slot. Layout as
+     * XGetLaunchInfo reads it and as the toolkit printed it at the exit:
+     * +0 type (0 for a title launch), +4 title id, +8 the path (520 bytes,
+     * "\Device\CdRom0;default.xbe" for "D:\default.xbe"), +0x210 flags,
+     * +0x400 the 3072 bytes of launch data. */
+    int bw_gameplay_boot = 0;   /* launch data SPLASH mode 1 (below) */
+    {
+        const char *lf = getenv("BW_LAUNCH_DATA_FILE");
+        if (lf && *lf) {
+            FILE *f = fopen(lf, "rb");
+            char magic[4] = {0}, path[261] = {0}, dev[520] = {0};
+            uint32_t ver = 0, plen = 0, dlen = 0, page = 0;
+            uint8_t *mem = (uint8_t *)g_xbox_mem_offset;
+            int ok = f && fread(magic, 1, 4, f) == 4 && !memcmp(magic, "BWRL", 4)
+                     && fread(&ver, 4, 1, f) == 1 && ver == 1
+                     && fread(&plen, 4, 1, f) == 1 && plen < sizeof(path)
+                     && fread(path, 1, plen, f) == plen
+                     && fread(&dlen, 4, 1, f) == 1 && (dlen == 0 || dlen == 3072);
+            if (ok)
+                page = xbox_HeapAlloc(0x1000, 0x1000);
+            if (ok && page) {
+                memset(mem + page, 0, 0x1000);
+                if (dlen && fread(mem + page + 0x400, 1, dlen, f) != dlen)
+                    ok = 0;
+                if (!_strnicmp(path, "D:\\", 3))
+                    snprintf(dev, sizeof dev, "\\Device\\CdRom0;%s", path + 3);
+                else
+                    snprintf(dev, sizeof dev, "%s", path);
+                *(uint32_t *)(mem + page + 0) = 0;              /* title launch */
+                *(uint32_t *)(mem + page + 4) = 0x4D530010u;    /* Blood Wake */
+                memcpy(mem + page + 8, dev, strlen(dev) + 1);
+                *(uint32_t *)(mem + XBOX_KERNEL_DATA_BASE + KDATA_LAUNCH_DATA_PAGE) = page;
+                fprintf(stderr, "[BW] launch data page 0x%08X from %s: path '%s', "
+                        "data %08X %08X %08X\n", page, lf, dev,
+                        *(uint32_t *)(mem + page + 0x400), *(uint32_t *)(mem + page + 0x404),
+                        *(uint32_t *)(mem + page + 0x408));
+            }
+            if (!ok || !page)
+                bw_fail("BW_LAUNCH_DATA_FILE could not be read or placed");
+            if (f)
+                fclose(f);
+            {
+                /* Launch data "SPLASH", then a dword: 1 boots gameplay
+                 * (missions, battles, the attract demo; the level name at
+                 * offset 600: "01".."28", "sm_...", "attract_01"), 0 the
+                 * title and menus (offset 600 can hold leftovers then).
+                 * Gameplay is held to two vblanks a frame, as the console's
+                 * draw time held it: the game steps its clock 1/30 s per
+                 * frame (nv2a_pb_exec.c, bw_set_min_flip_interval).
+                 * BW_GAMEPLAY_30=0 turns it off. */
+                extern void bw_set_min_flip_interval(unsigned n);
+                const uint8_t *ld = mem + page + 0x400;
+                const char *lvl = (const char *)(ld + 600);
+                const char *e = getenv("BW_GAMEPLAY_30");
+                int gameplay = dlen && !memcmp(ld, "SPLASH", 6)
+                               && *(const uint32_t *)(ld + 8) == 1;
+                bw_gameplay_boot = ok && page && gameplay;
+                /* Every edition but Original: the high frame rate instead
+                 * (src/bw_hifps_hooks.c, D-016): the game keeps its own 30 Hz
+                 * step and the extra frames are interpolated, so the D-013
+                 * hold isn't needed. In Original bw_hifps_boot returns 0. */
+                extern unsigned bw_hifps_boot(int gameplay);
+                if (gameplay && bw_hifps_boot(gameplay)) {
+                    fprintf(stderr, "[BW] gameplay boot (level '%.16s'): high frame rate, "
+                            "game speed from the game's own 30 Hz step\n", lvl);
+                } else if (gameplay && !(e && e[0] == '0')) {
+                    fprintf(stderr, "[BW] gameplay boot (level '%.16s'): 30 fps, as on the console\n", lvl);
+                    bw_set_min_flip_interval(2);
+                }
+            }
+        }
+    }
+
+    /* Remastered widescreen (bw_widescreen.h): this boot's shape. Gameplay
+     * boots are Hor+ at the display's aspect; the title and menus stay 4:3,
+     * pillarboxed in the wide window. In Original, and with -WIDESCREEN,
+     * nothing changes: k stays 1 and no hook or back-end path departs from
+     * the old code. */
+    bw_ws_init(bw_gameplay_boot, 1);
+    bw_d3d11_ws_start();
+    if (bw_ws_aspect() > 4.0f / 3.0f + 0.001f) {
+        extern void bw_fb_set_window_aspect(float aspect);   /* carried fb_present.c */
+        bw_fb_set_window_aspect(bw_ws_aspect());
+    }
+
+    /* Blood Wake: D3D's swap throttle (ANALYSIS "First runs", run
+     * 20261025-221347-r2-pixels). D3D's present (0x00129630) waits while
+     * frames submitted (device+0x2B60) minus frames completed (device+0x2518)
+     * is 2 or more; the device pointer is at 0x00136B00. On hardware the
+     * "completed" count moves through D3D's own GPU interrupt path: the GPU
+     * traps a NO_OPERATION software method, D3D's handler marks the flip
+     * pending, and the next vblank completes it. The toolkit doesn't deliver
+     * software-method traps (TOOLKIT_ISSUES TK-9), so the count never moved.
+     * Its counter mirror keeps completed = submitted instead (it can't run
+     * ahead, so the unsigned difference never underflows). Approximation:
+     * the throttle no longer holds the game back, so pacing comes from
+     * elsewhere (FIRST_RUN_PLAN W10). */
+    {
+        extern int xbox_Nv2aMirrorCounter(uint32_t device_ptr_va,
+                                          uint32_t src_off, uint32_t dst_off);
+        if (!getenv("BW_NO_SWAP_MIRROR"))
+            xbox_Nv2aMirrorCounter(0x00136B00u, 0x2B60u, 0x2518u);
+    }
+
+    /* Step 6: Initialize stack */
+    g_esp = XBOX_STACK_TOP;
+
+    /*
+     * TODO: Pre-initialize CRT globals if needed.
+     *
+     * Many Xbox games use the MSVC CRT. The CRT's __heap_init sets up a
+     * heap descriptor at a game-specific address. You may need to
+     * pre-initialize __active_heap to avoid small-block heap issues:
+     *
+     *   uint32_t *active_heap = (uint32_t *)((uint8_t *)g_xbox_mem_offset + ACTIVE_HEAP_VA);
+     *   *active_heap = 1;  // 1 = system heap (HeapAlloc), avoids SBH init
+     *
+     * Find ACTIVE_HEAP_VA by searching the disassembly for __heap_init
+     * or by looking for the CRT's __active_heap global in the data section.
+     */
+
+    printf("\n=== Initialization complete ===\n");
+    printf("Entry point: 0x%08X\n", YOUR_GAME_ENTRY_POINT);
+    printf("ESP: 0x%08X\n", g_esp);
+
+    /* Build the flat dispatch table before the guest runs.
+     *
+     * Without this recomp_lookup falls back to a binary search over the
+     * whole function table -- roughly log2(n) branches on *every*
+     * indirect call, which for a 45,000-function C++ title is about 16
+     * every time the game goes through a vtable. Half-Life 2 spent most
+     * of its static initialisation inside recomp_lookup for exactly this
+     * reason, and it read as a hang.
+     *
+     * Optional by design: if the allocation fails the search still works,
+     * so a failure is worth one line and not a fatal error. */
+    if (!recomp_dispatch_init())
+        fprintf(stderr, "[BOOT] flat dispatch unavailable; "
+                        "indirect calls will use the binary search\n");
+
+    /* Arm the hang watchdog. Does nothing unless RECOMP_WATCHDOG_SECS is set,
+     * and must be called from this thread -- the guest registers it samples are
+     * thread-local, so it has to be handed the copies belonging to the thread
+     * that runs guest code.
+     *
+     * Not optional boilerplate: without this call RECOMP_WATCHDOG_SECS is
+     * silently inert, and the one diagnostic that tells a hang from slowness
+     * does nothing while appearing to be set. */
+    xbox_WatchdogStart();
+
+    /* Step 7: Call the recompiled entry point */
+    printf("\nStarting game...\n");
+    fflush(stdout);
+
+    xbe_entry_point();
+
+    printf("\nGame returned. Cleaning up...\n");
+
+    /* Cleanup */
+    xbox_kernel_shutdown();
+    xbox_MemoryLayoutShutdown();
+    free(xbe_data);
+
+    return 0;
+}
+
+/* ── XBE Loading ───────────────────────────────────────────── */
+
+static BOOL load_xbe(const char *path, void **out_data, size_t *out_size)
+{
+    FILE *f = fopen(path, "rb");
+    if (!f) {
+        fprintf(stderr, "Cannot open XBE: %s\n", path);
+        return FALSE;
+    }
+
+    fseek(f, 0, SEEK_END);
+    long size = ftell(f);
+    fseek(f, 0, SEEK_SET);
+
+    if (size <= 0) {
+        fclose(f);
+        return FALSE;
+    }
+
+    void *data = malloc((size_t)size);
+    if (!data) {
+        fclose(f);
+        return FALSE;
+    }
+
+    if (fread(data, 1, (size_t)size, f) != (size_t)size) {
+        free(data);
+        fclose(f);
+        return FALSE;
+    }
+
+    fclose(f);
+    *out_data = data;
+    *out_size = (size_t)size;
+    return TRUE;
+}
+
+/* Console entry point (for debugging -- lets you see printf output) */
+int main(int argc, char **argv)
+{
+    (void)argc;
+    (void)argv;
+    return WinMain(GetModuleHandle(NULL), NULL, GetCommandLineA(), SW_SHOW);
+}

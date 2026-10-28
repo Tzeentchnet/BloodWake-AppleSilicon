@@ -1,0 +1,306 @@
+--- xboxrecomp/src/video/fb_present.c
++++ src/toolkit_patches/video/fb_present.c
+@@ -152,16 +152,63 @@
+ }
+ 
+ /* Called by the pushbuffer executor when the title flips. */
++/* Blood Wake carried patch: while the GPU back end presents the frame itself
++ * (bw_fb_external_present) and no window dump is asked for, this window
++ * shows nothing of its own, so the per-flip copy of the frame (two per flip:
++ * the executor's and the back end's) is skipped: 4.7% of the NV2A thread at
++ * high frame rates (profile run 20261027-023720-r6-gpu-d7hfprof2). The
++ * output is unchanged; the window's title (FPS) still updates. */
++static volatile LONG s_bw_external;
++/* Blood Wake carried patch (P1), test runs only: BW_FB_WINDOW_COPY=0 skips
++ * the copy (and its CPU gamma) even when the GPU does not present, so an
++ * off-screen frame-rate run pays what real play pays. With readback off the
++ * guest surface holds no finished picture anyway; the window shows nothing.
++ * It was 16% of the NV2A thread in such runs (profile -132820-p1swprof15). */
++static int bw_fb_nocopy(void)
++{
++    static int v = -1;
++    if (v < 0) {
++        const char *e = getenv("BW_FB_WINDOW_COPY");
++        v = e && e[0] == '0';
++    }
++    return v;
++}
++static int bw_fb_copy_needed(void)
++{
++    static int dump = -1, pinned = -1;
++    if (dump < 0)
++        dump = getenv("RECOMP_FB_DUMP") != NULL;
++    if (pinned < 0)
++        pinned = getenv("RECOMP_FB_VA") != NULL;
++    return pinned ? -1 : ((!s_bw_external && !bw_fb_nocopy()) || dump);
++}
++
++/* Blood Wake carried patch (TK-51): resolve a 2x-wide frame with the title's
++ * quincunx filter (BW_GPU_CONV, default on). */
++static int bw_resolve_conv(void)
++{
++    static int on = -1;
++    if (on < 0) {
++        const char *e = getenv("BW_GPU_CONV");
++        on = !(e && e[0] == '0');
++    }
++    return on;
++}
++
+ void xbox_FramebufferWindowPresent(uint32_t fb_va, uint32_t pitch)
+ {
+     const uint8_t *src;
+     LONG next;
+     uint32_t bpp, x, y;
++    int need;
+ 
+     if (!s_fb_running || !fb_va || !pitch)
+         return;
+-    if (getenv("RECOMP_FB_VA"))
++    need = bw_fb_copy_needed();
++    if (need < 0)
+         return;                       /* pinned: leave the old path alone */
++    if (!need)
++        return;                       /* Blood Wake: nothing here shows it */
+     next = (s_present_idx == 0) ? 1 : 0;
+     if (!s_present[next]) {
+         s_present[next] = (uint32_t *)calloc((size_t)s_fb_width * s_fb_height,
+@@ -177,6 +224,32 @@
+ 
+         if (bpp == 4) {
+             memcpy(dst, row, (size_t)s_fb_width * 4);
++        } else if (bpp == 8 && s_fb_aa_sy == 1 && bw_resolve_conv()) {
++            /* Blood Wake carried patch (TK-51): the title's own resolve,
++             * D3DTEXF_QUINCUNX, as the GPU back end draws it (xemu's 3x3
++             * Gaussian of bilinear taps one texel apart, centred on each
++             * pixel's two samples): across, [1 3 3 1]/8 over samples
++             * 2x-1..2x+2; down, [1 2 1]/4 over rows y-1..y+1; edges clamp.
++             * BW_GPU_CONV=0 takes every other sample, as before. */
++            const uint32_t *rows[3];
++            uint32_t w2 = s_fb_width * 2, k, ch;
++            rows[0] = (const uint32_t *)(src + (size_t)(y ? y - 1 : 0) * pitch);
++            rows[1] = (const uint32_t *)row;
++            rows[2] = (const uint32_t *)(src + (size_t)(y + 1 < s_fb_height ? y + 1 : y) * pitch);
++            for (x = 0; x < s_fb_width; x++) {
++                uint32_t i0 = x ? 2 * x - 1 : 0, i3 = 2 * x + 2 < w2 ? 2 * x + 2 : w2 - 1, out = 0;
++                for (ch = 0; ch < 24; ch += 8) {
++                    uint32_t acc = 0;
++                    for (k = 0; k < 3; k++) {
++                        const uint32_t *p = rows[k];
++                        uint32_t hsum = ((p[i0] >> ch) & 0xFF) + 3 * ((p[2 * x] >> ch) & 0xFF)
++                                      + 3 * ((p[2 * x + 1] >> ch) & 0xFF) + ((p[i3] >> ch) & 0xFF);
++                        acc += hsum * (k == 1 ? 2 : 1);
++                    }
++                    out |= ((acc + 16) / 32) << ch;
++                }
++                dst[x] = out;
++            }
+         } else if (bpp == 8) {
+             /* 2x-wide anti-aliased 32-bit surface: every other pixel, as in
+              * fb_convert. */
+@@ -196,6 +269,13 @@
+             memset(dst, 0, (size_t)s_fb_width * 4);
+         }
+     }
++    /* Blood Wake carried patch: the title's DAC gamma ramp (src/gpu/bw_gamma.c,
++     * BW_GPU_GAMMA), as the console's video output applied it. Not needed
++     * while the GPU back end presents into this window itself. */
++    if (!s_bw_external) {
++        extern void bw_gamma_apply_xrgb(uint32_t *px, size_t n);
++        bw_gamma_apply_xrgb(s_present[next], (size_t)s_fb_width * s_fb_height);
++    }
+     /* Published only once it is whole. */
+     InterlockedExchange(&s_present_idx, next);
+ }
+@@ -222,6 +302,38 @@
+     InterlockedExchange(&s_frame_draws, (LONG)draws);
+ }
+ 
++/* Blood Wake (carried patch): BW_PARENT_HWND=<handle> is the launcher's
++ * window (src/bw_host.c), which stays up across the game's self-reboots. The
++ * frame is drawn into a child window filling it; fullscreen and the title
++ * bar are the host's. Without it, the toolkit's own top-level window. */
++#define BW_HOST_FULLSCREEN (WM_APP + 0x42)    /* child -> host: Alt+Enter / F11 */
++static HWND s_bw_parent;
++
++/* Blood Wake carried patch: presenting from the GPU (src/gpu/bw_d3d11.c,
++ * BW_GPU_PRESENT). The back end draws each flipped frame into this window
++ * through its own swap chain; while it does, this thread stops painting the
++ * window (GDI stretched every frame on the CPU: 70% of this thread). */
++static HWND volatile s_bw_hwnd;
++
++void *bw_fb_window(void) { return (void *)s_bw_hwnd; }
++
++/* Blood Wake carried patch (Remastered widescreen, src/bw_widescreen.h): the
++ * window's shape, width / height. 0, as in Original, keeps the frame's own
++ * 640x480. main.c sets it before the title runs, so before the window opens. */
++static float s_bw_aspect;
++void bw_fb_set_window_aspect(float aspect) { s_bw_aspect = aspect; }
++void bw_fb_external_present(int on) { InterlockedExchange(&s_bw_external, on ? 1 : 0); }
++
++static HWND bw_parent_window(void)
++{
++    const char *e = getenv("BW_PARENT_HWND");
++    HWND h;
++    if (!e || !*e)
++        return NULL;
++    h = (HWND)(uintptr_t)_strtoui64(e, NULL, 0);
++    return IsWindow(h) ? h : NULL;
++}
++
+ /* Alt+Enter / F11: borderless fullscreen on the window's monitor, and back.
+  * (DXGI's own Alt+Enter, exclusive mode at the frame's 640x480, is off --
+  * gpu_present.c; both presenters letterbox to any size.) */
+@@ -256,7 +368,10 @@
+      * (bit 29) for Enter; neither reaches the key table. */
+     if ((m == WM_SYSKEYDOWN && w == VK_RETURN && (l & (1 << 29)) && !(l & (1 << 30)))
+         || (m == WM_KEYDOWN && w == VK_F11 && !(l & (1 << 30)))) {
+-        fb_toggle_fullscreen(h);
++        if (s_bw_parent)
++            PostMessageA(s_bw_parent, BW_HOST_FULLSCREEN, 0, 0);
++        else
++            fb_toggle_fullscreen(h);
+         return 0;
+     }
+     if (m == WM_SYSKEYDOWN && w == VK_RETURN)
+@@ -435,6 +550,19 @@
+     return 0;
+ }
+ 
++#include <dwmapi.h>
++#pragma comment(lib, "dwmapi.lib")
++
++static int bw_dwm_sync(void)
++{
++    static int on = -1;
++    if (on < 0) {
++        const char *e = getenv("BW_FB_DWMSYNC");
++        on = !(e && e[0] == '0');
++    }
++    return on;
++}
++
+ /* GDI: the frame letterboxed into the client area, like the D3D11
+  * presenter; the borders are cleared when the size changes. */
+ static void gdi_blit(HWND hwnd, HDC hdc, const BITMAPINFO *bi)
+@@ -455,6 +583,33 @@
+     } else {
+         h = ch; w = (LONG)((long long)ch * s_fb_width / s_fb_height);
+     }
++    if (bw_dwm_sync()) {
++        /* Blood Wake (carried patch): the slow HALFTONE stretch goes into a
++         * memory bitmap, then, right after the compositor's pass
++         * (DwmFlush), one plain BitBlt puts it in the window. Stretched
++         * straight into the window it took milliseconds, and DWM could
++         * compose it half drawn: a frame torn across sky and water,
++         * worst in the cut-scenes' camera pans. BW_FB_DWMSYNC=0 reverts. */
++        static HDC mdc;
++        static HBITMAP bmp;
++        static LONG bw_, bh_;
++        if (!mdc)
++            mdc = CreateCompatibleDC(hdc);
++        if (!bmp || bw_ != w || bh_ != h) {
++            if (bmp)
++                DeleteObject(bmp);
++            bmp = CreateCompatibleBitmap(hdc, w, h);
++            SelectObject(mdc, bmp);
++            bw_ = w; bh_ = h;
++        }
++        SetStretchBltMode(mdc, HALFTONE);
++        SetBrushOrgEx(mdc, 0, 0, NULL);
++        StretchDIBits(mdc, 0, 0, w, h, 0, 0, (int)s_fb_width, (int)s_fb_height,
++                      s_rgb, bi, DIB_RGB_COLORS, SRCCOPY);
++        DwmFlush();
++        BitBlt(hdc, (cw - w) / 2, (ch - h) / 2, w, h, mdc, 0, 0, SRCCOPY);
++        return;
++    }
+     SetStretchBltMode(hdc, HALFTONE);
+     SetBrushOrgEx(hdc, 0, 0, NULL);     /* HALFTONE wants it after the mode */
+     StretchDIBits(hdc, (cw - w) / 2, (ch - h) / 2, w, h,
+@@ -466,9 +621,15 @@
+  * for vsync, so returns 1 when the loop is already paced), else GDI. */
+ static int fb_show(HWND hwnd, HDC hdc, const BITMAPINFO *bi)
+ {
++    if (s_bw_external)
++        return 0;           /* the GPU back end presents */
+     if (gpu_present_active())
+         return gpu_present_frame(s_rgb);
+     gdi_blit(hwnd, hdc, bi);
++    if (bw_dwm_sync()) {
++        Sleep(1);           /* DwmFlush paced it; this only stops a spin if DWM is off */
++        return 1;
++    }
+     return 0;
+ }
+ 
+@@ -506,11 +667,26 @@
+         for (;; scale--) {
+             r.left = 0; r.top = 0;
+             r.right = (LONG)s_fb_width * scale; r.bottom = (LONG)s_fb_height * scale;
++            if (s_bw_aspect > 0.0f)               /* Blood Wake: widescreen */
++                r.right = (LONG)((float)s_fb_height * s_bw_aspect + 0.5f) * scale;
+             AdjustWindowRect(&r, WS_OVERLAPPEDWINDOW, FALSE);
+             if (scale <= 1 || (r.right - r.left <= work.right - work.left
+                                && r.bottom - r.top <= work.bottom - work.top))
+                 break;
+         }
++        s_bw_parent = bw_parent_window();
++        if (s_bw_parent) {
++            RECT pc;
++            GetClientRect(s_bw_parent, &pc);
++            hwnd = CreateWindowExA(0, "XboxRecompFramebuffer", "Blood Wake",
++                                   WS_CHILD | WS_VISIBLE | WS_CLIPSIBLINGS,
++                                   0, 0, pc.right - pc.left, pc.bottom - pc.top,
++                                   s_bw_parent, NULL, GetModuleHandleA(NULL), NULL);
++            if (hwnd)
++                SetFocus(hwnd);
++            else
++                s_bw_parent = NULL;
++        } else
+         hwnd = CreateWindowExA(0, "XboxRecompFramebuffer", "Xbox Recomp - Framebuffer",
+                                WS_OVERLAPPEDWINDOW | WS_VISIBLE,
+                                work.left + ((work.right - work.left) - (r.right - r.left)) / 2,
+@@ -523,9 +699,10 @@
+         return 0;
+     }
+     hdc = GetDC(hwnd);
++    s_bw_hwnd = hwnd;
+     {
+         const char *fs = getenv("RECOMP_FULLSCREEN");
+-        if (fs && *fs && *fs != '0')
++        if (fs && *fs && *fs != '0' && !s_bw_parent)    /* the host's, in a host */
+             fb_toggle_fullscreen(hwnd);
+     }
+ 
+@@ -553,7 +730,9 @@
+             TranslateMessage(&msg);
+             DispatchMessageA(&msg);
+         }
+-        if (s_present_idx >= 0 && s_rgb) {
++        if ((s_bw_external || bw_fb_nocopy()) && bw_fb_copy_needed() == 0) {
++            /* Blood Wake: the GPU back end presents; nothing to copy here */
++        } else if (s_present_idx >= 0 && s_rgb) {
+             /* A finished frame, published by the flip. Copied into s_rgb so
+              * the dump path and GDI see one consistent image even if the
+              * next flip lands mid-blit. */
+@@ -608,7 +787,11 @@
+                            t0 ? (f - f0) * 1000.0 / (now - t0) : 0.0,
+                            (long)s_frame_draws);
+                 tb[127] = 0;
+-                SetWindowTextW(hwnd, tb);
++                if (s_bw_parent)
++                    SendMessageTimeoutW(s_bw_parent, WM_SETTEXT, 0, (LPARAM)tb,
++                                        SMTO_ABORTIFHUNG | SMTO_BLOCK, 100, NULL);
++                else
++                    SetWindowTextW(hwnd, tb);
+                 t0 = now; f0 = f;
+             }
+         }
+@@ -617,6 +800,7 @@
+     }
+ 
+     gpu_present_shutdown();
++    s_bw_hwnd = NULL;
+     ReleaseDC(hwnd, hdc);
+     DestroyWindow(hwnd);
+     free(s_rgb);

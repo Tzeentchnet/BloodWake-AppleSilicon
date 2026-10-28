@@ -1,0 +1,419 @@
+--- xboxrecomp/src/kernel/kernel_bridge.c
++++ src/toolkit_patches/kernel/kernel_bridge.c
+@@ -474,8 +474,29 @@
+ struct bridge_thread_start {
+     recomp_func_t fn;
+     uint32_t ctx1, ctx2, stack_top, obj_va, tls_size;
++    uint32_t routine, suspended;   /* Blood Wake carried patch (TK-36) */
+ };
+ 
++/* Blood Wake carried patch (D3, 2026-10-27; docs/TOOLKIT_ISSUES.md TK-36/TK-37).
++ * The original file is xboxrecomp/src/kernel/kernel_bridge.c (sha256 guarded in
++ * CMakeLists.txt). Diagnostics for the Bink worker crash: failing waits, the
++ * status a failing XAPI call converts, worker TIB layout and handle closes are
++ * logged with a "[BWD3]" prefix, rate-limited. Failures only, so a normal run
++ * prints a handful of lines. BW_D3_DIAG=0 silences them. */
++static int bwd3_diag_on(void)
++{
++    static int on = -1;
++    if (on < 0) {
++        const char *e = getenv("BW_D3_DIAG");
++        on = !(e && e[0] == '0');
++    }
++    return on;
++}
++static volatile LONG g_bwd3_lines;
++#define BWD3_LOG(...) do { \
++        if (bwd3_diag_on() && InterlockedIncrement(&g_bwd3_lines) <= 400) { \
++            fprintf(stderr, __VA_ARGS__); fflush(stderr); } } while (0)
++
+ /* Lay out a thread's TLS the way the Xbox kernel does.
+  *
+  * PsCreateSystemThreadEx takes a TlsDataSize, and the kernel carves that many
+@@ -741,6 +762,15 @@
+             if (bridge_layout_tls(s->obj_va, top, s->tls_size))
+                 g_esp = ((top - s->tls_size) & ~0xFu) - 16;
+         }
++        BWD3_LOG("[BWD3] worker 0x%08X starts (host thread %lu): TIB 0x%08X "
++                 "fs:[4]=0x%08X fs:[0x24]=%u fs:[0x28]=0x%08X stack top 0x%08X tls %u%s\n",
++                 s->routine == 0x000D90D7u ? s->ctx1 : s->routine,
++                 (unsigned long)GetCurrentThreadId(), tib,
++                 tib ? BRIDGE_MEM32(tib + 4) : 0,
++                 tib ? (unsigned)*(volatile uint8_t *)((uintptr_t)g_xbox_mem_offset + tib + 0x24) : 0u,
++                 tib ? BRIDGE_MEM32(tib + 0x28) : 0,
++                 s->stack_top, s->tls_size,
++                 s->suspended ? " (was created suspended)" : "");
+     }
+     free(s);
+ 
+@@ -769,7 +799,8 @@
+ 
+ static HANDLE bridge_spawn_thread(recomp_func_t fn, uint32_t ctx1,
+                                   uint32_t ctx2, uint32_t stack_top,
+-                                  uint32_t obj_va, uint32_t tls_size)
++                                  uint32_t obj_va, uint32_t tls_size,
++                                  uint32_t routine, uint32_t suspended)
+ {
+     struct bridge_thread_start *s = malloc(sizeof(*s));
+     HANDLE th;
+@@ -778,8 +809,16 @@
+     s->fn = fn; s->ctx1 = ctx1; s->ctx2 = ctx2; s->stack_top = stack_top;
+     s->obj_va = obj_va;
+     s->tls_size = tls_size;
++    s->routine = routine;
++    s->suspended = suspended;
+ 
+-    th = CreateThread(NULL, 0, bridge_thread_main, s, 0, NULL);
++    /* Blood Wake carried patch (TK-36): PsCreateSystemThreadEx's
++     * CreateSuspended was ignored, so a thread the title creates suspended
++     * ran at once, before the title had finished setting it up (Bink makes
++     * its worker's mutex and exit event after CreateThread, then resumes it).
++     * It now starts suspended on the host too; NtResumeThread resumes it. */
++    th = CreateThread(NULL, 0, bridge_thread_main, s,
++                      suspended ? CREATE_SUSPENDED : 0, NULL);
+     if (!th) free(s);
+     /* Record the game thread so a host-tick-driven title's watchdog can sample
+      * it via xbox_thread_debug_handle. Harmless for default-model titles: they
+@@ -794,13 +833,15 @@
+  * of the host thread handle, which is what KeWaitForSingleObject waits on. */
+ static HANDLE bridge_spawn_guest_thread(recomp_func_t fn, uint32_t ctx1,
+                                         uint32_t ctx2, uint32_t stack_top,
+-                                        uint32_t handle_va, uint32_t tls_size)
++                                        uint32_t handle_va, uint32_t tls_size,
++                                        uint32_t routine, uint32_t suspended)
+ {
+     uint32_t obj = thobj_alloc();
+     HANDLE th, shadow = NULL;
+ 
+     thobj_ref(obj);
+-    th = bridge_spawn_thread(fn, ctx1, ctx2, stack_top, obj, tls_size);
++    th = bridge_spawn_thread(fn, ctx1, ctx2, stack_top, obj, tls_size,
++                             routine, suspended);
+     if (!th) {
+         thobj_unref(obj);   /* the thread's own: it never ran */
+     } else {
+@@ -838,11 +879,27 @@
+     uint32_t start_context1  = STACK_ARG(5);
+     uint32_t start_context2  = STACK_ARG(6);
+     uint32_t start_routine   = STACK_ARG(9);
++    /* Blood Wake carried patch (TK-36): CreateSuspended (BOOLEAN, arg 7) was
++     * never read. BW_THREAD_SUSPEND=0 restores starting every worker at once. */
++    uint32_t create_suspended = STACK_ARG(7) & 0xFFu;
+     /* In SPAWN mode there is no privileged "first call": every thread is real,
+      * so the entry can return. In INLINE mode the first call runs the game. */
+     int is_first_call = (g_thread_mode == XBOX_THREAD_MODE_INLINE)
+                         && (g_thread_call_count == 0);
+     g_thread_call_count++;
++    {
++        static int honour = -1;
++        if (honour < 0) {
++            const char *e = getenv("BW_THREAD_SUSPEND");
++            honour = !(e && e[0] == '0');
++        }
++        if (create_suspended)
++            BWD3_LOG("[BWD3] PsCreateSystemThreadEx #%d (ctx1 0x%08X): "
++                     "CreateSuspended=1, %s\n", g_thread_call_count, start_context1,
++                     honour ? "honoured" : "ignored (BW_THREAD_SUSPEND=0)");
++        if (!honour)
++            create_suspended = 0;
++    }
+ 
+     fprintf(stderr, "  [KERNEL] PsCreateSystemThreadEx #%d: routine=0x%08X ctx1=0x%08X ctx2=0x%08X\n",
+             g_thread_call_count, start_routine, start_context1, start_context2);
+@@ -944,11 +1001,15 @@
+                 } else {
+                     bridge_spawn_guest_thread(fn, start_context1, start_context2,
+                                               stack_top, xbox_handle_ptr,
+-                                              tls_size);
++                                              tls_size, start_routine,
++                                              create_suspended);
+                     fprintf(stderr, "  [KERNEL] PsCreateSystemThreadEx: spawned "
+                             "worker 0x%08X (ctx=0x%08X, stack top 0x%08X)\n",
+                             start_routine, start_context1, stack_top);
+                     fflush(stderr);
++                    BWD3_LOG("[BWD3] worker ctx1 0x%08X handle token 0x%08X\n",
++                             start_context1,
++                             xbox_handle_ptr ? BRIDGE_MEM32(xbox_handle_ptr) : 0);
+                 }
+             }
+         } else {
+@@ -991,6 +1052,19 @@
+     /* Close real handles but skip fake/synthetic ones */
+     if (raw_handle && raw_handle != 0xDEAD0001u && raw_handle != 0xBEEF0010u) {
+         HANDLE h = bridge_take_handle(raw_handle);
++        {   /* Blood Wake carried patch (D3 diagnostics) */
++            static int closelog = -1;
++            if (closelog < 0) {
++                const char *e = getenv("BW_D3_CLOSELOG");
++                closelog = e && e[0] == '1';
++            }
++            if (closelog || (!h && (raw_handle & 0xFF000000u) == 0x48000000u))
++                BWD3_LOG("[BWD3] NtClose token 0x%08X host %p%s, caller 0x%08X "
++                         "(above: %08X %08X), thread %lu\n", raw_handle, h,
++                         h ? "" : " (slot already empty: double close?)",
++                         g_xbox_kernel_caller, BRIDGE_MEM32(g_esp + 4),
++                         BRIDGE_MEM32(g_esp + 8), (unsigned long)GetCurrentThreadId());
++        }
+         if (h && h != INVALID_HANDLE_VALUE)
+             xbox_NtClose(h);   /* settles a pending overwrite; drops a dir context */
+     }
+@@ -1542,6 +1616,10 @@
+         /* FreeSize 0 means "the whole region from here". */
+         if (!size)
+             size = left;
++        if (!left)   /* Blood Wake carried patch (D3 diagnostics) */
++            BWD3_LOG("[BWD3] NtFreeVirtualMemory decommit 0x%08X size %u is in no "
++                     "live heap block: zeroed unclamped, caller 0x%08X\n",
++                     base, size, g_xbox_kernel_caller);
+         end = (uint32_t)(((uint64_t)base + size + 0xFFFu) & ~(uint64_t)0xFFFu);
+         if (end > mapped || end < page_base)
+             end = mapped;
+@@ -2068,6 +2146,13 @@
+     g_eax = (uint32_t)xbox_KeWaitForSingleObject(
+         h, wait_reason, wait_mode,
+         (BOOLEAN)alertable, XBOX_TO_NATIVE(timeout_ptr));
++    if ((int32_t)g_eax < 0) {
++        DWORD err = GetLastError();
++        BWD3_LOG("[BWD3] KeWaitForSingleObject failed 0x%08X: object 0x%08X host %p "
++                 "err %lu, caller 0x%08X, thread %lu\n", g_eax, object, h,
++                 (unsigned long)err, g_xbox_kernel_caller,
++                 (unsigned long)GetCurrentThreadId());
++    }
+ }
+ 
+ /* ── NtWaitForSingleObject (ordinal 233) ─────────────────── */
+@@ -2087,6 +2172,13 @@
+         return;
+     g_eax = (uint32_t)xbox_NtWaitForSingleObject(
+         handle, (BOOLEAN)alertable, XBOX_TO_NATIVE(timeout_ptr));
++    if ((int32_t)g_eax < 0) {
++        DWORD err = GetLastError();
++        BWD3_LOG("[BWD3] NtWaitForSingleObject failed 0x%08X: token 0x%08X host %p "
++                 "err %lu, caller 0x%08X, thread %lu\n", g_eax, STACK_ARG(0), handle,
++                 (unsigned long)err, g_xbox_kernel_caller,
++                 (unsigned long)GetCurrentThreadId());
++    }
+ }
+ 
+ /* ── NtClearEvent (ordinal 186) ──────────────────────────── */
+@@ -2152,6 +2244,14 @@
+     g_eax = (uint32_t)xbox_NtWaitForSingleObjectEx(
+         handle, (KPROCESSOR_MODE)wait_mode, (BOOLEAN)alertable,
+         XBOX_TO_NATIVE(timeout_ptr));
++    if ((int32_t)g_eax < 0) {
++        DWORD err = GetLastError();
++        BWD3_LOG("[BWD3] NtWaitForSingleObjectEx failed 0x%08X: token 0x%08X "
++                 "host %p err %lu, caller 0x%08X, thread %lu, fs:[4]=0x%08X\n",
++                 g_eax, STACK_ARG(0), handle, (unsigned long)err,
++                 g_xbox_kernel_caller, (unsigned long)GetCurrentThreadId(),
++                 BRIDGE_MEM32(g_fs_base + 4));
++    }
+ }
+ 
+ /* ── MmQueryAddressProtect (ordinal 179) ─────────────────── */
+@@ -2225,6 +2325,16 @@
+     g_eax = (uint32_t)xbox_NtWaitForMultipleObjectsEx(
+         count, handles, wait_type, (BOOLEAN)alertable,
+         XBOX_TO_NATIVE(timeout_ptr));
++    if ((int32_t)g_eax < 0) {
++        DWORD err = GetLastError();
++        BWD3_LOG("[BWD3] NtWaitForMultipleObjectsEx failed 0x%08X (count %u type %u) "
++                 "err %lu, caller 0x%08X, thread %lu\n", g_eax, count, wait_type,
++                 (unsigned long)err, g_xbox_kernel_caller,
++                 (unsigned long)GetCurrentThreadId());
++        for (i = 0; i < count && i < 4; i++)
++            BWD3_LOG("[BWD3]     [%u] token 0x%08X host %p\n", i,
++                     BRIDGE_MEM32(handles_va + i * 4), handles[i]);
++    }
+ }
+ 
+ /*
+@@ -2344,11 +2454,23 @@
+  * failure surfaced later somewhere unrelated. Report the code and stop
+  * pretending the call succeeded.
+  */
++int xbox_IrqlCurrent(void);
++void xbox_IrqlDumpHolders(void);
++
+ static void bridge_KeBugCheck(void)
+ {
+     fprintf(stderr, "  [KERNEL] *** KeBugCheck: code=0x%08X ***\n",
+             STACK_ARG(0));
+     fflush(stderr);
++    /* Blood Wake carried patch (D3 diagnostics): who, and at what IRQL. */
++    BWD3_LOG("[BWD3] KeBugCheck(0x%X) from 0x%08X (above: %08X %08X %08X), thread %lu, "
++             "IRQL %d, fs:[0x24]=%u, fs 0x%08X\n", STACK_ARG(0), g_xbox_kernel_caller,
++             BRIDGE_MEM32(g_esp + 4), BRIDGE_MEM32(g_esp + 8), BRIDGE_MEM32(g_esp + 12),
++             (unsigned long)GetCurrentThreadId(), xbox_IrqlCurrent(),
++             (unsigned)*(volatile uint8_t *)((uintptr_t)g_xbox_mem_offset + g_fs_base + 0x24),
++             g_fs_base);
++    if (bwd3_diag_on())
++        xbox_IrqlDumpHolders();
+     g_eax = 0;
+ }
+ 
+@@ -3224,9 +3346,39 @@
+  * edge, 0 when vblanks are off. */
+ #define VBLANK_RESTART_NS 100000000ull
+ 
++/* Blood Wake carried patch (TK-44, docs/TOOLKIT_ISSUES.md): the schedule was
++ * exactly 60.00 Hz, but an NTSC Xbox's vertical blank runs at 60000/1001 Hz
++ * (59.94), so a title paced on vblanks ran 0.1% fast in wall time. Vblank N is
++ * now due at t0 + N * 1001e6 / 60 ns (period 16,683,333.3 ns). The product
++ * stays far inside 64 bits (N < 1.8e10, years of vblanks). BW_VBLANK_HZ=60
++ * restores exactly 60 Hz; BW_VBLANK_HZ=50 gives PAL's 50 Hz for a test. */
++static uint64_t s_vbl_mult = 0, s_vbl_div = 60;
++
++static void vblank_rate_once(void)
++{
++    const char *e;
++    if (s_vbl_mult)
++        return;
++    e = getenv("BW_VBLANK_HZ");
++    if (e && !strcmp(e, "60")) {
++        s_vbl_mult = 1000000000ull; s_vbl_div = 60;
++    } else if (e && !strcmp(e, "50")) {
++        s_vbl_mult = 1000000000ull; s_vbl_div = 50;
++    } else {
++        s_vbl_mult = 1001000000ull; s_vbl_div = 60;     /* NTSC 59.94 Hz */
++    }
++    fprintf(stderr, "[BW] vblank schedule: %s (period %.1f us)\n",
++            s_vbl_mult == 1001000000ull ? "59.94 Hz, NTSC (BW_VBLANK_HZ=60 for exactly 60)"
++                                        : (s_vbl_div == 50 ? "50 Hz (BW_VBLANK_HZ=50)"
++                                                           : "exactly 60 Hz (BW_VBLANK_HZ=60)"),
++            (double)s_vbl_mult / (double)s_vbl_div / 1000.0);
++    fflush(stderr);
++}
++
+ static uint64_t vblank_due(uint64_t t0_ns, uint64_t n)
+ {
+-    return t0_ns + n * 1000000000ull / 60u;
++    vblank_rate_once();
++    return t0_ns + n * s_vbl_mult / s_vbl_div;
+ }
+ 
+ static int kernel_vblank_tick_ns(uint64_t now_ns, uint64_t *next_due_ns)
+@@ -3256,6 +3408,22 @@
+     *next_due_ns = vblank_due(t0_ns, count);
+     kernel_vblank_count(kernel_clock_ms());
+     kernel_vblank_raise();
++    {   /* Blood Wake (TK-44): the measured rate, every 3600 vblanks (a
++         * minute), over every vblank raised since the first. Restarts of the
++         * schedule (a host stall) start the measurement again. */
++        static uint64_t m0_ns, m_count, m_t0;
++        if (m_t0 != t0_ns) {
++            m_t0 = t0_ns;
++            m0_ns = now_ns;
++            m_count = 0;
++        }
++        if (++m_count % 3600 == 0 && now_ns > m0_ns) {
++            fprintf(stderr, "[BW] vblank rate: %llu in %.3f s = %.4f Hz\n",
++                    (unsigned long long)m_count, (double)(now_ns - m0_ns) / 1e9,
++                    (double)m_count * 1e9 / (double)(now_ns - m0_ns));
++            fflush(stderr);
++        }
++    }
+     return 1;
+ }
+ 
+@@ -3890,6 +4058,21 @@
+ {
+     uint32_t status = STACK_ARG(0);
+ 
++    /* Blood Wake carried patch (D3 diagnostics): XAPI's SetLastNTError calls
++     * this and then stores the answer through fs:[4] (the TLS block); a zero
++     * fs:[4] there is the Bink worker crash. */
++    if (status & 0x80000000u) {
++        uint32_t fs4 = BRIDGE_MEM32(g_fs_base + 4);
++        /* Errors (0xC...) and anything about to fault; warnings such as
++         * STATUS_NO_MORE_FILES at the end of a directory listing are routine. */
++        if ((status & 0xC0000000u) == 0xC0000000u || !fs4) {
++            BWD3_LOG("[BWD3] RtlNtStatusToDosError(0x%08X) from 0x%08X, thread %lu, "
++                     "fs 0x%08X fs:[4]=0x%08X%s\n", status, g_xbox_kernel_caller,
++                     (unsigned long)GetCurrentThreadId(), g_fs_base, fs4,
++                     fs4 ? "" : "  <-- ZERO: SetLastError will fault");
++        }
++    }
++
+     /* Simple mapping of common status codes */
+     switch (status) {
+     case 0x00000000: g_eax = 0; break;          /* STATUS_SUCCESS → ERROR_SUCCESS */
+@@ -4191,6 +4374,39 @@
+     st = xbox_NtCreateFile(&h, access, &oa, &ios, NULL,
+                            file_attrs, share, disposition, options);
+ 
++    /* Blood Wake carried patch (TK-57): a host file can be held for a moment
++     * by another program, typically the virus scanner reading a file the save
++     * folder just got (seen: Partition0.img in a freshly seeded save folder,
++     * ERROR_SHARING_VIOLATION at XAPI's start-up open of partition0, which the
++     * title treats as a fatal disk error and leaves for the dashboard). A
++     * console has no such thing, so a sharing or lock violation is retried
++     * for up to 2 s before the failure is returned. BW_FILE_SHARE_RETRY=0
++     * turns it off. */
++    if (!NT_SUCCESS(st)) {
++        extern uint32_t xbox_LastFileError(void);
++        static int retry_on = -1;
++        uint32_t e = xbox_LastFileError();
++        if (retry_on < 0) {
++            const char *v = getenv("BW_FILE_SHARE_RETRY");
++            retry_on = !(v && v[0] == '0');
++        }
++        if (retry_on && (e == 32u || e == 33u)) {
++            int k;
++            for (k = 0; k < 100 && !NT_SUCCESS(st); k++) {
++                Sleep(20);
++                memset(&ios, 0, sizeof(ios));
++                st = xbox_NtCreateFile(&h, access, &oa, &ios, NULL,
++                                       file_attrs, share, disposition, options);
++                e = NT_SUCCESS(st) ? 0u : xbox_LastFileError();
++                if (!NT_SUCCESS(st) && e != 32u && e != 33u)
++                    break;
++            }
++            fprintf(stderr, "[BW] file open: %s on retry %d after a sharing violation (%s; TK-57)\n",
++                    NT_SUCCESS(st) ? "opened" : "still failing", k,
++                    name.Buffer ? name.Buffer : "?");
++        }
++    }
++
+     if (NT_SUCCESS(st)) {
+         bridge_write_handle(handle_va, h);
+         bridge_write_iostatus(iostatus_va, ios.Status, (uint32_t)ios.Information);
+@@ -5446,7 +5662,17 @@
+  * through the block table and takes the raw 32-bit guest VA. */
+ static void bridge_ExFreePool(void)
+ {
+-    xbox_HeapFree(STACK_ARG(0));
++    /* Blood Wake carried patch (D3 diagnostics): a free of a block that is not
++     * live (a double free, or a pointer the pool never handed out). With the
++     * pool's free blocks handed whole to the next request, a double free can
++     * release someone else's block, which is then zeroed by its next owner. */
++    uint32_t va = STACK_ARG(0);
++    if (va && !xbox_HeapBlockSize(va))
++        BWD3_LOG("[BWD3] ExFreePool(0x%08X): not a live pool block, caller 0x%08X "
++                 "(above: %08X %08X), thread %lu\n", va, g_xbox_kernel_caller,
++                 BRIDGE_MEM32(g_esp + 4), BRIDGE_MEM32(g_esp + 8),
++                 (unsigned long)GetCurrentThreadId());
++    xbox_HeapFree(va);
+     g_eax = 0;
+ }
+ 
+@@ -5643,6 +5869,9 @@
+     g_eax = (uint32_t)xbox_NtResumeThread(
+         bridge_resolve_handle(STACK_ARG(0)),
+         (PULONG)XBOX_TO_NATIVE(STACK_ARG(1)));
++    BWD3_LOG("[BWD3] NtResumeThread token 0x%08X -> 0x%08X, previous count %u, "
++             "caller 0x%08X\n", STACK_ARG(0), g_eax,
++             STACK_ARG(1) ? BRIDGE_MEM32(STACK_ARG(1)) : 0u, g_xbox_kernel_caller);
+ }
+ 
+ /* ── ObfDereferenceObject (ordinal 250, fastcall: object in ecx)
+@@ -9241,7 +9470,8 @@
+                     bridge_run_thread_inline(fn, start_context1, start_context2);
+                 } else {
+                     bridge_spawn_guest_thread(fn, start_context1, start_context2,
+-                                              stack_top, xbox_handle_ptr, 0);
++                                              stack_top, xbox_handle_ptr, 0,
++                                              start_routine, 0);
+                 }
+             }
+         } else {

@@ -1,0 +1,839 @@
+--- xboxrecomp/src/apu/apu_core.c
++++ src/toolkit_patches/apu/apu_core.c
+@@ -26,6 +26,32 @@
+ #include "fpconv.h"
+ #include "../kernel/xbox_memory_layout.h"   /* XBOX_WORKER_STACK_TOP */
+ 
++/* Blood Wake carried patch (TK-14, docs/TOOLKIT_ISSUES.md): the sequencer
++ * sample-limit tick (ISTS bit 3) made switchable, and the title's sequencer
++ * stops and the ticks raised are counted, so a restart loop shows in the log.
++ * BW_APU_SSL_TICK=off (default)|once|periodic (the toolkit's behaviour); the
++ * original file is at xboxrecomp/src/apu/apu_core.c (sha256 guarded in
++ * CMakeLists.txt). Blood Wake initialises DirectSound without the tick. */
++static int s_bw_tick_mode = -1;        /* 0 off, 1 once, 2 periodic */
++static unsigned s_bw_ticks, s_bw_seq_stops;
++
++static int bw_ssl_tick_allowed(void)
++{
++    if (s_bw_tick_mode < 0) {
++        const char *e = getenv("BW_APU_SSL_TICK");
++        s_bw_tick_mode = e && !strcmp(e, "periodic") ? 2
++                       : e && !strcmp(e, "once") ? 1 : 0;
++        fprintf(stderr, "[APU] BW sequencer tick: %s\n",
++                s_bw_tick_mode == 2 ? "periodic" : s_bw_tick_mode == 1 ? "once" : "off");
++    }
++    if (s_bw_tick_mode == 0 || (s_bw_tick_mode == 1 && s_bw_ticks))
++        return 0;
++    s_bw_ticks++;
++    if (s_bw_ticks <= 3 || s_bw_ticks % 200 == 0)
++        fprintf(stderr, "[APU] BW sequencer tick raised (%u so far)\n", s_bw_ticks);
++    return 1;
++}
++
+ /* ============================================================
+  * Globals
+  * ============================================================ */
+@@ -89,9 +115,31 @@
+     return (uint32_t)(g_xbox_map_size ? g_xbox_map_size : g_xbox_total_ram);
+ }
+ 
++/* TK-15 (Blood Wake carried patch): resolve the image before the window. */
++static int bw_apu_image_first(void)
++{
++    static int on = -1;
++    if (on < 0) {
++        const char *e = getenv("BW_APU_PHYS_ORDER");
++        on = !(e && !strcmp(e, "toolkit"));
++        fprintf(stderr, "[APU] BW physical order: %s\n",
++                on ? "image before window (TK-15)" : "toolkit (window first)");
++    }
++    return on;
++}
++
+ uint8_t *mcpx_apu_phys(uint64_t addr)
+ {
+     uint32_t a = (uint32_t)addr & 0x0FFFFFFFu;
++    /* Blood Wake carried patch (TK-17): a buffer page or stream segment the
++     * title posted carries the copy it meant (apu_vp.c bw_tag_intent):
++     * bit 29 the window, bit 28 RAM. Honoured before every rule below. */
++    if (a < (64u << 20)) {
++        if ((uint32_t)addr & 0x20000000u)
++            return g_apu_ram_ptr + 0x80000000u + a;
++        if ((uint32_t)addr & 0x10000000u)
++            return g_apu_ram_ptr + a;
++    }
+     /* RAM above the window's 64 MB. On a 128 MB layout (a devkit) most of
+      * the heap sits above 0x04000000, and so do the sound buffers a title
+      * malloc()s and hands to DirectSound as plain pointers, which
+@@ -122,6 +170,17 @@
+      * voice off its list and re-trapped it every frame. (The OHCI resolves
+      * the image first: a USB driver can read its descriptors into .data on a
+      * page the boot has also allocated as contiguous memory.) */
++    /* Blood Wake carried patch (TK-15): the image first, as the OHCI does.
++     * DirectSound's keep-alive voice loops over two zero samples in its own
++     * section (0x001040A8); the contiguous allocator had handed out that
++     * physical page as part of a D3D frame buffer (0x80104000), so the voice
++     * played screen pixels: a near-Nyquist square wave at up to -5 dBFS.
++     * Blood Wake's image is small (0x00010000-0x001D0000) and nothing the
++     * APU legitimately reads is a window page inside it; DirectSound's own
++     * structures sit at 0x00C88000 and up. BW_APU_PHYS_ORDER=toolkit puts
++     * the window first again. */
++    if (bw_apu_image_first() && a >= g_xbox_image_lo && a < g_xbox_image_hi)
++        return g_apu_ram_ptr + a;
+     if (xbox_ContiguousPageMap()[a >> 12])
+         return g_apu_ram_ptr + 0x80000000u + a;
+     if (a >= g_xbox_image_lo && a < g_xbox_image_hi)
+@@ -142,10 +201,18 @@
+ const char *mcpx_apu_phys_class(uint64_t addr)
+ {
+     uint32_t a = (uint32_t)addr & 0x0FFFFFFFu;
++    if (a < (64u << 20)) {                         /* TK-17 posted intent */
++        if ((uint32_t)addr & 0x20000000u)
++            return "post-win";
++        if ((uint32_t)addr & 0x10000000u)
++            return "post-ram";
++    }
+     if (a >= (64u << 20))
+         return a < apu_mapped_ram() ? "ram" : "wrap";
+     if (xbox_PhysRamNameMap()[a >> 12])
+         return "named";
++    if (bw_apu_image_first() && a >= g_xbox_image_lo && a < g_xbox_image_hi)
++        return "img";
+     if (xbox_ContiguousPageMap()[a >> 12])
+         return "win";
+     if (a >= g_xbox_image_lo && a < g_xbox_image_hi)
+@@ -159,8 +226,30 @@
+  * '0', as RECOMP_HEADLESS is read: =0 turns it off rather than on. */
+ int apu_env_on(const char *name)
+ {
+-    const char *e = getenv(name);
+-    return e && *e && *e != '0';
++    /* Blood Wake carried patch: cached per name. The toolkit's
++     * apu_mmio_hook.c asks for RECOMP_APU_TRACE on every trapped APU
++     * register access, and getenv scans the whole environment: 1.8% of the
++     * game thread in mission 1, all of it under DSound_HwVoiceSet* (profile
++     * with callers, run 20261027-021008-r6-gpu-d7callers). The environment
++     * doesn't change while the game runs; callers pass string literals, so
++     * the pointer is the key. A race between two first callers stores the
++     * same answer twice. */
++    enum { SLOTS = 16 };
++    static const char *volatile names[SLOTS];
++    static volatile int vals[SLOTS];
++    int i;
++    for (i = 0; i < SLOTS && names[i]; i++)
++        if (names[i] == name)
++            return vals[i];
++    {
++        const char *e = getenv(name);
++        int on = e && *e && *e != '0';
++        if (i < SLOTS) {
++            vals[i] = on;
++            names[i] = name;
++        }
++        return on;
++    }
+ }
+ 
+ /* RECOMP_APU_TRACE register lines, read once: every MMIO access tests it. */
+@@ -289,6 +378,9 @@
+     apu_call_isr();
+ }
+ 
++/* BW_APU_IRQSTAT (Blood Wake carried patch): what interrupt delivery did. */
++static volatile LONG s_bw_irq_held, s_bw_irq_posted, s_bw_irq_isr;
++
+ static void apu_deliver_irq(MCPXAPUState *d)
+ {
+     /* Per thread, like the g_fs_base it guards: a new instance's frame
+@@ -327,6 +419,7 @@
+     if (xbox_IrqSafePointsOn()) {
+         how = xbox_IrqPost(XBOX_IRQ_APU);
+         if (how == XBOX_IRQ_POSTED) {
++            InterlockedIncrement(&s_bw_irq_posted);
+             qemu_mutex_lock(&d->lock);
+             return;
+         }
+@@ -334,7 +427,19 @@
+         /* No gate (the default): a hold-off while a guest thread sits at
+          * raised IRQL, which is when the single-CPU console could not have
+          * taken the interrupt, then delivered anyway. */
+-        if (xbox_IrqlBlocksInterrupts() && ++held_off <= 50) {
++        /* Blood Wake carried patch (TK-19): no hold-off by default. The
++         * APU's interrupt is a device IRQL, above DISPATCH, so on the console
++         * it preempts a thread sitting at DISPATCH (DirectSound's raised-IRQL
++         * sections). Held off for up to 50 frames at a time, DirectSound's
++         * trap handling starved once the game ran fast (GPU back end): the
++         * main thread spun forever at raised IRQL in sub_000FE041 waiting for
++         * a voice's idle report. BW_APU_HOLDOFF=1 restores the toolkit's
++         * hold-off. */
++        static int no_holdoff = -1;
++        if (no_holdoff < 0)
++            no_holdoff = !apu_env_on("BW_APU_HOLDOFF");
++        if (!no_holdoff && xbox_IrqlBlocksInterrupts() && ++held_off <= 50) {
++            InterlockedIncrement(&s_bw_irq_held);
+             qemu_mutex_lock(&d->lock);
+             return;
+         }
+@@ -357,6 +462,7 @@
+         g_esp = XBOX_WORKER_STACK_TOP(slot);
+         g_eax = g_ecx = g_edx = g_ebx = g_esi = g_edi = 0;
+         apu_call_isr();
++        InterlockedIncrement(&s_bw_irq_isr);
+         xbox_worker_stack_free(slot);
+     }
+     if (how == XBOX_IRQ_GATED)
+@@ -404,6 +510,13 @@
+         fprintf(stderr, "[APU] write [0x%05llX] size=%u <- 0x%08llX\n",
+                 (unsigned long long)addr, size, (unsigned long long)val);
+     (void)size;
++    {   /* D3 diagnostics: list registers, FECTL and ISTS into the event ring
++         * (apu_vp.c, bwd3_apu_event), tagged 0x1xxxx with the register. */
++        extern void bwd3_apu_event(MCPXAPUState *d, uint32_t what, uint32_t arg);
++        if ((addr >= 0x2054 && addr <= 0x2074) || addr == NV_PAPU_FECTL
++                || addr == NV_PAPU_ISTS)
++            bwd3_apu_event(d, 0x10000u | (uint32_t)addr, (uint32_t)val);
++    }
+ 
+     switch (addr) {
+     case NV_PAPU_XGSCNT:
+@@ -419,6 +532,19 @@
+         break;
+     case NV_PAPU_FECTL:
+     case NV_PAPU_SECTL:
++        if (addr == NV_PAPU_SECTL
++                && (qatomic_read(&d->regs[addr]) & NV_PAPU_SECTL_XCNTMODE)
++                       != NV_PAPU_SECTL_XCNTMODE_OFF
++                && ((uint32_t)val & NV_PAPU_SECTL_XCNTMODE)
++                       == NV_PAPU_SECTL_XCNTMODE_OFF) {
++            /* TK-14 (Blood Wake carried patch): the title stopping a
++             * running sequencer. */
++            s_bw_seq_stops++;
++            if (s_bw_seq_stops <= 3 || s_bw_seq_stops % 200 == 0)
++                fprintf(stderr, "[APU] BW sequencer stopped by the title"
++                                " (%u so far, %u ticks raised)\n",
++                        s_bw_seq_stops, s_bw_ticks);
++        }
+         qatomic_set(&d->regs[addr], (uint32_t)val);
+         /* Starting the APU has to start the frame thread.
+          *
+@@ -453,6 +579,23 @@
+         stl_le_phys(address_space_memory, d->regs[NV_PAPU_FEMEMADDR], (uint32_t)val);
+         qatomic_set(&d->regs[addr], (uint32_t)val);
+         break;
++    case NV_PAPU_GPSADDR:
++    case NV_PAPU_GPFADDR:
++    case NV_PAPU_EPSADDR:
++    case NV_PAPU_EPFADDR:
++    case NV_PAPU_GPSMAXSGE:
++    case NV_PAPU_GPFMAXSGE:
++    case NV_PAPU_EPSMAXSGE:
++    case NV_PAPU_EPFMAXSGE:
++        /* D-012 (Blood Wake carried patch): with the DSPs on, their SGE
++         * entries get their copy (window or RAM, TK-17) decided now, right
++         * after DirectSound's translations (bw_apu_xdsp.c). */
++        qatomic_set(&d->regs[addr], (uint32_t)val);
++        {
++            extern void bw_xdsp_sge_written(MCPXAPUState *d, uint32_t addr);
++            bw_xdsp_sge_written(d, (uint32_t)addr);
++        }
++        break;
+     default:
+         if (addr < 0x20000) {
+             qatomic_set(&d->regs[addr], (uint32_t)val);
+@@ -504,6 +647,256 @@
+ 
+ static WaveOutState g_waveout = { 0 };
+ 
++#include "../../bw_edition.h"
++
++/* Blood Wake carried patch (Remastered, BW_FIX AUDIO_MAKEUP_GAIN, D-016):
++ * the game mixes quietly (gameplay -23..-29 dBFS RMS, title music about -39,
++ * peaks -4..-12), and neither the stub nor the DSPs undo the bins' headroom.
++ * The finished stereo period gets a makeup gain (+4 dB, BW_AUDIO_GAIN_DB)
++ * and a look-ahead peak limiter at -1 dBFS, so the whole mix comes up
++ * together: music, effects and voice keep the game's balance, and nothing
++ * clips. The limiter (stereo-linked, 1 ms look-ahead, 100 ms release) is the
++ * min-filter/box-filter kind, which never lets a sample past the ceiling and
++ * changes gain smoothly. At +6 dB an Admiral battle had 8% of its samples
++ * limited, by up to 4.1 dB (run 20261027-031905-*-ed-bat-remastered): an
++ * audible duck of the whole mix on explosions. The default is +4 dB, where
++ * only the loudest peaks (battle peaks reach -3.7 dBFS) are touched.
++ * BW_AUDIO_GAIN_DB=<dB> forces a gain in any edition (0 turns it off). */
++#define BW_LIM_LA 48                         /* look-ahead, samples */
++static int s_bwg_on = -1;
++static float s_bwg_gain = 1.0f, s_bwg_ceiling = 0.891251f, s_bwg_rel;
++
++static int bw_gain_on(void)
++{
++    if (s_bwg_on < 0) {
++        const char *e = getenv("BW_AUDIO_GAIN_DB");
++        double db = 4.0;
++        int i;
++        s_bwg_on = bw_fix_enabled(BW_FIX_AUDIO_MAKEUP_GAIN);
++        if (e && *e) {
++            db = atof(e);
++            s_bwg_on = db != 0.0;
++        }
++        s_bwg_gain = (float)pow(10.0, db / 20.0);
++        s_bwg_rel = (float)(1.0 - exp(-1.0 / (0.100 * 48000.0)));
++        (void)i;
++        if (s_bwg_on)
++            fprintf(stderr, "[APU] BW output gain %+.1f dB with a -1 dBFS look-ahead limiter"
++                            " (Remastered AUDIO_MAKEUP_GAIN; BW_AUDIO_GAIN_DB)\n", db);
++    }
++    return s_bwg_on;
++}
++
++/* The limiter, for N interleaved channels (2 for the stereo period, 6 for
++ * the 5.1 one); one state per stream. */
++typedef struct {
++    float x[BW_LIM_LA][6], r[BW_LIM_LA + 1], h[BW_LIM_LA];
++    float hsum, hlast;
++    unsigned i;
++    double min_gain;                         /* deepest limiting, for the log */
++    unsigned long limited;
++    int inited;
++} BwLim;
++static BwLim s_lim2, s_lim6;
++
++static void bw_lim_period(BwLim *L, int16_t *buf, int n, int ch, int log)
++{
++    int k, j, c;
++    if (!L->inited) {
++        for (j = 0; j <= BW_LIM_LA; j++)
++            L->r[j] = 1.0f;
++        for (j = 0; j < BW_LIM_LA; j++)
++            L->h[j] = 1.0f;
++        L->hsum = (float)BW_LIM_LA;
++        L->hlast = 1.0f;
++        L->min_gain = 1.0;
++        L->inited = 1;
++    }
++    for (k = 0; k < n; k++) {
++        int16_t *s = buf + k * ch;
++        float v[6], pk = 0.0f, m, h, g;
++        unsigned i = L->i % BW_LIM_LA;
++        for (c = 0; c < ch; c++) {
++            v[c] = s[c] / 32768.0f * s_bwg_gain;
++            if (fabsf(v[c]) > pk)
++                pk = fabsf(v[c]);
++        }
++        /* the gain this sample needs, and the least over the look-ahead;
++         * the need window is one longer than the delay, so every box term
++         * covers the sample leaving the delay line */
++        L->r[L->i % (BW_LIM_LA + 1)] = pk > s_bwg_ceiling ? s_bwg_ceiling / pk : 1.0f;
++        for (j = 0, m = 1.0f; j <= BW_LIM_LA; j++)
++            if (L->r[j] < m)
++                m = L->r[j];
++        /* release: rise toward 1 slowly, never above the window's need */
++        h = L->hlast + (1.0f - L->hlast) * s_bwg_rel;
++        if (h > m)
++            h = m;
++        L->hlast = h;
++        /* box filter over the look-ahead: smooth, and still under the need
++         * of the sample leaving the delay line */
++        L->hsum += h - L->h[i];
++        L->h[i] = h;
++        g = L->hsum / BW_LIM_LA;
++        for (c = 0; c < ch; c++) {
++            float o = L->x[i][c] * g;        /* the delayed sample */
++            L->x[i][c] = v[c];
++            if (o > 1.0f) o = 1.0f;
++            if (o < -1.0f) o = -1.0f;
++            s[c] = (int16_t)lrintf(o * 32767.0f);
++        }
++        L->i++;
++        if (g < 0.999f) {
++            L->limited++;
++            if (g < L->min_gain)
++                L->min_gain = g;
++        }
++    }
++    if (log && L->i % (48000 * 30) < (unsigned)n && L->limited) {
++        fprintf(stderr, "[APU] BW limiter: %lu samples limited in 30 s, deepest %.1f dB\n",
++                L->limited, 20.0 * log10(L->min_gain));
++        L->limited = 0;
++        L->min_gain = 1.0;
++    }
++}
++
++static void bw_gain_period(int16_t period[][2], int n)
++{
++    bw_lim_period(&s_lim2, &period[0][0], n, 2, 1);
++}
++
++/* Blood Wake (Remastered AUDIO_SURROUND): the carried apu_xaudio2.c's source
++ * voice channels, and BW_AUDIO_WAV6=<path>, a 6-channel WAV of exactly what
++ * a 5.1 device is given (the header is rewritten every second). */
++extern int xa2_output_channels(void);
++
++static void apu_wav6_write(const int16_t *s, int n)
++{
++    static FILE *f;
++    static int tried;
++    static uint32_t frames;
++    if (!tried) {
++        const char *p = getenv("BW_AUDIO_WAV6");
++        tried = 1;
++        if (p && *p)
++            f = fopen(p, "wb");
++        if (f) {
++            uint8_t h[44] = { 0 };
++            fwrite(h, 1, 44, f);
++        }
++    }
++    if (!f)
++        return;
++    fwrite(s, 12, (size_t)n, f);
++    frames += (uint32_t)n;
++    if (frames % 48000 < (uint32_t)n) {
++        uint8_t h[44];
++        uint32_t data = frames * 12, riff = 36 + data, sr = 48000, br = 48000 * 12, fl = 16;
++        uint16_t pcm = 1, ch = 6, ba = 12, bps = 16;
++        long pos = ftell(f);
++        memcpy(h, "RIFF", 4); memcpy(h + 4, &riff, 4); memcpy(h + 8, "WAVEfmt ", 8);
++        memcpy(h + 16, &fl, 4); memcpy(h + 20, &pcm, 2); memcpy(h + 22, &ch, 2);
++        memcpy(h + 24, &sr, 4); memcpy(h + 28, &br, 4); memcpy(h + 32, &ba, 2);
++        memcpy(h + 34, &bps, 2); memcpy(h + 36, "data", 4); memcpy(h + 40, &data, 4);
++        fseek(f, 0, SEEK_SET);
++        fwrite(h, 1, 44, f);
++        fseek(f, pos, SEEK_SET);
++        fflush(f);
++    }
++}
++
++/* Blood Wake carried patch (audio robustness, every edition): the device
++ * queue's target adapts to the machine. The pacing keeps the XAudio2 queue
++ * between low and high (high = 4 buffers of 512 = 43 ms, low = half): a
++ * busy PC that delays the frame thread, or the system audio engine, past
++ * that runs the device dry (mission 10 beside parallel compiles: 400
++ * starves in 70 s with the fold-down, run 20261027-023423-r6-gpu-D2-load-
++ * m10-fold). Each new device underrun now raises high by one buffer (low
++ * stays half of it), up to 7 buffers (75 ms); after 20 s without one it
++ * comes down a buffer at a time to its floor (4 buffers, the old latency;
++ * 2 in Remastered). Underruns in the first 3 s of audio (the start-up fill)
++ * don't count. BW_APU_QUEUE=fixed keeps the old fixed marks. */
++static int s_bq_mode = -1;                 /* 1 adaptive, 0 fixed */
++static int s_bq_base, s_bq_cap, s_bq_step; /* high mark, samples */
++static unsigned s_bq_last_u;
++static int64_t s_bq_calm_since, s_bq_start;
++static int s_bq_logged;
++
++static int bw_queue_adaptive(void)
++{
++    if (s_bq_mode < 0) {
++        const char *e = getenv("BW_APU_QUEUE");
++        s_bq_mode = !(e && e[0] == 'f');
++    }
++    return s_bq_mode;
++}
++
++static void bw_queue_init(int buf_samples, int count, int *low, int *high)
++{
++    int l, h, floor_bufs = 4;
++    const char *e = getenv("BW_APU_QUEUE_FLOOR");      /* buffers; for tests */
++    if (!bw_queue_adaptive())
++        return;
++    /* Remastered (BW_FIX AUDIO_LOW_LATENCY): the queue may come down to 2
++     * buffers (21 ms). Every boot starts at 4 (43 ms), the old level: a
++     * boot starting at 2 starved through its first seconds of loading (40
++     * dry spells in 2.4 s, run 20261027-032136-r6-gpu-D2-ed2-bat-remastered),
++     * so it steps down once the device has run 20 s without a dry spell. */
++    if (e && *e)
++        floor_bufs = atoi(e);
++    else if (bw_fix_enabled(BW_FIX_AUDIO_LOW_LATENCY))
++        floor_bufs = 2;
++    if (floor_bufs < 2)
++        floor_bufs = 2;
++    xa2_pacing_marks(buf_samples, count < floor_bufs ? count : floor_bufs,
++                     MIXER_FRAME_SAMPLES, &l, &s_bq_base);
++    xa2_pacing_marks(buf_samples, count < 4 ? count : 4, MIXER_FRAME_SAMPLES, &l, &h);
++    if (h < s_bq_base)
++        h = s_bq_base;
++    s_bq_step = buf_samples;
++    s_bq_cap = buf_samples * (count - 1);
++    if (s_bq_cap < h)
++        s_bq_cap = h;
++    *high = h;
++    *low = h / 2;
++    fprintf(stderr, "[APU] BW device queue: adaptive, starts at %d samples (%.1f ms), %d..%d"
++                    " (%.1f..%.1f ms) (BW_APU_QUEUE=fixed for the old marks)\n",
++            h, h / 48.0, s_bq_base, s_bq_cap, s_bq_base / 48.0, s_bq_cap / 48.0);
++}
++
++static void bw_queue_adapt(MCPXAPUState *d, int64_t now_us)
++{
++    unsigned u = xa2_underruns();
++    int high = d->monitor.queued_bytes_high / SAMPLE_BYTES, h = high;
++
++    if (s_bq_mode <= 0 || !s_bq_step)
++        return;
++    if (!s_bq_start) {
++        s_bq_start = now_us;
++        s_bq_calm_since = now_us;
++        s_bq_last_u = u;
++        return;
++    }
++    if (u != s_bq_last_u) {
++        s_bq_last_u = u;
++        s_bq_calm_since = now_us;
++        if (now_us - s_bq_start < 3000000)
++            return;
++        if (high < s_bq_cap)
++            h = high + s_bq_step > s_bq_cap ? s_bq_cap : high + s_bq_step;
++    } else if (now_us - s_bq_calm_since > 20000000 && high > s_bq_base) {
++        s_bq_calm_since = now_us;
++        h = high - s_bq_step < s_bq_base ? s_bq_base : high - s_bq_step;
++    }
++    if (h != high) {
++        d->monitor.queued_bytes_high = h * SAMPLE_BYTES;
++        d->monitor.queued_bytes_low = h / 2 * SAMPLE_BYTES;
++        if (s_bq_logged++ < 40)
++            fprintf(stderr, "[APU] BW device queue %s to %d samples (%.1f ms; underruns %u)\n",
++                    h > high ? "raised" : "lowered", h, h / 48.0, u);
++    }
++}
++
+ void mcpx_apu_monitor_init(MCPXAPUState *d, Error **errp)
+ {
+     (void)errp;
+@@ -520,6 +913,13 @@
+             apu_wav_open(wav, secs ? atof(secs) : 0.0);
+     }
+ 
++    /* Blood Wake carried patch (audio robustness, every edition): an
++     * adaptive device queue (bw_queue_adapt) needs room to grow, so the
++     * device gets 8 buffers unless RECOMP_AUDIO_BUF_COUNT says otherwise;
++     * the pacing starts at the same 4-buffer level as before. */
++    if (bw_queue_adaptive() && !getenv("RECOMP_AUDIO_BUF_COUNT"))
++        _putenv_s("RECOMP_AUDIO_BUF_COUNT", "8");
++
+     /* Try XAudio2 first (lower latency) */
+     if (xa2_init()) {
+         /* Pacing marks in samples (xa2_pacing_marks): high is all the
+@@ -528,6 +928,7 @@
+         int low, high;
+         xa2_pacing_marks(xa2_get_buffer_size(), xa2_get_buffer_count(),
+                          MIXER_FRAME_SAMPLES, &low, &high);
++        bw_queue_init(xa2_get_buffer_size(), xa2_get_buffer_count(), &low, &high);
+         d->monitor.queued_bytes_low  = low * SAMPLE_BYTES;
+         d->monitor.queued_bytes_high = high * SAMPLE_BYTES;
+         fprintf(stderr, "[APU] Using %s audio backend (pacing: %d..%d samples queued)\n",
+@@ -907,6 +1308,8 @@
+         }
+         mixer_render(extra, MIXER_FRAME_SAMPLES);
+         mix_into(period, (const int16_t (*)[2])extra, MIXER_FRAME_SAMPLES);
++        if (bw_gain_on())
++            bw_gain_period(period, MIXER_FRAME_SAMPLES);
+     }
+ 
+     /* A period dropped while pacing is stalled never reaches the device,
+@@ -917,9 +1320,24 @@
+     if (xa2_is_active()) {
+         if (!d->pace_stalled) {
+             int q = hs_poll();
++            const int16_t *out = (const int16_t *)period;
++            int16_t p6[MIXER_FRAME_SAMPLES][6];
++            if (xa2_output_channels() == 6) {
++                /* Blood Wake (Remastered AUDIO_SURROUND): the device gets the
++                 * 5.1 period the fold-down made beside frame_buf; the stereo
++                 * period above stays the WAV dump's (and the meters'). */
++                extern int16_t g_bw_frame6[256][6];
++                memcpy(p6, g_bw_frame6, sizeof p6);
++                memset(g_bw_frame6, 0, sizeof p6);
++                if (g_audio_muted)
++                    memset(p6, 0, sizeof p6);
++                else if (bw_gain_on())
++                    bw_lim_period(&s_lim6, &p6[0][0], MIXER_FRAME_SAMPLES, 6, 0);
++                apu_wav6_write(&p6[0][0], MIXER_FRAME_SAMPLES);
++                out = &p6[0][0];
++            }
+             hs_submit(MIXER_FRAME_SAMPLES,
+-                      xa2_submit_samples((const int16_t *)period,
+-                                         MIXER_FRAME_SAMPLES), q);
++                      xa2_submit_samples(out, MIXER_FRAME_SAMPLES), q);
+         }
+         return;
+     }
+@@ -937,6 +1355,18 @@
+  * accept (4096 samples, 85 ms) still fit. */
+ #define PACE_STALL_US 200000
+ 
++/* BW_APU_PACESTAT counters (see bw_pacestat_tick). */
++typedef struct {
++    int on;
++    int64_t t0;
++    long periods, restarts, waits, timeouts;
++    int64_t late_us, late_max, yield_us, yield_max, work_max;
++    int q_min;
++    int64_t q_sum;
++    long q_n;
++} BwPaceStat;
++static BwPaceStat s_ps = { -1 };
++
+ /* One pacing decision, taken at an EP-period boundary. Returns 0 to render
+  * the next period now, or how many microseconds to wait before asking again.
+  *
+@@ -982,6 +1412,7 @@
+ 
+     if (xa2_is_active()) {
+         int q    = xa2_queued_samples();
++        bw_queue_adapt(d, now_us);
+         int low  = d->monitor.queued_bytes_low / SAMPLE_BYTES;
+         int high = d->monitor.queued_bytes_high / SAMPLE_BYTES;
+ 
+@@ -1018,8 +1449,11 @@
+     }
+ 
+     if (d->next_frame_time_us == 0 ||
+-        now_us - d->next_frame_time_us > EP_FRAME_US)
++        now_us - d->next_frame_time_us > EP_FRAME_US) {
++        if (d->next_frame_time_us && s_ps.on > 0)
++            s_ps.restarts++;
+         d->next_frame_time_us = now_us;
++    }
+ 
+     /* In the band the lead a render-ahead built is already in the queue;
+      * keeping it in the schedule as well would idle until the queue had
+@@ -1029,6 +1463,13 @@
+ 
+     if (d->next_frame_time_us - now_us > ahead_us)
+         return d->next_frame_time_us - now_us - ahead_us;
++    if (s_ps.on > 0 && xa2_is_active()) {
++        int q = d->pace_q_seen;
++        if (q < s_ps.q_min)
++            s_ps.q_min = q;
++        s_ps.q_sum += q;
++        s_ps.q_n++;
++    }
+     return 0;
+ }
+ 
+@@ -1038,17 +1479,69 @@
+     d->next_frame_time_us += EP_FRAME_US;
+ }
+ 
++/* Blood Wake carried patch (audio robustness): BW_APU_PACESTAT=1 prints,
++ * every 5 s of wall clock, how the frame thread kept time: periods rendered
++ * against the wall clock's count, clock restarts (pace_step finding the
++ * thread more than a period behind), the timed waits and how late they woke
++ * (from the time asked for, so the ms rounding of the wait counts too), the
++ * per-frame lock hand-off (unlock, yield, relock), the longest pass of work,
++ * and the device queue at each period it admitted. */
++
++static int bw_pacestat_on(void)
++{
++    if (s_ps.on < 0) {
++        s_ps.on = apu_env_on("BW_APU_PACESTAT");
++        s_ps.q_min = 1 << 30;
++    }
++    return s_ps.on;
++}
++
++static void bw_pacestat_tick(int64_t now_us)
++{
++    if (!s_ps.t0)
++        s_ps.t0 = now_us;
++    if (now_us - s_ps.t0 < 5000000)
++        return;
++    fprintf(stderr, "[APU-PACE] %.1f s: periods %ld (wall %.0f), restarts %ld; waits %ld"
++                    " (timed out %ld), late avg %.2f max %.2f ms; lock hand-off %.1f ms"
++                    " (max %.2f); longest pass %.2f ms; queue min %d avg %.0f samples;"
++                    " underruns %u\n",
++            (now_us - s_ps.t0) / 1e6, s_ps.periods, (now_us - s_ps.t0) / (double)EP_FRAME_US,
++            s_ps.restarts, s_ps.waits, s_ps.timeouts,
++            s_ps.timeouts ? s_ps.late_us / 1000.0 / s_ps.timeouts : 0.0, s_ps.late_max / 1000.0,
++            s_ps.yield_us / 1000.0, s_ps.yield_max / 1000.0, s_ps.work_max / 1000.0,
++            s_ps.q_n ? s_ps.q_min : -1, s_ps.q_n ? (double)s_ps.q_sum / s_ps.q_n : -1.0,
++            xa2_underruns());
++    memset(&s_ps, 0, sizeof s_ps);
++    s_ps.on = 1;
++    s_ps.t0 = now_us;
++    s_ps.q_min = 1 << 30;
++}
++
+ static void throttle(MCPXAPUState *d)
+ {
+     int64_t start_us = qemu_clock_get_us(QEMU_CLOCK_REALTIME);
+ 
+     while (!d->pause_requested) {
+-        int64_t wait_us = mcpx_apu_pace_step(
+-            d, qemu_clock_get_us(QEMU_CLOCK_REALTIME));
++        int64_t now_us = qemu_clock_get_us(QEMU_CLOCK_REALTIME);
++        int64_t wait_us = mcpx_apu_pace_step(d, now_us);
+         if (wait_us <= 0)
+             break;
+-        qemu_cond_timedwait(&d->cond, &d->lock,
+-                            (int)((wait_us + 999) / 1000));
++        if (bw_pacestat_on()) {
++            BOOL ok = SleepConditionVariableCS(&d->cond.cv, &d->lock.cs,
++                                               (DWORD)((wait_us + 999) / 1000));
++            s_ps.waits++;
++            if (!ok) {
++                int64_t late = qemu_clock_get_us(QEMU_CLOCK_REALTIME) - (now_us + wait_us);
++                s_ps.timeouts++;
++                s_ps.late_us += late;
++                if (late > s_ps.late_max)
++                    s_ps.late_max = late;
++            }
++        } else {
++            qemu_cond_timedwait(&d->cond, &d->lock,
++                                (int)((wait_us + 999) / 1000));
++        }
+     }
+ 
+     d->sleep_acc_us += (int)(qemu_clock_get_us(QEMU_CLOCK_REALTIME) - start_us);
+@@ -1104,6 +1597,41 @@
+ static int s_irq_trace = -1;
+ static uint64_t s_irq_next_ns;
+ 
++extern int xbox_IrqlRaisedCount(void);
++
++/* BW_APU_IRQSTAT=1: every 2 s, the front end's trap state, the interrupt
++ * registers and line, and what delivery did since the last line. Reads
++ * registers only, so it does not slow the title the way RECOMP_APU_TRACE's
++ * per-access lines do (which hid a timing race, 2026-10-26). */
++static void bw_irq_stat(MCPXAPUState *d)
++{
++    static int on = -1;
++    static uint64_t next;
++    static unsigned last_traps, last_ftf, last_se;
++    uint64_t now;
++    if (on < 0)
++        on = apu_env_on("BW_APU_IRQSTAT");
++    if (!on)
++        return;
++    now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
++    if (now < next)
++        return;
++    next = now + 2000000000ull;
++    fprintf(stderr, "[APU-IRQSTAT] FECTL %08X ISTS %08X IEN %08X line %ld FEDEC %08X/%08X"
++                    " | traps +%u fe-trapped-frames +%u se_frames +%u | delivered %ld"
++                    " held %ld posted %ld | irql-raised %d\n",
++            qatomic_read(&d->regs[NV_PAPU_FECTL]), qatomic_read(&d->regs[NV_PAPU_ISTS]),
++            qatomic_read(&d->regs[NV_PAPU_IEN]), (long)InterlockedCompareExchange(&s_irq_line, 0, 0),
++            qatomic_read(&d->regs[NV_PAPU_FEDECMETH]), qatomic_read(&d->regs[NV_PAPU_FEDECPARAM]),
++            apu_irq_stats.traps - last_traps, apu_irq_stats.fe_trapped_frames - last_ftf,
++            apu_irq_stats.se_frames - last_se,
++            (long)InterlockedExchange(&s_bw_irq_isr, 0), (long)InterlockedExchange(&s_bw_irq_held, 0),
++            (long)InterlockedExchange(&s_bw_irq_posted, 0), xbox_IrqlRaisedCount());
++    last_traps = apu_irq_stats.traps;
++    last_ftf = apu_irq_stats.fe_trapped_frames;
++    last_se = apu_irq_stats.se_frames;
++}
++
+ static void apu_irq_stats_line(void)
+ {
+     uint64_t now;
+@@ -1122,9 +1650,39 @@
+     s_irq_next_ns = now + 5000000000ull;
+ }
+ 
++/* Blood Wake carried patch (D-012): the frame thread is the audio's real-time
++ * thread, and with the DSPs on (bw_apu_xdsp.c) it is busy for about half of
++ * each period. At normal priority a burst of other work on the machine (a
++ * parallel compile in the measurements) delayed it past the device queue:
++ * 19 device starves (262 ms) in a 100 s battle against 0 with the
++ * fold-down. BW_APU_THREAD_PRIORITY = normal | above | highest (default) |
++ * critical. */
++static void bw_apu_thread_priority(void)
++{
++    const char *e = getenv("BW_APU_THREAD_PRIORITY");
++    int p = THREAD_PRIORITY_HIGHEST;
++    const char *name = "highest";
++    if (e && *e) {
++        if (e[0] == 'n') {
++            p = THREAD_PRIORITY_NORMAL;
++            name = "normal";
++        } else if (e[0] == 'a') {
++            p = THREAD_PRIORITY_ABOVE_NORMAL;
++            name = "above normal";
++        } else if (e[0] == 'c' || e[0] == 't') {
++            p = THREAD_PRIORITY_TIME_CRITICAL;
++            name = "time critical";
++        }
++    }
++    if (p != THREAD_PRIORITY_NORMAL && !SetThreadPriority(GetCurrentThread(), p))
++        name = "normal (SetThreadPriority failed)";
++    fprintf(stderr, "[APU] BW frame thread priority: %s (BW_APU_THREAD_PRIORITY)\n", name);
++}
++
+ static void *mcpx_apu_frame_thread(void *arg)
+ {
+     MCPXAPUState *d = MCPX_APU_DEVICE(arg);
++    bw_apu_thread_priority();
+     qemu_mutex_lock(&d->lock);
+ 
+     while (!qatomic_read(&d->exiting)) {
+@@ -1143,6 +1701,7 @@
+          * need continuous frame delivery regardless of APU register state.
+          * The VP/DSP pipeline (se_frame) only runs when registers allow it. */
+         throttle(d);
++        int64_t bw_t_work = bw_pacestat_on() ? qemu_clock_get_us(QEMU_CLOCK_REALTIME) : 0;
+         int div0 = d->ep_frame_div;
+ 
+         /* The doorbell ack stands in for the GP DSP, which on hardware runs
+@@ -1191,8 +1750,10 @@
+             d->ep_frame_div++;
+         }
+ 
+-        if (div0 % 8 == 0 && d->ep_frame_div != div0)
++        if (div0 % 8 == 0 && d->ep_frame_div != div0) {
+             mcpx_apu_pace_rendered(d);
++            s_ps.periods++;
++        }
+ 
+         /* The SSL tick: the sequencer's periodic sample-limit interrupt.
+          *
+@@ -1211,8 +1772,18 @@
+                     && (sectl & NV_PAPU_SECTL_XCNTMODE)
+                            != NV_PAPU_SECTL_XCNTMODE_OFF) {
+                 d->sample_count -= ssl;
+-                qatomic_or(&d->regs[NV_PAPU_ISTS], NV_PAPU_ISTS_SSLINTSTS);
+-                d->set_irq = true;
++                /* Blood Wake carried patch (TK-14): Blood Wake's DirectSound
++                 * answers bit 3 with a full hardware restart (0x000FC6CC ->
++                 * 0x00102C98(0,0) + 0x00102630(1)), which stops the sequencer
++                 * and zeroes XGSCNT, so a tick every SSL samples restarts the
++                 * APU ~23 times a second and each restart leaves 256-768
++                 * samples of silence in the output. BW_APU_SSL_TICK picks the
++                 * tick: off (default), once (first crossing only), periodic
++                 * (the toolkit's). */
++                if (bw_ssl_tick_allowed()) {
++                    qatomic_or(&d->regs[NV_PAPU_ISTS], NV_PAPU_ISTS_SSLINTSTS);
++                    d->set_irq = true;
++                }
+             }
+         }
+ 
+@@ -1226,6 +1797,7 @@
+         }
+         apu_deliver_irq(d);
+         apu_irq_stats_line();
++        bw_irq_stat(d);
+ 
+         /* Let the guest in once per frame.
+          *
+@@ -1237,9 +1809,22 @@
+          * thread starved there indefinitely: Burnout 3 froze on its vehicle
+          * select, blocked in voice_lock at raised IRQL, which in turn held
+          * off every USB interrupt. */
++        if (bw_t_work) {
++            int64_t t = qemu_clock_get_us(QEMU_CLOCK_REALTIME);
++            if (t - bw_t_work > s_ps.work_max)
++                s_ps.work_max = t - bw_t_work;
++            bw_t_work = t;
++        }
+         qemu_mutex_unlock(&d->lock);
+         SwitchToThread();
+         qemu_mutex_lock(&d->lock);
++        if (bw_t_work) {
++            int64_t t = qemu_clock_get_us(QEMU_CLOCK_REALTIME);
++            s_ps.yield_us += t - bw_t_work;
++            if (t - bw_t_work > s_ps.yield_max)
++                s_ps.yield_max = t - bw_t_work;
++            bw_pacestat_tick(t);
++        }
+         if (fe_trapped &&
+             (qatomic_read(&d->regs[NV_PAPU_FECTL]) &
+              NV_PAPU_FECTL_FEMETHMODE_TRAPPED)) {

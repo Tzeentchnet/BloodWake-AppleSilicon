@@ -1,0 +1,194 @@
+--- xboxrecomp/src/kernel/xbox_memory_layout.c
++++ src/toolkit_patches/kernel/xbox_memory_layout.c
+@@ -1390,6 +1390,8 @@
+  * and a level load, thousands of kickoffs long, looked frozen. Clearing them
+  * from inside the walk answers the kickoff within a few hundred commands,
+  * without a thread of its own spinning on a host core. */
++#include "../../bw_wait.h"   /* Blood Wake carried patch: bw_flush_acked */
++
+ static void nv2a_ack_busy_bits(int flip_held)
+ {
+     volatile uint32_t *regs = (volatile uint32_t *)g_nv2a_memory;
+@@ -1416,8 +1418,14 @@
+         }
+         /* Interlocked: the vblank-ack thread and the guest change other
+          * bits of the same word meanwhile. */
+-        if (*r & mask)
++        if (*r & mask) {
+             InterlockedAnd((volatile LONG *)r, (LONG)~mask);
++            /* Blood Wake carried patch: wake the KickOff that waits for
++             * this flush now, rather than at its next timer poll
++             * (bw_wait.c, bw_flush_acked). */
++            if (NV2A_ACK[i].offset == NV2A_ACK_PFB_FLUSH)
++                bw_flush_acked();
++        }
+     }
+ }
+ 
+@@ -1436,9 +1444,15 @@
+     return (volatile uint32_t *)((char *)g_nv2a_memory + offset);
+ }
+ 
++#include "../../bw_wait.h"   /* Blood Wake carried patch: bw_ack_idle */
++#include "../../bw_framelog.h" /* Blood Wake carried patch (P2b): BW_FRAMELOG test aid */
++
+ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
+ {
+     volatile uint32_t *regs = (volatile uint32_t *)param;
++    int bw_fl_held = 0;                 /* Blood Wake (P2b): the last pass's hold, for the log */
++    unsigned long long bw_fl_hold_t0 = 0;
++    bw_fl_thread(1);
+     while (!InterlockedCompareExchange(&g_nv2a_ack_stop, 0, 0)) {
+         /* A flip held for its vblank (nv2a_flip_hold.h): this pass walks
+          * nothing, leaves DMA_GET where it is and acknowledges no PFB flush,
+@@ -1453,6 +1467,16 @@
+          * flips paces only the last. */
+         extern int nv2a_pb_exec_flip_poll(void);
+         int flip_held = nv2a_pb_exec_flip_poll();
++        int bw_worked = 0;      /* Blood Wake: this pass executed a segment */
++        unsigned long long bw_fl_w0 = 0;
++        if (g_bw_fl_on && flip_held != bw_fl_held) {
++            if (flip_held) {
++                bw_fl_hold_t0 = bw_fl_ticks();
++                bw_fl_event(BW_FL_N_HOLD, 0, 0, 0);
++            } else
++                bw_fl_event(BW_FL_N_HOLD_END, bw_fl_us_since(bw_fl_hold_t0), 0, 0);
++            bw_fl_held = flip_held;
++        }
+         nv2a_ack_busy_bits(flip_held);
+         for (size_t i = 0; i < sizeof(NV2A_IDLE) / sizeof(NV2A_IDLE[0]); i++) {
+             volatile uint32_t *r =
+@@ -1502,8 +1526,14 @@
+             static uint32_t get_written = 0xFFFFFFFFu;  /* GET as we last left it */
+             DWORD now_ms = GetTickCount();
+             uint32_t put = *(volatile uint32_t *)((char *)regs + NV2A_USER_DMA_PUT);
++            /* Blood Wake carried patch (P1): one KickOff segment at a time
++             * when BW_PB_SEGWALK is on (bw_wait.c); else the register's PUT */
++            if (!flip_held)
++                put = bw_put_queue_take(last_put, put);
+             if (!flip_held
+                     && (put != last_put || (now_ms - last_put_ms) > 2000)) {
++                if (g_bw_fl_on)
++                    bw_fl_w0 = bw_fl_ticks();
+                 /* Survey the segment the title just submitted, once. */
+                 {
+                     extern void nv2a_pb_scan(uint32_t);
+@@ -1526,6 +1556,7 @@
+                      * guess. */
+                     extern void nv2a_pb_resync(uint32_t);
+                     extern int  nv2a_pb_dma_walk(void);
++                    extern int  nv2a_pb_ring_walk(void);   /* Blood Wake TK-38 */
+                     extern void nv2a_pb_scan_segment(uint32_t, uint32_t);
+ 
+                     if (nv2a_pb_dma_walk()) {
+@@ -1541,6 +1572,42 @@
+                             nv2a_pb_resync(get_now);
+                         if (put != last_put)
+                             nv2a_pb_scan(put);
++                    } else if (nv2a_pb_ring_walk()) {
++                        /* Blood Wake carried patch (TK-38): the ring walk.
++                         * From the last PUT to this one, following the
++                         * ring's own JUMP and keeping a method PUT cut short
++                         * (nv2a_pb_scan.c). If the title moved GET itself (a
++                         * ring restart), the walk starts there. The first
++                         * segment is skipped, as the segment scan does. */
++                        extern void nv2a_pb_scan_ring(uint32_t, uint32_t);
++                        extern void nv2a_pb_ring_reset(void);
++                        extern void nv2a_pb_bw_segstat(void);
++                        uint32_t get_now = *(volatile uint32_t *)
++                                           ((char *)regs + NV2A_USER_DMA_GET);
++                        uint32_t from = last_put;
++                        extern void nv2a_pb_first_segment(uint32_t, uint32_t);
++                        int first = 0;
++                        if (!last_put && put && put != get_now
++                                && ((put - get_now) & 0x0FFFFFFFu) < 0x400000u) {
++                            /* The first segment: D3D's device
++                             * initialisation, from the GET it set (Blood
++                             * Wake's ring starts at physical 0, so GET reads
++                             * 0) to its first PUT. Both scans used to skip
++                             * it (a "from" of 0 meant "nothing yet"). Decoded,
++                             * reported (BW_PB_SEGSTAT) and executed;
++                             * BW_PB_FIRSTSEG=skip skips it, as before. */
++                            nv2a_pb_ring_reset();
++                            nv2a_pb_first_segment(XBOX_CONTIG_BASE | (get_now & 0x0FFFFFFFu),
++                                                  XBOX_CONTIG_BASE | (put     & 0x0FFFFFFFu));
++                            first = 1;
++                        } else if (get_written != 0xFFFFFFFFu && get_now != get_written) {
++                            from = get_now;
++                            nv2a_pb_ring_reset();
++                        }
++                        if (!first && from && put != from)
++                            nv2a_pb_scan_ring(XBOX_CONTIG_BASE | (from & 0x0FFFFFFFu),
++                                              XBOX_CONTIG_BASE | (put  & 0x0FFFFFFFu));
++                        nv2a_pb_bw_segstat();
+                     } else {
+                         /* The segment scan, the default: the bytes between
+                          * the previous PUT and this one. The pushbuffer is a
+@@ -1548,6 +1615,8 @@
+                          * wrap, not a rewind; the ring's bounds are learned
+                          * from the lowest and highest PUT seen. */
+                         static uint32_t put_lo, put_hi;
++                        extern void nv2a_pb_bw_segstat(void);
++                        nv2a_pb_bw_segstat();
+                         if (!put_lo || put < put_lo) put_lo = put;
+                         if (put > put_hi) put_hi = put;
+                         if (last_put && put > last_put) {
+@@ -1587,10 +1656,14 @@
+                     volatile uint32_t *get =
+                         (volatile uint32_t *)((char *)regs
+                                               + NV2A_USER_DMA_GET);
++                    if (bw_fl_w0)
++                        bw_fl_event(BW_FL_N_WALK, put, bw_fl_us_since(bw_fl_w0), get_written);
+                     *get = put;
+                     get_written = put;
++                    bw_flush_acked();   /* Blood Wake: wake a KickOff waiting on GET */
+                 }
+                 last_put = put; last_put_ms = now_ms;
++                bw_worked = 1;
+                 /* GET as well as PUT. A title that stops submitting has either
+                  * finished or is spinning on the GPU catching up, and only GET
+                  * tells those apart -- D3D waits for GET to reach PUT before it
+@@ -1637,7 +1710,12 @@
+         *(volatile uint32_t *)((uintptr_t)(XBOX_KERNEL_DATA_BASE + KDATA_TICK_COUNT)
+                                + g_memory_offset) = GetTickCount();
+ 
+-        Sleep(0);  /* yield; the waiter is spinning on another core */
++        /* Blood Wake carried patch: Sleep(0) here kept this thread at 100%
++         * of a core whether or not the title submitted anything. Once it has
++         * been idle a little while it naps instead (bw_wait.c: ~200 us on a
++         * high-resolution timer, or at once when the title kicks off a new
++         * segment). BW_ACK_NAP=0 restores the spin. */
++        bw_ack_idle(bw_worked);
+     }
+     return 0;
+ }
+@@ -3933,6 +4011,29 @@
+     *(uint32_t *)TIB_VA(block)      = thread_data;   /* slot 0           */
+     *(uint32_t *)TIB_VA(tib + 0x04) = block + total; /* fs:[4], see above*/
+ 
++    /* Blood Wake carried patch (TK-37, docs/TOOLKIT_ISSUES.md): the copy above
++     * also took the main thread's IRQL byte (KPCR.Irql, fs:[0x24]) as it was at
++     * that moment. kernel_hal.c publishes a thread's level into its own TIB
++     * only when the level changes, so a new thread whose copy said DISPATCH
++     * kept saying so while it ran at PASSIVE. Blood Wake's audio thread got 2
++     * in most runs: DirectSound's lock and IRQL guard (DSound_EnterCriticalSection,
++     * DSound_IrqlRaise) read fs:[0x24] directly and skipped both, so the music
++     * stream ran without DirectSound's lock for the whole session, and the CRT
++     * called KeBugCheck(0x0A) when the thread exited. The new thread's byte now
++     * holds the new thread's own level (it starts at PASSIVE).
++     * BW_TIB_IRQL=copy restores the copied byte. */
++    {
++        static int copy = -1;
++        if (copy < 0) {
++            const char *e = getenv("BW_TIB_IRQL");
++            copy = e && !strcmp(e, "copy");
++        }
++        if (!copy) {
++            extern int xbox_IrqlCurrent(void);
++            *(uint8_t *)TIB_VA(tib + 0x24) = (uint8_t)xbox_IrqlCurrent();
++        }
++    }
++
+     return tib;
+     #undef TIB_VA
+ }

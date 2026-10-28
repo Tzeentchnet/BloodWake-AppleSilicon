@@ -1,0 +1,828 @@
+#!/usr/bin/env python3
+"""Build Blood Wake (the PC port) from your own disc: the one command.
+
+    python tools/build_from_disc.py --disc <folder|image.iso> --install-dir <dir>
+        [--toolkit <dir>] [--work-dir <dir>] [--jobs N] [--check-only] [--progress json]
+
+You bring your own copy of the game: a folder of the disc's files, an XISO, or
+a full disc image. This script checks that it is an unmodified retail copy
+(hashes of its files, fingerprints/retail.json), translates the game's code to
+C on your PC with the xboxrecomp toolkit at its pinned commit, checks that the
+generated C is exactly what the maintainers get (hashes only,
+fingerprints/generated.json; the code itself is never published), and builds
+it with Microsoft's compiler. Nothing from the game leaves your PC.
+
+Steps (each prints one progress line with --progress json):
+  identify     what --disc is: a folder, an XISO or a full (Redump) image
+  toolkit      xboxrecomp at the pinned commit: --toolkit (checked), or
+               GitHub's archive of that commit (SHA-256 checked)
+  unpack       an image's files into <install-dir>/game/disc (a folder is copied there)
+  fingerprint  every file against fingerprints/retail.json
+  pipeline     tools/run_pipeline.py (no Ghidra) into <work-dir>/gen
+  verify       the generated C against fingerprints/generated.json
+  build        CMake + Visual Studio 2022 (x64, Release)
+  stage        the exe, the launcher and the files it runs with, install.json
+  done
+
+--check-only stops after the fingerprint (nothing is unpacked or copied).
+--progress json prints one JSON object per line on stdout:
+  {"step": "<step>", "pct": 0-100, "msg": "..."}
+pct is the whole job's progress. A failure adds "error": true and "exit": <code>.
+Tool output goes to <work-dir>/logs/.
+
+Exit codes: 0 ok; 2 not a supported unmodified retail copy; 3 missing
+dependency (the message says which); 4 pipeline failed; 5 the generated code
+doesn't match ours; 6 build failed; 7 disk space or I/O.
+
+Needs: Python 3.13 (3.10+ runs; the fingerprints were made with 3.13),
+capstone 5.0.9, CMake 3.20+ (Visual Studio's own is fine) and Visual Studio
+2022 or its Build Tools with the C++ workload; about 2.6 GB free, and an
+internet connection for the toolkit unless --toolkit is given. No admin
+rights, no `py` launcher, paths with spaces are fine. About 15 minutes on a
+recent desktop (most of it the translation). Stdlib only.
+"""
+import argparse
+import datetime as _dt
+import glob
+import hashlib
+import json
+import os
+import queue
+import re
+import shutil
+import subprocess
+import sys
+import threading
+import time
+import urllib.request
+import zipfile
+
+REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+FINGERPRINTS = os.path.join(REPO, "fingerprints")
+
+TOOLKIT_COMMIT = "f0f8a461496a4f23d9b0aeaa284b8d70ba7ab82b"      # xboxrecomp v0.16.0 (D-002)
+TOOLKIT_URL = "https://github.com/sp00nznet/xboxrecomp/archive/%s.zip" % TOOLKIT_COMMIT
+TOOLKIT_ZIP_SHA256 = "64b27ee84e70d7fbbcce901716e8ca77b37f5c1c050a8455f376ecc2ee378cd5"
+# The archive's files (paths and contents), in case GitHub ever re-compresses
+# the same commit: see tree_digest().
+TOOLKIT_TREE_SHA256 = "5ee0e96d5cf95da95e0212afe32fdca7b535c7264c49fadd0e65724cfda0ca33"
+TOOLKIT_MARKER = ".bw_toolkit.json"                              # read by tools/run_pipeline.py
+
+CAPSTONE = "5.0.9"
+PYTHON_PIN = (3, 13)
+SECTOR = 2048
+GB = 1 << 30
+# Space needed (bytes, with margin): the unpacked disc and the staged exe
+# (measured 1.97 GB + 31 MB), and the work folder (generated C, toolkit, build
+# tree, logs: measured 211 MB). Added up when both are on one drive.
+NEED_INSTALL = int(2.2 * GB)
+NEED_WORK = int(0.4 * GB)
+
+EXIT_OK, EXIT_DISC, EXIT_DEP, EXIT_PIPELINE, EXIT_GEN, EXIT_BUILD, EXIT_IO = 0, 2, 3, 4, 5, 6, 7
+
+# Overall progress: where each step starts and ends (pct).
+SPAN = {"identify": (0, 1), "toolkit": (1, 3), "unpack": (3, 18), "fingerprint": (18, 20),
+        "pipeline": (20, 68), "verify": (68, 70), "build": (70, 97), "stage": (97, 99),
+        "done": (100, 100)}
+# Rough seconds per pipeline step on a 2020s desktop, for the bar between lines.
+PIPE_SECONDS = {"parse": 2, "disasm": 520, "funcid": 3, "abi": 3, "ghidra": 1, "recomp": 75}
+
+
+class Fail(Exception):
+    def __init__(self, code, step, msg):
+        Exception.__init__(self, msg)
+        self.code, self.step, self.msg = code, step, msg
+
+
+# ── Progress ──────────────────────────────────────────────────────────────
+
+class Progress:
+    def __init__(self, json_mode):
+        self.json = json_mode
+        self.last = 0
+
+    def __call__(self, step, frac, msg, **extra):
+        lo, hi = SPAN[step]
+        pct = int(round(lo + (hi - lo) * max(0.0, min(1.0, frac))))
+        pct = max(pct, self.last) if not extra.get("error") else pct
+        self.last = pct
+        if self.json:
+            d = {"step": step, "pct": pct, "msg": msg}
+            d.update(extra)
+            sys.stdout.write(json.dumps(d) + "\n")
+        else:
+            sys.stdout.write("[%3d%%] %-11s %s\n" % (pct, step, msg))
+        sys.stdout.flush()
+
+
+# ── Hashing ───────────────────────────────────────────────────────────────
+
+def sha256_file(path, h=None):
+    h = h or hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def path_key(rel):
+    """The fingerprint's name for a disc file: SHA-256 of its lower-case path
+    with forward slashes (the published list carries no file names)."""
+    return hashlib.sha256(rel.replace("\\", "/").strip("/").lower().encode("utf-8")).hexdigest()
+
+
+def total_digest(pairs):
+    """One hash for a set of (name, sha256) pairs, order-independent."""
+    h = hashlib.sha256()
+    for name, digest in sorted(pairs):
+        h.update(("%s\0%s\n" % (name, digest)).encode("utf-8"))
+    return h.hexdigest()
+
+
+def tree_digest(files):
+    """files: (relative path, sha256 of contents). The toolkit's tree hash."""
+    return total_digest((p.replace("\\", "/"), d) for p, d in files)
+
+
+GEN_SKIP = {"bw_ocean_native.inc"}      # written by the build (tools/bw_ocean_xlate.py), not the pipeline
+
+
+def gen_fingerprint(gen_dir):
+    """{file: {"size", "sha256"}} for the pipeline's output files."""
+    out = {}
+    for name in sorted(os.listdir(gen_dir)):
+        p = os.path.join(gen_dir, name)
+        if name in GEN_SKIP or not os.path.isfile(p):
+            continue
+        out[name] = {"size": os.path.getsize(p), "sha256": sha256_file(p)}
+    return out
+
+
+# Tracked files whose contents decide the generated C (besides the XBE and the
+# toolkit), recorded so a mismatch can say which input differs.
+GEN_INPUTS = ["tools/run_pipeline.py", "tools/xbr_patches.py",
+              "names/icall_seeds.json", "src/recomp_manual.c"]
+
+
+def gen_inputs(repo):
+    files = list(GEN_INPUTS) + sorted(
+        os.path.relpath(p, repo).replace(os.sep, "/")
+        for p in glob.glob(os.path.join(repo, "src", "bw_*_hooks.c")))
+    out = {}
+    for rel in files:
+        p = os.path.join(repo, rel)
+        out[rel] = sha256_file(p) if os.path.isfile(p) else None
+    return out
+
+
+def load_json(path, what):
+    try:
+        with open(path, encoding="utf-8") as f:
+            return json.load(f)
+    except OSError:
+        raise Fail(EXIT_IO, "identify", "%s is missing (%s). Get the complete source." % (what, path))
+    except ValueError as e:
+        raise Fail(EXIT_IO, "identify", "%s is damaged (%s): %s" % (what, path, e))
+
+
+# ── Dependencies ──────────────────────────────────────────────────────────
+
+def module_version(name):
+    try:
+        from importlib.metadata import version
+        return version(name)
+    except Exception:
+        return None
+
+
+def check_python():
+    notes = []
+    if sys.version_info < (3, 10):
+        raise Fail(EXIT_DEP, "identify", "Python 3.13 is needed (this is %s)." % sys.version.split()[0])
+    if sys.version_info[:2] != PYTHON_PIN:
+        notes.append("Python %s: the fingerprints were made with 3.13; if the check of the "
+                     "generated code fails, use 3.13." % sys.version.split()[0])
+    cap = module_version("capstone")
+    if cap is None:
+        raise Fail(EXIT_DEP, "identify", "capstone is not installed for this Python (%s). "
+                   "Install it: %s -m pip install capstone==%s" % (sys.executable, sys.executable, CAPSTONE))
+    if cap != CAPSTONE:
+        raise Fail(EXIT_DEP, "identify", "capstone %s is needed (found %s): "
+                   "%s -m pip install capstone==%s" % (CAPSTONE, cap, sys.executable, CAPSTONE))
+    return notes
+
+
+def find_vs():
+    """Visual Studio 2022 / Build Tools 17.x with the x64 C++ compiler: (path, version)."""
+    roots = [os.environ.get("ProgramFiles(x86)"), os.environ.get("ProgramFiles")]
+    vswhere = None
+    for r in roots:
+        if r:
+            c = os.path.join(r, "Microsoft Visual Studio", "Installer", "vswhere.exe")
+            if os.path.isfile(c):
+                vswhere = c
+                break
+    if not vswhere:
+        return None, None
+    try:
+        out = subprocess.run([vswhere, "-products", "*", "-version", "[17.0,18.0)",
+                              "-requires", "Microsoft.VisualStudio.Component.VC.Tools.x86.x64",
+                              "-format", "json", "-utf8"], capture_output=True, timeout=60)
+        found = json.loads(out.stdout.decode("utf-8", "replace") or "[]")
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return None, None
+    if not found:
+        return None, None
+    found.sort(key=lambda d: d.get("installationVersion", ""), reverse=True)
+    return found[0].get("installationPath"), found[0].get("installationVersion")
+
+
+def find_cmake(vs_path):
+    cands = [shutil.which("cmake")]
+    if vs_path:
+        cands.append(os.path.join(vs_path, "Common7", "IDE", "CommonExtensions", "Microsoft",
+                                  "CMake", "CMake", "bin", "cmake.exe"))
+    for c in cands:
+        if c and os.path.isfile(c):
+            try:
+                v = subprocess.run([c, "--version"], capture_output=True, text=True, timeout=60).stdout
+            except (OSError, subprocess.SubprocessError):
+                continue
+            m = re.search(r"cmake version (\d+)\.(\d+)(\.\d+)?", v)
+            if m and (int(m.group(1)), int(m.group(2))) >= (3, 20):
+                return c, m.group(0).split()[-1]
+    return None, None
+
+
+def check_space(path, need, step, what):
+    probe = os.path.abspath(path)
+    while not os.path.exists(probe):
+        parent = os.path.dirname(probe)
+        if parent == probe:
+            break
+        probe = parent
+    try:
+        free = shutil.disk_usage(probe).free
+    except OSError as e:
+        raise Fail(EXIT_IO, step, "Can't check free space at %s: %s" % (probe, e))
+    if free < need:
+        raise Fail(EXIT_IO, step, "Not enough free space for %s at %s: %.1f GB free, %.1f GB needed."
+                   % (what, probe, free / GB, need / GB))
+
+
+# ── The toolkit ───────────────────────────────────────────────────────────
+
+def zip_tree(zf):
+    """(relative path, sha256) of every file in the toolkit archive."""
+    out = []
+    for info in zf.infolist():
+        if info.is_dir():
+            continue
+        rel = info.filename.split("/", 1)[1] if "/" in info.filename else info.filename
+        out.append((rel, hashlib.sha256(zf.read(info)).hexdigest()))
+    return out
+
+
+def get_toolkit(a, work, prog):
+    """A clean toolkit folder at the pinned commit."""
+    if a.toolkit:
+        tk = os.path.abspath(a.toolkit)
+        if not os.path.isdir(os.path.join(tk, "tools", "recomp")):
+            raise Fail(EXIT_DEP, "toolkit", "--toolkit %s is not an xboxrecomp folder." % tk)
+        if os.path.exists(os.path.join(tk, ".git")):
+            head = run_text(["git", "rev-parse", "HEAD"], tk)
+            dirty = run_text(["git", "status", "--porcelain", "--untracked-files=no"], tk)
+            if head != TOOLKIT_COMMIT:
+                raise Fail(EXIT_DEP, "toolkit", "--toolkit %s is at %s, not the pinned commit %s "
+                           "(git checkout %s)." % (tk, head, TOOLKIT_COMMIT[:7], TOOLKIT_COMMIT))
+            if dirty:
+                raise Fail(EXIT_DEP, "toolkit", "--toolkit %s has local changes; use a clean "
+                           "checkout of %s." % (tk, TOOLKIT_COMMIT[:7]))
+            prog("toolkit", 1, "xboxrecomp %s (git checkout %s)" % (TOOLKIT_COMMIT[:7], tk))
+            return tk
+        marker = os.path.join(tk, TOOLKIT_MARKER)
+        try:
+            with open(marker, encoding="utf-8") as f:
+                m = json.load(f)
+            files = m["files"]
+        except (OSError, ValueError, KeyError):
+            raise Fail(EXIT_DEP, "toolkit", "--toolkit %s is neither a git checkout nor a folder "
+                       "this script extracted. Leave --toolkit out to download it." % tk)
+        got = [(rel, sha256_file(os.path.join(tk, rel))) for rel in files
+               if os.path.isfile(os.path.join(tk, rel))]
+        if len(got) != len(files) or tree_digest(got) != TOOLKIT_TREE_SHA256:
+            raise Fail(EXIT_DEP, "toolkit", "--toolkit %s doesn't match the pinned commit's files." % tk)
+        prog("toolkit", 1, "xboxrecomp %s (checked folder %s)" % (TOOLKIT_COMMIT[:7], tk))
+        return tk
+
+    tdir = os.path.join(work, "toolkit")
+    os.makedirs(tdir, exist_ok=True)
+    zpath = os.path.join(tdir, "xboxrecomp-%s.zip" % TOOLKIT_COMMIT)
+    if not (os.path.isfile(zpath) and sha256_file(zpath) == TOOLKIT_ZIP_SHA256):
+        prog("toolkit", 0.1, "downloading xboxrecomp %s from GitHub" % TOOLKIT_COMMIT[:7])
+        tmp = zpath + ".part"
+        try:
+            with urllib.request.urlopen(TOOLKIT_URL, timeout=120) as r, open(tmp, "wb") as f:
+                shutil.copyfileobj(r, f, 1 << 20)
+        except OSError as e:
+            raise Fail(EXIT_DEP, "toolkit", "Couldn't download the toolkit (%s): %s. Check the "
+                       "internet connection, or pass --toolkit <a clean checkout of %s>."
+                       % (TOOLKIT_URL, e, TOOLKIT_COMMIT))
+        os.replace(tmp, zpath)
+    zsha = sha256_file(zpath)
+    try:
+        zf = zipfile.ZipFile(zpath)
+    except zipfile.BadZipFile:
+        os.remove(zpath)
+        raise Fail(EXIT_DEP, "toolkit", "The toolkit download is damaged; run again.")
+    with zf:
+        files = zip_tree(zf)
+        if zsha != TOOLKIT_ZIP_SHA256:
+            # GitHub builds archives on the fly; the same commit's files are what count.
+            if tree_digest(files) != TOOLKIT_TREE_SHA256:
+                os.remove(zpath)
+                raise Fail(EXIT_DEP, "toolkit", "The toolkit download doesn't match the pinned "
+                           "commit (SHA-256 %s). Nothing was used." % zsha)
+        tk = os.path.join(tdir, "xboxrecomp")
+        if os.path.isdir(tk):
+            shutil.rmtree(tk)              # a fresh copy: the pipeline writes into the toolkit
+        os.makedirs(tk)
+        prefix = zf.namelist()[0].split("/", 1)[0] + "/"
+        for info in zf.infolist():
+            if info.is_dir() or not info.filename.startswith(prefix):
+                continue
+            rel = info.filename[len(prefix):]
+            dest = os.path.join(tk, *rel.split("/"))
+            os.makedirs(os.path.dirname(dest), exist_ok=True)
+            with zf.open(info) as src, open(dest, "wb") as out:
+                shutil.copyfileobj(src, out, 1 << 20)
+    with open(os.path.join(tk, TOOLKIT_MARKER), "w", encoding="utf-8") as f:
+        json.dump({"commit": TOOLKIT_COMMIT, "describe": "v0.16.0", "url": TOOLKIT_URL,
+                   "archive_sha256": zsha, "tree_sha256": tree_digest(files),
+                   "files": sorted(p for p, _ in files)}, f, indent=1)
+    prog("toolkit", 1, "xboxrecomp %s (archive SHA-256 %s...)" % (TOOLKIT_COMMIT[:7], zsha[:12]))
+    return tk
+
+
+def run_text(cmd, cwd):
+    try:
+        r = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True, timeout=120)
+        return r.stdout.strip() if r.returncode == 0 else None
+    except (OSError, subprocess.SubprocessError):
+        return None
+
+
+# ── The disc ──────────────────────────────────────────────────────────────
+
+def xiso_module(tk):
+    if tk not in sys.path:
+        sys.path.insert(0, tk)
+    from tools.xiso import xdvdfs          # the pinned toolkit's reader
+    return xdvdfs
+
+
+def identify(disc):
+    """("folder" | "image", absolute path)."""
+    p = os.path.abspath(disc)
+    if os.path.isdir(p):
+        if not any(n.lower() == "default.xbe" for n in os.listdir(p)):
+            raise Fail(EXIT_DISC, "identify", "%s has no default.xbe: pick the folder with the "
+                       "disc's files in it." % p)
+        return "folder", p
+    if os.path.isfile(p):
+        return "image", p
+    raise Fail(EXIT_DISC, "identify", "%s doesn't exist." % p)
+
+
+def folder_files(root):
+    """(relative path, absolute path) of every file under root."""
+    out = []
+    for d, dirs, files in os.walk(root):
+        dirs.sort()
+        for n in sorted(files):
+            full = os.path.join(d, n)
+            out.append((os.path.relpath(full, root).replace(os.sep, "/"), full))
+    return out
+
+
+def image_files(iso):
+    return [((d + "/" + e.name).lstrip("/"), e) for d, e in iso.walk()]
+
+
+def copy_hashed(read_chunks, dest):
+    """Write the chunks to dest (if given) and return their SHA-256."""
+    h = hashlib.sha256()
+    out = None
+    if dest:
+        os.makedirs(os.path.dirname(dest), exist_ok=True)
+        out = open(dest + ".part", "wb")
+    try:
+        for chunk in read_chunks:
+            h.update(chunk)
+            if out:
+                out.write(chunk)
+    finally:
+        if out:
+            out.close()
+    if dest:
+        os.replace(dest + ".part", dest)
+    return h.hexdigest()
+
+
+def image_chunks(iso, e, xd):
+    iso._f.seek(iso.base + e.sector * xd.SECTOR)
+    left = e.size
+    while left > 0:
+        chunk = iso._f.read(min(1 << 20, left))
+        if not chunk:
+            raise xd.XisoError("the image ends inside %s" % e.name)
+        left -= len(chunk)
+        yield chunk
+
+
+def file_chunks(path):
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            yield chunk
+
+
+class Retail:
+    def __init__(self, data):
+        self.data = data
+        self.by_key = {f["name_sha256"]: f for f in data["files"]}
+
+    def compare(self, got):
+        """got: {relative path: (size, sha256)}. Returns (ok, plain-words summary, details)."""
+        seen, bad, extra = set(), [], []
+        for rel, (size, digest) in sorted(got.items()):
+            k = path_key(rel)
+            ref = self.by_key.get(k)
+            if ref is None:
+                extra.append(rel)
+                continue
+            seen.add(k)
+            if (size, digest) != (ref["size"], ref["sha256"]) and ref.get("required", True):
+                bad.append(rel)
+        missing = [f for k, f in self.by_key.items() if k not in seen and f.get("required", True)]
+        ok = not bad and not missing
+        if ok:
+            msg = "an unmodified %s copy of %s (%d files checked)" % (
+                self.data.get("label", "retail"), self.data.get("game", "the game"), len(seen))
+        else:
+            parts = []
+            if bad:
+                parts.append("%d file%s differ%s from the retail disc (%s%s)" % (
+                    len(bad), "s" if len(bad) > 1 else "", "" if len(bad) > 1 else "s",
+                    ", ".join(bad[:3]), ", ..." if len(bad) > 3 else ""))
+            if missing:
+                parts.append("%d file%s the retail disc has %s missing" % (
+                    len(missing), "s" if len(missing) > 1 else "", "are" if len(missing) > 1 else "is"))
+            msg = ("This isn't an unmodified retail copy of %s (%s): %s. Only an unmodified "
+                   "copy of the supported version works." % (
+                       self.data.get("game", "the game"), self.data.get("label", "retail"),
+                       "; ".join(parts)))
+        return ok, msg, {"differ": bad, "missing": len(missing), "extra": extra}
+
+
+def check_disc(a, kind, src, tk, game_dir, retail, prog):
+    """Hash (and, unless --check-only, unpack or copy) the disc. Returns the summary."""
+    got = {}
+    if kind == "image":
+        xd = xiso_module(tk)
+        try:
+            iso = xd.Xiso(src)
+        except (xd.XisoError, OSError) as e:
+            raise Fail(EXIT_DISC, "identify", "%s isn't an Xbox disc image (%s)." % (src, e))
+        with iso:
+            layout = "full disc image (Redump layout)" if iso.base == 0x18300000 else \
+                     "XISO" if iso.base == 0 else "Xbox image (partition at 0x%X)" % iso.base
+            prog("identify", 1, "%s: %s" % (os.path.basename(src), layout))
+            entries = image_files(iso)
+            # The XBE first: a wrong disc stops here, before 2 GB are written.
+            xbe = [(r, e) for r, e in entries if r.lower() == "default.xbe"]
+            if not xbe:
+                raise Fail(EXIT_DISC, "fingerprint", "The image has no default.xbe.")
+            ref = retail.by_key.get(path_key("default.xbe"))
+            xsha = copy_hashed(image_chunks(iso, xbe[0][1], xd), None)
+            if not ref or (xbe[0][1].size, xsha) != (ref["size"], ref["sha256"]):
+                ok, msg, _ = retail.compare({"default.xbe": (xbe[0][1].size, xsha)})
+                raise Fail(EXIT_DISC, "fingerprint", "This isn't the supported retail version of "
+                           "%s: its default.xbe differs (%s)." % (retail.data.get("game"), retail.data.get("label")))
+            total = sum(e.size for _, e in entries) or 1
+            done = 0
+            step = "fingerprint" if a.check_only else "unpack"
+            last = 0
+            for rel, e in entries:
+                dest = None if a.check_only else os.path.join(game_dir, *rel.split("/"))
+                try:
+                    digest = copy_hashed(image_chunks(iso, e, xd), dest)
+                except xd.XisoError as err:
+                    raise Fail(EXIT_DISC, step, "The image is damaged or cut short: %s." % err)
+                got[rel] = (e.size, digest)
+                done += e.size
+                if time.time() - last > 2:
+                    last = time.time()
+                    prog(step, done / total, "%s %d of %d files (%.1f of %.1f GB)" % (
+                        "checking" if a.check_only else "unpacking", len(got), len(entries),
+                        done / GB, total / GB))
+    else:
+        prog("identify", 1, "a folder of the disc's files: %s" % src)
+        files = folder_files(src)
+        total = sum(os.path.getsize(p) for _, p in files) or 1
+        done, last = 0, 0
+        same = os.path.normcase(os.path.abspath(src)) == os.path.normcase(os.path.abspath(game_dir))
+        step = "fingerprint" if (a.check_only or same) else "unpack"
+        for rel, full in files:
+            k = path_key(rel)
+            dest = None
+            if not (a.check_only or same) and k in retail.by_key:
+                dest = os.path.join(game_dir, *rel.split("/"))   # only the disc's own files
+            got[rel] = (os.path.getsize(full), copy_hashed(file_chunks(full), dest))
+            done += got[rel][0]
+            if time.time() - last > 2:
+                last = time.time()
+                prog(step, done / total, "%s %d of %d files (%.1f of %.1f GB)" % (
+                    "checking" if dest is None else "copying", len(got), len(files),
+                    done / GB, total / GB))
+    ok, msg, details = retail.compare(got)
+    if not ok:
+        raise Fail(EXIT_DISC, "fingerprint", msg)
+    prog("fingerprint", 1, msg)
+    files = sorted((path_key(r), d) for r, (s, d) in got.items()     # as retail.json's total
+                   if retail.by_key.get(path_key(r), {}).get("required", False))
+    return {"kind": kind if kind == "folder" else ("redump" if "Redump" in layout else "xiso"),
+            "label": retail.data.get("label"), "files_total_sha256": total_digest(files),
+            "extra_files_ignored": len(details["extra"])}
+
+
+# ── Running tools ─────────────────────────────────────────────────────────
+
+def run_logged(cmd, log_path, cwd=None, env=None, on_line=None, tick=None):
+    """Run cmd with its output in log_path; on_line(line) per line, tick() every 5 s."""
+    os.makedirs(os.path.dirname(log_path), exist_ok=True)
+    q = queue.Queue()
+    with open(log_path, "w", encoding="utf-8", errors="replace") as log:
+        log.write("$ %s\n(cwd %s)\n\n" % (subprocess.list2cmdline(cmd), cwd or os.getcwd()))
+        log.flush()
+        try:
+            p = subprocess.Popen(cmd, cwd=cwd, env=env, stdin=subprocess.DEVNULL,
+                                 stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                 text=True, encoding="utf-8", errors="replace")
+        except OSError as e:
+            log.write("could not start: %s\n" % e)
+            return 127
+
+        def pump():
+            for line in p.stdout:
+                q.put(line)
+            q.put(None)
+        threading.Thread(target=pump, daemon=True).start()
+        while True:
+            try:
+                line = q.get(timeout=5)
+            except queue.Empty:
+                if tick:
+                    tick()
+                continue
+            if line is None:
+                break
+            log.write(line)
+            log.flush()
+            if on_line:
+                on_line(line)
+        return p.wait()
+
+
+def tail(path, n=12):
+    try:
+        with open(path, encoding="utf-8", errors="replace") as f:
+            return "".join(f.readlines()[-n:])
+    except OSError:
+        return ""
+
+
+def run_pipeline(repo, tk, xbe, gen, work, prog):
+    """tools/run_pipeline.py from a clean tree: parse..recomp, no Ghidra."""
+    if os.path.isdir(gen):
+        shutil.rmtree(gen)
+    evid = os.path.join(work, "pipeline")
+    log = os.path.join(work, "logs", "pipeline.log")
+    cmd = [sys.executable, os.path.join(repo, "tools", "run_pipeline.py"),
+           "--toolkit", tk, "--xbe", xbe, "--gen-dir", gen, "--to", "recomp",
+           "--seeds", os.path.join(repo, "names", "icall_seeds.json"),
+           "--evidence-dir", evid, "--no-cached-names", "--no-names"]
+    order = ["parse", "disasm", "funcid", "abi", "ghidra", "recomp"]
+    total = float(sum(PIPE_SECONDS[s] for s in order))
+    state = {"step": "parse", "t0": time.time()}
+
+    def frac():
+        before = sum(PIPE_SECONDS[s] for s in order[:order.index(state["step"])])
+        within = min(time.time() - state["t0"], PIPE_SECONDS[state["step"]] * 0.95)
+        return (before + within) / total
+
+    def on_line(line):
+        m = re.match(r"^\[(\w+)\] (\S.*)$", line.strip())
+        if m and m.group(1) in order and m.group(1) != state["step"]:
+            state["step"], state["t0"] = m.group(1), time.time()
+            prog("pipeline", frac(), "translating the game's code: %s" % state["step"])
+
+    def tick():
+        prog("pipeline", frac(), "translating the game's code: %s (%d s)" % (
+            state["step"], time.time() - state["t0"]))
+
+    env = dict(os.environ, PYTHONIOENCODING="utf-8", PYTHONDONTWRITEBYTECODE="1")
+    prog("pipeline", 0, "translating the game's code (about 10 minutes)")
+    t0 = time.time()
+    rc = run_logged(cmd, log, cwd=repo, env=env, on_line=on_line, tick=tick)
+    if rc != 0 or not glob.glob(os.path.join(gen, "*.c")):
+        raise Fail(EXIT_PIPELINE, "pipeline", "The translation failed (exit %d). Log: %s\n%s"
+                   % (rc, log, tail(log)))
+    prog("pipeline", 1, "translated in %d s" % (time.time() - t0))
+    return time.time() - t0
+
+
+def verify_gen(repo, gen, prog):
+    ref = load_json(os.path.join(FINGERPRINTS, "generated.json"), "fingerprints/generated.json")
+    got = gen_fingerprint(gen)
+    total = total_digest((n, f["sha256"]) for n, f in got.items())
+    if total != ref.get("total_sha256"):
+        want = ref.get("files", {})
+        differ = sorted(n for n in set(got) | set(want)
+                        if got.get(n, {}).get("sha256") != want.get(n, {}).get("sha256"))
+        inputs = gen_inputs(repo)
+        changed = sorted(k for k, v in inputs.items() if ref.get("inputs", {}).get(k) != v)
+        hint = (" Source files that differ from the ones the fingerprints were made with: %s."
+                % ", ".join(changed)) if changed else ""
+        raise Fail(EXIT_GEN, "verify", "The generated code doesn't match ours: %d of %d files "
+                   "differ (%s%s).%s Check Python 3.13 and capstone %s, and that the source is "
+                   "complete and unchanged." % (len(differ), len(want), ", ".join(differ[:4]),
+                                                 ", ..." if len(differ) > 4 else "", hint, CAPSTONE))
+    prog("verify", 1, "the generated code matches ours (%d files, SHA-256 %s...)" % (len(got), total[:12]))
+    return total
+
+
+def build(repo, tk, gen, work, cmake, jobs, prog):
+    bdir = os.path.join(work, "build")
+    logc = os.path.join(work, "logs", "cmake_configure.log")
+    logb = os.path.join(work, "logs", "cmake_build.log")
+    cfg = [cmake, "-S", repo, "-B", bdir, "-G", "Visual Studio 17 2022", "-A", "x64",
+           "-DXBOXRECOMP_DIR=" + tk.replace("\\", "/"), "-DBW_GEN_DIR=" + gen.replace("\\", "/"),
+           "-DPython3_EXECUTABLE=" + sys.executable.replace("\\", "/")]
+    prog("build", 0, "configuring (CMake, Visual Studio 2022 x64)")
+    if run_logged(cfg, logc, cwd=repo) != 0:
+        raise Fail(EXIT_BUILD, "build", "CMake couldn't configure the build. Log: %s\n%s" % (logc, tail(logc)))
+    srcs = (len(glob.glob(os.path.join(gen, "*.c"))) + len(glob.glob(os.path.join(repo, "src", "*.c")))
+            + len(glob.glob(os.path.join(repo, "src", "*", "*.c")))
+            + len(glob.glob(os.path.join(repo, "src", "*", "*", "*.c")))
+            + len(glob.glob(os.path.join(tk, "src", "**", "*.c"), recursive=True)))
+    state = {"n": 0, "t0": time.time()}
+
+    def on_line(line):
+        if re.match(r"^\s+[\w.-]+\.c\s*$", line):
+            state["n"] += 1
+            if state["n"] % 10 == 0:
+                prog("build", min(0.95, state["n"] / float(srcs or 1)),
+                     "compiling (%d of about %d files)" % (state["n"], srcs))
+
+    def tick():
+        prog("build", min(0.95, state["n"] / float(srcs or 1)),
+             "compiling (%d of about %d files, %d s)" % (state["n"], srcs, time.time() - state["t0"]))
+
+    cmd = [cmake, "--build", bdir, "--config", "Release", "--parallel", str(jobs)]
+    if run_logged(cmd, logb, cwd=repo, on_line=on_line, tick=tick) != 0:
+        raise Fail(EXIT_BUILD, "build", "The build failed. Log: %s\n%s" % (logb, tail(logb, 20)))
+    exe = os.path.join(bdir, "Release", "bloodwake.exe")
+    if not os.path.isfile(exe):
+        raise Fail(EXIT_BUILD, "build", "The build finished without bloodwake.exe. Log: %s" % logb)
+    prog("build", 1, "built in %d s" % (time.time() - state["t0"]))
+    return exe, time.time() - state["t0"]
+
+
+CMD_LAUNCHER = """@echo off
+rem Blood Wake: opens the launcher (settings and a Play button; tools\\launcher.pyw).
+cd /d "%%~dp0"
+start "" "%s" tools\\launcher.pyw
+"""
+CMD_PLAY = """@echo off
+rem Play Blood Wake. With no options the launcher opens; with options it plays
+rem straight away:  play.cmd --edition remastered    play.cmd --keyboard
+cd /d "%%~dp0"
+if "%%~1"=="" (
+  start "" "%s" tools\\launcher.pyw
+) else (
+  "%s" tools\\play.py %%*
+)
+"""
+
+
+def stage(repo, exe, inst, record, prog):
+    rel = os.path.join(inst, "build", "Release")
+    os.makedirs(rel, exist_ok=True)
+    for src in (exe, os.path.splitext(exe)[0] + ".pdb"):
+        if os.path.isfile(src):
+            shutil.copy2(src, os.path.join(rel, os.path.basename(src)))
+    os.makedirs(os.path.join(inst, "tools"), exist_ok=True)
+    for name in ("launcher.pyw", "play.py"):
+        shutil.copy2(os.path.join(repo, "tools", name), os.path.join(inst, "tools", name))
+    py = sys.executable
+    pyw = os.path.join(os.path.dirname(py), "pythonw.exe")
+    pyw = pyw if os.path.isfile(pyw) else py
+    with open(os.path.join(inst, "Blood Wake.cmd"), "w", newline="\r\n") as f:
+        f.write(CMD_LAUNCHER % pyw)
+    with open(os.path.join(inst, "play.cmd"), "w", newline="\r\n") as f:
+        f.write(CMD_PLAY % (pyw, py))
+    with open(os.path.join(inst, "install.json"), "w", encoding="utf-8") as f:
+        json.dump(record, f, indent=2)
+    prog("stage", 1, "installed in %s" % inst)
+
+
+# ── Main ──────────────────────────────────────────────────────────────────
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--disc", required=True, help="a folder of the disc's files, an XISO or a full disc image")
+    ap.add_argument("--install-dir", required=True, help="where the game goes (created if needed)")
+    ap.add_argument("--toolkit", help="a clean xboxrecomp checkout at %s (default: download it)" % TOOLKIT_COMMIT[:7])
+    ap.add_argument("--work-dir", help="for the toolkit, the generated C and the build (default <install-dir>/work)")
+    ap.add_argument("--jobs", type=int, default=os.cpu_count() or 4, help="parallel build jobs")
+    ap.add_argument("--check-only", action="store_true", help="only identify and check the disc")
+    ap.add_argument("--progress", choices=("text", "json"), default="text")
+    a = ap.parse_args(argv)
+    prog = Progress(a.progress == "json")
+    inst = os.path.abspath(a.install_dir)
+    work = os.path.abspath(a.work_dir) if a.work_dir else os.path.join(inst, "work")
+    game_dir = os.path.join(inst, "game", "disc")
+    t_start = time.time()
+    times = {}
+    try:
+        notes = check_python()
+        retail = Retail(load_json(os.path.join(FINGERPRINTS, "retail.json"), "fingerprints/retail.json"))
+        if not a.check_only:
+            load_json(os.path.join(FINGERPRINTS, "generated.json"), "fingerprints/generated.json")
+            vs, vs_ver = find_vs()
+            if not vs:
+                raise Fail(EXIT_DEP, "identify", "Visual Studio 2022 (or the Build Tools for Visual "
+                           "Studio 2022) with the 'Desktop development with C++' workload is needed.")
+            cmake, cmake_ver = find_cmake(vs)
+            if not cmake:
+                raise Fail(EXIT_DEP, "identify", "CMake 3.20 or newer is needed (Visual Studio's "
+                           "C++ CMake tools component, or cmake.org).")
+            if os.path.splitdrive(inst)[0].lower() == os.path.splitdrive(work)[0].lower():
+                check_space(inst, NEED_INSTALL + NEED_WORK, "identify", "the game's files and the build")
+            else:
+                check_space(inst, NEED_INSTALL, "identify", "the game's files")
+                check_space(work, NEED_WORK, "identify", "the build")
+        for n in notes:
+            prog("identify", 0, n)
+        kind, src = identify(a.disc)
+        os.makedirs(work, exist_ok=True)
+        tk = None
+        if kind == "image" or not a.check_only:
+            t0 = time.time()
+            tk = get_toolkit(a, work, prog)
+            times["toolkit"] = time.time() - t0
+        t0 = time.time()
+        disc = check_disc(a, kind, src, tk, game_dir, retail, prog)
+        times["unpack_and_check"] = time.time() - t0
+        if a.check_only:
+            prog("done", 1, "the disc is fine: an unmodified %s copy" % disc["label"], disc=disc)
+            return EXIT_OK
+
+        xbe_dir = os.path.join(work, "xbe")         # the pipeline writes its analysis beside the XBE
+        os.makedirs(xbe_dir, exist_ok=True)
+        xbe = os.path.join(xbe_dir, "default.xbe")
+        shutil.copy2(next(p for r, p in folder_files(game_dir) if r.lower() == "default.xbe"), xbe)
+        gen = os.path.join(work, "gen")
+        times["pipeline"] = run_pipeline(REPO, tk, xbe, gen, work, prog)
+        gen_total = verify_gen(REPO, gen, prog)
+        exe, times["build"] = build(REPO, tk, gen, work, cmake, a.jobs, prog)
+        record = {
+            "format": 1,
+            "installed": _dt.datetime.now().isoformat(timespec="seconds"),
+            "editions": ["original", "remastered"],
+            "source": {"commit": run_text(["git", "rev-parse", "HEAD"], REPO)
+                       if os.path.exists(os.path.join(REPO, ".git")) else None,
+                       "generated_inputs": gen_inputs(REPO)},
+            "toolkit": {"commit": TOOLKIT_COMMIT, "path": tk},
+            "tools": {"python": sys.version.split()[0], "python_exe": sys.executable,
+                      "capstone": module_version("capstone"), "cmake": cmake_ver,
+                      "visual_studio": vs_ver},
+            "disc": disc,
+            "generated_total_sha256": gen_total,
+            "paths": {"game": game_dir, "work": work, "exe": os.path.join(inst, "build", "Release", "bloodwake.exe")},
+            "seconds": {k: round(v) for k, v in times.items()},
+        }
+        stage(REPO, exe, inst, record, prog)
+        prog("done", 1, "Blood Wake is built. Start it with \"Blood Wake.cmd\" in %s (%d min)."
+             % (inst, (time.time() - t_start) / 60))
+        return EXIT_OK
+    except Fail as f:
+        prog(f.step, 0, f.msg, error=True, exit=f.code)
+        return f.code
+    except OSError as e:
+        prog("done", 0, "File error: %s" % e, error=True, exit=EXIT_IO)
+        return EXIT_IO
+
+
+if __name__ == "__main__":
+    sys.exit(main())

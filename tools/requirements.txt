@@ -1,0 +1,7 @@
+# Python packages for the xboxrecomp v0.16.0 pipeline and its test suite.
+# Verified 2026-10-25: 932 passed, 4 skipped (Linux, Python 3.13) with exactly these.
+#   py -3 -m pip install -r tools/requirements.txt
+capstone==5.0.9   # x86 decoder; capstone 6 changed its API, so stay on 5.x
+pefile==2024.8.26 # imported by tools/fusion; without it pytest stops at collection
+numpy==2.5.4      # imported by tools/fusion/module.py; missing on Windows (session 1)
+pytest>=8

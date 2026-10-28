@@ -1,0 +1,572 @@
+/*
+ * bw_settings.c - the settings file and its table (bw_settings.h). Agent D5.
+ *
+ * Each setting has a few options; each option says what it does in terms of
+ * switches the port already reads:
+ *   "fix:+ID" / "fix:-ID"   a change in the registry (src/bw_fixes.def), on or
+ *                           off; collected into BW_FIX ahead of any BW_FIX the
+ *                           environment has, so the environment's tokens win
+ *   "env:NAME=VALUE"        an environment variable, set only if the
+ *                           environment doesn't already have one
+ * several separated by ';'. A setting the file doesn't mention does nothing,
+ * so the game's own defaults stand. Fix tokens a setting would give an
+ * edition that doesn't have that change (Original has none) are dropped, so
+ * a file written for one edition can't stop another edition's boot.
+ */
+#include <windows.h>
+#include <shlobj.h>
+#include <ctype.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include "bw_edition.h"
+#include "bw_settings.h"
+
+typedef struct {
+    const char *value, *label, *effect;
+} BwOpt;
+
+typedef struct {
+    const char *tab, *section, *key, *label, *tip, *dflt;
+    const char *editions;       /* "all", or "remastered" (and every later edition) */
+    BwOpt opt[8];
+} BwSetting;
+
+#define ON_OFF(ID) { { "on", "On", "fix:+" #ID }, { "off", "Off", "fix:-" #ID } }
+
+static const BwSetting s_set[] = {
+    /* ---- Edition ------------------------------------------------------- */
+    { "Edition", "edition", "edition", "Edition",
+      "Original is the game exactly as it shipped in 2001, bugs and all. Remastered fixes "
+      "its bugs and plays it on a modern PC: widescreen, sharper picture, higher frame rate, "
+      "better sound, with the original art. Each edition keeps its own saves.",
+      "original", "all",
+      { { "original", "Original (as shipped)", "" },
+        { "remastered", "Remastered", "env:BW_EDITION=remastered" },
+      } },
+
+    /* ---- Display --------------------------------------------------------- */
+    { "Display", "display", "mode", "Window",
+      "Play in a window, or fill the whole screen without a border (Alt+Enter or F11 "
+      "switches while you play).",
+      "window", "all",
+      { { "window", "Window", "" },
+        { "fullscreen", "Fullscreen (borderless)", "env:RECOMP_FULLSCREEN=1" } } },
+    { "Display", "display", "window_size", "Window size",
+      "How big the window opens, in steps of the console's 480-line picture. It shrinks "
+      "itself to fit the screen.",
+      "large", "all",
+      { { "small", "Small (480 lines)", "env:RECOMP_WINDOW_SCALE=1" },
+        { "large", "Large (960 lines)", "" },
+        { "huge", "Huge (1440 lines)", "env:RECOMP_WINDOW_SCALE=3" } } },
+    { "Display", "display", "aspect", "Picture shape",
+      "Widescreen shows more of the world at the sides, as a modern game does; nothing is "
+      "stretched. Match my display picks your monitor's shape (21:9 on an ultrawide). 4:3 "
+      "is the console's shape.",
+      "auto", "remastered",
+      { { "auto", "Match my display", "fix:+WIDESCREEN" },
+        { "16:9", "16:9", "fix:+WIDESCREEN;env:BW_ASPECT=16:9" },
+        { "21:9", "21:9 (ultrawide)", "fix:+WIDESCREEN;env:BW_ASPECT=21:9" },
+        { "4:3", "4:3 (as the console)", "fix:-WIDESCREEN" } } },
+    { "Display", "display", "hud", "HUD position",
+      "In widescreen, put the radar and the status panel in the corners of the screen, or "
+      "keep the whole HUD in the middle, where the console had it.",
+      "edges", "remastered",
+      { { "edges", "Screen corners", "fix:+WS_HUD_EDGES" },
+        { "centre", "Middle (as the console)", "fix:-WS_HUD_EDGES" } } },
+    { "Display", "display", "resolution", "Rendering resolution",
+      "How sharp the game is drawn. Native draws at your screen's or window's own "
+      "resolution (sharpest); lower settings are kinder to a slower graphics card. 480p is "
+      "the console's own resolution.",
+      "native", "remastered",
+      { { "native", "Native (match the screen)", "fix:+VFX_NATIVE_RES" },
+        { "2160", "4K (2160p)", "fix:+VFX_NATIVE_RES;env:BW_VFX_SCALE=4.5" },
+        { "1440", "1440p", "fix:+VFX_NATIVE_RES;env:BW_VFX_SCALE=3" },
+        { "1080", "1080p", "fix:+VFX_NATIVE_RES;env:BW_VFX_SCALE=2.25" },
+        { "720", "720p", "fix:+VFX_NATIVE_RES;env:BW_VFX_SCALE=1.5" },
+        { "480", "480p (as the console)", "fix:-VFX_NATIVE_RES" } } },
+    { "Display", "display", "framerate", "Frame rate cap",
+      "The most frames a second the game draws. The console ran missions at 30. Higher "
+      "rates draw extra frames between the game's own steps, so it looks smoother while "
+      "playing at the same speed. Match my display follows your screen's refresh rate, "
+      "which on a very fast monitor means hundreds of frames a second: 120 or 144 is "
+      "plenty and keeps the PC cooler and quieter.",
+      "display", "remastered",
+      { { "display", "Match my display", "fix:+HIFPS" },
+        { "240", "240", "fix:+HIFPS;env:BW_HIFPS=240" },
+        { "144", "144", "fix:+HIFPS;env:BW_HIFPS=144" },
+        { "120", "120", "fix:+HIFPS;env:BW_HIFPS=120" },
+        { "60", "60", "fix:+HIFPS;env:BW_HIFPS=60" },
+        { "30", "30 (as the console)", "fix:-HIFPS" } } },
+    { "Display", "display", "vsync", "Vertical sync",
+      "Wait for the screen before showing each frame: no tearing on screens without "
+      "variable refresh (G-Sync/FreeSync), a little more delay.",
+      "off", "remastered",
+      { { "off", "Off", "" },
+        { "on", "On", "env:BW_HIFPS_VSYNC=1" } } },
+
+    /* ---- Graphics -------------------------------------------------------- */
+    { "Graphics", "graphics", "antialiasing", "Anti-aliasing",
+      "Smooths jagged edges. 4x is a good balance; 8x is smoothest and slowest.",
+      "4", "remastered",
+      { { "off", "Off", "fix:-VFX_MSAA" },
+        { "2", "2x", "fix:+VFX_MSAA;env:BW_VFX_MSAA=2" },
+        { "4", "4x", "fix:+VFX_MSAA;env:BW_VFX_MSAA=4" },
+        { "8", "8x", "fix:+VFX_MSAA;env:BW_VFX_MSAA=8" } } },
+    { "Graphics", "graphics", "texture_filtering", "Texture filtering",
+      "Keeps textures sharp when seen at an angle, like the water and the cliffs far away.",
+      "16", "remastered",
+      { { "off", "Off (as the console)", "fix:-VFX_ANISO" },
+        { "4", "4x", "fix:+VFX_ANISO;env:BW_VFX_AF=4" },
+        { "8", "8x", "fix:+VFX_ANISO;env:BW_VFX_AF=8" },
+        { "16", "16x", "fix:+VFX_ANISO;env:BW_VFX_AF=16" } } },
+    { "Graphics", "graphics", "draw_distance", "Detail distance",
+      "How far away boats and buildings keep their full detail. Farther looks better "
+      "and costs a little speed.",
+      "far", "remastered",
+      { { "original", "As the console", "fix:-VFX_DRAW_DISTANCE" },
+        { "far", "Far (2x)", "fix:+VFX_DRAW_DISTANCE;env:BW_VFX_LOD=2" },
+        { "farther", "Farther (3x)", "fix:+VFX_DRAW_DISTANCE;env:BW_VFX_LOD=3" } } },
+    { "Graphics", "graphics", "ambient_occlusion", "Ambient occlusion",
+      "Soft shadows where things meet (under ledges, around boats). Adds depth; off by "
+      "default because the original didn't have it.",
+      "off", "remastered", ON_OFF(VFX_AO) },
+    { "Graphics", "graphics", "bloom", "Bloom",
+      "A soft glow around the brightest highlights (sun, explosions). Off by default: it "
+      "adds light the original didn't have.",
+      "off", "remastered", ON_OFF(VFX_BLOOM) },
+    { "Graphics", "graphics", "sharpen", "Sharpening",
+      "Crisper textures. Off by default: it changes the look a little.",
+      "off", "remastered", ON_OFF(VFX_SHARPEN) },
+    { "Graphics", "graphics", "fxaa", "Edge smoothing (FXAA)",
+      "An extra smoothing pass for edges anti-aliasing misses (foliage, wires). Softens "
+      "text a little.",
+      "off", "remastered", ON_OFF(VFX_FXAA) },
+    { "Graphics", "graphics", "split_detail", "Split-screen detail",
+      "In 2-, 3- and 4-player split screen the console drew the sea coarser, and with 3 or 4 "
+      "players it froze the boats' gunners, turrets and props. Balanced brings back the "
+      "animations and gives every view the same sea as one player. Balanced gives 3 or 4 "
+      "players the sea the game draws for 2, for slower PCs (with 4 players about 15% "
+      "faster than Full).",
+      "full", "remastered",
+      { { "console", "As the console", "fix:-SPLIT_FULL_DETAIL" },
+        { "balanced", "Balanced (for slower PCs)", "fix:+SPLIT_FULL_DETAIL;env:BW_SPLIT_WATER=balanced" },
+        { "full", "Full", "fix:+SPLIT_FULL_DETAIL;env:BW_SPLIT_WATER=full" } } },
+    { "Graphics", "graphics", "smooth_gradients", "Smooth gradients",
+      "Draws with more colour precision: no banding in dark skies, fog and smoke, same look.",
+      "on", "remastered", ON_OFF(VFX_PRECISION) },
+    { "Graphics", "graphics", "sharp_text", "Sharp text",
+      "Draws the game's own lettering crisply at high resolution.",
+      "on", "remastered", ON_OFF(VFX_TEXT) },
+    { "Graphics", "graphics", "smooth_hud_edges", "Smooth HUD edges",
+      "Draws the edges of the HUD's shapes (the radar's compass ring, weapon icons) "
+      "smooth and round at high resolution, instead of a beaded edge with dark specks.",
+      "on", "remastered", ON_OFF(VFX_HUD_EDGES) },
+    { "Graphics", "graphics", "texture_restoration", "Texture restoration",
+      "Texture restoration: close-up textures redrawn more cleanly from the original art; "
+      "nothing added. Boats, cliffs and buildings seen up close lose the blocky "
+      "compression steps; from a distance they look exactly as before, and the sea, "
+      "spray and the HUD are untouched. The menu photos and logo movies are cleaned the same way.",
+      "on", "remastered", ON_OFF(VFX_TEX_RESTORE) },
+    { "Graphics", "graphics", "hdr", "HDR",
+      "Brighter highlights on an HDR screen. Needs HDR turned on in Windows.",
+      "off", "remastered", ON_OFF(VFX_HDR) },
+    { "Graphics", "graphics", "oled_care", "OLED care",
+      "Slowly dims parts of the picture that don't change for a long time (the HUD, a "
+      "paused menu), to spare an OLED screen.",
+      "off", "remastered", ON_OFF(VFX_OLED_CARE) },
+
+    /* ---- Audio ------------------------------------------------------------- */
+    { "Audio", "audio", "sound_processor", "Sound processor",
+      "Accurate runs the Xbox's own sound chip programs (echo, 3D sound) as the console "
+      "did. Simple skips them, for a slow PC. Applies to every edition.",
+      "accurate", "all",
+      { { "accurate", "Accurate (as the console)", "" },
+        { "simple", "Simple (faster)", "env:BW_APU_DSP=fold" } } },
+    { "Audio", "audio", "resampling", "High-quality resampling",
+      "Cleaner, brighter sound when the game changes a sound's pitch (engines, speed).",
+      "on", "remastered", ON_OFF(AUDIO_SINC_RESAMPLE) },
+    { "Audio", "audio", "louder", "Louder output",
+      "The game mixes quietly; this lifts the whole mix a little, with a limiter so "
+      "nothing clips. The balance between music, effects and voices stays the same.",
+      "on", "remastered", ON_OFF(AUDIO_MAKEUP_GAIN) },
+    { "Audio", "audio", "surround", "Surround sound (5.1)",
+      "With 5.1 or 7.1 speakers (or a surround headset), the game's surround mix comes "
+      "out of all of them. Stereo setups are not affected.",
+      "on", "remastered", ON_OFF(AUDIO_SURROUND) },
+    { "Audio", "audio", "low_latency", "Low latency",
+      "Sound reacts a little sooner to what happens on screen.",
+      "on", "remastered", ON_OFF(AUDIO_LOW_LATENCY) },
+
+
+    /* ---- Fixes ----------------------------------------------------------------- */
+    { "Fixes", "fixes", "mission10", "Mission 10 can always be won",
+      "Sink the first strike force before it reaches Kerang and the second one waits off the "
+      "map forever, so the mission can never end. On, the second force comes as scripted.",
+      "on", "remastered", ON_OFF(M10_SECOND_STRIKE) },
+    { "Fixes", "fixes", "ai_rules", "AI target rules",
+      "Seventeen of the AI's target rules were written so they could never match, so in "
+      "missions 9, 10, 14, 24, 26 and 27 some enemies ignored the targets the designers gave "
+      "them (in mission 10 the strike force never went for Kerang's batteries). On, they work "
+      "as written, and those fights play a little differently.",
+      "on", "remastered", ON_OFF(AI_RULES_AND_AS_OR) },
+    { "Fixes", "fixes", "autocannon_sound", "Autocannon hit sound",
+      "One autocannon hit in three was silent: its third recording was never made. On, those "
+      "hits play one of the other two.",
+      "on", "remastered", ON_OFF(AUTOCANNON_HIT_SOUND) },
+    { "Fixes", "fixes", "hull_sounds", "Hull impact sounds",
+      "Hull smacks, splashes and plunges checked the wrong sound before playing, so some were "
+      "dropped and some restarted over themselves.",
+      "on", "remastered", ON_OFF(BOAT_IMPACT_SOUND_SELF) },
+    { "Fixes", "fixes", "ai_mood", "AI mood swing",
+      "The AI's slow 20-minute swing between cautious and aggressive was miscalculated into "
+      "random noise several times a second. On, it swings slowly as written.",
+      "on", "remastered", ON_OFF(AI_MOOD_WAVE_PERIOD) },
+    { "Fixes", "fixes", "shield_hits", "Dreadnought shield-hit sound",
+      "A sound the original never played because its name was misspelt.",
+      "on", "remastered", ON_OFF(SOUND_SHIELDHITS_NAME) },
+    { "Fixes", "fixes", "boat_splash", "Boat landing splash",
+      "The splash sound for landing after a jump never played: every landing plunged. On, "
+      "light landings splash and heavy ones (a second or more in the air, or nose first) "
+      "plunge; little hops still slap the water as before.",
+      "on", "remastered",
+      { { "on", "On", "fix:+BOAT_SPLASH_RANGE;fix:+BOAT_LANDING_WEIGHT" },
+        { "off", "Off", "fix:-BOAT_SPLASH_RANGE;fix:-BOAT_LANDING_WEIGHT" } } },
+    { "Fixes", "fixes", "m17_crate", "Mission 17 health crate",
+      "The health crate comes back every second, forever: the only endless crate in the "
+      "story missions. On, it appears once like the mission's other crates (on by default: "
+      "the maintainer's call).",
+      "on", "remastered", ON_OFF(M17_CRATE_RESPAWN) },
+    { "Fixes", "fixes", "m21_patrol", "Mission 21 patrol boat",
+      "After the destroyer sinks, the patrol boat SeahawkE keeps coming back forever: the "
+      "only one of 100 respawning squads that does. On, it comes back once like the others "
+      "(on by default: the maintainer's call).",
+      "on", "remastered", ON_OFF(M21_PATROL_RESPAWN) },
+    { "Fixes", "fixes", "voice_lines", "Missing voice lines",
+      "In missions 2, 7, 8, 10, 14 and 19 some radio calls (the out-of-bounds "
+      "warnings, the friendly-fire calls, one taunt) showed their subtitle in silence: the "
+      "mission's copy of the recording was left empty. On, they play the same recording the "
+      "other missions use.",
+      "on", "remastered", ON_OFF(VOICE_PLACEHOLDER_BORROW) },
+    { "Fixes", "fixes", "m20_edge", "Mission 20 map edge",
+      "In the south-east corner you can slip past the end of the out-of-bounds "
+      "line and sail off the map. On, leaving there fails the mission like the rest of that "
+      "edge (on by default: the maintainer's call; off leaves the corner open to explore).",
+      "on", "remastered", ON_OFF(M20_EDGE_GAP) },
+    { "Fixes", "fixes", "m23_textures", "Mission 23 missing textures",
+      "Two textures in mission 23 were never shipped, so the grates in the hallway's "
+      "ceiling show as plain black holes and the rods on the arena's banners are flat "
+      "white. On, they use the closest match from the game's own textures: a riveted girder "
+      "lattice for the grates, and pitted copper for the rods. (Advanced: "
+      "BW_M23_GRATE and BW_M23_BRASS pick other textures by name.)",
+      "on", "remastered", ON_OFF(M23_MISSING_TEXTURES) },
+    { "Fixes", "fixes", "battle_water", "Battle Mode boat water sounds",
+      "In Battle Mode the boats made no splash, slap or spray sounds on the water: those "
+      "recordings were only packed with the story missions. On, battles use the same water "
+      "sounds the story missions play.",
+      "on", "remastered", ON_OFF(BATTLE_WATER_SOUNDS) },
+    { "Fixes", "fixes", "m14_shield", "Mission 14 shield cutscene",
+      "Grab the shield before blowing up the ammo depots and its cutscene played much later, "
+      "showing the empty spot where the shield had been. On, it plays when you grab the shield.",
+      "on", "remastered", ON_OFF(M14_SHIELD_CUTSCENE) },
+    { "Fixes", "fixes", "m27_shield_hit", "Mission 27 \"You hit the Dragon!\"",
+      "The radio call for turning the Dragon's Claw back into the Dragon with your shield was "
+      "recorded but never played: the game listened for a weapon that nothing reports. On, "
+      "the first shield blast that hits the Dragon plays it.",
+      "on", "remastered", ON_OFF(M27_SHIELD_HIT_LINE) },
+    { "Fixes", "fixes", "distant_wake", "Distant wake foam",
+      "The game builds the far-away versions of the boat-wake foam from a mask it reads in "
+      "the wrong order, so distant foam uses a scrambled pattern (almost certainly a slip; "
+      "the sea's colour, waves and sky are not affected). Fixed reads it in the order the "
+      "code intended; Smooth averages it instead. The difference is very small: try it in "
+      "a stormy mission and decide.",
+      "fixed", "remastered",
+      { { "off", "As shipped", "fix:-OCEAN_MIPALPHA_FIX" },
+        { "fixed", "Fixed", "fix:+OCEAN_MIPALPHA_FIX;env:BW_OCEAN_MIPALPHA_FIX=1" },
+        { "smooth", "Smooth", "fix:+OCEAN_MIPALPHA_FIX;env:BW_OCEAN_MIPALPHA_FIX=2" } } },
+
+    /* ---- Controls ---------------------------------------------------------------- */
+    { "Controls", "controls", "keyboard", "Keyboard as a controller",
+      "Lets the keyboard act as controller 1 as well as any pad.",
+      "off", "all",
+      { { "off", "Off", "" },
+        { "on", "On", "env:RECOMP_KEYBOARD=1" } } },
+};
+#define BW_NSET ((int)(sizeof s_set / sizeof s_set[0]))
+
+/* ---- the file ------------------------------------------------------------- */
+
+const char *bw_settings_path(void)
+{
+    static char path[MAX_PATH];
+    const char *e = getenv("BW_SETTINGS");
+    char base[MAX_PATH];
+    if (e && *e) {
+        if (!_stricmp(e, "none") || !strcmp(e, "0") || !_stricmp(e, "off"))
+            return NULL;
+        _snprintf(path, sizeof path, "%s", e);
+    } else if (SUCCEEDED(SHGetFolderPathA(NULL, CSIDL_LOCAL_APPDATA, NULL, 0, base)))
+        _snprintf(path, sizeof path, "%s\\BloodWake\\settings.ini", base);
+    else
+        return NULL;
+    path[sizeof path - 1] = 0;
+    return path;
+}
+
+#define BW_MAXKV 160
+typedef struct { char sec[32], key[64], val[256]; } BwKv;
+
+static void trim(char *s)
+{
+    char *e;
+    while (*s && isspace((unsigned char)*s))
+        memmove(s, s + 1, strlen(s));
+    e = s + strlen(s);
+    while (e > s && isspace((unsigned char)e[-1]))
+        *--e = 0;
+}
+
+static int read_file(const char *path, BwKv *kv, int max)
+{
+    FILE *f = fopen(path, "r");
+    char line[512], sec[32] = "";
+    int n = 0;
+    if (!f)
+        return -1;
+    while (fgets(line, sizeof line, f) && n < max) {
+        char *eq;
+        trim(line);
+        if (!line[0] || line[0] == ';' || line[0] == '#')
+            continue;
+        if (line[0] == '[') {
+            char *c = strchr(line, ']');
+            if (c) {
+                *c = 0;
+                _snprintf(sec, sizeof sec, "%s", line + 1);
+                sec[sizeof sec - 1] = 0;
+                _strlwr(sec);
+            }
+            continue;
+        }
+        if (!(eq = strchr(line, '=')))
+            continue;
+        *eq = 0;
+        _snprintf(kv[n].sec, sizeof kv[n].sec, "%s", sec);
+        _snprintf(kv[n].key, sizeof kv[n].key, "%s", line);
+        _snprintf(kv[n].val, sizeof kv[n].val, "%s", eq + 1);
+        kv[n].sec[sizeof kv[n].sec - 1] = kv[n].key[sizeof kv[n].key - 1] = 0;
+        kv[n].val[sizeof kv[n].val - 1] = 0;
+        trim(kv[n].key);
+        trim(kv[n].val);
+        n++;
+    }
+    fclose(f);
+    return n;
+}
+
+static const char *find_kv(const BwKv *kv, int n, const char *sec, const char *key)
+{
+    int i;
+    for (i = n - 1; i >= 0; i--)                 /* the last one wins */
+        if (!_stricmp(kv[i].sec, sec) && !_stricmp(kv[i].key, key))
+            return kv[i].val;
+    return NULL;
+}
+
+static int env_set(const char *name)
+{
+    const char *v = getenv(name);
+    return v && *v;
+}
+
+/* ---- applying it -------------------------------------------------------------- */
+
+static int fix_ok_for(const char *id, bw_edition_t ed)
+{
+    int i;
+    if (ed == BW_ED_ORIGINAL)
+        return 0;
+    for (i = 0; i < BW_FIX_COUNT; i++)
+        if (!_stricmp(g_bw_fixes[i].name, id))
+            return (g_bw_fixes[i].editions & BW_ED_BIT(ed)) != 0;
+    return 0;
+}
+
+void bw_settings_apply(void)
+{
+    static BwKv kv[BW_MAXKV];
+    static char fix[2048], log[2048], kept[512];
+    const char *path = bw_settings_path(), *ev;
+    bw_edition_t ed = BW_ED_ORIGINAL;
+    int n, i, k, choices = 0, envs = 0;
+
+    if (!path) {
+        fprintf(stderr, "[SET] no settings file (BW_SETTINGS=none): switches from the environment only\n");
+        return;
+    }
+    /* A boot under the host window inherits the host's environment, which
+     * already holds the file's choices: applying them again would only
+     * repeat the BW_FIX tokens. */
+    ev = getenv("BW_SETTINGS_APPLIED");
+    if (ev && *ev) {
+        fprintf(stderr, "[SET] settings %s: applied by the launching process (inherited)\n", ev);
+        return;
+    }
+    n = read_file(path, kv, BW_MAXKV);
+    if (n < 0) {
+        fprintf(stderr, "[SET] no settings file (%s): the game's defaults\n", path);
+        return;
+    }
+    fix[0] = log[0] = kept[0] = 0;
+
+    /* The edition first: it decides which changes a token may name. */
+    ev = getenv("BW_EDITION");
+    if (!(ev && *ev)) {
+        const char *v = find_kv(kv, n, "edition", "edition");
+        if (v && bw_edition_parse(v, &ed) == 0 && ed != BW_ED_ORIGINAL)
+            _putenv_s("BW_EDITION", bw_edition_name(ed));
+    } else if (bw_edition_parse(ev, &ed) != 0)
+        ed = BW_ED_ORIGINAL;                     /* main.c refuses it later */
+
+    for (i = 0; i < BW_NSET; i++) {
+        const BwSetting *st = &s_set[i];
+        const char *v = find_kv(kv, n, st->section, st->key);
+        const BwOpt *o = NULL;
+        char eff[256], *tok, *ctx = NULL;
+        if (!v || (!strcmp(st->key, "edition") && !strcmp(st->section, "edition")))
+            continue;
+        /* A setting for a later edition does nothing in an edition that
+         * doesn't have it: Original takes only the "all" ones (window, keys,
+         * the sound processor). */
+        if ((!strcmp(st->editions, "remastered") && ed == BW_ED_ORIGINAL)
+            )
+            continue;
+        for (k = 0; k < 8 && st->opt[k].value; k++)
+            if (!_stricmp(st->opt[k].value, v))
+                o = &st->opt[k];
+        if (!o) {
+            fprintf(stderr, "[SET] %s.%s = %s: not one of its choices; ignored\n",
+                    st->section, st->key, v);
+            continue;
+        }
+        choices++;
+        _snprintf(eff, sizeof eff, "%s", o->effect);
+        eff[sizeof eff - 1] = 0;
+        for (tok = strtok_s(eff, ";", &ctx); tok; tok = strtok_s(NULL, ";", &ctx)) {
+            if (!strncmp(tok, "fix:", 4)) {
+                if (fix_ok_for(tok + 5, ed)) {
+                    strncat(fix, fix[0] ? "," : "", sizeof fix - strlen(fix) - 1);
+                    strncat(fix, tok + 4, sizeof fix - strlen(fix) - 1);
+                }
+            } else if (!strncmp(tok, "env:", 4)) {
+                char name[64], *val = strchr(tok + 4, '=');
+                if (!val)
+                    continue;
+                _snprintf(name, sizeof name, "%.*s", (int)(val - (tok + 4)), tok + 4);
+                name[sizeof name - 1] = 0;
+                if (env_set(name)) {
+                    strncat(kept, " ", sizeof kept - strlen(kept) - 1);
+                    strncat(kept, name, sizeof kept - strlen(kept) - 1);
+                } else {
+                    _putenv_s(name, val + 1);
+                    envs++;
+                    strncat(log, " ", sizeof log - strlen(log) - 1);
+                    strncat(log, tok + 4, sizeof log - strlen(log) - 1);
+                }
+            }
+        }
+    }
+    /* [advanced]: raw switches, NAME = value, same rule. */
+    for (i = 0; i < n; i++) {
+        const char *p;
+        int good = kv[i].key[0] != 0;
+        if (_stricmp(kv[i].sec, "advanced"))
+            continue;
+        for (p = kv[i].key; *p; p++)
+            if (!(isupper((unsigned char)*p) || isdigit((unsigned char)*p) || *p == '_'))
+                good = 0;
+        if (!good || !strcmp(kv[i].key, "BW_SETTINGS") || !strcmp(kv[i].key, "BW_EDITION")
+            || !strcmp(kv[i].key, "BW_FIX")) {
+            fprintf(stderr, "[SET] advanced.%s: not a switch name; ignored\n", kv[i].key);
+            continue;
+        }
+        if (env_set(kv[i].key)) {
+            strncat(kept, " ", sizeof kept - strlen(kept) - 1);
+            strncat(kept, kv[i].key, sizeof kept - strlen(kept) - 1);
+        } else {
+            _putenv_s(kv[i].key, kv[i].val);
+            envs++;
+            strncat(log, " ", sizeof log - strlen(log) - 1);
+            strncat(log, kv[i].key, sizeof log - strlen(log) - 1);
+            strncat(log, "=", sizeof log - strlen(log) - 1);
+            strncat(log, kv[i].val, sizeof log - strlen(log) - 1);
+        }
+    }
+    /* The file's changes go first; the environment's BW_FIX, if any, after
+     * them, so its tokens win (BW_FIX is read left to right). */
+    if (fix[0]) {
+        static char merged[4096];
+        const char *old = getenv("BW_FIX");
+        _snprintf(merged, sizeof merged, "%s%s%s", fix, old && *old ? "," : "", old && *old ? old : "");
+        merged[sizeof merged - 1] = 0;
+        _putenv_s("BW_FIX", merged);
+    }
+    fprintf(stderr, "[SET] settings %s: %d choices for %s; changes %s; switches set%s%s%s%s\n",
+            path, choices, bw_edition_title(ed), fix[0] ? fix : "(none)",
+            envs ? "" : " (none)", log, kept[0] ? "; kept from the environment:" : "", kept);
+    fflush(stderr);
+    _putenv_s("BW_SETTINGS_APPLIED", path);
+}
+
+/* ---- the schema, for the launcher ------------------------------------------------ */
+
+static void js(FILE *f, const char *s)
+{
+    fputc('"', f);
+    for (; s && *s; s++) {
+        if (*s == '"' || *s == '\\')
+            fputc('\\', f);
+        if ((unsigned char)*s < 0x20)
+            fprintf(f, "\\u%04x", (unsigned char)*s);
+        else
+            fputc(*s, f);
+    }
+    fputc('"', f);
+}
+
+void bw_settings_print_schema(FILE *f)
+{
+    int i, k;
+    const char *path = bw_settings_path();
+    fprintf(f, "{\n  \"file\": ");
+    js(f, path ? path : "");
+    fprintf(f, ",\n  \"tabs\": [\"Edition\", \"Display\", \"Graphics\", \"Audio\", "
+               "\"Fixes\", \"Controls\"],\n  \"advanced_section\": \"advanced\",\n  \"settings\": [\n");
+    for (i = 0; i < BW_NSET; i++) {
+        const BwSetting *st = &s_set[i];
+        fprintf(f, "    {\"tab\": ");
+        js(f, st->tab);
+        fprintf(f, ", \"section\": ");
+        js(f, st->section);
+        fprintf(f, ", \"key\": ");
+        js(f, st->key);
+        fprintf(f, ", \"label\": ");
+        js(f, st->label);
+        fprintf(f, ", \"default\": ");
+        js(f, st->dflt);
+        fprintf(f, ", \"editions\": ");
+        js(f, st->editions);
+        fprintf(f, ",\n     \"tip\": ");
+        js(f, st->tip);
+        fprintf(f, ",\n     \"options\": [");
+        for (k = 0; k < 8 && st->opt[k].value; k++) {
+            fprintf(f, "%s{\"value\": ", k ? ", " : "");
+            js(f, st->opt[k].value);
+            fprintf(f, ", \"label\": ");
+            js(f, st->opt[k].label);
+            fprintf(f, "}");
+        }
+        fprintf(f, "]}%s\n", i + 1 < BW_NSET ? "," : "");
+    }
+    fprintf(f, "  ]\n}\n");
+}

@@ -1,0 +1,85 @@
+/* bw_texrestore.h - Remastered texture restoration (agent T1, VFX_TEX_RESTORE;
+ * docs/day1/T1.md, design in docs/agents/BRIEF_T1T2.md).
+ *
+ * For a DXT1/3/5 texture drawn by 3D (non-overlay) draws, a second texture
+ * whose mip chain is
+ *   level 0      the game's level 0 enlarged k times (k = 4, or 2),
+ *   level 1      (k = 4 only) the same enlarged 2 times,
+ *   level lk...  the game's own level 0 and its own mips, decoded and
+ *                deblocked ("Plan A": small steps across the 4x4 block edges
+ *                between two flat sides are smoothed; real edges stay),
+ * so anything drawn at or below its painted size samples the shipped detail
+ * (no new shimmer, by construction) and the enlarged copies are only sampled
+ * where the texture is drawn larger than painted. The enlargement is
+ * Lanczos-2 (4x4 texels) held within the 2x2 texels around each point (no
+ * ringing), no sharpening; cut-out alpha stays hard, smooth alpha is
+ * enlarged the same way. Done once per texture, at its first 3D draw, on the
+ * back end's device thread. Guest memory is never touched.
+ *
+ * Not restored: normal maps (pixel statistics), the water's textures and the
+ * effect sprites and atlas (by content key), cube maps, 32-bit and linear
+ * textures, render targets, textures smaller than 16 texels across, and
+ * anything an overlay (HUD, menu) draw samples: those keep the original. */
+#ifndef BW_TEXRESTORE_H
+#define BW_TEXRESTORE_H
+
+#define COBJMACROS
+#include <windows.h>
+#include <d3d11.h>
+#include <stdint.h>
+#include <stddef.h>
+
+/* Per cached texture. Zeroed = not tried yet. */
+typedef struct {
+    ID3D11Texture2D *tex;
+    ID3D11ShaderResourceView *srv;
+    uint32_t bytes;             /* VRAM of tex (estimated from its levels) */
+    uint32_t ticket;            /* the request being worked on (state 3) */
+    uint8_t state;              /* 0 untried, 1 restored, 2 left as shipped, 3 being made */
+    uint8_t why;                /* BW_TR_WHY_* when state 2 */
+    uint8_t lk;                 /* restored: number of enlarged levels (1 for 2x, 2 for 4x) */
+    uint8_t alpha;              /* restored: 0 opaque, 1 hard (cut-out), 2 smooth */
+} BwTrSlot;
+
+enum {
+    BW_TR_WHY_NONE = 0,
+    BW_TR_WHY_NORMAL,           /* a tangent-space normal map */
+    BW_TR_WHY_EXCLUDED,         /* water or effect texture (content key) */
+    BW_TR_WHY_SMALL,            /* under 16 texels across, or odd size */
+    BW_TR_WHY_BUDGET,           /* the VRAM budget is used up */
+    BW_TR_WHY_CHURN,            /* its contents keep changing */
+    BW_TR_WHY_FAIL,             /* a D3D call failed */
+    BW_TR_WHY_N
+};
+
+/* Compile the enlargement shader (device setup, Remastered with the switch on). */
+void bw_tr_init(void);
+
+/* Ask for a DXT texture's restored chain (color 0x0C/0x0E/0x0F, w x h,
+ * `levels` levels in guest memory at `src`, each level's blocks after the
+ * previous). addr_u/addr_v: the NV097 address modes of the draw that asked
+ * (1 wrap, 2 mirror, else clamp): how the enlargement treats the edges.
+ * addr: the guest address, for the log. Copies the blocks now and queues the
+ * work: `s` becomes state 3 (draw the original meanwhile), or 2. Device
+ * thread. */
+void bw_tr_request(BwTrSlot *s, uint32_t color, const uint8_t *src, uint32_t w, uint32_t h,
+                   uint32_t levels, uint32_t addr_u, uint32_t addr_v, uint32_t addr);
+/* Once per frame on the device thread (the flip): finish the textures the
+ * worker has ready, within BW_TEXRESTORE_FRAME_MS (0.3 ms; the first texture always). Changes pipeline state;
+ * returns 1 if it drew (the caller rebinds its targets). */
+int  bw_tr_pump(ID3D11Device *dev, ID3D11DeviceContext *ctx);
+void bw_tr_release(BwTrSlot *s);
+
+/* Menu and title photos (kind 1, BW_TEXRESTORE_MENUS: the JPEG screens) and
+ * movie frames (kind 2, BW_TEXRESTORE_MOVIES, item 11): the same deblock on
+ * the `grid` (8: JPEG and Bink blocks), on the GPU, from src (w x h) into a
+ * new B8G8R8A8 texture returned with its view; 0 if it couldn't. Device
+ * thread; changes pipeline state (the caller rebinds its targets). */
+int  bw_tr_deblock_gpu(ID3D11Device *dev, ID3D11DeviceContext *ctx, ID3D11ShaderResourceView *src,
+                       uint32_t w, uint32_t h, int grid, int kind, ID3D11Texture2D **out_tex,
+                       ID3D11ShaderResourceView **out_srv);
+
+/* A [TEXRESTORE] summary line now and then (call once per frame). */
+void bw_tr_frame(void);
+
+#endif

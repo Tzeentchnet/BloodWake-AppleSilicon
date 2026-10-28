@@ -1,0 +1,359 @@
+--- xboxrecomp/src/kernel/nv2a_pb_scan.c
++++ src/toolkit_patches/kernel/nv2a_pb_scan.c
+@@ -25,6 +25,7 @@
+ #include <stddef.h>   /* ptrdiff_t */
+ #include <stdlib.h>
+ #include <string.h>
++#include <time.h>    /* Blood Wake: BW_PB_SEGSTAT */
+ 
+ extern ptrdiff_t xbox_GetMemoryOffset(void);
+ 
+@@ -47,6 +48,23 @@
+ static int s_exec_enabled = -1;
+ static int s_scan_enabled = -1;
+ 
++/* Blood Wake carried patch (TK-38): what the walks hand the executor, counted
++ * for BW_PB_SEGSTAT (BEGIN_END begins and ends must balance; the tagged NOPs
++ * that D5's widescreen hooks write must all arrive). */
++static uint64_t s_bw_begins, s_bw_ends, s_bw_nops_tagged;
++/* Blood Wake (first segment): methods executed after the first segment. */
++static uint8_t s_bw_after[8][0x800];
++static void bw_pb_exec(uint32_t subch, uint32_t m, uint32_t param)
++{
++    s_bw_after[subch & 7][(m & 0x1FFCu) >> 2] = 1;
++    if (m == 0x17FC) {
++        if (param) s_bw_begins++; else s_bw_ends++;
++    } else if (m == 0x0100 && (param >> 16) == 0xB1D3u) {
++        s_bw_nops_tagged++;
++    }
++    nv2a_pb_exec_method(subch, m, param);
++}
++
+ /* Clears the NV2A request bits (xbox_memory_layout.c); called every 256
+  * words while executing, so kickoffs are answered mid-walk. */
+ extern void xbox_Nv2aAckBusyBits(void);
+@@ -74,6 +92,13 @@
+ {
+     uint16_t *slot = &s_seen_slot[subch & 7][(method & 0x1FFC) / 4];
+ 
++    /* Blood Wake carried patch: the inventory is only printed with
++     * RECOMP_PB_SCAN (nv2a_pb_scan_report), and counting every word cost
++     * about 4% of the NV2A thread in a Remastered mission at 146 fps
++     * (profile 20261027-082558-r6-gpu-d9prof-on). Without the survey, skip. */
++    if (s_scan_enabled <= 0)
++        return;
++
+     if (*slot) {
+         s_seen[*slot - 1].count++;
+         return;
+@@ -287,7 +312,7 @@
+          * acts. Keeping them on one decode means they can never
+          * disagree about what the stream said. */
+         if (s_exec_enabled)
+-            nv2a_pb_exec_method(s_pend_subch, m, param);
++            bw_pb_exec(s_pend_subch, m, param);
+         s_get = (s_get + 4) & PB_PHYS_MASK;
+         s_pend_i++;
+         s_pend_left--;
+@@ -507,13 +532,29 @@
+             uint32_t subch  = (w >> 13) & 7u;
+             uint32_t method =  w & 0x1FFCu;
+             int noninc = (w & 0xE0000000u) == 0x40000000u;
++            uint32_t i0 = 0;
+ 
+-            for (uint32_t i = 0; i < count && va < end_va; i++) {
++            /* Blood Wake carried patch (P1): index runs in one call, as in
++             * nv2a_pb_scan_ring (the game's pre-recorded pushbuffers, CALLed
++             * from the ring, may carry them) */
++            if (noninc && method == 0x1800u && subch == 0 && count > 1 && va < end_va
++                    && s_exec_enabled > 0 && s_scan_enabled <= 0) {
++                extern int nv2a_pb_exec_idx16(const uint32_t *p, uint32_t n);
++                uint32_t n = count;
++                if ((end_va - va) / 4u < n)
++                    n = (end_va - va) / 4u;
++                if (nv2a_pb_exec_idx16((const uint32_t *)(mem + va), n)) {
++                    s_bw_after[0][0x1800u >> 2] = 1;
++                    va += 4u * n;
++                    words += n;
++                    i0 = n;
++                }
++            }
++            for (uint32_t i = i0; i < count && va < end_va; i++) {
+                 uint32_t m = noninc ? method : method + i * 4;
+                 note(subch, m);
+                 if (s_exec_enabled)
+-                    nv2a_pb_exec_method(subch, m,
+-                                        *(const uint32_t *)(mem + va));
++                    bw_pb_exec(subch, m, *(const uint32_t *)(mem + va));
+                 va += 4;
+                 words++;
+             }
+@@ -544,3 +585,268 @@
+     s_tot_jumps += jumps;
+     s_tot_segments++;
+ }
++
++
++/* ==== Blood Wake carried patch (TK-38): the ring walk ======================
++ *
++ * The segment scan above loses commands in two ways (seen in code; the
++ * counts below measure it):
++ *
++ *   1. Ring wraps. When PUT comes back below where it was, the caller scanned
++ *      [last PUT, highest PUT ever seen) and [lowest PUT ever seen, PUT).
++ *      XDK D3D wraps with a JUMP from wherever the ring's last command ended
++ *      to the ring's start. Commands written past the highest PUT seen so
++ *      far, and between the ring's start and the lowest PUT seen, were never
++ *      read: a frame lost a stretch of state changes and draws at every wrap
++ *      (wrong-camera frames, batches whose END never arrived).
++ *   2. Methods split across kickoffs. A method whose parameters ran past PUT
++ *      was cut off, and its remaining parameters were read as headers by the
++ *      next segment.
++ *
++ * The ring walk goes from the last PUT to the new one, following the
++ * top-level JUMP wherever it is (the DMA engine's own rule), and keeps a
++ * method whose parameters PUT cut short pending until the next kickoff.
++ * Calls are followed as before (one level). It never publishes GET mid-walk,
++ * so XDK D3D's fence code stays on the path it takes under the segment scan.
++ * BW_PB_RINGWALK=0 restores the old two-piece scan. */
++static uint32_t s_rw_pend_left, s_rw_pend_i, s_rw_pend_method, s_rw_pend_subch;
++static int      s_rw_pend_noninc;
++static uint64_t s_rw_segments, s_rw_wraps, s_rw_splits, s_rw_words, s_rw_runaways;
++
++int nv2a_pb_ring_walk(void)
++{
++    static int on = -1;
++    if (on < 0) {
++        const char *e = getenv("BW_PB_RINGWALK");
++        on = !(e && e[0] == '0');
++        fprintf(stderr, "[PB] ring walk %s (BW_PB_RINGWALK)\n",
++                on ? "on: follows the ring's JUMP, keeps split methods" : "off: two-piece segment scan");
++    }
++    return on;
++}
++
++/* A new start (the title moved GET itself): nothing pending carries over. */
++void nv2a_pb_ring_reset(void)
++{
++    s_rw_pend_left = 0;
++}
++
++void nv2a_pb_scan_ring(uint32_t start_va, uint32_t put_va)
++{
++    const uint8_t *mem = (const uint8_t *)xbox_GetMemoryOffset();
++    uint32_t va = start_va, words = 0, jumps = 0, unknown = 0;
++    const uint32_t cap = 0x100000u;       /* 4 MB of words: a runaway, not a frame */
++
++    if (!pb_walk_enabled() || start_va == put_va)
++        return;
++    if (s_exec_enabled) {
++        extern void nv2a_pb_exec_walk_begin(void);
++        nv2a_pb_exec_walk_begin();        /* the flip hold's vblank */
++    }
++    s_rw_segments++;
++    /* the method the last PUT stalled inside */
++    while (s_rw_pend_left && va != put_va) {
++        uint32_t m = s_rw_pend_noninc ? s_rw_pend_method : s_rw_pend_method + s_rw_pend_i * 4;
++        note(s_rw_pend_subch, m);
++        if (s_exec_enabled)
++            bw_pb_exec(s_rw_pend_subch, m, *(const uint32_t *)(mem + va));
++        va += 4; words++;
++        s_rw_pend_i++; s_rw_pend_left--;
++    }
++    while (va != put_va && words < cap) {
++        uint32_t w = *(const uint32_t *)(mem + va);
++        va += 4;
++        words++;
++
++        if ((w & 3u) == 1u || (w & 0xE0000003u) == 0x20000000u) {     /* JUMP */
++            uint32_t target = (w & 3u) == 1u ? (w & 0xFFFFFFFCu) : (w & 0x1FFFFFFCu);
++            if ((target & 0x0FFFFFFFu) >= PB_RAM_BYTES) {
++                unknown++;
++                break;
++            }
++            jumps++;
++            s_rw_wraps++;
++            va = 0x80000000u | (target & 0x0FFFFFFFu);
++            continue;
++        }
++        if ((w & 0xFFFF0003u) == 0x00020000u)        /* RETURN outside a call */
++            continue;
++        if ((w & 3u) == 2u) {                         /* CALL: one level */
++            uint32_t sub = 0x80000000u | ((w & 0xFFFFFFFCu) & 0x0FFFFFFFu);
++            s_tot_calls++;
++            s_in_call = 1;
++            words += pb_walk_segment(sub, sub + 0x400000u, 1, &jumps, &unknown);
++            s_in_call = 0;
++            continue;
++        }
++        if ((w & 0x00030003u) == 0u) {
++            uint32_t count  = (w >> 18) & 0x7FFu;
++            uint32_t subch  = (w >> 13) & 7u;
++            uint32_t method =  w & 0x1FFCu;
++            int noninc = (w & 0xE0000000u) == 0x40000000u;
++            uint32_t i = 0;
++            /* Blood Wake carried patch (P1): a run of index words
++             * (ARRAY_ELEMENT16, non-incrementing, subchannel 0) goes to the
++             * executor in one call (nv2a_pb_exec_idx16), up to PUT: the
++             * same words, the same effect. Not while surveying (note()
++             * counts every word). */
++            if (noninc && method == 0x1800u && subch == 0 && count > 1
++                    && s_exec_enabled > 0 && s_scan_enabled <= 0) {
++                extern int nv2a_pb_exec_idx16(const uint32_t *p, uint32_t n);
++                uint32_t n = count;
++                if (put_va > va && (put_va - va) / 4u < n)
++                    n = (put_va - va) / 4u;
++                if (va != put_va && nv2a_pb_exec_idx16((const uint32_t *)(mem + va), n)) {
++                    s_bw_after[0][0x1800u >> 2] = 1;
++                    va += 4u * n;
++                    words += n;
++                    i = n;
++                }
++            }
++            for (; i < count && va != put_va; i++) {
++                uint32_t m = noninc ? method : method + i * 4;
++                note(subch, m);
++                if (s_exec_enabled)
++                    bw_pb_exec(subch, m, *(const uint32_t *)(mem + va));
++                va += 4;
++                words++;
++            }
++            if (i < count) {                          /* PUT came first: carry on next time */
++                s_rw_pend_left = count - i;
++                s_rw_pend_i = i;
++                s_rw_pend_method = method;
++                s_rw_pend_subch = subch;
++                s_rw_pend_noninc = noninc;
++                s_rw_splits++;
++            }
++            continue;
++        }
++        unknown++;
++    }
++    if (words >= cap)
++        s_rw_runaways++;
++    s_rw_words += words;
++    s_tot_words += words;
++    s_tot_unknown += unknown;
++    s_tot_jumps += jumps;
++    s_tot_segments++;
++}
++
++/* ==== Blood Wake carried patch: the first segment ===========================
++ *
++ * Both walks start at the first PUT the NV2A thread sees: whatever D3D sent
++ * before it, from the ring start (GET as D3D set it) to that PUT, its device
++ * initialisation, never reached the executor. xemu's pusher starts at GET.
++ * nv2a_pb_first_segment decodes that segment (and, unless BW_PB_FIRSTSEG=skip,
++ * executes it), and BW_PB_SEGSTAT reports which of its methods were never
++ * sent again (state the executor would otherwise never have seen). */
++#define BW_FS_MAX 2048
++static struct { uint32_t sm, v; } s_fs[BW_FS_MAX];
++static unsigned s_fs_n, s_fs_words, s_fs_reported;
++static uint32_t s_fs_get, s_fs_put;
++
++int nv2a_pb_first_segment_exec(void)
++{
++    static int v = -1;
++    if (v < 0) {
++        const char *e = getenv("BW_PB_FIRSTSEG");
++        v = !(e && (e[0] == 's' || e[0] == '0'));
++    }
++    return v;
++}
++
++static void fs_note(uint32_t subch, uint32_t m, uint32_t v)
++{
++    if (s_fs_n < BW_FS_MAX) {
++        s_fs[s_fs_n].sm = (subch << 16) | m;
++        s_fs[s_fs_n].v = v;
++        s_fs_n++;
++    }
++}
++
++void nv2a_pb_first_segment(uint32_t start_va, uint32_t put_va)
++{
++    const uint8_t *mem = (const uint8_t *)xbox_GetMemoryOffset();
++    uint32_t va = start_va, words = 0;
++    if (!pb_walk_enabled() || start_va == put_va)
++        return;
++    s_fs_get = start_va; s_fs_put = put_va;
++    /* decode only: headers, parameters, the ring's JUMP and one-level CALLs */
++    while (va != put_va && words < 0x40000u) {
++        uint32_t w = *(const uint32_t *)(mem + va);
++        va += 4; words++;
++        if ((w & 3u) == 1u || (w & 0xE0000003u) == 0x20000000u) {
++            uint32_t target = (w & 3u) == 1u ? (w & 0xFFFFFFFCu) : (w & 0x1FFFFFFCu);
++            if ((target & 0x0FFFFFFFu) >= PB_RAM_BYTES) break;
++            va = 0x80000000u | (target & 0x0FFFFFFFu);
++            continue;
++        }
++        if ((w & 0xFFFF0003u) == 0x00020000u || (w & 3u) == 2u)
++            continue;                       /* calls in the init segment: not decoded */
++        if ((w & 0x00030003u) == 0u) {
++            uint32_t count = (w >> 18) & 0x7FFu, subch = (w >> 13) & 7u, method = w & 0x1FFCu, i;
++            int noninc = (w & 0xE0000000u) == 0x40000000u;
++            for (i = 0; i < count && va != put_va; i++) {
++                fs_note(subch, noninc ? method : method + i * 4, *(const uint32_t *)(mem + va));
++                va += 4; words++;
++            }
++        }
++    }
++    s_fs_words = words;
++    fprintf(stderr, "[PB-FIRST] first segment GET %08X .. PUT %08X: %u words, %u method writes; %s\n",
++            start_va, put_va, words, s_fs_n,
++            nv2a_pb_first_segment_exec() ? "executed (BW_PB_FIRSTSEG=skip skips it, as before)"
++                                         : "skipped (BW_PB_FIRSTSEG=skip)");
++    if (nv2a_pb_first_segment_exec())
++        nv2a_pb_scan_ring(start_va, put_va);
++    memset(s_bw_after, 0, sizeof s_bw_after);   /* from here on: "sent again" */
++}
++
++static void fs_report(void)
++{
++    unsigned i, j, shown = 0, never = 0;
++    fprintf(stderr, "[PB-FIRST] first segment %08X..%08X, %u words, %u method writes; methods never sent again:\n",
++            s_fs_get, s_fs_put, s_fs_words, s_fs_n);
++    for (i = 0; i < s_fs_n; i++) {
++        uint32_t sm = s_fs[i].sm, subch = sm >> 16, m = sm & 0x1FFC;
++        int later = 0;
++        for (j = i + 1; j < s_fs_n; j++)
++            if (s_fs[j].sm == sm) { later = 1; break; }     /* report each method's last value */
++        if (later || s_bw_after[subch & 7][m >> 2])
++            continue;
++        never++;
++        if (shown++ < 160)
++            fprintf(stderr, "[PB-FIRST]   subch %u method 0x%04X = 0x%08X\n", subch, m, s_fs[i].v);
++    }
++    fprintf(stderr, "[PB-FIRST] %u methods of the first segment were never sent again\n", never);
++}
++
++/* BW_PB_SEGSTAT=1: every 10 s, what the walk handed the executor. */
++void nv2a_pb_bw_segstat(void)
++{
++    static int on = -1;
++    static time_t t0;
++    time_t now;
++    if (on < 0) {
++        const char *e = getenv("BW_PB_SEGSTAT");
++        on = e && e[0] == '1';
++    }
++    if (!on)
++        return;
++    now = time(NULL);
++    if (!t0)
++        t0 = now;
++    if (now - t0 < 10)
++        return;
++    t0 = now;
++    if (s_fs_n && !s_fs_reported++)
++        fs_report();
++    fprintf(stderr, "[PB-SEG] segments %llu (ring walk %llu: wraps %llu, split methods %llu, runaways %llu, words %llu)"
++                    " | BEGIN %llu END %llu (diff %lld) | tagged NOPs %llu | unknown words %u\n",
++            (unsigned long long)s_tot_segments, (unsigned long long)s_rw_segments,
++            (unsigned long long)s_rw_wraps, (unsigned long long)s_rw_splits,
++            (unsigned long long)s_rw_runaways, (unsigned long long)s_rw_words,
++            (unsigned long long)s_bw_begins, (unsigned long long)s_bw_ends,
++            (long long)(s_bw_begins - s_bw_ends), (unsigned long long)s_bw_nops_tagged,
++            s_tot_unknown);
++}

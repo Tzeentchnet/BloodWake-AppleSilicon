@@ -1,0 +1,71 @@
+--- xboxrecomp/src/kernel/nv2a_vsh_interp.c
++++ src/toolkit_patches/kernel/nv2a_vsh_interp.c
+@@ -40,6 +40,11 @@
+ static uint32_t s_const_load, s_const_word;
+ static uint32_t s_cxt_write;
+ static int      s_const_trace = -1;      /* RECOMP_VSH_DUMP: constant traffic */
++/* Blood Wake carried patch (P1): bumped by every write to the constant file,
++ * so the GPU back end can tell "unchanged since the last batch" without
++ * comparing all 192 constants (nv2a_vsh_constants_gen). */
++static uint32_t s_const_gen;
++uint32_t nv2a_vsh_constants_gen(void) { return s_const_gen; }
+ 
+ static int vsh_dump_enabled(void)
+ {
+@@ -84,6 +89,7 @@
+ 
+ void nv2a_vsh_constant_word(uint32_t word)
+ {
++    s_const_gen++;
+     if (s_const_load < NV2A_VSH_CONSTANTS)
+         memcpy(&s_const[s_const_load][s_const_word], &word, 4);
+     else if (vsh_dump_enabled()) {
+@@ -108,6 +114,7 @@
+ 
+ void nv2a_vsh_set_constant(uint32_t index, const float v[4])
+ {
++    s_const_gen++;
+     if (index < NV2A_VSH_CONSTANTS)
+         memcpy(s_const[index], v, sizeof s_const[index]);
+ }
+@@ -190,6 +197,7 @@
+ 
+ void nv2a_vsh_constant_component(uint32_t index, uint32_t comp, uint32_t word)
+ {
++    s_const_gen++;
+     if (index < NV2A_VSH_CONSTANTS && comp < 4)
+         memcpy(&s_const[index][comp], &word, 4);
+ }
+@@ -329,6 +337,12 @@
+     return r;
+ }
+ 
++/* Blood Wake carried patch: the point size (oPts.x) of the last vertex run,
++ * for point-sprite expansion in the executor (nv2a_pb_exec.c). The output
++ * register was computed and never handed out. */
++static float s_bw_last_pts;
++float bw_vsh_last_point_size(void) { return s_bw_last_pts; }
++
+ int nv2a_vsh_run(const float in[NV2A_VSH_INPUTS][4], Nv2aVshOutput *out)
+ {
+     static int dump = -1;
+@@ -401,8 +415,10 @@
+         if (omask) {
+             const vec4 *src = field(ins, 3, 2, 1) ? &ires : &mres;
+             if (!field(ins, 3, 11, 1)) {                  /* to c[] */
+-                if (s_cxt_write && oaddr < NV2A_VSH_CONSTANTS)
++                if (s_cxt_write && oaddr < NV2A_VSH_CONSTANTS) {
+                     write_masked(s_const[oaddr], src, omask);
++                    s_const_gen++;
++                }
+             } else if (oaddr == 0) {
+                 write_masked(opos.v, src, omask);
+             } else if (oaddr < 13) {
+@@ -425,6 +441,7 @@
+             memcpy(out->tex[1], outregs[10], sizeof out->tex[1]);
+             memcpy(out->tex[2], outregs[11], sizeof out->tex[2]);
+             memcpy(out->tex[3], outregs[12], sizeof out->tex[3]);
++            s_bw_last_pts = outregs[6][0];        /* Blood Wake: oPts */
+             return 1;
+         }
+     }

@@ -1,0 +1,32 @@
+--- xboxrecomp/src/usb/ohci.c
++++ src/toolkit_patches/usb/ohci.c
+@@ -1,4 +1,10 @@
+ /*
++ * Blood Wake carried patch of xboxrecomp v0.16.0 src/usb/ohci.c (MIT License,
++ * Copyright (c) 2026 sp00nz -- see ../xboxrecomp/LICENSE). Built in place of the
++ * toolkit's copy by our CMakeLists.txt; the only change is bus_resolve (TK-13).
++ * ohci.c.diff beside this file is the exact difference from the pinned original.
++ */
++/*
+  * ohci.c -- OHCI 1.0a host controller registers for the MCPX.
+  *
+  * See ohci.h for what this is and is not. The short version: enough for a
+@@ -513,6 +519,18 @@
+ {
+     if (addr >= g_xbox_image_lo && addr < g_xbox_image_hi)
+         return addr;
++    /* Blood Wake carried patch (docs/TOOLKIT_ISSUES.md TK-13, D-010).
++     *
++     * A heap page the title named through MmGetPhysicalAddress is RAM, even
++     * where the contiguous allocator has handed out the same number as a
++     * window page -- the rule the APU already follows (apu_core.c). XAPI's
++     * XID driver gives the controller a heap buffer for the pad's input
++     * report; once the arena's high-water mark passed it, every report went
++     * to the window copy (0x814430CA in run 20261025-234225-r4-input, START
++     * seen there) while the driver read the heap one, and no button ever
++     * reached the title. */
++    if (addr && addr < (64u << 20) && xbox_PhysRamNameMap()[addr >> 12])
++        return addr;
+     if (addr && addr < xbox_ContiguousAllocatedBytes())
+         return OHCI_CONTIG_BASE + addr;
+     return addr;

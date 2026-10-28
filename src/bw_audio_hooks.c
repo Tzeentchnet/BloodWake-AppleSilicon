@@ -1,0 +1,84 @@
+/* bw_audio_hooks.c - D-011 wrappers for the audio path (agent D2).
+ *
+ * Every hook here is a wrapper sub_X that calls the game's own generated body
+ * sub_X_gen (tools/run_pipeline.py hands this file to the generator with
+ * src/recomp_manual.c). Unless its own switch or Remastered change says
+ * otherwise it returns what the body returned, so Original is unchanged.
+ *
+ * Claims are labelled as in the docs: seen, inferred, unknown.
+ */
+
+#include <stdio.h>
+#include <stdint.h>
+#include <stdlib.h>
+#include <string.h>
+
+#include "bw_edition.h"
+
+/* The guest registers are thread-local in the runtime (TOOLKIT_ISSUES TK-7). */
+extern __declspec(thread) uint32_t g_eax;
+
+/* ── The speaker configuration ─────────────────────────────────────────────
+ *
+ * XAPI_XGetAudioFlags (0x000D9240): ExQueryNonVolatileSetting(XC_AUDIO)
+ * adjusted by the AV pack (seen, names batch). Two readers (seen):
+ * DSound_SettingsCtor (0xFAE52), when the title's override global [0x116710]
+ * isn't a valid config (Blood Wake never writes it), and the game's
+ * Sound_MixToCenter (0x18610), which routes to the centre only when bit 1
+ * (surround) is set. The port's kernel answers 0: stereo.
+ *
+ * Values (XC_AUDIO_FLAGS): low word 0 stereo, 1 mono, 2 surround; 0x10000
+ * Dolby Digital (AC3) out, 0x20000 DTS. DirectSound treats "surround, or AC3
+ * without headphones" as the speaker mode that sends rear sources to the rear
+ * bins instead of folding them onto the front HRTF (DSound_ApuApplySpeakerConfig
+ * 0xFCC80, seen).
+ *
+ * BW_AUDIO_SPEAKERS = stereo | mono | surround | ac3 | 0x<hex> forces the
+ * answer in any edition (a test switch). Remastered (BW_FIX AUDIO_SURROUND)
+ * answers surround when the host's audio device has 6 or more channels
+ * (bw_audio_host_channels, the carried XAudio2 output). */
+extern void sub_000D9240_gen(void);
+extern int bw_audio_surround_wanted(void);      /* toolkit_patches/apu */
+
+static int s_spk_mode = -2;                     /* -1: the game's own answer */
+static uint32_t s_spk_flags;
+
+uint32_t bw_audio_speaker_flags(int *forced)
+{
+    if (s_spk_mode == -2) {
+        const char *e = getenv("BW_AUDIO_SPEAKERS");
+        s_spk_mode = -1;
+        if (e && *e) {
+            s_spk_mode = 1;
+            if (!strcmp(e, "stereo"))
+                s_spk_flags = 0;
+            else if (!strcmp(e, "mono"))
+                s_spk_flags = 1;
+            else if (!strcmp(e, "surround"))
+                s_spk_flags = 2;
+            else if (!strcmp(e, "ac3"))
+                s_spk_flags = 0x10000;
+            else
+                s_spk_flags = (uint32_t)strtoul(e, NULL, 0);
+        } else if (bw_audio_surround_wanted()) {
+            s_spk_mode = 1;
+            s_spk_flags = 2;
+        }
+        if (s_spk_mode > 0)
+            fprintf(stderr, "[AUDIO] speaker configuration the game sees: 0x%X (%s)\n",
+                    s_spk_flags, e && *e ? "BW_AUDIO_SPEAKERS" : "Remastered AUDIO_SURROUND");
+    }
+    if (forced)
+        *forced = s_spk_mode > 0;
+    return s_spk_flags;
+}
+
+void sub_000D9240(void)
+{
+    int forced;
+    uint32_t flags;
+    sub_000D9240_gen();
+    flags = bw_audio_speaker_flags(&forced);
+    if (forced)
+        g_eax = flags;
+}

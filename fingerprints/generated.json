@@ -1,0 +1,186 @@
+{
+ "format": 1,
+ "game": "Blood Wake",
+ "made": "2026-10-28",
+ "toolkit_commit": "f0f8a461496a4f23d9b0aeaa284b8d70ba7ab82b",
+ "python": "3.13.15",
+ "capstone": "5.0.9",
+ "pipeline": "tools/run_pipeline.py --to recomp --seeds names/icall_seeds.json --no-cached-names --no-names",
+ "names": "none: functions keep their sub_ names (names/bw_names.json is not public)",
+ "runs": [
+  {
+   "seconds": 542,
+   "pipeline_seconds": 541,
+   "total_sha256": "d2552e199cb8d94484ee589d151a41faf52b83c231aa7f241151d19c820689aa"
+  },
+  {
+   "seconds": 544,
+   "pipeline_seconds": 544,
+   "total_sha256": "d2552e199cb8d94484ee589d151a41faf52b83c231aa7f241151d19c820689aa"
+  }
+ ],
+ "inputs": {
+  "tools/run_pipeline.py": "7a822ff9361f64833e61ddaee547da07ca4a8e4b141f9fe6a822a2a7b2b79358",
+  "tools/xbr_patches.py": "8395b61776f84ea2500d7317a890dff1d5d1c1b693a5e5501d45a77b872162f3",
+  "names/icall_seeds.json": "fdcefa05897c424a4587d8c4ce6d85019df5acb71a77361dd37d21ebf079eaf6",
+  "src/recomp_manual.c": "6083e7e9f9e97406f67e4e1ce40d78f23c1c75a97cd7dcf03ef3448bd636c8a4",
+  "src/bw_audio_hooks.c": "cd3bf0472c0e6e547b7f99513e1f4f5e5a16bbc8481b00acc9d863be33f44b90",
+  "src/bw_fix_hooks.c": "f2f4b0c6314b9b741af531b04d189f9436e0b3f7bb3c458f6bd9e26d7ca9f7ae",
+  "src/bw_hifps_hooks.c": "14456381444a9c7df450c3c60ce397d0611c3077d26b97f12e6c7db65ff03bc0",
+  "src/bw_remaster_hooks.c": "0edbad0697e829df127572bf0727b6cb047514942c6072ec215184cfab0e4604",
+  "src/bw_visextra_hooks.c": "e26f6fc35b69a6bc985a7483db3948853ea03733eeeb07d21bbb169f3c7bc3df"
+ },
+ "file_count": 37,
+ "total_bytes": 33266559,
+ "total_sha256": "d2552e199cb8d94484ee589d151a41faf52b83c231aa7f241151d19c820689aa",
+ "files": {
+  "recomp_0000.c": {
+   "size": 1005003,
+   "sha256": "71ebaf6d4ddd6dca5f12557934c6056b779dfc7763b52b14047737280835618c"
+  },
+  "recomp_0001.c": {
+   "size": 1396980,
+   "sha256": "57c785226755db749c045cb5c93b486f67846f08ac63317c1deaf7ab68704dde"
+  },
+  "recomp_0002.c": {
+   "size": 1547258,
+   "sha256": "68841ffdb082db7efd55ffe332f25d6a9781b966c5ee2140fa1a2b7d0aafe632"
+  },
+  "recomp_0003.c": {
+   "size": 1617012,
+   "sha256": "51f9cf40cd0ffb8d05e849070b0514ceda6c222b504239718006bbf81c1336ca"
+  },
+  "recomp_0004.c": {
+   "size": 1658604,
+   "sha256": "c468f44535cb4f86c858eb970380b818883e044dc94b511cf04acf75c6aacea0"
+  },
+  "recomp_0005.c": {
+   "size": 1685712,
+   "sha256": "5cf2c187e1a371f9831b2374f05a7a0531b37f8945434c9a543b634a77e31560"
+  },
+  "recomp_0006.c": {
+   "size": 1507522,
+   "sha256": "94683de9e9fb1ed751c6c39e371bc61634e7ec0a1f7b523b4417aeeecf7a7f22"
+  },
+  "recomp_0007.c": {
+   "size": 1255980,
+   "sha256": "4dd003738692d952b3d0231c19055d6f88605ee23d6994d3453ac0ccda537539"
+  },
+  "recomp_0008.c": {
+   "size": 1940513,
+   "sha256": "a848cd0fcbff5dc97e608a72bdd1fa519bfa7e8b4b3e11a191408baed7a80066"
+  },
+  "recomp_0009.c": {
+   "size": 952348,
+   "sha256": "c7073616053cdbd9e4f5ece36c947a24bce24e060d5dd96d47674e4157bc8d78"
+  },
+  "recomp_0010.c": {
+   "size": 865654,
+   "sha256": "6612136143697f9be5d200836a657644cda491c4fb3ba48d8de882397d58a6c2"
+  },
+  "recomp_0011.c": {
+   "size": 907730,
+   "sha256": "05f487273f1ac06b654f3bf453dab74250295c9bea7430aeb3ca7640abb1ee70"
+  },
+  "recomp_0012.c": {
+   "size": 788768,
+   "sha256": "8d7e1cc9d2a1a5c9aaf17fcbdfe1590944b454aa69a2129dd7c775ee1f5ad06c"
+  },
+  "recomp_0013.c": {
+   "size": 594226,
+   "sha256": "26434993c4aee7e29c02f5905b34cce8d2e61a3f2ecb71275d11d8f4b23cb57e"
+  },
+  "recomp_0014.c": {
+   "size": 1376604,
+   "sha256": "3ee3d7709b6409ac2fdacb1dd89dc646638dfa1178469b0a7af1e645c90740de"
+  },
+  "recomp_0015.c": {
+   "size": 1374312,
+   "sha256": "54f2c855be2e2544f766d6b684deafe3c161fae052abfc84a2855444c5e63283"
+  },
+  "recomp_0016.c": {
+   "size": 746138,
+   "sha256": "b19961b65bf9911a37e367cd3124ddaf582732e2acbbf6e44a935f9ae5d6af19"
+  },
+  "recomp_0017.c": {
+   "size": 178559,
+   "sha256": "ecfd8b078c253b13fe6fb86b9d30351c68a6acf8ac83fcd323041cc287f56b01"
+  },
+  "recomp_0018.c": {
+   "size": 225430,
+   "sha256": "2fb9b31b6d528ff44ec0d43f411308a0f9778a6b7bc6d2a009d81a2c5552995a"
+  },
+  "recomp_0019.c": {
+   "size": 224284,
+   "sha256": "4c0c93737a42f30e718f3d2e12804607064895d0577f53c4897ab911add4b8e2"
+  },
+  "recomp_0020.c": {
+   "size": 222503,
+   "sha256": "1c3e501c4ecf6dffba17f047d0d52ef4a7e9f019d7b07c8f4226b25849b730f4"
+  },
+  "recomp_0021.c": {
+   "size": 223972,
+   "sha256": "dca7ae20b93d06fe1972bfab2ee9370fc74ec77de128fa955dcefd3889c8b3a4"
+  },
+  "recomp_0022.c": {
+   "size": 206445,
+   "sha256": "cd46e74058cac8a80499902f844542ec00482bf195c61169691fbb7a353212ce"
+  },
+  "recomp_0023.c": {
+   "size": 207111,
+   "sha256": "04a3699f56dfbd97bff0e514c62220705155d7362922d3ff4fbd7b496abc4281"
+  },
+  "recomp_0024.c": {
+   "size": 222800,
+   "sha256": "5e3165035529a17069c5786afe93127ea0815c56436a4d0387133cf30cf7e2f2"
+  },
+  "recomp_0025.c": {
+   "size": 219163,
+   "sha256": "c9fce69574383f57761fd06a16f908a123283c77db7c47a026d8252d68650818"
+  },
+  "recomp_0026.c": {
+   "size": 466295,
+   "sha256": "ace4e0ad10d1e640d162ee5edd45e1b41717316cba73e2ad6829a8fbf7898f6c"
+  },
+  "recomp_0027.c": {
+   "size": 901985,
+   "sha256": "f5a97c2f4f7b8fb4ab4641ddd3ff4be7e200c1908b37d86dae33f65b77857844"
+  },
+  "recomp_0028.c": {
+   "size": 1207183,
+   "sha256": "59f2d09d481a75fe9cabacf1e1ec5fd855eef6f864cb8acdded82f94d03045f3"
+  },
+  "recomp_0029.c": {
+   "size": 1591284,
+   "sha256": "94a3c0b8b0b274e3290a81fb36d3a0c5419393065f53e1fddbf54d4561343b49"
+  },
+  "recomp_0030.c": {
+   "size": 1977903,
+   "sha256": "36396855f36a60787f197fe60e8cd142b6df5b561a7d4c619d9ba00584fb6d3d"
+  },
+  "recomp_0031.c": {
+   "size": 2334699,
+   "sha256": "b54f222826b5a11391e0437489f77a24b0e254443d336a45d64392016441ecd9"
+  },
+  "recomp_0032.c": {
+   "size": 916551,
+   "sha256": "015f5cc3d771a44c55e6357a26973983c54679c623e2126c6c8bcd5d30f4b01e"
+  },
+  "recomp_dispatch.c": {
+   "size": 424156,
+   "sha256": "95c4eabfb59651a1368ce4de2c8cf7d4d584b1ce169abfc97d40dc02bfe40227"
+  },
+  "recomp_funcs.h": {
+   "size": 217348,
+   "sha256": "a2629c49d24aa4265da447d2a3b37c1b517985bc3a305418504a630ee13208b3"
+  },
+  "recomp_stubs_unresolved.c": {
+   "size": 2216,
+   "sha256": "0ceef6d52bdea2ac14f21208ac9d2f703cd3d32f52b8f685462a3e385669dbaa"
+  },
+  "recomp_types.h": {
+   "size": 76308,
+   "sha256": "a14e666bb81bbb3c77d0f337e8c0e1bf3ba625d4483ea87b79603cca3a9991ef"
+  }
+ }
+}
