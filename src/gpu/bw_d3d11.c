@@ -3999,13 +3999,127 @@ static int s_vlast_raw;
 static UINT s_vlast_ns, s_vlast_strides[BW_XVS_MAX_STREAMS], s_vlast_offs[BW_XVS_MAX_STREAMS];
 static ID3D11InputLayout *s_vlast_il;
 
+/* OCEAN_REFLECT_SINGLE (Remastered; agent P2a, docs/day1/P2a.md sections
+ * 7-8): the distant-water line. The sea's passes draw with depth writes off
+ * and alpha blending, so where a wave folds over itself at a grazing angle
+ * two front-facing layers cover the same pixels and the sky-reflection pass
+ * (stage 3 DOT_RFLCT_SPEC on a cube) is blended twice. Here each draw of the
+ * lit pass (the run of tile draws right before the reflection run) is drawn
+ * a second time, depth only, into a private copy of the scene's depth taken
+ * at the run's first draw (LESS_EQUAL, writing, a hair of extra depth bias:
+ * ors_biased). The reflection draws are then drawn as the game draws them
+ * but with a LESS_EQUAL, no-write test against that copy, so only the
+ * nearest water layer of each pixel gets the reflection, once. The scene's
+ * depth view is bound again right after each such draw and the scene's
+ * depth is never written: nothing drawn after the sea sees a difference.
+ * BW_OCEAN_REFLECT_SINGLE=0 turns it off; BW_GPU_AB=oceanreflect turns it
+ * off on odd frames (same-run A/B). */
+static ID3D11Texture2D *s_ors_tex;
+static ID3D11DepthStencilView *s_ors_dsv;
+static ID3D11BlendState *s_ors_bs;
+static ID3D11DepthStencilState *s_ors_prime, *s_ors_eq;
+static BwDepth *s_ors_src;          /* the depth copied for this run of reflection draws; NULL: stale */
+static int s_ors_inlit, s_ors_primed;
+static unsigned long s_ors_draws, s_ors_copies;
+static struct { ID3D11RasterizerState *from, *to; } s_ors_rs[8];
+static int s_ors_nrs;
+
+/* The prime is drawn with the lit pass's own rasteriser state (the game's
+ * depth bias included) plus a little more bias (64 steps of the 24-bit depth
+ * and 2x the slope), so it lies a hair behind the surface. The reflection
+ * pass, whose vertex program computes the same position with its own
+ * instructions and gets the game's same bias, then passes the LESS_EQUAL
+ * test at the nearest layer whatever its last bits. Layers of a folded wave
+ * are metres apart in depth, far more than that. */
+static ID3D11RasterizerState *ors_biased(ID3D11RasterizerState *from)
+{
+    D3D11_RASTERIZER_DESC rd;
+    int i;
+    if (!from)
+        return NULL;
+    for (i = 0; i < s_ors_nrs; i++)
+        if (s_ors_rs[i].from == from)
+            return s_ors_rs[i].to;
+    if (s_ors_nrs == 8)
+        return NULL;
+    ID3D11RasterizerState_GetDesc(from, &rd);
+    rd.DepthBias += 64;
+    rd.SlopeScaledDepthBias += 2.0f;
+    s_ors_rs[s_ors_nrs].to = NULL;
+    if (FAILED(ID3D11Device_CreateRasterizerState(s_dev, &rd, &s_ors_rs[s_ors_nrs].to)))
+        return NULL;
+    ID3D11RasterizerState_AddRef(from);     /* keep the key alive */
+    s_ors_rs[s_ors_nrs].from = from;
+    return s_ors_rs[s_ors_nrs++].to;
+}
+
+static int ors_enabled(void)
+{
+    static int v = -1;
+    if (v < 0) {
+        const char *e = getenv("BW_OCEAN_REFLECT_SINGLE");
+        v = bw_fix_enabled(BW_FIX_OCEAN_REFLECT_SINGLE) && !(e && e[0] == '0');
+    }
+    return v && !bw_ab_off("oceanreflect");
+}
+
+static int ors_prepare(BwDepth *d)
+{
+    D3D11_TEXTURE2D_DESC td, have;
+    if (!s_ors_bs) {
+        D3D11_BLEND_DESC bd;
+        D3D11_DEPTH_STENCIL_DESC dd;
+        memset(&bd, 0, sizeof(bd));
+        bd.RenderTarget[0].RenderTargetWriteMask = 0;          /* depth only */
+        ID3D11Device_CreateBlendState(s_dev, &bd, &s_ors_bs);
+        memset(&dd, 0, sizeof(dd));
+        dd.DepthEnable = TRUE;
+        dd.DepthWriteMask = D3D11_DEPTH_WRITE_MASK_ALL;
+        dd.DepthFunc = D3D11_COMPARISON_LESS_EQUAL;
+        ID3D11Device_CreateDepthStencilState(s_dev, &dd, &s_ors_prime);
+        dd.DepthWriteMask = D3D11_DEPTH_WRITE_MASK_ZERO;
+        dd.DepthFunc = D3D11_COMPARISON_LESS_EQUAL;     /* the game's own test, against the primed copy */
+        ID3D11Device_CreateDepthStencilState(s_dev, &dd, &s_ors_eq);
+        if (!s_ors_bs || !s_ors_prime || !s_ors_eq)
+            return 0;
+    }
+    ID3D11Texture2D_GetDesc(d->tex, &td);
+    if (s_ors_tex) {
+        ID3D11Texture2D_GetDesc(s_ors_tex, &have);
+        if (memcmp(&have, &td, sizeof(td))) {
+            ID3D11DepthStencilView_Release(s_ors_dsv);
+            ID3D11Texture2D_Release(s_ors_tex);
+            s_ors_tex = NULL;
+            s_ors_dsv = NULL;
+            s_ors_src = NULL;
+        }
+    }
+    if (!s_ors_tex) {
+        D3D11_DEPTH_STENCIL_VIEW_DESC vd;
+        ID3D11DepthStencilView_GetDesc(d->dsv, &vd);
+        if (FAILED(ID3D11Device_CreateTexture2D(s_dev, &td, NULL, &s_ors_tex)))
+            return 0;
+        if (FAILED(ID3D11Device_CreateDepthStencilView(s_dev, (ID3D11Resource *)s_ors_tex, &vd, &s_ors_dsv))) {
+            ID3D11Texture2D_Release(s_ors_tex);
+            s_ors_tex = NULL;
+            return 0;
+        }
+    }
+    if (s_ors_src != d) {
+        ID3D11DeviceContext_CopyResource(s_ctx, (ID3D11Resource *)s_ors_tex, (ID3D11Resource *)d->tex);
+        s_ors_src = d;
+        s_ors_copies++;
+    }
+    return 1;
+}
+
 static int bw_xdraw_vsh(const Nv2aSurface *s, const BwXVsBatch *b)
 {
     BwVsh *v;
     ID3D11Buffer *cbs[2];
     UINT voff = 0, ioff, stride;
     ID3D11InputLayout *il;
-    int r;
+    int r, ors;
 
     if (!gpu_vsh_on() || !b || !b->nindices || !ensure_device())
         return 0;
@@ -4228,6 +4342,42 @@ bw_kdone:
     ID3D11DeviceContext_VSSetShader(s_ctx, v->vs, NULL, 0);
     ID3D11DeviceContext_VSSetConstantBuffers(s_ctx, 0, 2, cbs);
     ID3D11DeviceContext_GSSetShader(s_ctx, vsh_filter_gs(), NULL, 0);
+    ors = 0;
+    {
+        /* OCEAN_REFLECT_SINGLE (see ors_prepare). The sea's lit pass (stage
+         * program 0x21081, seen: the run of draws right before the
+         * reflection run, one per tile) primes a private copy of the scene's
+         * depth with every tile; the reflection draws then test against it. */
+        uint32_t prog = b->xb.rc ? b->xb.rc->stage_program : 0xFFFFFFFFu;
+        int refl = ((prog >> 15) & 0x1F) == 0x0C, lit = prog == 0x21081u;
+        if (!refl && !lit) {
+            s_ors_inlit = 0;            /* any other draw: the copy is stale */
+            s_ors_primed = 0;
+        } else if (s_cur && s_cur_depth && s_cur_depth->tex && s_cur_depth->dsv && ors_enabled()) {
+            if (lit) {
+                if (!s_ors_inlit) {     /* a new run: copy the scene's depth at its first draw */
+                    s_ors_src = NULL;
+                    s_ors_inlit = 1;
+                    s_ors_primed = 0;
+                }
+                ors = ors_prepare(s_cur_depth) ? 2 : 0;
+            } else if (s_ors_inlit || s_ors_primed) {
+                ID3D11RenderTargetView *rtv = s_cur->mrtv ? s_cur->mrtv : s_cur->rtv;
+                static int shown;
+                if (!shown++ && b->xb.state)
+                    fprintf(stderr, "[BW] ocean reflect single on: the game's depth state for the reflection"
+                            " pass: test %u func 0x%X write %u stencil %u%c",
+                            (unsigned)b->xb.state->depth_test_enable, (unsigned)b->xb.state->depth_func,
+                            (unsigned)b->xb.state->depth_write, (unsigned)b->xb.state->stencil_enable, 10);
+                s_ors_inlit = 0;
+                s_ors_primed = 1;
+                ID3D11DeviceContext_OMSetRenderTargets(s_ctx, 1, &rtv, s_ors_dsv);
+                ID3D11DeviceContext_OMSetDepthStencilState(s_ctx, s_ors_eq, 0);
+                ors = 1;
+                s_ors_draws++;
+            }
+        }
+    }
     if (trc_on()) {                                         /* T1 test aid */
         double t0 = qpc_ms();
         ID3D11DeviceContext_DrawIndexed(s_ctx, b->nindices, ioff / 4u, 0);
@@ -4235,6 +4385,41 @@ bw_kdone:
         s_trc_ndraw++;
     } else
     ID3D11DeviceContext_DrawIndexed(s_ctx, b->nindices, ioff / 4u, 0);
+    if (ors == 2) {                 /* OCEAN_REFLECT_SINGLE: the lit tile again, depth only, into the copy */
+        ID3D11RenderTargetView *rtv = s_cur->mrtv ? s_cur->mrtv : s_cur->rtv;
+        ID3D11BlendState *obs = NULL;
+        FLOAT obf[4] = { 0, 0, 0, 0 };
+        UINT omask = 0xFFFFFFFFu, oref = 0;
+        ID3D11DepthStencilState *ods = NULL;
+        ID3D11PixelShader *ops = NULL;
+        ID3D11RasterizerState *orst = NULL, *brst;
+        ID3D11DeviceContext_RSGetState(s_ctx, &orst);
+        brst = ors_biased(orst);
+        ID3D11DeviceContext_OMGetBlendState(s_ctx, &obs, obf, &omask);
+        ID3D11DeviceContext_OMGetDepthStencilState(s_ctx, &ods, &oref);
+        ID3D11DeviceContext_PSGetShader(s_ctx, &ops, NULL, NULL);
+        if (brst) {
+            ID3D11DeviceContext_OMSetRenderTargets(s_ctx, 1, &rtv, s_ors_dsv);
+            ID3D11DeviceContext_OMSetBlendState(s_ctx, s_ors_bs, NULL, 0xFFFFFFFFu);
+            ID3D11DeviceContext_OMSetDepthStencilState(s_ctx, s_ors_prime, 0);
+            ID3D11DeviceContext_RSSetState(s_ctx, brst);
+            ID3D11DeviceContext_PSSetShader(s_ctx, NULL, NULL, 0);
+            ID3D11DeviceContext_DrawIndexed(s_ctx, b->nindices, ioff / 4u, 0);
+            ID3D11DeviceContext_RSSetState(s_ctx, orst);
+            ID3D11DeviceContext_PSSetShader(s_ctx, ops, NULL, 0);
+            ID3D11DeviceContext_OMSetBlendState(s_ctx, obs, obf, omask);
+            ID3D11DeviceContext_OMSetDepthStencilState(s_ctx, ods, oref);
+        } else
+            s_ors_inlit = 0;        /* no state to prime with: this run's reflection draws as shipped */
+        if (orst) ID3D11RasterizerState_Release(orst);
+        if (ops) ID3D11PixelShader_Release(ops);
+        if (obs) ID3D11BlendState_Release(obs);
+        if (ods) ID3D11DepthStencilState_Release(ods);
+    }
+    if (ors) {                      /* OCEAN_REFLECT_SINGLE: the scene's own depth view again */
+        ID3D11RenderTargetView *rtv = s_cur->mrtv ? s_cur->mrtv : s_cur->rtv;
+        ID3D11DeviceContext_OMSetRenderTargets(s_ctx, 1, &rtv, s_cur_depth->dsv);
+    }
     if (bw_vfx_active()) {
         vfx_drawlog('v', b->nindices, &b->xb, NULL, b->ninstr);     /* VFX (D9) test aid */
         vfx_drawlog_inputs(b);                                      /* V1: the HUD quads' inputs */

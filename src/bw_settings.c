@@ -299,6 +299,13 @@ static const BwSetting s_set[] = {
       { { "off", "As shipped", "fix:-OCEAN_MIPALPHA_FIX" },
         { "fixed", "Fixed", "fix:+OCEAN_MIPALPHA_FIX;env:BW_OCEAN_MIPALPHA_FIX=1" },
         { "smooth", "Smooth", "fix:+OCEAN_MIPALPHA_FIX;env:BW_OCEAN_MIPALPHA_FIX=2" } } },
+    { "Fixes", "fixes", "water_line", "Distant-water line",
+      "Where waves overlap each other in the distance, the game puts the sky's reflection on "
+      "the water twice, which draws a thin dark line along the wave at night. On, the "
+      "reflection goes on once; nothing else about the sea changes.",
+      "on", "remastered",
+      { { "on", "On", "fix:+OCEAN_REFLECT_SINGLE" },
+        { "off", "As shipped", "fix:-OCEAN_REFLECT_SINGLE" } } },
 
     /* ---- Controls ---------------------------------------------------------------- */
     { "Controls", "controls", "keyboard", "Keyboard as a controller",

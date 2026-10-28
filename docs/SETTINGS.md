@@ -518,6 +518,17 @@ Applies to: Remastered. Default: **Fixed**.
 | Fixed (default) | `fix:+OCEAN_MIPALPHA_FIX;env:BW_OCEAN_MIPALPHA_FIX=1` |
 | Smooth | `fix:+OCEAN_MIPALPHA_FIX;env:BW_OCEAN_MIPALPHA_FIX=2` |
 
+### Distant-water line
+
+Where waves overlap each other in the distance, the game puts the sky's reflection on the water twice, which draws a thin dark line along the wave at night. On, the reflection goes on once; nothing else about the sea changes.
+
+Applies to: Remastered. Default: **On**.
+
+| Choice | Under the hood |
+|---|---|
+| On (default) | `fix:+OCEAN_REFLECT_SINGLE` |
+| As shipped | `fix:-OCEAN_REFLECT_SINGLE` |
+
 ## Controls
 
 ### Keyboard as a controller

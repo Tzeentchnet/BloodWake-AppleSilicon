@@ -12,7 +12,7 @@
 > [!NOTE]
 > Unofficial, free and non-commercial. You need your own Blood Wake disc, and nothing from the game is in this repository. See [Staying safe](#staying-safe).
 
-<img src="docs/images/stats.svg" width="600" alt="100%: recompiled, 0 functions failed, the whole game plays. 8,110 functions named. About 3 days from the first plan to the first release. 70+ AI agents. 0 crashes in 948 mission runs of soak tests. 16 bugs from 2001 fixed in Remastered.">
+<img src="docs/images/stats.svg" width="600" alt="100%: recompiled, 0 functions failed, the whole game plays. 8,110 functions named. About 3 days from the first plan to the first release. 70+ AI agents. 0 crashes in 948 mission runs of soak tests. 17 bugs from 2001 fixed in Remastered.">
 
 ## Features and Showcase
 One program, two editions, picked in the launcher.
@@ -55,7 +55,7 @@ The original art and sound, never replaced. Every change has its own switch.
 - Cleaner pitch changes, a louder mix with a limiter, the game's own surround mix on 5.1 and 7.1, lower latency.
 
 **Fixes**
-- 16 bugs from 2001 fixed, each switchable: a mission that could never be won, sounds and radio calls that never played, AI rules that never matched, two textures that never shipped, and more.
+- 17 bugs from 2001 fixed, each switchable: a mission that could never be won, sounds and radio calls that never played, AI rules that never matched, two textures that never shipped, a dark line on the distant night sea, and more.
 
 ![The final storm: lightning, rain, green energy arcs and an enemy ship lit by an explosion, with a radio subtitle](docs/images/shot-lightning.jpg)
 *The final storm: lightning, rain and the green arcs of the legendary shield.*
@@ -141,7 +141,7 @@ The engineering was done by Claude, Anthropic's AI model: a lead session plus **
 - **57 toolkit issues found and fixed here.** From 8- and 16-bit multiplies translated as 32-bit ones, to point sprites, fog and polygon offset never drawn, to a 60.00 Hz vertical blank where NTSC runs at 59.94. The fixes are carried in this project (`src/toolkit_patches/`, `tools/xbr_patches.py`), with the toolkit itself untouched at its pinned version. They will be offered to xboxrecomp with neutral repros containing nothing from any game; none has been submitted yet.
 - **Every function named: 8,110.** Each name proposed with evidence from the code, and 6,149 re-checked independently (6,109 confirmed as they stood). Ten functions that deal with the console's security were left alone on purpose.
 - **The file formats, decoded.** Models, boats and weapons, missions, effects, fonts, menus, sound and textures: specced, checked against every archive on the disc, then verified blind.
-- **Bugs explained before they're fixed.** Each of the 16 fixes was traced in the code first. The faint dark line on the distant sea was traced too: the game's own drawing, where folded waves get the sky reflection blended twice. It's very likely on the console as well, so Original keeps it.
+- **Bugs explained before they're fixed.** Each of the 17 fixes was traced in the code first. The hardest and strangest: a faint dark line on the distant sea at night, where folded waves got the sky reflection blended twice. Remastered now draws it once; Original keeps it, as the console very likely showed it.
 - **Data, not guesswork.** The project works from captured data (logs, traces, frame dumps, step-by-step comparisons), never from memory or feel, and labels every finding seen, inferred or unknown.
 
 ## The Roadmap
