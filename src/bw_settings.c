@@ -44,6 +44,18 @@ static const BwSetting s_set[] = {
       { { "original", "Original (as shipped)", "" },
         { "remastered", "Remastered", "env:BW_EDITION=remastered" },
       } },
+    /* The launcher's preset picker (D-021; the presets are s_preset, below).
+     * The game doesn't act on it: the launcher writes every setting a preset
+     * sets, so these choices switch nothing themselves. */
+    { "Edition", "edition", "preset", "Preset",
+      "Sets the Display and Graphics tabs in one go; you can still change any setting "
+      "afterwards (the preset then shows Custom). A preset never changes HDR or OLED care: "
+      "they depend on your screen.",
+      "best", "remastered",
+      { { "best", "Best Quality", "" },
+        { "balanced", "Balanced and Original", "" },
+        { "performance", "Best Performance", "" },
+        { "custom", "Custom", "" } } },
 
     /* ---- Display --------------------------------------------------------- */
     { "Display", "display", "mode", "Window",
@@ -128,16 +140,19 @@ static const BwSetting s_set[] = {
         { "far", "Far (2x)", "fix:+VFX_DRAW_DISTANCE;env:BW_VFX_LOD=2" },
         { "farther", "Farther (3x)", "fix:+VFX_DRAW_DISTANCE;env:BW_VFX_LOD=3" } } },
     { "Graphics", "graphics", "ambient_occlusion", "Ambient occlusion",
-      "Soft shadows where things meet (under ledges, around boats). Adds depth; off by "
-      "default because the original didn't have it.",
-      "off", "remastered", ON_OFF(VFX_AO) },
+      "Soft shadows where things meet (under ledges, around boats). Adds depth; off in "
+      "Balanced and Original because the original didn't have it.",
+      "off", "remastered",              /* On's levels here and below: S1's (D-021) */
+      { { "on", "On", "fix:+VFX_AO;env:BW_VFX_AO=0.4" }, { "off", "Off", "fix:-VFX_AO" } } },
     { "Graphics", "graphics", "bloom", "Bloom",
-      "A soft glow around the brightest highlights (sun, explosions). Off by default: it "
-      "adds light the original didn't have.",
-      "off", "remastered", ON_OFF(VFX_BLOOM) },
+      "A soft glow around the brightest highlights (sun, explosions). Off in Balanced and "
+      "Original: it adds light the original didn't have.",
+      "off", "remastered",
+      { { "on", "On", "fix:+VFX_BLOOM;env:BW_VFX_BLOOM=0.15" }, { "off", "Off", "fix:-VFX_BLOOM" } } },
     { "Graphics", "graphics", "sharpen", "Sharpening",
-      "Crisper textures. Off by default: it changes the look a little.",
-      "off", "remastered", ON_OFF(VFX_SHARPEN) },
+      "Crisper textures. Off in Balanced and Original: it changes the look a little.",
+      "off", "remastered",
+      { { "on", "On", "fix:+VFX_SHARPEN;env:BW_VFX_SHARPEN=0.15" }, { "off", "Off", "fix:-VFX_SHARPEN" } } },
     { "Graphics", "graphics", "fxaa", "Edge smoothing (FXAA)",
       "An extra smoothing pass for edges anti-aliasing misses (foliage, wires). Softens "
       "text a little.",
@@ -293,6 +308,38 @@ static const BwSetting s_set[] = {
         { "on", "On", "env:RECOMP_KEYBOARD=1" } } },
 };
 #define BW_NSET ((int)(sizeof s_set / sizeof s_set[0]))
+
+/* ---- Remastered's presets (D-021) ------------------------------------------
+ * Picking one in the launcher sets every setting in BW_PRESET_SETS: to the
+ * choice the preset names, or else to that setting's own default above (which
+ * is today's Remastered, so Balanced and Original names nothing). The game
+ * never reads a preset; a run without the launcher's file plays as before.
+ * Never in a preset: HDR and OLED care (they depend on the screen), the
+ * window, the HUD position and vsync (taste, not speed). */
+#define BW_PRESET_SETS "display.aspect display.resolution display.framerate " \
+    "graphics.antialiasing graphics.texture_filtering graphics.draw_distance " \
+    "graphics.ambient_occlusion graphics.bloom graphics.sharpen graphics.fxaa " \
+    "graphics.split_detail graphics.smooth_gradients graphics.sharp_text " \
+    "graphics.smooth_hud_edges graphics.texture_restoration"
+/* Best Quality's choices: S1's (docs/day1/S1.md, D-021), this one line; the
+ * levels of AO, bloom and sharpening are S1's too, in those settings' On. */
+#define BW_PRESET_BEST "graphics.antialiasing=8 graphics.texture_filtering=16 graphics.draw_distance=farther graphics.ambient_occlusion=on graphics.bloom=on graphics.sharpen=on graphics.fxaa=off"
+
+static const struct { const char *value, *text, *choices; } s_preset[] = {
+    { "best", "A modern game on max settings: every upgrade and extra on, ambient occlusion, "
+              "bloom and gentle sharpening included, tuned so nothing overlaps.",
+      BW_PRESET_BEST },
+    { "balanced", "The original game true to form, looking its best on a modern screen: none "
+                  "of the extras that change the look.",
+      "" },
+    { "performance", "For a slower PC: the cheapest settings that keep the essentials "
+                     "(widescreen, a high frame rate, light anti-aliasing), so it still feels "
+                     "like a modern game.",
+      "display.framerate=60 graphics.antialiasing=2 graphics.texture_filtering=4 "
+      "graphics.draw_distance=original graphics.split_detail=balanced "
+      "graphics.smooth_gradients=off graphics.texture_restoration=off" },
+};
+#define BW_NPRESET ((int)(sizeof s_preset / sizeof s_preset[0]))
 
 /* ---- the file ------------------------------------------------------------- */
 
@@ -534,6 +581,78 @@ static void js(FILE *f, const char *s)
     fputc('"', f);
 }
 
+/* Where id starts a word of a space-separated list (the word ending there or
+ * at '='), or NULL. */
+static const char *find_word(const char *list, const char *id)
+{
+    size_t len = strlen(id);
+    const char *s;
+    for (s = strstr(list, id); s; s = strstr(s + 1, id))
+        if ((s == list || s[-1] == ' ') && (!s[len] || s[len] == ' ' || s[len] == '='))
+            return s;
+    return NULL;
+}
+
+/* Each preset with the choice it gives every preset setting; a slip in the
+ * table is reported on stderr and left out, so the launcher never sees it. */
+static void print_presets(FILE *f)
+{
+    int p, i, k;
+    fprintf(f, "  \"presets\": [\n");
+    for (p = 0; p < BW_NPRESET; p++) {
+        char buf[1024], *id, *ctx = NULL;
+        int n = 0;
+        _snprintf(buf, sizeof buf, "%s", s_preset[p].choices);
+        buf[sizeof buf - 1] = 0;
+        for (id = strtok_s(buf, " ", &ctx); id; id = strtok_s(NULL, " ", &ctx)) {
+            char *eq = strchr(id, '=');
+            if (eq)
+                *eq = 0;
+            if (!eq || !find_word(BW_PRESET_SETS, id))
+                fprintf(stderr, "[SET] preset %s: %s is not a preset setting; ignored\n",
+                        s_preset[p].value, id);
+        }
+        fprintf(f, "    {\"value\": ");
+        js(f, s_preset[p].value);
+        fprintf(f, ", \"text\": ");
+        js(f, s_preset[p].text);
+        fprintf(f, ",\n     \"settings\": {");
+        _snprintf(buf, sizeof buf, "%s", BW_PRESET_SETS);
+        buf[sizeof buf - 1] = 0;
+        ctx = NULL;
+        for (id = strtok_s(buf, " ", &ctx); id; id = strtok_s(NULL, " ", &ctx)) {
+            const BwSetting *st = NULL;
+            const char *w = find_word(s_preset[p].choices, id);
+            char name[96], val[64];
+            for (i = 0; i < BW_NSET && !st; i++) {
+                _snprintf(name, sizeof name, "%s.%s", s_set[i].section, s_set[i].key);
+                name[sizeof name - 1] = 0;
+                if (!strcmp(name, id))
+                    st = &s_set[i];
+            }
+            if (w && w[strlen(id)] == '=') {
+                w += strlen(id) + 1;
+                _snprintf(val, sizeof val, "%.*s", (int)strcspn(w, " "), w);
+            } else
+                _snprintf(val, sizeof val, "%s", st ? st->dflt : "");
+            val[sizeof val - 1] = 0;
+            for (k = 0; st && k < 8 && st->opt[k].value && strcmp(st->opt[k].value, val); k++)
+                ;
+            if (!st || k == 8 || !st->opt[k].value) {
+                fprintf(stderr, "[SET] preset %s: %s=%s is not a setting and one of its choices; "
+                        "left out\n", s_preset[p].value, id, val);
+                continue;
+            }
+            fprintf(f, "%s", n++ ? ", " : "");
+            js(f, id);
+            fprintf(f, ": ");
+            js(f, val);
+        }
+        fprintf(f, "}}%s\n", p + 1 < BW_NPRESET ? "," : "");
+    }
+    fprintf(f, "  ]\n");
+}
+
 void bw_settings_print_schema(FILE *f)
 {
     int i, k;
@@ -568,5 +687,7 @@ void bw_settings_print_schema(FILE *f)
         }
         fprintf(f, "]}%s\n", i + 1 < BW_NSET ? "," : "");
     }
-    fprintf(f, "  ]\n}\n");
+    fprintf(f, "  ],\n");
+    print_presets(f);
+    fprintf(f, "}\n");
 }

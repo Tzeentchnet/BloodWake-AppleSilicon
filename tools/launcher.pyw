@@ -7,6 +7,9 @@ Open it with "Blood Wake.cmd" (or play.cmd with no options) in the repo folder.
     --settings-schema; src/bw_settings.c), so this window and the game always
     agree on what each choice means. Hover over anything for a short
     explanation.
+  - Remastered's presets (the Edition tab: Best Quality, the default; Balanced
+    and Original; Best Performance) set the Display and Graphics tabs in one
+    go. Change any of those settings afterwards and the preset shows Custom.
   - Your choices are saved to %LOCALAPPDATA%/BloodWake/settings.ini, which every
     boot of the game reads, and are remembered for next time.
   - Play saves and starts the game (tools/play.py: one window for the whole
@@ -94,6 +97,14 @@ class Launcher:
             os.environ.get("LOCALAPPDATA", REPO), "BloodWake", "settings.ini")
         self.settings = schema["settings"]
         self.vars, self.widgets, self.proc = {}, {}, None
+        # Remastered's presets (D-021). A setting the file doesn't hold yet (a
+        # new install) starts at the default preset's choice (Best Quality).
+        self.presets = schema.get("presets", [])
+        self.pst = next((s for s in self.settings
+                         if s["section"] == "edition" and s["key"] == "preset"), None)
+        first = next((p for p in self.presets if self.pst and p["value"] == self.pst["default"]),
+                     None)
+        self.first = dict(first["settings"]) if first else {}
         self.ini = configparser.ConfigParser(interpolation=None)
         self.ini.optionxform = str
         try:
@@ -130,13 +141,23 @@ class Launcher:
         style = ttk.Style()
         style.configure("Play.TButton", font=("Segoe UI", 14, "bold"), padding=(24, 10))
         ttk.Button(foot, text="Play", style="Play.TButton", command=self.play).pack(side="right")
+        self.match_preset()
         self.refresh()
 
     # ---- building the tabs ---------------------------------------------------
     def saved(self, st):
         val = self.ini.get(st["section"], st["key"], fallback=None)
         values = [o["value"] for o in st["options"]]
-        return val if val in values else st["default"]
+        return val if val in values else self.first.get(st["section"] + "." + st["key"],
+                                                        st["default"])
+
+    @staticmethod
+    def label_of(st, value):
+        return next((o["label"] for o in st["options"] if o["value"] == value), value)
+
+    def current(self, key):
+        st, var = self.vars[key]
+        return next((o["value"] for o in st["options"] if o["label"] == var.get()), None)
 
     def build_edition(self, frame):
         st = next(s for s in self.settings if s["key"] == "edition")
@@ -149,6 +170,26 @@ class Launcher:
             rb.pack(anchor="w", pady=(10, 0))
             ttk.Label(frame, text=EDITION_TEXT.get(o["value"], ""), wraplength=px(520),
                       foreground="#444").pack(anchor="w", padx=24)
+        if self.pst and self.presets:
+            st = self.pst
+            lab = ttk.Label(frame, text=st["label"], font=("Segoe UI", 12, "bold"))
+            lab.pack(anchor="w", pady=(18, 0))
+            row = ttk.Frame(frame)
+            row.pack(anchor="w", pady=(6, 0))
+            var = tk.StringVar()
+            box = ttk.Combobox(row, values=[self.label_of(st, p["value"]) for p in self.presets],
+                               textvariable=var, state="readonly", width=24)
+            box.pack(side="left")
+            box.bind("<<ComboboxSelected>>", self.pick_preset)
+            note = ttk.Label(row, text="", foreground="#888")
+            note.pack(side="left", padx=8)
+            tip = st["tip"] + "\n\nApplies to: %s." % APPLIES.get(st["editions"], st["editions"])
+            Tip(lab, tip)
+            Tip(box, tip)
+            self.preset_text = ttk.Label(frame, text="", wraplength=px(520), foreground="#444")
+            self.preset_text.pack(anchor="w", padx=24, pady=(4, 0))
+            self.vars["edition.preset"] = (st, var)
+            self.widgets["edition.preset"] = (lab, box, note)
         ttk.Label(frame, text="\nEach edition keeps its own saved games. The first time you play "
                              "%s, it starts with a copy of your Original saves." % LATER,
                   wraplength=px(540), foreground="#666").pack(anchor="w")
@@ -166,6 +207,7 @@ class Launcher:
             lab.grid(row=row, column=0, sticky="w", pady=5, padx=(0, 16))
             box = ttk.Combobox(frame, values=labels, textvariable=var, state="readonly", width=30)
             box.grid(row=row, column=1, sticky="w", pady=5)
+            box.bind("<<ComboboxSelected>>", self.match_preset)
             note = ttk.Label(frame, text="", foreground="#888")
             note.grid(row=row, column=2, sticky="w", padx=8)
             tip = st["tip"] + "\n\nApplies to: %s." % APPLIES.get(st["editions"], st["editions"])
@@ -216,10 +258,34 @@ class Launcher:
         for key, (st, var) in self.vars.items():
             if key == "edition":
                 continue
-            var.set(next(o["label"] for o in st["options"] if o["value"] == st["default"]))
+            var.set(self.label_of(st, self.first.get(key, st["default"])))
         self.adv.delete("1.0", "end")
+        self.match_preset()
         self.status.configure(text="Defaults restored (the edition is kept).")
         self.refresh()
+
+    def pick_preset(self, _e=None):
+        """A preset was picked: set every setting it names."""
+        st, var = self.vars["edition.preset"]
+        p = next((p for p in self.presets if self.label_of(st, p["value"]) == var.get()), None)
+        for key, value in (p["settings"].items() if p else ()):
+            if key in self.vars:
+                var2 = self.vars[key][1]
+                var2.set(self.label_of(self.vars[key][0], value))
+        self.match_preset()
+        self.status.configure(text="%s: the Display and Graphics tabs are set." % var.get())
+
+    def match_preset(self, _e=None):
+        """Show the preset the settings match, or Custom."""
+        if "edition.preset" not in self.vars:
+            return
+        st, var = self.vars["edition.preset"]
+        hit = next((p for p in self.presets
+                    if all(k in self.vars and self.current(k) == v for k, v in p["settings"].items())),
+                   None)
+        var.set(self.label_of(st, hit["value"] if hit else "custom"))
+        self.preset_text.configure(text=hit["text"] if hit else
+                                   "Your own mix: a setting was changed after picking a preset.")
 
     def save(self):
         cp = configparser.ConfigParser(interpolation=None)

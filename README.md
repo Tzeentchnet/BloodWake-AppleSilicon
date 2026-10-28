@@ -100,6 +100,11 @@ Then start the launcher from the install folder. Every option, step and exit cod
 *The launcher: pick an edition and your settings, then press Play.*
 
 - The launcher has a tab each for Edition, Display, Graphics, Audio, Fixes and Controls. Hover over anything for an explanation.
+
+**Presets (Remastered).** The Edition tab has three presets that set the Display and Graphics tabs in one go. Best Quality is the default. You can still change any setting afterwards; the preset then shows Custom. HDR and OLED care are never changed by a preset.
+- **Best Quality:** a modern game on max settings: every upgrade and extra on (ambient occlusion, bloom and gentle sharpening included), tuned so nothing overlaps.
+- **Balanced and Original:** the original game true to form, looking its best on a modern screen, with none of the extras that change the look.
+- **Best Performance:** for a slower PC: the cheapest settings that keep the essentials (widescreen, a high frame rate, light anti-aliasing), so it still feels like a modern game.
 - Alt+Enter or F11 switches between a window and borderless fullscreen while you play.
 - Each edition keeps its own saves, under `%LOCALAPPDATA%\xboxrecomp\` (Remastered's in `editions\remastered`). The first time you play Remastered, it starts with a copy of your Original saves. Settings live in `%LOCALAPPDATA%\BloodWake\settings.ini`.
 
@@ -110,7 +115,7 @@ Then start the launcher from the install folder. Every option, step and exit cod
 - **"generated code doesn't match" (exit code 5):** usually a different version of a Python package or of the toolkit. Reinstall the pinned versions and try again.
 - **The build failed (exit code 6):** make sure Visual Studio 2022 (17.x) Build Tools with the C++ workload is installed.
 - **Disk space or a file error (exit code 7):** free some space, or pick an install folder you can write to.
-- **The game is slow:** in the launcher, lower the rendering resolution or the frame rate cap, or turn off anti-aliasing.
+- **The game is slow:** in the launcher, pick the Best Performance preset, or lower the rendering resolution or the frame rate cap.
 - **Crackling sound on a slow PC:** Audio tab, Sound processor: Simple (it skips the sound chip's echo and 3D effects).
 
 Still stuck? Open an issue: say what you did, what you saw, and your Windows version and graphics card. Please don't attach game files, screenshots of the game's text, or your disc image.

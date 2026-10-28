@@ -17,6 +17,19 @@ Applies to: Original and Remastered. Default: **Original (as shipped)**.
 | Original (as shipped) (default) | (no switch) |
 | Remastered | `env:BW_EDITION=remastered` |
 
+### Preset
+
+Sets the Display and Graphics tabs in one go; you can still change any setting afterwards (the preset then shows Custom). A preset never changes HDR or OLED care: they depend on your screen.
+
+Applies to: Remastered. Default: **Best Quality**.
+
+| Choice | Under the hood |
+|---|---|
+| Best Quality (default) | (no switch) |
+| Balanced and Original | (no switch) |
+| Best Performance | (no switch) |
+| Custom | (no switch) |
+
 ## Display
 
 ### Window
@@ -149,35 +162,35 @@ Applies to: Remastered. Default: **Far (2x)**.
 
 ### Ambient occlusion
 
-Soft shadows where things meet (under ledges, around boats). Adds depth; off by default because the original didn't have it.
+Soft shadows where things meet (under ledges, around boats). Adds depth; off in Balanced and Original because the original didn't have it.
 
 Applies to: Remastered. Default: **Off**.
 
 | Choice | Under the hood |
 |---|---|
-| On | `fix:+VFX_AO` |
+| On | `fix:+VFX_AO;env:BW_VFX_AO=0.4` |
 | Off (default) | `fix:-VFX_AO` |
 
 ### Bloom
 
-A soft glow around the brightest highlights (sun, explosions). Off by default: it adds light the original didn't have.
+A soft glow around the brightest highlights (sun, explosions). Off in Balanced and Original: it adds light the original didn't have.
 
 Applies to: Remastered. Default: **Off**.
 
 | Choice | Under the hood |
 |---|---|
-| On | `fix:+VFX_BLOOM` |
+| On | `fix:+VFX_BLOOM;env:BW_VFX_BLOOM=0.15` |
 | Off (default) | `fix:-VFX_BLOOM` |
 
 ### Sharpening
 
-Crisper textures. Off by default: it changes the look a little.
+Crisper textures. Off in Balanced and Original: it changes the look a little.
 
 Applies to: Remastered. Default: **Off**.
 
 | Choice | Under the hood |
 |---|---|
-| On | `fix:+VFX_SHARPEN` |
+| On | `fix:+VFX_SHARPEN;env:BW_VFX_SHARPEN=0.15` |
 | Off (default) | `fix:-VFX_SHARPEN` |
 
 ### Edge smoothing (FXAA)
