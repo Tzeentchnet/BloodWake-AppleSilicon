@@ -48,7 +48,11 @@ def tree_files(src):
             dirs[:] = [x for x in dirs if x != ".git"]
             for n in names:
                 files.append(os.path.relpath(os.path.join(d, n), src).replace(os.sep, "/"))
-    return sorted(f for f in files if not f.startswith("installer/") and not f.startswith(".git"))
+    # docs/images/ holds the README's pictures (game screenshots among them, D-019): they
+    # belong on the repository page only and never ship inside Setup. Every other image
+    # anywhere is still refused below.
+    return sorted(f for f in files if not f.startswith("installer/") and not f.startswith(".git")
+                  and not f.startswith("docs/images/"))
 
 
 def refuse(src, files):
