@@ -2,7 +2,8 @@
 """Build Blood Wake (the PC port) from your own disc: the one command.
 
     python tools/build_from_disc.py --disc <folder|image.iso> --install-dir <dir>
-        [--toolkit <dir>] [--work-dir <dir>] [--jobs N] [--check-only] [--progress json]
+        [--toolkit <dir>] [--work-dir <dir>] [--jobs N] [--check-only] [--no-warmup]
+        [--progress json]
 
 You bring your own copy of the game: a folder of the disc's files, an XISO, or
 a full disc image. This script checks that it is an unmodified retail copy
@@ -22,6 +23,11 @@ Steps (each prints one progress line with --progress json):
   verify       the generated C against fingerprints/generated.json
   build        CMake + Visual Studio 2022 (x64, Release)
   stage        the exe, the launcher and the files it runs with, install.json
+  warmup       "Preparing graphics (one time)": a few short scenes of the built
+               game, hidden and silent, so its pixel shaders are compiled into
+               the shader cache before the first play (tools/bw_warmup.py; about
+               2-4 minutes). --no-warmup skips it. It never fails the build: a
+               problem is reported and the step skipped.
   done
 
 --check-only stops after the fingerprint (nothing is unpacked or copied).
@@ -39,7 +45,8 @@ capstone 5.0.9, CMake 3.20+ (Visual Studio's own is fine) and Visual Studio
 2022 or its Build Tools with the C++ workload; about 2.6 GB free, and an
 internet connection for the toolkit unless --toolkit is given. No admin
 rights, no `py` launcher, paths with spaces are fine. About 15 minutes on a
-recent desktop (most of it the translation). Stdlib only.
+recent desktop (most of it the translation), plus 2-4 for the warm-up.
+Stdlib only.
 """
 import argparse
 import datetime as _dt
@@ -81,9 +88,10 @@ NEED_WORK = int(0.4 * GB)
 EXIT_OK, EXIT_DISC, EXIT_DEP, EXIT_PIPELINE, EXIT_GEN, EXIT_BUILD, EXIT_IO = 0, 2, 3, 4, 5, 6, 7
 
 # Overall progress: where each step starts and ends (pct).
+# (The installer reads fingerprint lines at pct 20 and up as the check result.)
 SPAN = {"identify": (0, 1), "toolkit": (1, 3), "unpack": (3, 18), "fingerprint": (18, 20),
-        "pipeline": (20, 68), "verify": (68, 70), "build": (70, 97), "stage": (97, 99),
-        "done": (100, 100)}
+        "pipeline": (20, 62), "verify": (62, 63), "build": (63, 83), "stage": (83, 84),
+        "warmup": (84, 99), "done": (100, 100)}
 # Rough seconds per pipeline step on a 2020s desktop, for the bar between lines.
 PIPE_SECONDS = {"parse": 2, "disasm": 520, "funcid": 3, "abi": 3, "ghidra": 1, "recomp": 75}
 
@@ -736,6 +744,36 @@ def stage(repo, exe, inst, record, prog):
     prog("stage", 1, "installed in %s" % inst)
 
 
+def warmup(exe, game_dir, work, prog):
+    """tools/bw_warmup.py's scenes with the installed exe. Never raises: the game
+    works without it (its first play just compiles the shaders as it goes)."""
+    t0 = time.time()
+    out = {"seconds": 0, "compiled": 0, "scenes": 0, "problems": []}
+    try:
+        sys.path.insert(0, os.path.join(REPO, "tools"))
+        import bw_warmup
+        prog("warmup", 0, "preparing graphics (one time, about 2-4 minutes): short scenes of the "
+             "game, hidden and silent")
+        res = bw_warmup.warmup(exe, game_dir, os.path.join(work, "warmup"),
+                               prog=lambda f, m: prog("warmup", f, m))
+        n, cached, bad = bw_warmup.summary(res)
+        out.update(compiled=n, from_cache=cached, scenes=len(res),
+                   problems=["%s %s: %s" % (r["edition"], r["scene"], r["error"] or "no shader report")
+                             for r in bad])
+        msg = "graphics ready: %d shaders compiled (%d already prepared) in %d s" % (
+            n, cached, time.time() - t0)
+        if bad:
+            msg += " (%d of %d scenes skipped: %s; log: %s)" % (
+                len(bad), len(res), "; ".join(out["problems"][:2]), os.path.join(work, "warmup", "logs"))
+        prog("warmup", 1, msg)
+    except Exception as e:                  # report and go on: never fail the install here
+        out["problems"].append("%s: %s" % (type(e).__name__, e))
+        prog("warmup", 1, "preparing graphics was skipped (%s); the first play compiles the "
+             "shaders as it goes" % e)
+    out["seconds"] = round(time.time() - t0)
+    return out
+
+
 # ── Main ──────────────────────────────────────────────────────────────────
 
 def main(argv=None):
@@ -746,6 +784,8 @@ def main(argv=None):
     ap.add_argument("--work-dir", help="for the toolkit, the generated C and the build (default <install-dir>/work)")
     ap.add_argument("--jobs", type=int, default=os.cpu_count() or 4, help="parallel build jobs")
     ap.add_argument("--check-only", action="store_true", help="only identify and check the disc")
+    ap.add_argument("--no-warmup", action="store_true",
+                    help="skip preparing the graphics (the first play then compiles its shaders as it goes)")
     ap.add_argument("--progress", choices=("text", "json"), default="text")
     a = ap.parse_args(argv)
     prog = Progress(a.progress == "json")
@@ -813,6 +853,11 @@ def main(argv=None):
             "seconds": {k: round(v) for k, v in times.items()},
         }
         stage(REPO, exe, inst, record, prog)
+        if not a.no_warmup:
+            record["warmup"] = warmup(record["paths"]["exe"], game_dir, work, prog)
+            record["seconds"]["warmup"] = record["warmup"]["seconds"]
+            with open(os.path.join(inst, "install.json"), "w", encoding="utf-8") as f:
+                json.dump(record, f, indent=2)
         prog("done", 1, "Blood Wake is built. Start it with \"Blood Wake.cmd\" in %s (%d min)."
              % (inst, (time.time() - t_start) / 60))
         return EXIT_OK

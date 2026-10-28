@@ -734,7 +734,7 @@ begin
     else
       S := S + Space + 'Microsoft''s Build Tools for Visual Studio 2022 {#VsVer} (about 3 GB; asks for permission)' + NewLine;
   end;
-  S := S + NewLine + 'Then it builds the game: about 15 minutes on a recent PC,' + NewLine +
+  S := S + NewLine + 'Then it builds the game and prepares its graphics: about 20 minutes on a recent PC,' + NewLine +
     'longer on an older one. You can use the PC meanwhile.' + NewLine;
   if MemoTasksInfo <> '' then
     S := S + NewLine + MemoTasksInfo + NewLine;
@@ -799,6 +799,7 @@ begin
   else if Step = 'verify' then Result := 'Checking the translated code matches ours...'
   else if Step = 'build' then Result := 'Compiling the game (Visual Studio)...'
   else if Step = 'stage' then Result := 'Finishing...'
+  else if Step = 'warmup' then Result := 'Preparing graphics (one time)...'
   else if Step = 'done' then Result := 'Done.'
   else Result := WizardForm.StatusLabel.Caption;
 end;

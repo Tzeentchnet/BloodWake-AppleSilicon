@@ -115,7 +115,9 @@ def stub_build(argv):
              ("pipeline", 40, "translating the game's code: disasm (stub)"),
              ("pipeline", 68, "translated in 0 s (stub)"), ("verify", 70, "the generated code matches ours (stub)"),
              ("build", 85, "compiling (stub)"), ("build", 97, "built in 0 s (stub)"),
-             ("stage", 99, "installed in %s (stub)" % inst)]
+             ("stage", 84, "installed in %s (stub)" % inst),
+             ("warmup", 90, "preparing graphics: 1 of 4 scenes (stub)"),
+             ("warmup", 99, "graphics ready: 0 shaders prepared in 0 s (stub)")]
     for step, pct, msg in steps:
         if fail and step == "fingerprint":
             say("fingerprint", 0, "This isn't an unmodified retail copy of Blood Wake (stub failure).",

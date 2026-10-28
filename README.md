@@ -78,7 +78,7 @@ The build also uses free tools, which the installer fetches if they're missing, 
 2. Accept the disclaimer, confirming you own the game and copied it from your own disc.
 3. Point it at your copy of the disc. It tells you in plain words whether the copy is recognised.
 4. Pick the install folder (by default `%LOCALAPPDATA%\Programs\Blood Wake Recomp`) and the shortcuts.
-5. Let it build: translating and compiling the game takes about 15 minutes, with a progress bar, and can't be cancelled once it starts.
+5. Let it build: translating and compiling the game takes about 15 minutes, with a progress bar, and can't be cancelled once it starts. Its last step, "Preparing graphics (one time)", plays a few short scenes hidden and silent (about 2 minutes) so your first game doesn't stutter while its graphics shaders compile.
 6. Play from the Start menu or the desktop shortcut.
 
 ![The installer's shortcuts page: a Start menu shortcut is always added, a desktop shortcut is optional](docs/images/ui-installer-shortcuts.jpg)
