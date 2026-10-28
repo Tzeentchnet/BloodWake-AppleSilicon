@@ -44,9 +44,9 @@ The build also needs these free tools. The installer fetches any that are missin
 
 ## Install
 ### With the installer (recommended)
-> **Coming soon:** the installer is being finished and isn't on the Releases page yet. Until it is, use [By hand](#by-hand) below.
+> **Windows may warn you:** the installer isn't code-signed, so SmartScreen can show "Windows protected your PC". Choose **More info**, then **Run anyway**. Each release lists the installer's SHA-256, so you can check you have the real file. The build takes about 15 minutes and can't be cancelled once it starts.
 
-1. Download the installer from this repository's Releases page.
+1. Download `BloodWakeRecomp-Setup-<version>.exe` from this repository's [Releases](https://github.com/minimalice92/bloodwake-recomp/releases) page.
 2. Run it. It installs for your Windows user only and doesn't need administrator rights, except for the one step that installs Microsoft's build tools, if you don't have them.
 3. Read and accept the disclaimer, confirming you own the game and made the copy from your own disc.
 4. Point it at your copy of the disc (a folder, an XISO or a full image). It tells you in plain words whether the copy is recognised.

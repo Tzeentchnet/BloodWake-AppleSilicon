@@ -1,0 +1,31 @@
+Please read this before you build or play.
+
+WHAT THIS IS
+Blood Wake Recomp is an unofficial, non-commercial fan project for preservation and interoperability. It lets a person who owns Blood Wake (Xbox, 2001) run their own copy natively on a Windows PC.
+
+It is not affiliated with, endorsed by, sponsored by or connected to Microsoft Corporation, Xbox Game Studios (formerly Microsoft Game Studios) or Stormfront Studios. "Blood Wake", "Xbox" and "Microsoft" are trademarks of their owners, used here only to say what this project works with.
+
+WHAT THIS SETUP CONTAINS, AND WHAT IT DOESN'T
+- It contains only this project's own work: source code, build scripts, the launcher and documentation, plus third-party open-source parts under their own licences.
+- It contains nothing from Blood Wake: no game code, no code generated from it, no executables built from it, no art, sound, music, video, text, saves or extracted files.
+- The game is built on this PC from your own copy. Setup checks your copy against published fingerprints (SHA-256 hashes, which reveal nothing about a file's contents) and refuses anything that isn't an unmodified retail copy.
+
+YOUR RESPONSIBILITIES
+- You must own a legitimate retail copy of Blood Wake, and make the copy you build from yourself, from your own disc.
+- Use this only for yourself. Don't share the files your build produces: the unpacked game, the generated code or the executable. They contain or are made from the game, which belongs to its rights holders.
+- Follow the law where you live. Whether making a personal copy of a game you own is allowed differs from country to country; that's yours to check.
+
+WHAT THIS PROJECT WILL NEVER DO
+- It doesn't circumvent DRM, copy protection, licence checks or console security, and needs none of that: the toolkit reads the game's program directly and only provides the system calls the game makes. <!-- audit:allow off-limits -->
+- It doesn't touch the Xbox's console security, signing keys, save signatures, disc authentication or online services, and it doesn't load or re-sign console saves. The port writes its own saves. <!-- audit:allow off-limits -->
+- It won't link to game images or ROM sites, and won't help anyone rip discs or get around any protection.
+- It is free: no sales, donations, ads or paid features.
+
+WHAT SETUP DOWNLOADS
+Only these, from their official sources, each checked against a pinned SHA-256 hash: Python (python.org), the Python packages capstone and pefile, and CMake if needed (pypi.org), the xboxrecomp toolkit (its GitHub archive), and, only if this PC doesn't have them, Microsoft's Build Tools for Visual Studio 2022 (microsoft.com). Nothing from the game is downloaded or sent anywhere.
+
+TAKEDOWN
+If Microsoft or the rights holders ask, the project will be taken down at once. If Blood Wake is ever re-released by Microsoft, the project will point to the official release first.
+
+NO WARRANTY
+This software is provided as is, without any warranty. Building and running it is at your own risk.
