@@ -52,6 +52,5 @@
     <!-- title -->
     <text x="72" y="148" font-family="'Segoe UI', 'Helvetica Neue', Helvetica, Arial, sans-serif" font-size="94" font-weight="900" letter-spacing="5" fill="#f4f7fb">BLOOD<tspan fill="#ff4a5f" dx="24">WAKE</tspan></text>
     <text x="76" y="198" font-family="'Segoe UI', 'Helvetica Neue', Helvetica, Arial, sans-serif" font-size="34" font-weight="600" letter-spacing="17" fill="#8ccfff">RECOMP</text>
-    <text x="76" y="268" font-family="'Segoe UI', 'Helvetica Neue', Helvetica, Arial, sans-serif" font-size="22" font-weight="500" fill="#c9d6e4">Xbox, 2001  ·  recompiled into native Windows code  ·  built from your own disc</text>
   </g>
 </svg>

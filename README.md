@@ -1,267 +1,192 @@
-<p align="center">
-  <img src="docs/images/banner.svg" alt="Blood Wake Recomp" width="100%">
-</p>
+![Blood Wake Recomp](docs/images/banner.svg)
 
-<h3 align="center">Blood Wake (Xbox, 2001) as a native Windows game,<br>built on your own PC from your own disc.</h3>
+**Blood Wake (Xbox, 2001), running natively on Windows.** The game's own program is translated into C and compiled on your PC, from your own disc: static recompilation, not emulation.
 
-<p align="center">
-  The game's own program is translated into C and compiled for your PC: <b>static recompilation, not emulation</b>.<br>
-  Play it exactly as it shipped, or remastered: ultrawide, 4K and hundreds of frames a second, with the original art and sound.<br>
-  <b>Get it:</b> run the installer from <a href="https://github.com/minimalice92/bloodwake-recomp/releases">Releases</a>, point it at your copy of the disc, and it builds the game for you. Or <a href="#by-hand">build it by hand</a>.
-</p>
+**100% complete.** Every function in the game recompiled to native code with none failing, and the whole game playable in both editions: all 28 story missions, Battle Mode and split screen for up to four players. Play it exactly as it shipped, or remastered: ultrawide, 4K and up to 290 frames a second, with the original art and sound.
 
-<p align="center">
-  <a href="https://github.com/minimalice92/bloodwake-recomp/releases"><b>Download the installer</b></a> ·
-  <a href="#quick-start">Quick start</a> ·
-  <a href="#what-you-get">Features</a> ·
-  <a href="#install">Install guide</a> ·
-  <a href="#troubleshooting">Troubleshooting</a> ·
-  <a href="#how-it-was-made">How it was made</a> ·
-  <a href="#found-on-the-disc">Found on the disc</a>
-</p>
+**[Download the installer](https://github.com/minimalice92/bloodwake-recomp/releases)** · [Features and Showcase](#features-and-showcase) · [Getting started](#getting-started) · [How it was made](#how-it-was-made) · [The roadmap](#the-roadmap) · [Staying safe](#staying-safe)
 
-<p align="center">
-  <img src="docs/images/shot-fjord.jpg" alt="Remastered at 21:9: a gunboat heads up a sunlit fjord between green cliffs, the radar and ammo display in the corners" width="100%">
-  <br><sub>Remastered at 21:9 ultrawide, captured at 3440×1440 and scaled down. The art is the original game's: nothing redrawn or replaced.</sub>
-</p>
+![Remastered at 21:9: a gunboat heads up a sunlit fjord between green cliffs, the radar and ammo display in the corners](docs/images/shot-fjord.jpg)
+*Remastered at 21:9, captured at 3440×1440. The original art: nothing redrawn or replaced.*
 
 > [!NOTE]
-> **Unofficial, free and non-commercial.** You need your own Blood Wake disc: the build accepts only an unmodified retail copy. Nothing from the game is in this repository, and the project is not affiliated with Microsoft or Stormfront Studios. [How it stays clean](#built-to-be-clean) · [Good faith](#good-faith)
+> Unofficial, free and non-commercial. You need your own Blood Wake disc, and nothing from the game is in this repository. See [Staying safe](#staying-safe).
 
-## Quick start
-1. **You need** Windows 10 or 11 (64-bit), a graphics card with DirectX 11, and your own Blood Wake disc copied to your PC as a folder, an Xbox ISO (XISO) or a full disc image. [Details](#what-you-need)
-2. **Download** `BloodWakeRecomp-Setup-<version>.exe` from [Releases](https://github.com/minimalice92/bloodwake-recomp/releases) and run it. It fetches any free build tools you're missing, from their official sites.
-3. **Point it at your copy of the disc.** It checks the copy, then translates and compiles the game on your PC (about 15 minutes).
-4. **Play** from the Start menu. The launcher picks the edition, Original or Remastered, and holds every setting.
+<img src="docs/images/stats.svg" width="600" alt="100%: recompiled, 0 functions failed, the whole game plays. 8,110 functions named. About 3 days from the first plan to the first release. 70+ AI agents. 0 crashes in 948 mission runs of soak tests. 16 bugs from 2001 fixed in Remastered.">
 
-Prefer the command line? [Build by hand](#by-hand). Stuck? [Troubleshooting](#troubleshooting).
+## Features and Showcase
+One program, two editions, picked in the launcher.
 
-<p align="center">
-  <img src="docs/images/stats.svg" alt="8,110 functions named. About 3 days from the first plan to the first public release. 70+ AI agent runs. 24 of 28 story missions won by an autopilot. 0 crashes in 948 mission runs of the crash soak tests. 16 bugs of the 2001 game fixed in Remastered." width="100%">
-</p>
+### Original: the game as it shipped
+- **Every mission and mode:** Story Mode's 28 missions, Battle Mode, and couch split screen for 2 to 4 players.
+- **Exactly as shipped in 2001:** the 4:3 picture, 30 frames a second, its quirks and its bugs. Only problems the port itself would cause are fixed.
+- **The console's own pace and sound:** the game runs on the console's 59.94 Hz clock, and the Xbox sound chip's own echo and 3D-sound programs run as they did on the console.
+- **Its own saves**, kept apart from Remastered's.
+- **Proven unchanged:** every merge is replayed against the previous build with the same random seed and compared step by step, for example 2,990 of 2,990 steps identical.
 
-## What you get
-One program, two editions, picked in the launcher. Story Mode, Battle Mode and couch split screen for 2 to 4 players work in both.
+### Remastered: the same game at its best
+The original art and sound, never replaced. Every change has its own switch.
 
-<p align="center">
-  <img src="docs/images/shot-original-43.jpg" alt="Original edition: Battle Mode at 4:3, as the Xbox showed it" width="100%">
-  <br><sub><b>Original:</b> exactly as it shipped in 2001. 4:3, 30 frames a second, quirks included.</sub>
-</p>
-<p align="center">
-  <img src="docs/images/shot-remastered-219.jpg" alt="Remastered edition: the same moment at 21:9, with more of the sea and cliffs at the sides and the HUD in the corners" width="100%">
-  <br><sub><b>Remastered:</b> the same moment at 21:9. More of the world at the sides, nothing stretched, the HUD in the corners, sharper and smoother everywhere.</sub>
-</p>
+**Looks**
+- 16:9 and 21:9 widescreen: more of the world, nothing stretched, the HUD in the corners.
+- Native resolution up to 4K, 8x anti-aliasing, 16x texture filtering, longer detail distance.
+- Cleaner textures up close, no banding, sharp text. Optional HDR, ambient occlusion, bloom and an OLED care mode.
 
-### Original
-- **The game exactly as it shipped in 2001**, at the console's 4:3 and 30 frames a second, its quirks and bugs included. Only problems caused by the port itself are fixed.
-- **The reference.** Every Remastered change is tested against it with a fixed random seed, step by step, to prove Original stays exactly as shipped.
-- **The Xbox sound chip's own effects** (its echo and 3D sound programs) run as on the console, in both editions.
+<!-- image slot: the one 21:9 ultrawide shot -->
+![Remastered at 21:9 ultrawide: a catamaran gunboat heads between towering sea stacks, with more of the sea and cliffs at the sides and the HUD in the corners](docs/images/shot-remastered-219.jpg)
+*21:9 ultrawide: more of the world at the sides, nothing stretched.*
 
-### Remastered
-The same game, with the **original art and sound**, looking, running and sounding its best on a modern PC. Every change has its own switch.
+<!-- image slots: 16:9 scenic shots 1 and 2 -->
+![A night storm: rain sweeps past a towering armoured battleship](docs/images/shot-storm.jpg)
+*Rain, night and a battleship.*
 
-| Area | What Remastered gives you |
-|---|---|
-| **Display** | Widescreen 16:9 and 21:9 ultrawide (more of the world, nothing stretched) · HUD in the corners · native resolution up to 4K · 60, 120, 144 or 240 fps, or your display's refresh rate, with the game still running at its own speed · variable refresh (G-Sync/FreeSync) · window or borderless fullscreen |
-| **Graphics** | Anti-aliasing up to 8x · texture filtering up to 16x · longer detail distance · smooth gradients with no banding · sharp text and HUD · texture restoration (the original textures cleaned up close up, nothing invented) · full split-screen detail |
-| **Optional extras** | Off by default, because the original didn't have them: ambient occlusion, bloom, sharpening, FXAA, **HDR**, and an **OLED care** mode |
-| **Sound** | Higher-quality resampling · a slightly louder mix with a limiter · the game's own surround mix on 5.1/7.1 · lower latency |
-| **Bug fixes** | **16 bugs of the original game fixed**: a story mission that could never be won, AI target rules that could never match, sounds and radio calls that never played, an endless health crate, a gap in a map edge, two textures that never shipped, and more. Original keeps every one. |
+![A gunboat crosses a dark sea at night toward a moonlit beach](docs/images/shot-night.jpg)
+*A night mission, dark the way it should be.*
 
-Every setting, with what it changes: [docs/SETTINGS.md](docs/SETTINGS.md). The editions in full: [docs/EDITIONS.md](docs/EDITIONS.md).
+**Runs**
+- Up to 290 fps at 3440×1440 and 229 at 4K, with the game still ticking 30 times a second: the same speed, far smoother.
+- Four-player split screen at full detail: 113 fps.
+- Every frame shown: 281 a second in Battle Mode on a 360 Hz variable-refresh screen, none dropped.
 
-<table>
-  <tr>
-    <td width="50%"><img src="docs/images/shot-storm.jpg" alt="A night storm: rain sweeps past a towering armoured battleship" width="100%"><br><sub>Rain, night and a battleship, at 21:9</sub></td>
-    <td width="50%"><img src="docs/images/shot-night.jpg" alt="A gunboat crosses a dark sea at night toward a moonlit beach" width="100%"><br><sub>A night mission, dark the way it should be</sub></td>
-  </tr>
-  <tr>
-    <td width="50%"><img src="docs/images/shot-village.jpg" alt="A sunlit bay with a temple, stilt houses and a long jetty on the shore" width="100%"><br><sub>Daylight, a temple and a village on stilts</sub></td>
-    <td width="50%"><img src="docs/images/shot-splitscreen.jpg" alt="Two-player split screen, one view above the other, each 21:9" width="100%"><br><sub>Two-player split screen on an ultrawide</sub></td>
-  </tr>
-</table>
+<img src="docs/images/fps.svg" width="600" alt="Frames per second, Remastered defaults at 3440×1440: Battle Mode 290, story mission 27 262, story mission 1 at 4K 229, 2-player split screen 214, story mission 1 205, story mission 3 175, 4-player split screen 113. The original runs at 30.">
 
-### Frame rates
-<p align="center">
-  <img src="docs/images/fps.svg" alt="Remastered frame rates at 3440×1440: Battle Mode 290, story mission 27 262, story mission 1 at 4K 229, 2-player split screen 214, story mission 1 205, story mission 3 175, 4-player split screen 113. The original game runs at 30." width="100%">
-</p>
+<!-- image slot: 16:9 scenic shot 3 -->
+![Two-player split screen, one view above the other, each 21:9](docs/images/shot-splitscreen.jpg)
+*Two-player split screen on an ultrawide.*
 
-- **The game still runs at its own speed.** It keeps its own 30 steps a second; the extra frames are drawn in between, so it plays at the same speed and looks far smoother.
-- **Every frame reaches the screen.** On a 360 Hz variable-refresh display, Battle Mode shows 281 frames a second with none dropped: frames are paced evenly and wait a moment for the screen instead of being thrown away.
+**Sounds**
+- Cleaner pitch changes, a louder mix with a limiter, the game's own surround mix on 5.1 and 7.1, lower latency.
 
-<details>
-<summary>The numbers as a table</summary>
+**Fixes**
+- 16 bugs from 2001 fixed, each switchable: a mission that could never be won, sounds and radio calls that never played, AI rules that never matched, two textures that never shipped, and more.
 
-| Scene (Remastered defaults) | Frames per second |
-|---|---|
-| Battle Mode, 3440×1440 | 290 |
-| Story mission 27, 3440×1440 | 262 |
-| Story mission 1, 3840×2160 (4K) | 229 |
-| 2-player split screen, 3440×1440 | 214 |
-| Story mission 1, 3440×1440 | 205 |
-| Story mission 3, 3440×1440 | 175 |
-| 4-player split screen (full detail), 3440×1440 | 113 |
-| The original game, any scene | 30 |
+<!-- image slots: 16:9 scenic shots 4 and 5 -->
 
-Measured on the project's test PC (GeForce RTX 4070 Ti SUPER), 28 Oct 2026.
-</details>
+Every setting: [docs/SETTINGS.md](docs/SETTINGS.md). Both editions in full: [docs/EDITIONS.md](docs/EDITIONS.md).
 
-## What you need
+## Getting started
+### What you need
 - **Windows 10 or 11, 64-bit**, and a graphics card with DirectX 11.
-- **Your own Blood Wake disc**, copied to your PC as one of: a folder of the disc's files, an Xbox ISO (XISO), or a full disc image. Only the retail release listed in [`fingerprints/retail.json`](fingerprints/retail.json) is accepted.
-- **Disk space:** several GB during the build (the game's files alone are about 2 GB).
+- **Your own Blood Wake disc**, copied to your PC as a folder of its files, an Xbox ISO (XISO) or a full disc image. Only the retail release in [`fingerprints/retail.json`](fingerprints/retail.json) is accepted.
+- **A few GB of free space** for the build (the game's files alone are about 2 GB).
 - An Xbox-style controller (XInput), or the keyboard.
 
-The build also needs these free tools. The installer fetches any that are missing, from their official sites only:
-- **Python 3.13** (64-bit, with tkinter) and the packages pinned in [`tools/requirements.txt`](tools/requirements.txt), notably `capstone==5.0.9` and `pefile==2024.8.26`;
-- **Visual Studio 2022 Build Tools** (version 17) with the C++ workload, and **CMake** 3.20 or later. Visual Studio 2026 is not supported yet;
-- the **xboxrecomp** toolkit at a pinned commit, downloaded by the build script from its GitHub page and checked against a pinned hash.
+The build also uses free tools, which the installer fetches if they're missing, from their official sites only: Python 3.13 with the packages pinned in [`tools/requirements.txt`](tools/requirements.txt), Visual Studio 2022 Build Tools (version 17, C++ workload; 2026 isn't supported yet), CMake 3.20 or later, and the xboxrecomp toolkit at a pinned commit, checked against a pinned hash.
 
-## Install
-### With the installer (recommended)
-> **Windows may warn you:** the installer isn't code-signed, so SmartScreen can show "Windows protected your PC". Choose **More info**, then **Run anyway**. Each release lists the installer's SHA-256, so you can check you have the real file. The build takes about 15 minutes and can't be cancelled once it starts.
+### Install
+> **Windows may warn you:** the installer isn't code-signed, so SmartScreen can say "Windows protected your PC". Choose **More info**, then **Run anyway**. Each release lists the installer's SHA-256, so you can check you have the real file.
 
-1. Download `BloodWakeRecomp-Setup-<version>.exe` from this repository's [Releases](https://github.com/minimalice92/bloodwake-recomp/releases) page.
-2. Run it. It installs for your Windows user only and doesn't need administrator rights, except for the one step that installs Microsoft's build tools, if you don't have them.
-3. Read and accept the disclaimer, confirming you own the game and made the copy from your own disc.
-4. Point it at your copy of the disc (a folder, an XISO or a full image). It tells you in plain words whether the copy is recognised.
-5. Pick where to install (by default `%LOCALAPPDATA%\Programs\Blood Wake Recomp`).
-6. Let it build. Translating and compiling the game takes a while; a progress bar shows each step.
-7. Play from the Start menu shortcut, which opens the launcher.
+1. Download `BloodWakeRecomp-Setup-<version>.exe` from [Releases](https://github.com/minimalice92/bloodwake-recomp/releases) and run it. It installs for your Windows user only; only the step that installs Microsoft's build tools, if needed, asks for administrator rights.
+2. Accept the disclaimer, confirming you own the game and copied it from your own disc.
+3. Point it at your copy of the disc. It tells you in plain words whether the copy is recognised.
+4. Pick the install folder (by default `%LOCALAPPDATA%\Programs\Blood Wake Recomp`) and the shortcuts.
+5. Let it build: translating and compiling the game takes about 15 minutes, with a progress bar, and can't be cancelled once it starts.
+6. Play from the Start menu or the desktop shortcut.
 
-The uninstaller (in Windows' **Apps** settings) removes the build and its shortcuts and asks about the rest; your saves and settings are kept unless you choose otherwise.
+![The installer's shortcuts page: a Start menu shortcut is always added, a desktop shortcut is optional](docs/images/ui-installer-shortcuts.jpg)
+*The installer: a Start menu shortcut always, a desktop one if you like.*
 
-### By hand
+To uninstall, use Windows' **Apps** settings: it removes the build and its shortcuts, and keeps your saves and settings unless you choose otherwise.
+
+**Or build by hand:**
 ```
 git clone https://github.com/minimalice92/bloodwake-recomp.git
 cd bloodwake-recomp
 python -m pip install -r tools/requirements.txt
 python tools/build_from_disc.py --disc "<your disc folder or image>" --install-dir "<where to install>"
 ```
-Then start the launcher from the install folder. Every option, step and exit code is in [docs/BUILDING.md](docs/BUILDING.md).
+Then start the launcher from the install folder. Every option, step and exit code: [docs/BUILDING.md](docs/BUILDING.md).
 
-## Playing
-The launcher has a tab per area (Edition, Display, Graphics, Audio, Fixes, Controls) and a Play button. Alt+Enter or F11 switches between a window and borderless fullscreen while you play.
+### Playing
+![The launcher's Graphics tab: anti-aliasing, texture filtering, detail distance and the other picture settings, with a Play button](docs/images/ui-launcher-graphics.jpg)
+*The launcher: pick an edition and your settings, then press Play.*
 
-Each edition keeps its own saves, under `%LOCALAPPDATA%\xboxrecomp\` (Remastered's in `editions\remastered` there); the launcher keeps its settings in `%LOCALAPPDATA%\BloodWake\settings.ini`.
+- The launcher has a tab each for Edition, Display, Graphics, Audio, Fixes and Controls. Hover over anything for an explanation.
+- Alt+Enter or F11 switches between a window and borderless fullscreen while you play.
+- Each edition keeps its own saves, under `%LOCALAPPDATA%\xboxrecomp\` (Remastered's in `editions\remastered`). The first time you play Remastered, it starts with a copy of your Original saves. Settings live in `%LOCALAPPDATA%\BloodWake\settings.ini`.
 
-## Troubleshooting
-| What you see | What to do |
-|---|---|
-| "not a supported unmodified retail copy" (exit code 2) | Only an unmodified retail copy of the release in `fingerprints/retail.json` is accepted. A copy that was patched, trimmed or re-packed won't match. Copy your disc again. |
-| A missing dependency (exit code 3) | The message names it. Install it (see What you need) or run the installer, which fetches it. |
-| The translation step failed (exit code 4) | Check the Python packages are exactly the pinned versions (`python -m pip install -r tools/requirements.txt`). |
-| "generated code doesn't match" (exit code 5) | Your translation came out different from ours: usually a different version of a Python package or of the toolkit. Reinstall the pinned versions and try again. |
-| The build failed (exit code 6) | Make sure Visual Studio 2022 (17.x) Build Tools with the C++ workload is installed. |
-| Disk space or a file error (exit code 7) | Free some space, or pick an install folder you can write to. |
-| The game is slow | In the launcher, lower the rendering resolution or the frame rate cap, or turn off anti-aliasing. |
-| Crackling or stuttering sound on a slow PC | Audio tab: Sound processor, Simple (it skips the sound chip's echo and 3D effects). |
+### Troubleshooting
+- **"not a supported unmodified retail copy" (exit code 2):** only an unmodified copy of the release in `fingerprints/retail.json` is accepted. A patched, trimmed or re-packed copy won't match: copy your disc again.
+- **A missing dependency (exit code 3):** the message names it. Install it, or run the installer, which fetches it.
+- **The translation failed (exit code 4):** check the Python packages are exactly the pinned versions (`python -m pip install -r tools/requirements.txt`).
+- **"generated code doesn't match" (exit code 5):** usually a different version of a Python package or of the toolkit. Reinstall the pinned versions and try again.
+- **The build failed (exit code 6):** make sure Visual Studio 2022 (17.x) Build Tools with the C++ workload is installed.
+- **Disk space or a file error (exit code 7):** free some space, or pick an install folder you can write to.
+- **The game is slow:** in the launcher, lower the rendering resolution or the frame rate cap, or turn off anti-aliasing.
+- **Crackling sound on a slow PC:** Audio tab, Sound processor: Simple (it skips the sound chip's echo and 3D effects).
 
-If you're stuck, open an issue: say what you did, what you saw, and your Windows and graphics card. Please don't attach game files, screenshots of the game's text, or your disc image.
+Still stuck? Open an issue: say what you did, what you saw, and your Windows version and graphics card. Please don't attach game files, screenshots of the game's text, or your disc image.
 
 ## How it was made
-### Three days from the first plan to the first release
-| Day | What happened |
-|---|---|
-| **Day 1** · 25 Oct 2026 | The plan and the ground rules in the morning. By night: the whole program translated (0 functions failed), the first launch, the title screen, the main menu, and a first Battle Mode match, at a few frames a second on a software renderer. |
-| **Day 2** · 26 Oct | First sound. The graphics on the GPU at full speed. Story Mode, every mission booting, split screen. 948 mission runs of crash soak tests with 0 crashes. Every archive on the disc decoded, the file formats specced, and three rounds of naming the game's functions. |
-| **Day 3** · 27 Oct | All 8,110 functions named. Remastered built in parallel: widescreen, high frame rate, the visual suite, the bug fixes, texture restoration, the water in native code. 24 of 28 story missions won by an autopilot. |
-| **That night** · early 28 Oct | This repository, its fail-closed audit, the installer, and release v0.1.0. |
-
-### Proof, not promises
-- **Every function named: 8,110.** Agents proposed each name with evidence from the code; a second round reviewed the less certain ones; a third re-checked 6,149 names independently and confirmed 6,109 of them as they stood. Ten functions that deal with the console's security were left alone on purpose.
-- **Original, proven unchanged.** Every merge is checked by playing the same seeded game on the old and new build and comparing the game's state step by step. A build made the public way, from the disc and with no names file, matches the workshop build for 3,867 of 3,867 steps, in each edition.
-- **24 of 28 story missions won by an autopilot** playing the port, the final mission included, with no port problem seen in about 37 attempts. The other four need skills the autopilot doesn't have yet.
-- **The water, in native code, bit for bit.** The functions that build the sea's surface every frame are re-translated at build time into plain native code doing the same operations in the same order. 2,627,309 batches compared against the game's own code: 0 differences. Four-player split screen at full detail went from 66 to 113 fps.
-- **The file formats, decoded.** Models, boats and weapons, missions, effects, fonts and menus, sound and textures: specced, checked against every archive on the disc, then verified blind by separate agents.
-- **57 toolkit issues found along the way.** Porting a whole game through xboxrecomp turned up 57 bugs and gaps in the toolkit: 8- and 16-bit multiplies and divides translated as 32-bit ones, point sprites, fog and polygon offset never drawn, a vertical blank of 60.00 Hz where NTSC runs at 59.94, and more. The ones that matter to the game are fixed or worked around in this project, mostly as carried copies of the toolkit's files with their diffs (`src/toolkit_patches/`) and as in-memory fixes to its translator (`tools/xbr_patches.py`), so the toolkit itself stays untouched at its pinned version. They will be offered to the xboxrecomp project with neutral repros that contain nothing from any game; none has been submitted yet.
-- **16 bugs from 2001, found and fixed.** Each traced in the code before it was touched, each with its own switch, and each kept as shipped in Original.
-- **A faint dark line on the distant sea, explained.** Traced to the game's own drawing: where waves fold at a grazing angle, the sky-reflection pass blends twice over the same pixels. Very likely on the original console too, so Original keeps it.
-- **Data, not guesswork.** The project's rule is to work from captured data (logs, traces, frame dumps, step-by-step comparisons), never from memory or feel, and to label every finding seen, inferred or unknown.
+### How it works
+The Xbox runs a PC-style x86 processor, so its program can be translated instead of emulated. The [xboxrecomp](https://github.com/sp00nznet/xboxrecomp) toolkit turns every function of the game into C, and Microsoft's compiler builds that into a Windows program. The toolkit's runtime stands in for the Xbox's system, memory, sound chip and controllers, and this port's Direct3D 11 back end turns the game's own graphics commands into work for your graphics card.
 
 ### Made with AI
-The engineering was done by Claude, Anthropic's AI model: a lead session plus more than 70 agent runs in batches (naming, file formats, stability, the fidelity checklist, the remaster, the installer), each with a written brief and a written report. The lead reviewed every batch, merged it, and re-ran the step-by-step comparison before anything counted as done. The maintainer set the direction, made the calls and played the game.
+The engineering was done by Claude, Anthropic's AI model: a lead session plus **70+ AI agents** working in batches (naming, file formats, stability, fidelity checks, the remaster, the installer). Each batch had a written brief and a written report, and the lead reviewed and re-verified it before merging. The maintainer set the direction, made the calls and played the game.
 
-## How it works
-The Xbox's processor is a PC-style x86 chip, so its program can be translated rather than emulated. The [xboxrecomp](https://github.com/sp00nznet/xboxrecomp) toolkit reads the game's program and translates every function into C. Microsoft's compiler turns that C into a normal Windows program. The toolkit's runtime provides the Xbox system calls the game makes, its memory, its sound chip and its controllers, and this port's Direct3D 11 back end turns the game's own graphics commands into work for your graphics card.
+- **25 Oct 2026:** the plan in the morning; by night the whole program translated, booting to the menus and playing Battle Mode.
+- **26 Oct:** sound, GPU graphics at full speed, every mission booting, split screen, 948 soak runs without a crash.
+- **27 Oct:** all 8,110 functions named, and Remastered built.
+- **Early 28 Oct:** the installer, this repository and release v0.1.0.
 
-```mermaid
-flowchart LR
-    A["Your own disc<br/>(folder, XISO or image)"] --> B{"Unmodified<br/>retail copy?"}
-    B -- "yes" --> C["xboxrecomp<br/>translates it to C"]
-    C --> D{"Matches the<br/>fingerprints?"}
-    D -- "yes" --> E["Microsoft's compiler<br/>builds the program"]
-    E --> F["Play: Original<br/>or Remastered"]
-    B -- "no" --> X["Stops.<br/>Nothing is built."]
-    D -- "no" --> Y["Stops and<br/>says why."]
-```
+### Proof, not promises
+- **Original stays exactly as shipped.** Every merge is replayed against the previous build with the same random seed and compared step by step. A build made the public way, from the disc and without the private names file, matches the workshop build for 3,867 of 3,867 steps in each edition.
+- **The translation is deterministic.** Six runs gave six identical sets of generated C, and every player's build is checked against the published fingerprints of it.
+- **The water, rewritten bit for bit.** The functions that build the sea's surface each frame are re-translated at build time into plain native code doing the same operations in the same order. 2,627,309 batches compared with the game's own code: 0 differences. Four-player split screen went from 66 to 113 fps.
+- **Stable.** 0 crashes in 948 mission runs of soak tests; a later soak of every mission, both battles and Blood Ball: 0 crashes, 0 freezes.
+- **Played through.** An autopilot won 24 of the 28 story missions, the final one included, with no port problem in about 37 attempts. The other four need skills the autopilot doesn't have yet.
+- **57 toolkit issues found and fixed here.** From 8- and 16-bit multiplies translated as 32-bit ones, to point sprites, fog and polygon offset never drawn, to a 60.00 Hz vertical blank where NTSC runs at 59.94. The fixes are carried in this project (`src/toolkit_patches/`, `tools/xbr_patches.py`), with the toolkit itself untouched at its pinned version. They will be offered to xboxrecomp with neutral repros containing nothing from any game; none has been submitted yet.
+- **Every function named: 8,110.** Each name proposed with evidence from the code, and 6,149 re-checked independently (6,109 confirmed as they stood). Ten functions that deal with the console's security were left alone on purpose.
+- **The file formats, decoded.** Models, boats and weapons, missions, effects, fonts, menus, sound and textures: specced, checked against every archive on the disc, then verified blind.
+- **Bugs explained before they're fixed.** Each of the 16 fixes was traced in the code first. The faint dark line on the distant sea was traced too: the game's own drawing, where folded waves get the sky reflection blended twice. It's very likely on the console as well, so Original keeps it.
+- **Data, not guesswork.** The project works from captured data (logs, traces, frame dumps, step-by-step comparisons), never from memory or feel, and labels every finding seen, inferred or unknown.
 
-All of it happens on your PC. The only downloads are free tools from their official sites (Python, CMake, Microsoft's build tools, the toolkit), pinned to exact versions; the toolkit and the installer's downloads are checked against pinned hashes.
+## The Roadmap
+### The Expanded Edition<!-- audit:allow expanded -->
+Expanded is the planned third edition: a tribute to the developers that finishes what they started. It builds on what turned up when every archive was decoded and every function named. **None of it is in this repository or in any release yet.** <!-- audit:allow expanded -->
 
-## Built to be clean
-Fan ports live in a grey area. This one was designed from the first day to sit at its very safest end, and to be able to show it.
+The plan, best value for the effort first (lift in agent time: S hours, M about a day, L days, XL weeks):
 
-- **Nothing from the game is in this repository.** No game code, no generated C, no executables, and no art, sound, music, video, text or extracted files. The one exception is the handful of screenshots on this page, each listed by its fingerprint.
-- **You build it yourself, from your own disc, on your own PC.** The build first checks your copy against published SHA-256 fingerprints of the unmodified retail release and refuses anything else. Then your PC translates and compiles the game with Microsoft's own build tools.
-- **Fingerprints, never code.** [`fingerprints/`](fingerprints/) holds SHA-256 hashes of the retail files and of the generated C. Your build proves it matches ours without either of us ever sharing the code.
-- **A fail-closed audit on every publish.** Changes reach this repository only through a scripted sync from the project's private workshop, and every file is scanned against the game itself: byte runs from the game's program and from every file on the disc (archives unpacked too), the game's text, the generated C and its telltale shapes, personal data, links, and anything to do with console security. One finding, or one input the audit can't read, and nothing is published. Each run also plants samples of game bytes, game text and generated code in memory and has to catch every one, so a broken scanner can't pass by accident. Screenshots pass only at their listed fingerprint, as plain JPEGs with no metadata.
-- **The names stay private.** The file of 8,110 function names is kept out of this repository. The public build works without it and plays step for step the same.
-- **Hands off the console's security.** No DRM, copy protection, licence checks, disc authentication, signing keys, save signatures or Xbox Live: none of it is touched, and none of it is needed. The toolkit reads the game's program directly and only provides the system calls the game makes. The port writes its own saves. <!-- audit:allow off-limits -->
-- **A commit guard for every clone.** [`tools/git-hooks/pre-commit`](tools/git-hooks/pre-commit), switched on with one git command (see [CONTRIBUTING.md](CONTRIBUTING.md)), refuses game files, disc images, archives, executables and generated C before they can be committed.
+1. **Co-op battles** (S–M). *Found:* six two-player co-op battles were cut; their names, descriptions and team rules are on the disc, and the game's mode list is plain data. *Plan:* put the six back in Battle Mode with their teams and AI opponents. <!-- audit:allow expanded -->
+2. **Co-op Story Mode** (M). *Found:* the launch data already holds up to four players, and split screen follows the player count. *Plan:* player 2 joins at boat select, two HUDs, respawns near your teammate, and a mission is lost only when both of you are down. Three or four players later. <!-- audit:allow expanded -->
+3. **Co-op survival** (S–M). *Found:* a two-player survival game ends the moment player 1 sinks. *Plan:* an everyone's-down rule, team results, and two-player versions of the six survival modes. <!-- audit:allow expanded -->
+4. **Blood Ball for everyone** (S–M). *Found:* the mode the team called their favourite sits behind a cheat. *Plan:* a normal menu entry plus team Blood Ball, two against two or both of you against the AI.
+5. **Every boat in Battle Mode** (S–M). *Found:* two story-only hulls, the named story boats (they already play when a battle names them), a dozen enemy-only classes and one class used nowhere. *Plan:* boat-select slots, a HUD icon where one is missing, and a balance check for each.
+6. **A developers' corner** (S). *Found:* a hidden level select that no code ever switches on, and debug switches nothing sets: free cameras, a mission clock on the HUD, switching boats. *Plan:* the harmless ones in a launcher tab, off by default.
+7. **Secret objectives and earned unlocks** (S–M). *Found:* a cut secret-objective type, one mission still carrying one, and unused messages for unlocking a joke boat that today is only a cheat. *Plan:* finish the system, so the cheat boats can be earned.
+8. **A leftovers gallery** (S–M). *Found:* an earlier front end that is never loaded (98 images found nowhere else), five unused font sets, early diary drafts, an epilogue page nothing opens, the artists' test effects, and a developer kit with a teapot in it. *Plan:* a gallery, a viewer arena for the effects, and the teapot hidden for you to find.
+9. **Living AI** (M–L). *Found:* three of the AI's five attitudes have empty tables, so only two ever chase, ram or grab power-ups. *Plan:* fill them in for more varied opponents.
+10. **Armour that counts** (M). *Found:* a cut armour system; only a test boat has armour values. *Plan:* finish it, with a balance pass.
+11. **Unused sounds and effects** (M). *Found:* 51 effects nothing can start, plus unused collision and scrape sounds. *Plan:* wire each to the event it was named for, after a careful listen.
+12. **Custom missions and boats** (L). *Found:* the missions are pure data in the decoded formats, built in the designers' own mission editor, and a capture objective that can never succeed. *Plan:* load your own missions and boats, with the capture objective finished.
+13. **Squad tactics** (L). *Found:* a squad-matchup evaluator for the AI that is compiled in but never switched on. *Plan:* switch it on and tune it.
+14. **Online, starting with a network Blood Ball** (XL). *Found:* the sequel's design called for networked multiplayer, and some of the developers once planned a network Blood Ball. *Plan:* delay-based lockstep, which a research pass for this project judged feasible. <!-- audit:allow expanded -->
+
+Some things can't come back faithfully: a 29th mission (the E3 2001 show demo) whose list entry ships but whose mission file doesn't, 41 voice lines that were written but never recorded, and a second weather set for one mission whose files are missing.
+
+## Staying safe
+Fan ports live in a grey area. This one is built to be clean, to sit at the very safest end of it, and to be able to show it.
+
+- **You must own the game.** The build accepts only an unmodified retail copy made from your own disc, and checks it against published SHA-256 fingerprints before it does anything else.
+- **You build it yourself, on your own PC.** Your PC translates and compiles the game with Microsoft's own build tools; no game code or program is ever downloaded.
+- **Nothing from the game is in this repository.** No game code, generated C or executables, and no art, sound, music, video, text or extracted files. The one exception is the handful of game screenshots on this page, each listed by its fingerprint.
+- **Fingerprints, never code.** [`fingerprints/`](fingerprints/) holds SHA-256 hashes of the retail files and of the generated C, so your build proves it matches ours without the code ever being shared.
+- **A fail-closed audit on every publish.** Every change arrives through a scripted sync that scans each file against the game itself (its program, every file on the disc, its text) and for generated C, personal data, outside links and anything to do with console security. One finding, or one input it can't read, and nothing is published. Each run plants samples of game bytes, text and code and must catch them all, and images pass only at their listed fingerprint, with no metadata.
+- **The names stay private.** The file of 8,110 function names is kept out; the public build works without it and plays step for step the same.
+- **A commit guard for every clone.** [`tools/git-hooks/pre-commit`](tools/git-hooks/pre-commit), switched on with one git command (see [CONTRIBUTING.md](CONTRIBUTING.md)), refuses game files, disc images, archives, executables and generated C.
+- **Hands off the console's security.** No DRM, copy protection, licence checks, disc authentication, signing keys, save signatures or Xbox Live: none of it is touched, and none of it is needed. The toolkit reads the game's program directly and only provides the system calls the game makes, and the port writes its own saves. <!-- audit:allow off-limits -->
+- **No help getting the game any other way.** No links to game images, and no help with ripping a disc or getting around any protection. <!-- audit:allow off-limits -->
 - **Free, for good.** No sales, donations, ads or paid features.
-- **Rights holders come first.** One issue titled **Takedown** and the project comes down, no questions asked. See [Contact and takedown](#contact-and-takedown).
-
-## Found on the disc
-Decoding every archive and naming every function turned up a lot that shipped on the disc but never made it into the game: cut modes, hidden boats, debug tools, early drafts. These are findings, described in our own words; **none of this content is switched on in this repository or in any release.**
-
-<details open>
-<summary><b>What was found</b></summary>
-
-- **Six cut two-player co-op battles.** Their names, descriptions and team rules are on the disc; no menu reaches them. <!-- audit:allow expanded -->
-- **A cut secret-objective system.** One mission still carries a secret objective, next to an unused results message and an unused unlock message for a joke boat.
-- **A hidden level select.** A cheat flag unlocks every story mission, but no code ever sets it.
-- **A developers' corner.** Debug switches survive in the code that nothing sets: free cameras, a mission clock on the HUD, switching boats, winning the mission on the spot.
-- **Boats you never get to drive.** Two story-only hulls, the named story boats, a dozen enemy-only classes, and one class used nowhere.
-- **Half-built systems.** Armour values that only a test boat has; AI attitudes with empty tables (only two of five attitudes ever chase or ram); a capture objective that can never succeed; a squad-tactics evaluator that is never created.
-- **Leftovers.** An earlier front end with 98 images found nowhere else, five unused font sets, early drafts of the story diary, a developer test screen, an epilogue diary page nothing opens, the artists' test effects, 51 effects nothing can start, unused collision sounds, and a developer kit with a teapot in it.
-- **Things that can't come back faithfully.** A 29th mission, the E3 2001 show demo, whose list entry ships but whose mission file doesn't; 41 voice lines that were written but never recorded; a second weather set for one mission whose files are missing.
-</details>
-
-### The developers' tribute (planned)
-The plan for a third edition, **Expanded**, is a tribute to the team: finish what they started, honouring what is known of the sequel they designed. It is on hold while Original and Remastered are finished, and **nothing of it is in this repository or in v0.1.0**. The plan, highest impact first: <!-- audit:allow expanded -->
-
-1. **Story Mode together.** The whole campaign with a friend in split screen, since the sequel was planned with co-op; later three or four players, for which the game's launch data already has room. <!-- audit:allow expanded -->
-2. **The six cut co-op battles**, back in Battle Mode's list, plus two-player versions of the six survival modes. <!-- audit:allow expanded -->
-3. **Online, starting with a network Blood Ball.** The sequel's design called for networked multiplayer, and some of the developers once planned a networked Blood Ball tribute that never happened. <!-- audit:allow expanded -->
-4. **Blood Ball for everyone:** out of the cheat menu, plus team Blood Ball. The team called it their favourite feature.
-5. **Living AI:** the three empty AI attitudes filled in, so battle opponents behave in more ways.
-6. **Every boat in Battle Mode:** the story-only hulls, the named story boats, the enemy classes and the unused one.
-7. **Secret objectives and earned unlocks:** the cut system finished, and the joke boats earned instead of typed in as codes.
-8. **Armour that counts:** the cut armour system finished.
-9. **A developers' corner:** the hidden level select and the harmless debug switches, in a launcher tab, off by default.
-10. **A leftovers gallery:** the early front end, the diary drafts and the epilogue page, the artists' test effects in a viewer arena, and the teapot hidden somewhere for you to find.
-11. **Unused sounds and effects on their events:** each wired to what it was named for, after a careful listen.
-12. **Custom missions and boats:** the missions are pure data in the decoded formats, and the designers built them in a mission editor of their own; the capture objective would come with them.
-13. **The squad-tactics AI** that was built but never switched on.
-
-## Good faith
-This project exists because Blood Wake is worth keeping playable, and it is meant to be a good neighbour to the people who made it and own it.
-
-- **You must own the game.** The build accepts only an unmodified retail copy, made from your own disc, and checks it against published fingerprints (SHA-256 hashes) before it does anything else.
-- **Nothing from the game is here**, apart from the few screenshots on this page: no game code, no generated C, no executables, no art, sound, music, video, text or extracted files. Your PC translates and compiles the game itself; we publish fingerprints of the generated code, never the code.
-- **Strictly non-commercial.** Free, no donations, no ads.
-- **No links to game images, and no help with ripping or getting around any protection.** The project doesn't need any of that and never touches console security, disc authentication or online services. <!-- audit:allow off-limits -->
-- **Credit to the original team.** Blood Wake was made by Stormfront Studios and published by Microsoft Game Studios. See [CREDITS.md](CREDITS.md).
-- **If Microsoft re-releases Blood Wake**, this page will point there first. Buy it.
+- **Credit where it's due.** Blood Wake was made by Stormfront Studios and published by Microsoft Game Studios ([CREDITS.md](CREDITS.md)). If Microsoft ever re-releases it, this page will point there first. Buy it.
 
 The full disclaimer is in [LEGAL.md](LEGAL.md); please read it before you build or play.
+
+### Contact and takedown
+The maintainer is [@minimalice92](https://github.com/minimalice92) on GitHub. Questions and bug reports: open an issue.
+
+**Rights holders:** if you are Microsoft or act for the rights holders and want this project taken down, open an issue titled **Takedown**, or contact the maintainer through GitHub. It will be taken down at once, no questions asked.
 
 ## Credits and licence
 Blood Wake is by **Stormfront Studios**, published by **Microsoft Game Studios**; all of its code, art, sound, music and writing is theirs. This port stands on [xboxrecomp](https://github.com/sp00nznet/xboxrecomp) by sp00nz and on [xemu](https://xemu.app)'s work on the Xbox's sound chip. Full credits: [CREDITS.md](CREDITS.md).
 
 Our own code is under the **MIT** licence ([LICENSE](LICENSE)); some parts are under the GPL or LGPL ([NOTICE.md](NOTICE.md), [LICENSES/](LICENSES/)). Please read [CONTRIBUTING.md](CONTRIBUTING.md) before you open an issue.
-
-## Contact and takedown
-The maintainer is [@minimalice92](https://github.com/minimalice92) on GitHub. Questions and bug reports: open an issue.
-
-**Rights holders:** if you are Microsoft or act for the rights holders and want this project taken down, open an issue titled **Takedown**, or contact the maintainer through GitHub. It will be taken down at once, no questions asked.

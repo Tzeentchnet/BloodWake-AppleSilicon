@@ -1,41 +1,48 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 960 506" width="960" height="506" role="img" aria-labelledby="t d">
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 600 676" width="600" height="676" role="img" aria-labelledby="t d">
   <title id="t">Remastered frame rates</title>
-  <desc id="d">Frames per second in Remastered at its shipped defaults, at 3440 by 1440 (21:9) unless noted: Battle Mode 290; Story mission 27 262; Story mission 1, at 4K (16:9) 229; 2-player split screen 214; Story mission 1 205; Story mission 3 175; 4-player split screen 113. The original game runs at 30 frames per second.</desc>
-  <rect x="1" y="1" width="958" height="504" rx="18" fill="#0d1726" stroke="#24405f" stroke-width="1.5"/>
+  <desc id="d">Frames per second in Remastered at its shipped defaults, 3440 by 1440 unless noted: Battle Mode 290; Story mission 27 262; Story mission 1, at 4K 229; 2-player split screen 214; Story mission 1 205; Story mission 3 175; 4-player split screen 113. The original game runs at 30.</desc>
+  <rect x="1" y="1" width="598" height="674" rx="18" fill="#0d1726" stroke="#24405f" stroke-width="1.5"/>
   <g font-family="'Segoe UI', 'Helvetica Neue', Helvetica, Arial, sans-serif">
-    <text x="32" y="48" font-size="24" font-weight="700" fill="#f4f7fb">Remastered frame rates, frames per second</text>
-    <text x="32" y="76" font-size="15" fill="#b4c3d4">3440×1440 (21:9) unless noted · shipped Remastered defaults · the game still runs its own 30 steps a second</text>
-    <line x1="312" y1="102" x2="312" y2="410" stroke="#22344d" stroke-width="1"/>
-    <text x="312" y="430" font-size="13" fill="#8a9bb0" text-anchor="middle">0</text>
-    <line x1="512" y1="102" x2="512" y2="410" stroke="#22344d" stroke-width="1"/>
-    <text x="512" y="430" font-size="13" fill="#8a9bb0" text-anchor="middle">100</text>
-    <line x1="712" y1="102" x2="712" y2="410" stroke="#22344d" stroke-width="1"/>
-    <text x="712" y="430" font-size="13" fill="#8a9bb0" text-anchor="middle">200</text>
-    <line x1="912" y1="102" x2="912" y2="410" stroke="#22344d" stroke-width="1"/>
-    <text x="912" y="430" font-size="13" fill="#8a9bb0" text-anchor="middle">300</text>
-    <text x="298" y="129" font-size="16" fill="#dbe4ee" text-anchor="end">Battle Mode</text>
-    <path d="M312 112 H888 Q892 112 892 116 V132 Q892 136 888 136 H312 Z" fill="#2f96e0"/>
-    <text x="902" y="129" font-size="16" font-weight="700" fill="#f4f7fb">290</text>
-    <text x="298" y="173" font-size="16" fill="#dbe4ee" text-anchor="end">Story mission 27</text>
-    <path d="M312 156 H832 Q836 156 836 160 V176 Q836 180 832 180 H312 Z" fill="#2f96e0"/>
-    <text x="846" y="173" font-size="16" font-weight="700" fill="#f4f7fb">262</text>
-    <text x="298" y="217" font-size="16" fill="#dbe4ee" text-anchor="end">Story mission 1, at 4K (16:9)</text>
-    <path d="M312 200 H766 Q770 200 770 204 V220 Q770 224 766 224 H312 Z" fill="#2f96e0"/>
-    <text x="780" y="217" font-size="16" font-weight="700" fill="#f4f7fb">229</text>
-    <text x="298" y="261" font-size="16" fill="#dbe4ee" text-anchor="end">2-player split screen</text>
-    <path d="M312 244 H736 Q740 244 740 248 V264 Q740 268 736 268 H312 Z" fill="#2f96e0"/>
-    <text x="750" y="261" font-size="16" font-weight="700" fill="#f4f7fb">214</text>
-    <text x="298" y="305" font-size="16" fill="#dbe4ee" text-anchor="end">Story mission 1</text>
-    <path d="M312 288 H718 Q722 288 722 292 V308 Q722 312 718 312 H312 Z" fill="#2f96e0"/>
-    <text x="732" y="305" font-size="16" font-weight="700" fill="#f4f7fb">205</text>
-    <text x="298" y="349" font-size="16" fill="#dbe4ee" text-anchor="end">Story mission 3</text>
-    <path d="M312 332 H658 Q662 332 662 336 V352 Q662 356 658 356 H312 Z" fill="#2f96e0"/>
-    <text x="672" y="349" font-size="16" font-weight="700" fill="#f4f7fb">175</text>
-    <text x="298" y="393" font-size="16" fill="#dbe4ee" text-anchor="end">4-player split screen</text>
-    <path d="M312 376 H534 Q538 376 538 380 V396 Q538 400 534 400 H312 Z" fill="#2f96e0"/>
-    <text x="548" y="393" font-size="16" font-weight="700" fill="#f4f7fb">113</text>
-    <line x1="372" y1="98" x2="372" y2="410" stroke="#d9652c" stroke-width="2" stroke-dasharray="5 4"/>
-    <text x="380" y="100" font-size="13" fill="#b4c3d4">← 30: the Xbox, and the Original edition</text>
-    <text x="32" y="482" font-size="13" fill="#8a9bb0">Measured on the project's test PC (GeForce RTX 4070 Ti SUPER), 28 Oct 2026.</text>
+    <text x="24" y="44" font-size="26" font-weight="700" fill="#f4f7fb">Frames per second</text>
+    <text x="24" y="74" font-size="18" fill="#b4c3d4">Remastered defaults, 3440×1440 (21:9) unless noted</text>
+    <line x1="24" y1="96" x2="24" y2="110" stroke="#d9652c" stroke-width="2.5" stroke-dasharray="5 4"/>
+    <text x="36" y="109" font-size="17" fill="#b4c3d4">30: the Xbox, and the Original edition</text>
+    <line x1="24" y1="144" x2="24" y2="598" stroke="#22344d" stroke-width="1"/>
+    <text x="24" y="620" font-size="15" fill="#8a9bb0" text-anchor="start">0</text>
+    <line x1="184" y1="144" x2="184" y2="598" stroke="#22344d" stroke-width="1"/>
+    <text x="184" y="620" font-size="15" fill="#8a9bb0" text-anchor="middle">100</text>
+    <line x1="344" y1="144" x2="344" y2="598" stroke="#22344d" stroke-width="1"/>
+    <text x="344" y="620" font-size="15" fill="#8a9bb0" text-anchor="middle">200</text>
+    <line x1="504" y1="144" x2="504" y2="598" stroke="#22344d" stroke-width="1"/>
+    <text x="504" y="620" font-size="15" fill="#8a9bb0" text-anchor="middle">300</text>
+    <text x="24" y="162" font-size="19" fill="#dbe4ee">Battle Mode</text>
+    <path d="M24 170 H484 Q488 170 488 174 V188 Q488 192 484 192 H24 Z" fill="#2f96e0"/>
+    <text x="498" y="188" font-size="19" font-weight="700" fill="#f4f7fb">290</text>
+    <text x="24" y="228" font-size="19" fill="#dbe4ee">Story mission 27</text>
+    <path d="M24 236 H439.2 Q443.2 236 443.2 240 V254 Q443.2 258 439.2 258 H24 Z" fill="#2f96e0"/>
+    <text x="453.2" y="254" font-size="19" font-weight="700" fill="#f4f7fb">262</text>
+    <text x="24" y="294" font-size="19" fill="#dbe4ee">Story mission 1, at 4K</text>
+    <path d="M24 302 H386.4 Q390.4 302 390.4 306 V320 Q390.4 324 386.4 324 H24 Z" fill="#2f96e0"/>
+    <text x="400.4" y="320" font-size="19" font-weight="700" fill="#f4f7fb">229</text>
+    <text x="24" y="360" font-size="19" fill="#dbe4ee">2-player split screen</text>
+    <path d="M24 368 H362.4 Q366.4 368 366.4 372 V386 Q366.4 390 362.4 390 H24 Z" fill="#2f96e0"/>
+    <text x="376.4" y="386" font-size="19" font-weight="700" fill="#f4f7fb">214</text>
+    <text x="24" y="426" font-size="19" fill="#dbe4ee">Story mission 1</text>
+    <path d="M24 434 H348 Q352 434 352 438 V452 Q352 456 348 456 H24 Z" fill="#2f96e0"/>
+    <text x="362" y="452" font-size="19" font-weight="700" fill="#f4f7fb">205</text>
+    <text x="24" y="492" font-size="19" fill="#dbe4ee">Story mission 3</text>
+    <path d="M24 500 H300 Q304 500 304 504 V518 Q304 522 300 522 H24 Z" fill="#2f96e0"/>
+    <text x="314" y="518" font-size="19" font-weight="700" fill="#f4f7fb">175</text>
+    <text x="24" y="558" font-size="19" fill="#dbe4ee">4-player split screen</text>
+    <path d="M24 566 H200.8 Q204.8 566 204.8 570 V584 Q204.8 588 200.8 588 H24 Z" fill="#2f96e0"/>
+    <text x="214.8" y="584" font-size="19" font-weight="700" fill="#f4f7fb">113</text>
+    <line x1="72" y1="165" x2="72" y2="197" stroke="#d9652c" stroke-width="2.5" stroke-dasharray="4 3"/>
+    <line x1="72" y1="231" x2="72" y2="263" stroke="#d9652c" stroke-width="2.5" stroke-dasharray="4 3"/>
+    <line x1="72" y1="297" x2="72" y2="329" stroke="#d9652c" stroke-width="2.5" stroke-dasharray="4 3"/>
+    <line x1="72" y1="363" x2="72" y2="395" stroke="#d9652c" stroke-width="2.5" stroke-dasharray="4 3"/>
+    <line x1="72" y1="429" x2="72" y2="461" stroke="#d9652c" stroke-width="2.5" stroke-dasharray="4 3"/>
+    <line x1="72" y1="495" x2="72" y2="527" stroke="#d9652c" stroke-width="2.5" stroke-dasharray="4 3"/>
+    <line x1="72" y1="561" x2="72" y2="593" stroke="#d9652c" stroke-width="2.5" stroke-dasharray="4 3"/>
+    <text x="24" y="658" font-size="15" fill="#8a9bb0">Test PC: GeForce RTX 4070 Ti SUPER, 28 Oct 2026.</text>
   </g>
 </svg>

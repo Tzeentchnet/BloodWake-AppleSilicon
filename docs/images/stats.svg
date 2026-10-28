@@ -1,56 +1,49 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 960 336" width="960" height="336" role="img" aria-labelledby="t d">
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 600 478" width="600" height="478" role="img" aria-labelledby="t d">
   <title id="t">The project in numbers</title>
-  <desc id="d">8,110 functions named. About three days from first plan to public release. More than 70 AI agent runs. 24 of 28 story missions won by an autopilot. 0 crashes in 948 mission runs of the crash soak tests. 16 bugs of the original game fixed in Remastered.</desc>
-  <defs>
-    <linearGradient id="tile" x1="0" y1="0" x2="0" y2="1">
-      <stop offset="0" stop-color="#112036"/>
-      <stop offset="1" stop-color="#0b1626"/>
-    </linearGradient>
-  </defs>
+  <desc id="d">100%: recompiled: 0 functions failed, the whole game plays. 8,110: functions named: the whole program. ~3 days: from the first plan to the first release. 70+: AI agents, in batches, with an AI lead. 0: crashes in 948 mission runs of soak tests. 16: bugs from 2001 fixed in Remastered.</desc>
+  <defs><linearGradient id="tile" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#112036"/><stop offset="1" stop-color="#0b1626"/></linearGradient></defs>
   <g font-family="'Segoe UI', 'Helvetica Neue', Helvetica, Arial, sans-serif">
-    <!-- row 1 -->
     <g transform="translate(0,0)">
-      <rect x="1" y="1" width="306" height="158" rx="16" fill="url(#tile)" stroke="#24405f" stroke-width="1.5"/>
-      <rect x="24" y="26" width="36" height="4" rx="2" fill="#ff4a5f"/>
-      <text x="24" y="86" font-size="46" font-weight="800" fill="#f4f7fb">8,110</text>
-      <text x="24" y="118" font-size="17" fill="#b4c3d4">functions named: the whole</text>
-      <text x="24" y="140" font-size="17" fill="#b4c3d4">program, each with evidence</text>
+      <rect x="1" y="1" width="291" height="148" rx="16" fill="url(#tile)" stroke="#24405f" stroke-width="1.5"/>
+      <rect x="22" y="22" width="36" height="4" rx="2" fill="#ff4a5f"/>
+      <text x="22" y="78" font-size="46" font-weight="800" fill="#f4f7fb">100%</text>
+      <text x="22" y="108" font-size="19" fill="#b4c3d4">recompiled: 0 functions</text>
+      <text x="22" y="132" font-size="19" fill="#b4c3d4">failed, the whole game plays</text>
     </g>
-    <g transform="translate(326,0)">
-      <rect x="1" y="1" width="306" height="158" rx="16" fill="url(#tile)" stroke="#24405f" stroke-width="1.5"/>
-      <rect x="24" y="26" width="36" height="4" rx="2" fill="#ff4a5f"/>
-      <text x="24" y="86" font-size="46" font-weight="800" fill="#f4f7fb">~3 days</text>
-      <text x="24" y="118" font-size="17" fill="#b4c3d4">from the first plan to the</text>
-      <text x="24" y="140" font-size="17" fill="#b4c3d4">first public release</text>
+    <g transform="translate(307,0)">
+      <rect x="1" y="1" width="291" height="148" rx="16" fill="url(#tile)" stroke="#24405f" stroke-width="1.5"/>
+      <rect x="22" y="22" width="36" height="4" rx="2" fill="#ff4a5f"/>
+      <text x="22" y="78" font-size="46" font-weight="800" fill="#f4f7fb">8,110</text>
+      <text x="22" y="108" font-size="19" fill="#b4c3d4">functions named:</text>
+      <text x="22" y="132" font-size="19" fill="#b4c3d4">the whole program</text>
     </g>
-    <g transform="translate(652,0)">
-      <rect x="1" y="1" width="306" height="158" rx="16" fill="url(#tile)" stroke="#24405f" stroke-width="1.5"/>
-      <rect x="24" y="26" width="36" height="4" rx="2" fill="#ff4a5f"/>
-      <text x="24" y="86" font-size="46" font-weight="800" fill="#f4f7fb">70+</text>
-      <text x="24" y="118" font-size="17" fill="#b4c3d4">AI agent runs: naming, formats,</text>
-      <text x="24" y="140" font-size="17" fill="#b4c3d4">fixes, Remastered, installer</text>
+    <g transform="translate(0,164)">
+      <rect x="1" y="1" width="291" height="148" rx="16" fill="url(#tile)" stroke="#24405f" stroke-width="1.5"/>
+      <rect x="22" y="22" width="36" height="4" rx="2" fill="#ff4a5f"/>
+      <text x="22" y="78" font-size="46" font-weight="800" fill="#f4f7fb">~3 days</text>
+      <text x="22" y="108" font-size="19" fill="#b4c3d4">from the first plan</text>
+      <text x="22" y="132" font-size="19" fill="#b4c3d4">to the first release</text>
     </g>
-    <!-- row 2 -->
-    <g transform="translate(0,176)">
-      <rect x="1" y="1" width="306" height="158" rx="16" fill="url(#tile)" stroke="#24405f" stroke-width="1.5"/>
-      <rect x="24" y="26" width="36" height="4" rx="2" fill="#4fb3ff"/>
-      <text x="24" y="86" font-size="46" font-weight="800" fill="#f4f7fb">24 / 28</text>
-      <text x="24" y="118" font-size="17" fill="#b4c3d4">story missions won by an</text>
-      <text x="24" y="140" font-size="17" fill="#b4c3d4">autopilot playing the port</text>
+    <g transform="translate(307,164)">
+      <rect x="1" y="1" width="291" height="148" rx="16" fill="url(#tile)" stroke="#24405f" stroke-width="1.5"/>
+      <rect x="22" y="22" width="36" height="4" rx="2" fill="#4fb3ff"/>
+      <text x="22" y="78" font-size="46" font-weight="800" fill="#f4f7fb">70+</text>
+      <text x="22" y="108" font-size="19" fill="#b4c3d4">AI agents, in batches,</text>
+      <text x="22" y="132" font-size="19" fill="#b4c3d4">with an AI lead</text>
     </g>
-    <g transform="translate(326,176)">
-      <rect x="1" y="1" width="306" height="158" rx="16" fill="url(#tile)" stroke="#24405f" stroke-width="1.5"/>
-      <rect x="24" y="26" width="36" height="4" rx="2" fill="#4fb3ff"/>
-      <text x="24" y="86" font-size="46" font-weight="800" fill="#f4f7fb">0 crashes</text>
-      <text x="24" y="118" font-size="17" fill="#b4c3d4">in 948 mission runs of the</text>
-      <text x="24" y="140" font-size="17" fill="#b4c3d4">crash soak tests</text>
+    <g transform="translate(0,328)">
+      <rect x="1" y="1" width="291" height="148" rx="16" fill="url(#tile)" stroke="#24405f" stroke-width="1.5"/>
+      <rect x="22" y="22" width="36" height="4" rx="2" fill="#4fb3ff"/>
+      <text x="22" y="78" font-size="46" font-weight="800" fill="#f4f7fb">0</text>
+      <text x="22" y="108" font-size="19" fill="#b4c3d4">crashes in 948 mission</text>
+      <text x="22" y="132" font-size="19" fill="#b4c3d4">runs of soak tests</text>
     </g>
-    <g transform="translate(652,176)">
-      <rect x="1" y="1" width="306" height="158" rx="16" fill="url(#tile)" stroke="#24405f" stroke-width="1.5"/>
-      <rect x="24" y="26" width="36" height="4" rx="2" fill="#4fb3ff"/>
-      <text x="24" y="86" font-size="46" font-weight="800" fill="#f4f7fb">16</text>
-      <text x="24" y="118" font-size="17" fill="#b4c3d4">bugs of the 2001 game fixed in</text>
-      <text x="24" y="140" font-size="17" fill="#b4c3d4">Remastered, each with a switch</text>
+    <g transform="translate(307,328)">
+      <rect x="1" y="1" width="291" height="148" rx="16" fill="url(#tile)" stroke="#24405f" stroke-width="1.5"/>
+      <rect x="22" y="22" width="36" height="4" rx="2" fill="#4fb3ff"/>
+      <text x="22" y="78" font-size="46" font-weight="800" fill="#f4f7fb">16</text>
+      <text x="22" y="108" font-size="19" fill="#b4c3d4">bugs from 2001 fixed</text>
+      <text x="22" y="132" font-size="19" fill="#b4c3d4">in Remastered</text>
     </g>
   </g>
 </svg>
