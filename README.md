@@ -6,8 +6,8 @@
 
 **[Download the installer](https://github.com/minimalice92/bloodwake-recomp/releases)** · [Features and Showcase](#features-and-showcase) · [Getting started](#getting-started) · [How it was made](#how-it-was-made) · [The roadmap](#the-roadmap) · [Staying safe](#staying-safe)
 
-![Remastered at 21:9: a gunboat heads up a sunlit fjord between green cliffs, the radar and ammo display in the corners](docs/images/shot-fjord.jpg)
-*Remastered at 21:9, captured at 3440×1440. The original art: nothing redrawn or replaced.*
+![Remastered at 4K: a gunboat at full speed into a low sunset, its wake trailing, the HUD in the corners](docs/images/shot-hero.jpg)
+*Full speed into the sunset. Remastered at 4K with every setting maxed: the original art, nothing redrawn or replaced.*
 
 > [!NOTE]
 > Unofficial, free and non-commercial. You need your own Blood Wake disc, and nothing from the game is in this repository. See [Staying safe](#staying-safe).
@@ -32,16 +32,14 @@ The original art and sound, never replaced. Every change has its own switch.
 - Native resolution up to 4K, 8x anti-aliasing, 16x texture filtering, longer detail distance.
 - Cleaner textures up close, no banding, sharp text. Optional HDR, ambient occlusion, bloom and an OLED care mode.
 
-<!-- image slot: the one 21:9 ultrawide shot -->
-![Remastered at 21:9 ultrawide: a catamaran gunboat heads between towering sea stacks, with more of the sea and cliffs at the sides and the HUD in the corners](docs/images/shot-remastered-219.jpg)
-*21:9 ultrawide: more of the world at the sides, nothing stretched.*
+![Remastered at 21:9 ultrawide: a temple skyline across the full width, the HUD at the screen's edges](docs/images/shot-ultrawide.jpg)
+*21:9 ultrawide: the whole temple skyline, more of the world at the sides, nothing stretched.*
 
-<!-- image slots: 16:9 scenic shots 1 and 2 -->
-![A night storm: rain sweeps past a towering armoured battleship](docs/images/shot-storm.jpg)
-*Rain, night and a battleship.*
+![Dawn among tropical islands, with a one-line radio subtitle on screen](docs/images/shot-islands.jpg)
+*Dawn in the islands, with the game's own subtitles drawn sharp at 4K.*
 
-![A gunboat crosses a dark sea at night toward a moonlit beach](docs/images/shot-night.jpg)
-*A night mission, dark the way it should be.*
+![Twilight: a temple under a rising moon, seen from the cockpit](docs/images/shot-temple.jpg)
+*Moonrise over the temple.*
 
 **Runs**
 - Up to 290 fps at 3440×1440 and 229 at 4K, with the game still ticking 30 times a second: the same speed, far smoother.
@@ -50,9 +48,8 @@ The original art and sound, never replaced. Every change has its own switch.
 
 <img src="docs/images/fps.svg" width="600" alt="Frames per second, Remastered defaults at 3440×1440: Battle Mode 290, story mission 27 262, story mission 1 at 4K 229, 2-player split screen 214, story mission 1 205, story mission 3 175, 4-player split screen 113. The original runs at 30.">
 
-<!-- image slot: 16:9 scenic shot 3 -->
-![Two-player split screen, one view above the other, each 21:9](docs/images/shot-splitscreen.jpg)
-*Two-player split screen on an ultrawide.*
+![Battle Mode: rockets arc over limestone peaks](docs/images/shot-rockets.jpg)
+*Rockets over the Tombstones: Battle Mode in widescreen.*
 
 **Sounds**
 - Cleaner pitch changes, a louder mix with a limiter, the game's own surround mix on 5.1 and 7.1, lower latency.
@@ -60,7 +57,8 @@ The original art and sound, never replaced. Every change has its own switch.
 **Fixes**
 - 16 bugs from 2001 fixed, each switchable: a mission that could never be won, sounds and radio calls that never played, AI rules that never matched, two textures that never shipped, and more.
 
-<!-- image slots: 16:9 scenic shots 4 and 5 -->
+![The final storm: lightning, rain, green energy arcs and an enemy ship lit by an explosion, with a radio subtitle](docs/images/shot-lightning.jpg)
+*The final storm: lightning, rain and the green arcs of the legendary shield.*
 
 Every setting: [docs/SETTINGS.md](docs/SETTINGS.md). Both editions in full: [docs/EDITIONS.md](docs/EDITIONS.md).
 
