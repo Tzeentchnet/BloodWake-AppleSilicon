@@ -9,7 +9,7 @@ It is **not affiliated with, endorsed by, sponsored by or connected to** Microso
 
 ## What this repository contains, and what it doesn't
 - It contains **only this project's own work**: source code, build scripts, the launcher, the installer and documentation, plus third-party open-source parts under their own licences (see `NOTICE.md`).
-- It contains **nothing from Blood Wake**: no game code, no code generated from it, no executables built from it, no art, models, textures, sound, music, video, text, saves, screenshots or extracted files.
+- It contains **nothing from Blood Wake**: no game code, no code generated from it, no executables built from it, no art, models, textures, sound, music, video, text, saves or extracted files. The one exception is a few screenshots shown in the README (at most eight, taken by the project from its own build, each listed by its SHA-256 fingerprint).
 - `fingerprints/` holds SHA-256 hashes only. A hash identifies a file without revealing anything about what's in it.
 
 ## Your responsibilities

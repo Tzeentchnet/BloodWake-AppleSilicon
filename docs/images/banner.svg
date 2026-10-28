@@ -1,0 +1,57 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1280 360" width="1280" height="360" role="img" aria-labelledby="t d">
+  <title id="t">Blood Wake Recomp</title>
+  <desc id="d">The project's banner: the title over a night sea, with a red wake trailing a small boat toward the horizon.</desc>
+  <defs>
+    <linearGradient id="sky" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#050a13"/>
+      <stop offset="0.55" stop-color="#0a1828"/>
+      <stop offset="1" stop-color="#0f2740"/>
+    </linearGradient>
+    <radialGradient id="glow" cx="0.3" cy="0.42" r="0.55">
+      <stop offset="0" stop-color="#b3122e" stop-opacity="0.32"/>
+      <stop offset="1" stop-color="#b3122e" stop-opacity="0"/>
+    </radialGradient>
+    <radialGradient id="moon" cx="0.5" cy="0.5" r="0.5">
+      <stop offset="0" stop-color="#cfe6ff" stop-opacity="0.22"/>
+      <stop offset="1" stop-color="#cfe6ff" stop-opacity="0"/>
+    </radialGradient>
+    <linearGradient id="wake" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#ff3b54" stop-opacity="0.95"/>
+      <stop offset="0.45" stop-color="#d7263d" stop-opacity="0.55"/>
+      <stop offset="1" stop-color="#8e0f22" stop-opacity="0"/>
+    </linearGradient>
+    <linearGradient id="foam" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#ffffff" stop-opacity="0.9"/>
+      <stop offset="1" stop-color="#ffffff" stop-opacity="0"/>
+    </linearGradient>
+    <clipPath id="card">
+      <rect width="1280" height="360" rx="22"/>
+    </clipPath>
+  </defs>
+  <g clip-path="url(#card)">
+    <rect width="1280" height="360" fill="url(#sky)"/>
+    <rect width="1280" height="360" fill="url(#glow)"/>
+    <circle cx="1070" cy="92" r="120" fill="url(#moon)"/>
+    <circle cx="1070" cy="92" r="20" fill="#dcecff" fill-opacity="0.85"/>
+    <!-- horizon -->
+    <rect x="0" y="214" width="1280" height="146" fill="#0b2034"/>
+    <path d="M0 214 H1280" stroke="#3d78a8" stroke-opacity="0.45" stroke-width="1.5"/>
+    <!-- swell bands -->
+    <path d="M0 232 C 120 220, 240 244, 360 232 S 600 220, 720 234 S 960 246, 1080 232 S 1220 224, 1280 230 V360 H0 Z" fill="#0e2e4b" fill-opacity="0.9"/>
+    <path d="M0 270 C 140 254, 260 286, 400 270 S 660 252, 800 272 S 1060 290, 1180 270 S 1260 262, 1280 266 V360 H0 Z" fill="#11406a" fill-opacity="0.85"/>
+    <path d="M0 312 C 160 292, 300 330, 460 310 S 760 290, 920 314 S 1180 334, 1280 306 V360 H0 Z" fill="#165684" fill-opacity="0.85"/>
+    <path d="M0 270 C 140 254, 260 286, 400 270 S 660 252, 800 272 S 1060 290, 1180 270 S 1260 262, 1280 266" fill="none" stroke="#7cc4ff" stroke-opacity="0.28" stroke-width="2"/>
+    <path d="M0 312 C 160 292, 300 330, 460 310 S 760 290, 920 314 S 1180 334, 1280 306" fill="none" stroke="#9fd6ff" stroke-opacity="0.3" stroke-width="2"/>
+    <!-- the wake: a widening red V behind a small boat heading for the horizon -->
+    <path d="M1046 252 C 1020 280, 980 318, 930 360 L 1170 360 C 1120 318, 1080 282, 1058 252 Z" fill="url(#wake)" fill-opacity="0.75"/>
+    <path d="M1046 254 C 1022 282, 984 320, 936 360" fill="none" stroke="url(#foam)" stroke-width="2.5" stroke-dasharray="14 5 6 5"/>
+    <path d="M1058 254 C 1082 284, 1118 320, 1164 360" fill="none" stroke="url(#foam)" stroke-width="2.5" stroke-dasharray="14 5 6 5"/>
+    <path d="M1036 276 Q 1052 270 1068 276 M1026 298 Q 1052 290 1078 298 M1014 322 Q 1052 312 1090 322 M1000 348 Q 1052 336 1104 348" fill="none" stroke="#ffc2ca" stroke-opacity="0.45" stroke-width="2" stroke-linecap="round"/>
+    <path d="M1052 226 C 1060 234, 1062 246, 1060 256 L 1044 256 C 1042 246, 1044 234, 1052 226 Z" fill="#e9f1fa"/>
+    <path d="M1047 244 H 1057" stroke="#5a6b80" stroke-width="3" stroke-linecap="round"/>
+    <!-- title -->
+    <text x="72" y="148" font-family="'Segoe UI', 'Helvetica Neue', Helvetica, Arial, sans-serif" font-size="94" font-weight="900" letter-spacing="5" fill="#f4f7fb">BLOOD<tspan fill="#ff4a5f" dx="24">WAKE</tspan></text>
+    <text x="76" y="198" font-family="'Segoe UI', 'Helvetica Neue', Helvetica, Arial, sans-serif" font-size="34" font-weight="600" letter-spacing="17" fill="#8ccfff">RECOMP</text>
+    <text x="76" y="268" font-family="'Segoe UI', 'Helvetica Neue', Helvetica, Arial, sans-serif" font-size="22" font-weight="500" fill="#c9d6e4">Xbox, 2001  ·  recompiled into native Windows code  ·  built from your own disc</text>
+  </g>
+</svg>
