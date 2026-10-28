@@ -26,6 +26,7 @@
 #define COBJMACROS
 /* WIN32_LEAN_AND_MEAN comes from the build */
 #include "../bw_framelog.h"   /* P2b: BW_FRAMELOG test aid */
+#include <math.h>   /* fabsf (flash_watch): an implicit declaration fails to link on newer toolsets */
 #include <windows.h>
 #include <d3d11.h>
 #include <dxgi1_5.h>   /* IDXGISwapChain2 (frame-latency waitable), IDXGIFactory5 (tearing) */
@@ -2966,6 +2967,8 @@ static int tr_stage(const BwXBatch *b, uint32_t prog, int st, ID3D11ShaderResour
  * b0 constants, textures and samplers, and the rasteriser, blend and depth
  * states. The caller then binds its vertex input and vertex shader and
  * draws. Returns 1 to draw, 0 if it cannot, -1 if both faces are culled. */
+static int begin(const Nv2aSurface *s, const Nv2aRenderState *rs);   /* defined below */
+
 static int xdraw_prepare(const Nv2aSurface *s, const BwXBatch *b)
 {
     const Nv2aRenderState *rs;

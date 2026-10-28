@@ -168,6 +168,10 @@ if(MSVC)
     # The generated code files can be very large. Increase object file section limit.
     target_compile_options(${PROJECT_NAME} PRIVATE /bigobj)
 
+    # Every call to an undeclared function is an error in our own code too (a community
+    # build failed: fabsf called without <math.h> links on some toolsets, not others).
+    target_compile_options(${PROJECT_NAME} PRIVATE /we4013)
+
     # Blood Wake (D-010, TOOLKIT_ISSUES TK-3): Ghidra can name a guest function after
     # one of the CRT's legacy POSIX names (flushall, itoa, strlwr...), which the UCRT
     # headers also declare, and the build stops on C2371. The generated code never

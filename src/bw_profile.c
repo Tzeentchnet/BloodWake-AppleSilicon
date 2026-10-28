@@ -17,6 +17,7 @@
  * Flat profile only (no call stacks): enough to say where the time goes.
  */
 #include <windows.h>
+#include <timeapi.h>   /* timeBeginPeriod / timeEndPeriod */
 #include <tlhelp32.h>
 #include <dbghelp.h>
 #include <stdint.h>
