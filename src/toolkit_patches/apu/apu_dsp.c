@@ -504,7 +504,7 @@ void mcpx_apu_dsp_frame(MCPXAPUState *d,
                 char sp[600];
                 uint32_t sge = qatomic_read(&d->regs[NV_PAPU_GPSADDR]), i, page;
                 static const uint8_t zero[4096];
-                _snprintf(sp, sizeof sp, "%s.scratch", path);
+                snprintf(sp, sizeof sp, "%s.scratch", path);
                 sp[sizeof sp - 1] = 0;
                 f = sge ? fopen(sp, "wb") : NULL;
                 if (f) {

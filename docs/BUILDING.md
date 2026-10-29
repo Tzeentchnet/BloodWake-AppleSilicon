@@ -38,7 +38,13 @@ python tools/build_from_disc.py --disc "<your copy>" --install-dir "<install fol
 | `--work-dir <folder>` | Where the toolkit, the generated C and the build go (default: `<install-dir>\work`). Logs are in `<work-dir>\logs\`. |
 | `--jobs N` | Parallel compile jobs (default: your number of CPU threads). |
 | `--check-only` | Only identify your copy and check its fingerprint. Nothing is unpacked or copied. |
+| `--prepare-only` | Unpack and fingerprint the disc, translate its program and verify the generated C, but don't build or install an executable. Available on macOS as well as Windows; incompatible with `--check-only`. A rerun replaces `<work-dir>/gen`. |
 | `--progress json` | One JSON object per line on standard output, for front ends such as the installer: `{"step": "...", "pct": 0-100, "msg": "..."}`. A failure adds `"error": true` and `"exit": <code>`. The default is plain text. |
+
+On macOS and Linux, generated text may use LF rather than the CRLF line endings
+in the published Windows fingerprints. Verification first checks the raw files;
+if that fails, it checks them again with Windows line endings for comparison
+only. Other byte differences, missing files and extra files still fail.
 
 ### What it does, step by step
 1. **identify:** works out whether `--disc` is a folder, an XISO or a full disc image.

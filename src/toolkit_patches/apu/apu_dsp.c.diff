@@ -1,6 +1,6 @@
 --- xboxrecomp/src/apu/apu_dsp.c
 +++ src/toolkit_patches/apu/apu_dsp.c
-@@ -27,6 +27,217 @@
+@@ -27,7 +27,218 @@
  
  #include <stdlib.h>
  #include <string.h>
@@ -164,7 +164,7 @@
 +    }
 +    return on;
 +}
-+
+ 
 +static void bw_binstat_frame(MCPXAPUState *d,
 +                             float mixbins[NUM_MIXBINS][NUM_SAMPLES_PER_FRAME])
 +{
@@ -215,9 +215,10 @@
 +    memset(s_bw_bin_sq, 0, sizeof(s_bw_bin_sq));
 +    s_bw_bin_frames = 0;
 +}
- 
++
  /* ── DSP command doorbell acknowledgement ────────────────────────────────
   *
+  * DirectSound does not stop at creating the device. It hands the audio DSP a
 @@ -155,8 +366,17 @@
      return (uint32_t *)(mcpx_apu_phys(page) + GP_DOORBELL_OFFSET);
  }
@@ -257,10 +258,11 @@
  void mcpx_apu_dsp_frame(MCPXAPUState *d,
                           float mixbins[NUM_MIXBINS][NUM_SAMPLES_PER_FRAME])
  {
-@@ -248,6 +475,60 @@
+@@ -247,7 +474,61 @@
+      */
  
      int off = (d->ep_frame_div % 8) * NUM_SAMPLES_PER_FRAME;
- 
++
 +    {
 +        /* Blood Wake (D-012 scoping): BW_APU_GPDUMP=<file> writes the GP and
 +         * EP DSP memory windows (MCPX 0x30000-0x7FFFF, guest 0xFE830000..,
@@ -290,7 +292,7 @@
 +                char sp[600];
 +                uint32_t sge = qatomic_read(&d->regs[NV_PAPU_GPSADDR]), i, page;
 +                static const uint8_t zero[4096];
-+                _snprintf(sp, sizeof sp, "%s.scratch", path);
++                snprintf(sp, sizeof sp, "%s.scratch", path);
 +                sp[sizeof sp - 1] = 0;
 +                f = sge ? fopen(sp, "wb") : NULL;
 +                if (f) {
@@ -306,7 +308,7 @@
 +            }
 +        }
 +    }
-+
+ 
 +    bw_binstat_frame(d, mixbins);
 +    if (bw_xdsp_frame(d, mixbins)) {
 +        bw_stems_frame(mixbins);

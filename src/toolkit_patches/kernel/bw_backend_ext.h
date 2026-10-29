@@ -169,4 +169,10 @@ int bw_backend_clear_rect(uint32_t r[4]);
  * register mirror), e.g. 0x1D78 SET_ZMIN_MAX_CONTROL. */
 uint32_t bw_backend_reg(uint32_t method);
 
+/* Whether the executor has received SET_COMBINER_CONTROL, including zero. */
+int bw_backend_combiner_seen(void);
+
+/* Which clear-rectangle axes the executor has received: bit 0 X, bit 1 Y. */
+uint32_t bw_backend_clear_rect_mask(void);
+
 #endif

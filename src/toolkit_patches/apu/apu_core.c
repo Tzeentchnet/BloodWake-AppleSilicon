@@ -25,6 +25,7 @@
 #include "apu_wav.h"
 #include "fpconv.h"
 #include "../kernel/xbox_memory_layout.h"   /* XBOX_WORKER_STACK_TOP */
+#include <errno.h>
 
 /* Blood Wake carried patch (TK-14, docs/TOOLKIT_ISSUES.md): the sequencer
  * sample-limit tick (ISTS bit 3) made switchable, and the title's sequencer
@@ -917,8 +918,15 @@ void mcpx_apu_monitor_init(MCPXAPUState *d, Error **errp)
      * adaptive device queue (bw_queue_adapt) needs room to grow, so the
      * device gets 8 buffers unless RECOMP_AUDIO_BUF_COUNT says otherwise;
      * the pacing starts at the same 4-buffer level as before. */
-    if (bw_queue_adaptive() && !getenv("RECOMP_AUDIO_BUF_COUNT"))
-        _putenv_s("RECOMP_AUDIO_BUF_COUNT", "8");
+    if (bw_queue_adaptive() && !getenv("RECOMP_AUDIO_BUF_COUNT")) {
+#if defined(_WIN32)
+        int error = _putenv_s("RECOMP_AUDIO_BUF_COUNT", "8");
+#else
+        int error = setenv("RECOMP_AUDIO_BUF_COUNT", "8", 0) == 0 ? 0 : errno;
+#endif
+        if (error)
+            fprintf(stderr, "[APU] couldn't set the adaptive buffer count: %s\n", strerror(error));
+    }
 
     /* Try XAudio2 first (lower latency) */
     if (xa2_init()) {

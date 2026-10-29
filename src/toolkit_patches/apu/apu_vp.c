@@ -22,7 +22,21 @@
 #include "apu_state.h"
 #include "apu.h"
 #include "fpconv.h"
+#if defined(_WIN32)
 #include <process.h>
+#else
+#include <stdatomic.h>
+#include <unistd.h>
+#endif
+
+static void bw_voice_memory_barrier(void)
+{
+#if defined(_WIN32)
+    MemoryBarrier();
+#else
+    atomic_thread_fence(memory_order_seq_cst);
+#endif
+}
 
 /* #define DEBUG_MCPX */
 
@@ -557,7 +571,7 @@ static void voice_on_link(MCPXAPUState *d, unsigned int selected_handle,
                        NV_PAVS_VOICE_TAR_PITCH_LINK,
                        NV_PAVS_VOICE_TAR_PITCH_LINK_NEXT_VOICE_HANDLE,
                        d->regs[top_reg]);
-        MemoryBarrier();
+        bw_voice_memory_barrier();
         d->regs[top_reg] = selected_handle;
     } else {
         unsigned int antecedent_voice =
@@ -571,7 +585,7 @@ static void voice_on_link(MCPXAPUState *d, unsigned int selected_handle,
                        NV_PAVS_VOICE_TAR_PITCH_LINK,
                        NV_PAVS_VOICE_TAR_PITCH_LINK_NEXT_VOICE_HANDLE,
                        next_handle);
-        MemoryBarrier();
+        bw_voice_memory_barrier();
         voice_set_mask(d, (uint16_t)antecedent_voice,
                        NV_PAVS_VOICE_TAR_PITCH_LINK,
                        NV_PAVS_VOICE_TAR_PITCH_LINK_NEXT_VOICE_HANDLE,
@@ -673,7 +687,12 @@ static int bw_audit_on(void)
             s_aud = (BwAudit *)calloc(1, sizeof(BwAudit));
             if (s_aud) {
                 /* one file per boot: <path>.<process id> */
-                _snprintf(s_aud->path, sizeof s_aud->path - 1, "%s.%d", e, _getpid());
+                snprintf(s_aud->path, sizeof s_aud->path, "%s.%ld", e,
+#if defined(_WIN32)
+                         (long)_getpid());
+#else
+                         (long)getpid());
+#endif
                 s_aud_on = 1;
                 fprintf(stderr, "[APU-AUDIT] counting the title's APU use into %s\n", e);
             }
@@ -1117,7 +1136,7 @@ static void fe_method(MCPXAPUState *d, uint32_t method, uint32_t argument)
         if (fe_spin_on())
             voice_spin_unlock(d, (uint16_t)selected_handle);
         if (!link_first) {
-            MemoryBarrier();         /* ACTIVE and the setup before the link */
+            bw_voice_memory_barrier(); /* ACTIVE and the setup before the link */
             voice_on_link(d, selected_handle, list);
         }
 

@@ -7,6 +7,9 @@
 tools/git-hooks/* text eol=lf
 *.py            text eol=lf
 
+# A unified diff's empty context line consists of a single required space.
+src/toolkit_patches/apu/*.diff whitespace=-blank-at-eol
+
 # Windows-only scripts keep CRLF.
 *.bat           text eol=crlf
 *.cmd           text eol=crlf

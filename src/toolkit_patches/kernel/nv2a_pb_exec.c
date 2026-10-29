@@ -6089,3 +6089,13 @@ void nv2a_pb_exec_report(void)
         s_unhandled_slot[(s_unhandled[i].method & 0x1FFC) / 4] = (uint16_t)(i + 1);
     fflush(stderr);
 }
+
+int bw_backend_combiner_seen(void)
+{
+    return s_gpu.rc_seen;
+}
+
+uint32_t bw_backend_clear_rect_mask(void)
+{
+    return s_gpu.clear_rect_set;
+}

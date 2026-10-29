@@ -2,7 +2,8 @@
 """Build Blood Wake (the PC port) from your own disc: the one command.
 
     python tools/build_from_disc.py --disc <folder|image.iso> --install-dir <dir>
-        [--toolkit <dir>] [--work-dir <dir>] [--jobs N] [--check-only] [--progress json]
+        [--toolkit <dir>] [--work-dir <dir>] [--jobs N]
+        [--check-only | --prepare-only] [--progress json]
 
 You bring your own copy of the game: a folder of the disc's files, an XISO, or
 a full disc image. This script checks that it is an unmodified retail copy
@@ -25,6 +26,8 @@ Steps (each prints one progress line with --progress json):
   done
 
 --check-only stops after the fingerprint (nothing is unpacked or copied).
+--prepare-only unpacks, translates, and verifies the generated C, without
+requiring Visual Studio or building an executable.
 --progress json prints one JSON object per line on stdout:
   {"step": "<step>", "pct": 0-100, "msg": "..."}
 pct is the whole job's progress. A failure adds "error": true and "exit": <code>.
@@ -34,8 +37,8 @@ Exit codes: 0 ok; 2 not a supported unmodified retail copy; 3 missing
 dependency (the message says which); 4 pipeline failed; 5 the generated code
 doesn't match ours; 6 build failed; 7 disk space or I/O.
 
-Needs: Python 3.13 (3.10+ runs; the fingerprints were made with 3.13),
-capstone 5.0.9, CMake 3.20+ (Visual Studio's own is fine) and Visual Studio
+Needs: Python 3.13 (3.10+ runs; the fingerprints were made with 3.13) and
+capstone 5.0.9. A full build also needs CMake 3.20+ and Visual Studio
 2022 or its Build Tools with the C++ workload; about 2.6 GB free, and an
 internet connection for the toolkit unless --toolkit is given. No admin
 rights, no `py` launcher, paths with spaces are fine. About 15 minutes on a
@@ -147,14 +150,19 @@ def tree_digest(files):
 GEN_SKIP = {"bw_ocean_native.inc"}      # written by the build (tools/bw_ocean_xlate.py), not the pipeline
 
 
-def gen_fingerprint(gen_dir):
+def gen_fingerprint(gen_dir, windows_line_endings=False):
     """{file: {"size", "sha256"}} for the pipeline's output files."""
     out = {}
     for name in sorted(os.listdir(gen_dir)):
         p = os.path.join(gen_dir, name)
         if name in GEN_SKIP or not os.path.isfile(p):
             continue
-        out[name] = {"size": os.path.getsize(p), "sha256": sha256_file(p)}
+        if windows_line_endings:
+            with open(p, "rb") as f:
+                data = f.read().replace(b"\r\n", b"\n").replace(b"\n", b"\r\n")
+            out[name] = {"size": len(data), "sha256": hashlib.sha256(data).hexdigest()}
+        else:
+            out[name] = {"size": os.path.getsize(p), "sha256": sha256_file(p)}
     return out
 
 
@@ -645,10 +653,20 @@ def verify_gen(repo, gen, prog):
     ref = load_json(os.path.join(FINGERPRINTS, "generated.json"), "fingerprints/generated.json")
     got = gen_fingerprint(gen)
     total = total_digest((n, f["sha256"]) for n, f in got.items())
+    normalized = False
+    crlf_got = None
+    if total != ref.get("total_sha256") and os.linesep == "\n":
+        # Published hashes were made with Windows text-mode output.
+        crlf_got = gen_fingerprint(gen, windows_line_endings=True)
+        crlf_total = total_digest((n, f["sha256"]) for n, f in crlf_got.items())
+        if crlf_total == ref.get("total_sha256"):
+            got, total, normalized = crlf_got, crlf_total, True
     if total != ref.get("total_sha256"):
         want = ref.get("files", {})
         differ = sorted(n for n in set(got) | set(want)
-                        if got.get(n, {}).get("sha256") != want.get(n, {}).get("sha256"))
+                        if got.get(n, {}).get("sha256") != want.get(n, {}).get("sha256")
+                        and (crlf_got is None or
+                             crlf_got.get(n, {}).get("sha256") != want.get(n, {}).get("sha256")))
         inputs = gen_inputs(repo)
         changed = sorted(k for k, v in inputs.items() if ref.get("inputs", {}).get(k) != v)
         hint = (" Source files that differ from the ones the fingerprints were made with: %s."
@@ -657,7 +675,9 @@ def verify_gen(repo, gen, prog):
                    "differ (%s%s).%s Check Python 3.13 and capstone %s, and that the source is "
                    "complete and unchanged." % (len(differ), len(want), ", ".join(differ[:4]),
                                                  ", ..." if len(differ) > 4 else "", hint, CAPSTONE))
-    prog("verify", 1, "the generated code matches ours (%d files, SHA-256 %s...)" % (len(got), total[:12]))
+    suffix = "; line endings normalized for comparison" if normalized else ""
+    prog("verify", 1, "the generated code matches ours (%d files, SHA-256 %s...%s)"
+         % (len(got), total[:12], suffix))
     return total
 
 
@@ -745,7 +765,10 @@ def main(argv=None):
     ap.add_argument("--toolkit", help="a clean xboxrecomp checkout at %s (default: download it)" % TOOLKIT_COMMIT[:7])
     ap.add_argument("--work-dir", help="for the toolkit, the generated C and the build (default <install-dir>/work)")
     ap.add_argument("--jobs", type=int, default=os.cpu_count() or 4, help="parallel build jobs")
-    ap.add_argument("--check-only", action="store_true", help="only identify and check the disc")
+    stop = ap.add_mutually_exclusive_group()
+    stop.add_argument("--check-only", action="store_true", help="only identify and check the disc")
+    stop.add_argument("--prepare-only", action="store_true",
+                      help="unpack, translate and verify; do not build an executable")
     ap.add_argument("--progress", choices=("text", "json"), default="text")
     a = ap.parse_args(argv)
     prog = Progress(a.progress == "json")
@@ -759,14 +782,15 @@ def main(argv=None):
         retail = Retail(load_json(os.path.join(FINGERPRINTS, "retail.json"), "fingerprints/retail.json"))
         if not a.check_only:
             load_json(os.path.join(FINGERPRINTS, "generated.json"), "fingerprints/generated.json")
-            vs, vs_ver = find_vs()
-            if not vs:
-                raise Fail(EXIT_DEP, "identify", "Visual Studio 2022 (or the Build Tools for Visual "
-                           "Studio 2022) with the 'Desktop development with C++' workload is needed.")
-            cmake, cmake_ver = find_cmake(vs)
-            if not cmake:
-                raise Fail(EXIT_DEP, "identify", "CMake 3.20 or newer is needed (Visual Studio's "
-                           "C++ CMake tools component, or cmake.org).")
+            if not a.prepare_only:
+                vs, vs_ver = find_vs()
+                if not vs:
+                    raise Fail(EXIT_DEP, "identify", "Visual Studio 2022 (or the Build Tools for Visual "
+                               "Studio 2022) with the 'Desktop development with C++' workload is needed.")
+                cmake, cmake_ver = find_cmake(vs)
+                if not cmake:
+                    raise Fail(EXIT_DEP, "identify", "CMake 3.20 or newer is needed (Visual Studio's "
+                               "C++ CMake tools component, or cmake.org).")
             if os.path.splitdrive(inst)[0].lower() == os.path.splitdrive(work)[0].lower():
                 check_space(inst, NEED_INSTALL + NEED_WORK, "identify", "the game's files and the build")
             else:
@@ -795,6 +819,10 @@ def main(argv=None):
         gen = os.path.join(work, "gen")
         times["pipeline"] = run_pipeline(REPO, tk, xbe, gen, work, prog)
         gen_total = verify_gen(REPO, gen, prog)
+        if a.prepare_only:
+            prog("done", 1, "Preparation complete; generated C is in %s. No executable was built." % gen,
+                 disc=disc, generated_total_sha256=gen_total)
+            return EXIT_OK
         exe, times["build"] = build(REPO, tk, gen, work, cmake, a.jobs, prog)
         record = {
             "format": 1,
