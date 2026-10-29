@@ -112,6 +112,22 @@ macOS.
 
 ## Blood Wake Recomp
 
+### Mixed constant-color and constant-alpha blend factors
+
+**Code-inspection candidate; Windows reproduction is still needed.** The
+D3D11 renderer maps both NV2A constant-color and constant-alpha factors to
+D3D11's blend constant. If either factor requests constant alpha, the
+renderer replaces the constant's RGB components with its alpha component.
+When the other factor simultaneously requests constant color and those
+components differ, it consequently uses alpha where the NV2A CPU blend
+equation uses RGB. It is not known whether Blood Wake uses this combination.
+
+A synthetic regression can use source factor `0x8001` (constant color),
+destination factor `0x8004` (one minus constant alpha), and a blend constant
+such as `0x604080C0`, then compare the D3D11 output with the executor's CPU
+blend equation. The local Metal test covers this combination; it does not
+establish Windows behavior or a game-visible defect.
+
 ### Generated fingerprints depend on Windows line endings
 
 **Reproduced on macOS; candidate for an upstream PR.** The pipeline completed

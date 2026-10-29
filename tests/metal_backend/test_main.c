@@ -1,5 +1,6 @@
 #include <stddef.h>
 #include <stdint.h>
+#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -252,6 +253,311 @@ static int color_near(uint32_t actual, uint32_t expected, int tolerance)
     return 1;
 }
 
+static void check_pixel_near(uint32_t expected, int tolerance, const char *label,
+                             uint32_t value)
+{
+    uint32_t actual = pixel(4, 3);
+    if (!color_near(actual, expected, tolerance)) {
+        fprintf(stderr, "%s 0x%08x: expected %08x, got %08x\n",
+                label, value, expected, actual);
+        s_failed = 1;
+    }
+}
+
+static void blend_state(uint32_t src, uint32_t dst, uint32_t equation, uint32_t constant)
+{
+    method(0x0304, 1);
+    method(0x0344, src);
+    method(0x0348, dst);
+    method(0x034C, constant);
+    method(0x0350, equation);
+}
+
+static float reference_factor(uint32_t factor, unsigned channel,
+                              const float src[4], const float dst[4], const float constant[4])
+{
+    switch (factor) {
+    case 0: return 0;
+    case 1: return 1;
+    case 0x300: return src[channel];
+    case 0x301: return 1 - src[channel];
+    case 0x302: return src[3];
+    case 0x303: return 1 - src[3];
+    case 0x304: return dst[3];
+    case 0x305: return 1 - dst[3];
+    case 0x306: return dst[channel];
+    case 0x307: return 1 - dst[channel];
+    case 0x308: return channel == 3 ? 1 : fminf(src[3], 1 - dst[3]);
+    case 0x8001: return constant[channel];
+    case 0x8002: return 1 - constant[channel];
+    case 0x8003: return constant[3];
+    case 0x8004: return 1 - constant[3];
+    default: abort();
+    }
+}
+
+static uint32_t reference_blend(uint32_t source, uint32_t destination, uint32_t constant,
+                                uint32_t src_factor, uint32_t dst_factor, uint32_t equation)
+{
+    const unsigned shifts[4] = {16, 8, 0, 24};
+    float src[4], dst[4], color[4];
+    uint32_t result = 0;
+    for (unsigned i = 0; i < 4; i++) {
+        src[i] = ((source >> shifts[i]) & 255u) / 255.0f;
+        dst[i] = ((destination >> shifts[i]) & 255u) / 255.0f;
+        color[i] = ((constant >> shifts[i]) & 255u) / 255.0f;
+    }
+    for (unsigned i = 0; i < 4; i++) {
+        float s = src[i] * reference_factor(src_factor, i, src, dst, color);
+        float d = dst[i] * reference_factor(dst_factor, i, src, dst, color);
+        float value;
+        switch (equation) {
+        case 0:
+        case 0x8006: value = s + d; break;
+        case 0x8007: value = fminf(src[i], dst[i]); break;
+        case 0x8008: value = fmaxf(src[i], dst[i]); break;
+        case 0x800A: value = s - d; break;
+        case 0x800B: value = d - s; break;
+        default: abort();
+        }
+        value = fmaxf(0, fminf(1, value));
+        result |= (uint32_t)lroundf(value * 255) << shifts[i];
+    }
+    return result;
+}
+
+static void blend_test(void)
+{
+    static const uint32_t factors[] = {
+        0, 1, 0x300, 0x301, 0x302, 0x303, 0x304, 0x305, 0x306, 0x307,
+        0x308, 0x8001, 0x8002, 0x8003, 0x8004
+    };
+    static const uint32_t equations[] = {0, 0x8006, 0x8007, 0x8008, 0x800A, 0x800B};
+    const uint32_t source = 0x8064C832u, destination = 0xB0402080u, constant = 0x604080C0u;
+    for (unsigned i = 0; i < sizeof factors / sizeof factors[0]; i++) {
+        blend_state(factors[i], 0, 0x8006, constant);
+        clear(destination);
+        triangle(source);
+        draw(3);
+        flip();
+        expect_no_error();
+        check_pixel_near(reference_blend(source, destination, constant, factors[i], 0, 0x8006),
+                         1, "source blend factor", factors[i]);
+        if (factors[i] == 0x308)
+            continue;
+        blend_state(0, factors[i], 0x8006, constant);
+        clear(destination);
+        draw(3);
+        flip();
+        expect_no_error();
+        check_pixel_near(reference_blend(source, destination, constant, 0, factors[i], 0x8006),
+                         1, "destination blend factor", factors[i]);
+    }
+    for (unsigned i = 0; i < sizeof equations / sizeof equations[0]; i++) {
+        blend_state(0x302, 0x303, equations[i], constant);
+        clear(destination);
+        draw(3);
+        flip();
+        expect_no_error();
+        check_pixel_near(reference_blend(source, destination, constant, 0x302, 0x303, equations[i]),
+                         1, "blend equation", equations[i]);
+    }
+    blend_state(0x8001, 0x8004, 0x8006, constant);
+    clear(destination);
+    draw(3);
+    flip();
+    expect_no_error();
+    check_pixel_near(reference_blend(source, destination, constant, 0x8001, 0x8004, 0x8006),
+                     1, "mixed constant factors", constant);
+    method(0x0304, 0);
+    method(0x0344, 0xFFFF);
+    method(0x0350, 0xFFFF);
+    clear(destination);
+    draw(3);
+    flip();
+    expect_no_error();
+    check_pixel_near(source, 0, "disabled blend state", 0);
+}
+
+static void color_mask_test(void)
+{
+    const uint32_t source = 0x12345678u, destination = 0xA1B2C3D4u;
+    const uint32_t nv_bits[] = {0x00010000u, 0x00000100u, 0x00000001u, 0x01000000u};
+    const unsigned shifts[] = {16, 8, 0, 24};
+    for (unsigned mask = 0; mask < 16; mask++) {
+        uint32_t nv_mask = 0, expected = destination;
+        for (unsigned i = 0; i < 4; i++) {
+            if (mask & (1u << i)) {
+                nv_mask |= nv_bits[i];
+                expected = (expected & ~(255u << shifts[i])) | (source & (255u << shifts[i]));
+            }
+        }
+        method(0x0358, nv_mask);
+        clear(destination);
+        triangle(source);
+        draw(3);
+        flip();
+        expect_no_error();
+        check_pixel_near(expected, 0, "colour mask", nv_mask);
+    }
+    method(0x0358, 0x00010001u);
+    blend_state(0x302, 0x303, 0x8006, 0);
+    clear(destination);
+    triangle(source);
+    draw(3);
+    flip();
+    expect_no_error();
+    uint32_t blended = reference_blend(source, destination, 0, 0x302, 0x303, 0x8006);
+    check_pixel_near((destination & 0xFF00FF00u) | (blended & 0x00FF00FFu),
+                     1, "blended colour mask", 0x00010001u);
+}
+
+static void pipeline_cache_test(void)
+{
+    const uint32_t factors[] = {0, 1, 0x300, 0x301, 0x302, 0x303, 0x304, 0x305, 0x306};
+    const uint32_t nv_bits[] = {0x00010000u, 0x00000100u, 0x00000001u, 0x01000000u};
+    const uint32_t source = 0x8064C832u, destination = 0xB0402080u;
+    triangle(source);
+    for (unsigned i = 0; i < 129; i++) {
+        unsigned mask = (i + 15u) % 16u;
+        uint32_t nv_mask = 0;
+        for (unsigned j = 0; j < 4; j++)
+            if (mask & (1u << j))
+                nv_mask |= nv_bits[j];
+        method(0x0358, nv_mask);
+        blend_state(factors[i / 16u], 1, 0x8006, 0);
+        clear(destination);
+        draw(3);
+    }
+    method(0x0358, 0x01010101u);
+    blend_state(0, 1, 0x8006, 0);
+    clear(destination);
+    draw(3);
+    flip();
+    expect_no_error();
+    check_pixel_near(destination, 0, "pipeline cache eviction", 0);
+}
+
+static void cull_test(void)
+{
+    const uint32_t source = 0xFFABCDEFu, destination = 0xFF123456u;
+    const uint32_t faces[] = {0x404, 0x405, 0x408};
+    method(0x0308, 1);
+    for (uint32_t front = 0x900; front <= 0x901; front++) {
+        method(0x03A0, front);
+        for (unsigned f = 0; f < 3; f++) {
+            method(0x039C, faces[f]);
+            for (unsigned ccw = 0; ccw < 2; ccw++) {
+                vertex(0, 2, 2, source, 0, 0);
+                vertex(1, ccw ? 2 : 14, ccw ? 10 : 2, source, 0, 0);
+                vertex(2, ccw ? 14 : 2, ccw ? 2 : 10, source, 0, 0);
+                int is_front = (front == 0x901) == (ccw != 0);
+                int visible = faces[f] != 0x408 &&
+                              (faces[f] == 0x404 ? !is_front : is_front);
+                clear(destination);
+                draw(3);
+                flip();
+                expect_no_error();
+                check_pixel_near(visible ? source : destination, 0, "cull state",
+                                 (front << 16) | (faces[f] << 1) | ccw);
+            }
+        }
+    }
+    method(0x0308, 0);
+    method(0x039C, 0xFFFF);
+    method(0x03A0, 0xFFFF);
+    clear(destination);
+    triangle(source);
+    draw(3);
+    flip();
+    expect_no_error();
+    check_pixel_near(source, 0, "disabled cull state", 0);
+}
+
+static int expected_alpha_pass(uint32_t function, uint32_t reference)
+{
+    switch (function) {
+    case 0x200: return 0;
+    case 0x201: return 128 < reference;
+    case 0x202: return 128 == reference;
+    case 0x203: return 128 <= reference;
+    case 0x204: return 128 > reference;
+    case 0x205: return 128 != reference;
+    case 0x206: return 128 >= reference;
+    case 0x207: return 1;
+    default: abort();
+    }
+}
+
+static void alpha_test(void)
+{
+    const uint32_t source = 0x80A0C0E0u, destination = 0xFF123456u;
+    method(0x0300, 1);
+    for (uint32_t function = 0x200; function <= 0x207; function++) {
+        for (uint32_t reference = 127; reference <= 129; reference++) {
+            method(0x033C, function);
+            method(0x0340, reference);
+            clear(destination);
+            triangle(source);
+            draw(3);
+            flip();
+            expect_no_error();
+            check_pixel_near(expected_alpha_pass(function, reference) ? source : destination,
+                             0, "alpha comparison", (function << 16) | reference);
+        }
+    }
+    vertex(0, 2, 2, 0x80FFFFFFu, 0, 0);
+    vertex(1, 14, 2, 0x82FFFFFFu, 0, 0);
+    vertex(2, 2, 10, 0x80FFFFFFu, 0, 0);
+    method(0x0340, 128);
+    for (uint32_t function = 0x202; function <= 0x205; function++) {
+        method(0x033C, function);
+        clear(destination);
+        draw(3);
+        flip();
+        expect_no_error();
+        check_pixel_near(function == 0x203 || function == 0x205 ? destination : 0x80FFFFFFu,
+                         1, "interpolated alpha comparison", function);
+    }
+    method(0x0300, 0);
+    method(0x033C, 0xFFFF);
+    clear(destination);
+    triangle(source);
+    draw(3);
+    flip();
+    expect_no_error();
+    check_pixel_near(source, 0, "disabled alpha state", 0);
+    method(0x0300, 1);
+    for (unsigned i = 0; i < 4; i++)
+        put32(TEX_AT + 4u * i, 0x40FFFFFFu);
+    setup_texture(TEX_AT, 0x01010000u);
+    quad();
+    for (unsigned i = 0; i < 6; i++)
+        put32(DIFF_AT + 4u * i, 0x80FFFFFFu);
+    method(0x033C, 0x204);
+    for (unsigned pass = 0; pass < 2; pass++) {
+        method(0x0340, pass ? 20u : 40u);
+        clear(destination);
+        draw(6);
+        flip();
+        expect_no_error();
+        check_pixel_near(pass ? 0x20FFFFFFu : destination, 1, "textured alpha", pass);
+    }
+    method(0x0358, 0x00010101u);
+    blend_state(0x302, 0x303, 0x8006, 0);
+    for (unsigned pass = 0; pass < 2; pass++) {
+        method(0x0340, pass ? 20u : 40u);
+        clear(destination);
+        draw(6);
+        flip();
+        expect_no_error();
+        uint32_t blended = reference_blend(0x20FFFFFFu, destination, 0, 0x302, 0x303, 0x8006);
+        uint32_t expected = pass ? (destination & 0xFF000000u) | (blended & 0x00FFFFFFu)
+                                 : destination;
+        check_pixel_near(expected, 1, "textured alpha with blending", pass);
+    }
+}
+
 static void perspective_test(void)
 {
     method(0x1760, 2 | (4 << 4) | (16 << 8));
@@ -375,8 +681,20 @@ static void failure_test(const char *which)
     } else {
         clear(0xFF102030u);
         if (!strcmp(which, "unsupported-state"))
-            method(0x0304, 1);
-        else if (!strcmp(which, "unsupported-fog"))
+            method(0x030C, 1);
+        else if (!strcmp(which, "invalid-blend-src") || !strcmp(which, "invalid-blend-dst") ||
+                 !strcmp(which, "invalid-blend-equation")) {
+            blend_state(!strcmp(which, "invalid-blend-src") ? 0xFFFFu : 1,
+                        !strcmp(which, "invalid-blend-dst") ? 0x308u : 0,
+                        !strcmp(which, "invalid-blend-equation") ? 0xFFFFu : 0x8006u, 0);
+        } else if (!strcmp(which, "invalid-alpha-func")) {
+            method(0x0300, 1);
+            method(0x033C, 0xFFFFu);
+        } else if (!strcmp(which, "invalid-cull-face") || !strcmp(which, "invalid-cull-winding")) {
+            method(0x0308, 1);
+            method(0x039C, !strcmp(which, "invalid-cull-face") ? 0xFFFFu : 0x405u);
+            method(0x03A0, !strcmp(which, "invalid-cull-winding") ? 0xFFFFu : 0x900u);
+        } else if (!strcmp(which, "unsupported-fog"))
             method(0x02A4, 1);
         else if (!strcmp(which, "unsupported-stage"))
             method(0x1B40, TEX_AT);
@@ -406,7 +724,13 @@ static void failure_test(const char *which)
               !strcmp(which, "texture-extent") ||
               !strcmp(which, "invalid-texture") || !strcmp(which, "unaligned-texture") ||
               !strcmp(which, "feedback")) ? 6 : 3);
-        const char *expected = !strcmp(which, "unsupported-state") ? "unsupported blend"
+        const char *expected = !strcmp(which, "unsupported-state") ? "unsupported depth"
+                             : !strcmp(which, "invalid-blend-src") ? "unsupported blend factor"
+                             : !strcmp(which, "invalid-blend-dst") ? "unsupported destination blend factor"
+                             : !strcmp(which, "invalid-blend-equation") ? "unsupported blend equation"
+                             : !strcmp(which, "invalid-alpha-func") ? "unsupported alpha comparison"
+                             : (!strcmp(which, "invalid-cull-face") ||
+                                !strcmp(which, "invalid-cull-winding")) ? "unsupported cull"
                              : !strcmp(which, "unsupported-fog") ? "unsupported fog"
                              : !strcmp(which, "unsupported-stage") ? "texture stages"
                              : !strcmp(which, "unsupported-combiner") ? "register-combiner"
@@ -448,6 +772,16 @@ int main(int argc, char **argv)
         seed_order_test();
     else if (!strcmp(argv[1], "perspective"))
         perspective_test();
+    else if (!strcmp(argv[1], "blend"))
+        blend_test();
+    else if (!strcmp(argv[1], "color-mask"))
+        color_mask_test();
+    else if (!strcmp(argv[1], "alpha-test"))
+        alpha_test();
+    else if (!strcmp(argv[1], "pipeline-cache"))
+        pipeline_cache_test();
+    else if (!strcmp(argv[1], "cull"))
+        cull_test();
     else if (!strcmp(argv[1], "full-rect"))
         full_rect_test();
     else if (!strcmp(argv[1], "extent-boundary"))

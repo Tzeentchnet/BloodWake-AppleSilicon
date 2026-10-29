@@ -60,8 +60,10 @@ target_link_libraries(bw_metal_backend_test PRIVATE
 set_target_properties(bw_metal_backend_test PROPERTIES C_STANDARD 11 C_STANDARD_REQUIRED ON)
 
 enable_testing()
-foreach(case visual seed-order perspective full-rect extent-boundary texture-boundary lifecycle invalid-base
-             unsupported-state unsupported-fog unsupported-texture cube-texture texture-extent
+foreach(case visual seed-order perspective blend color-mask alpha-test pipeline-cache cull full-rect extent-boundary texture-boundary lifecycle invalid-base
+             unsupported-state invalid-blend-src invalid-blend-dst invalid-blend-equation invalid-alpha-func
+             invalid-cull-face invalid-cull-winding
+             unsupported-fog unsupported-texture cube-texture texture-extent
              invalid-surface unsupported-surface unsupported-origin
              invalid-address surface-extent invalid-texture unaligned-texture unsupported-combiner
              screen-combiner unsupported-stage unsupported-clear unsupported-rect incomplete-rect

@@ -62,11 +62,13 @@ game or material generated from it. See [LEGAL.md](LEGAL.md) and
 The standalone Metal backend test sends synthetic NV2A methods through the
 carried pushbuffer executor into an off-screen Metal target. It covers 32-bit
 colour clears, coloured triangles, a basic nearest-filtered and clamp-to-edge
-stage-0 texture, and flip readback into synthetic guest memory. Unsupported
+stage-0 texture, blend factors and equations, colour-write masks, alpha
+comparisons, face culling, and flip readback into synthetic guest memory. Unsupported
 states encountered by this test backend are reported as errors; surface and
 texture dimensions are limited to 16384 pixels per axis. It is not
-registered with the game: register combiners, depth/stencil, blending, native
-window presentation and much of the renderer remain unfinished.
+registered with the game: register combiners, depth/stencil, native
+window presentation and much of the renderer remain unfinished. The new
+render states are exercised on the basic draw path, not combiner batches.
 
 The separate Metal smoke test renders and reads back a synthetic triangle.
 The audio test checks the SDL dummy device and the carried stereo output
@@ -102,7 +104,9 @@ The existing Windows build remains available through
 [`tools/build_from_disc.py`](tools/build_from_disc.py) without `--prepare-only`;
 see [docs/BUILDING.md](docs/BUILDING.md) for its Windows prerequisites and
 instructions. The original project and its documentation remain available
-[upstream](https://github.com/minimalice92/bloodwake-recomp).
+[upstream](https://github.com/minimalice92/bloodwake-recomp). Two newer
+upstream commits add Windows shader-cache warm-up to the installer; they are
+not yet merged into this fork and do not implement Metal rendering.
 
 ## Credits and licence
 

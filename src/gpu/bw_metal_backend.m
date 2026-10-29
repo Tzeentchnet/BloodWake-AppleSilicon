@@ -15,6 +15,7 @@
 extern ptrdiff_t xbox_GetMemoryOffset(void);
 
 #define METAL_TEST_MAX_DIMENSION 16384u
+#define METAL_TEST_MAX_PIPELINES 128u
 
 typedef struct {
     float position[4];
@@ -25,7 +26,13 @@ typedef struct {
 typedef struct {
     float surface_texture[4];
     float depth[4];
+    float alpha[4];
 } MetalUniforms;
+
+typedef struct {
+    uint32_t textured, color_mask;
+    uint32_t blend_enable, blend_src, blend_dst, blend_eq;
+} MetalPipelineKey;
 
 static uint8_t *s_guest;
 static size_t s_guest_size;
@@ -35,8 +42,10 @@ static int s_dirty;
 static Nv2aSurface s_current;
 static id<MTLDevice> s_device;
 static id<MTLCommandQueue> s_queue;
-static id<MTLRenderPipelineState> s_color_pipeline;
-static id<MTLRenderPipelineState> s_texture_pipeline;
+static id<MTLFunction> s_vertex_function;
+static id<MTLFunction> s_color_function;
+static id<MTLFunction> s_texture_function;
+static NSMutableDictionary<NSData *, id<MTLRenderPipelineState>> *s_pipelines;
 static id<MTLSamplerState> s_sampler;
 static id<MTLTexture> s_surface;
 
@@ -44,7 +53,7 @@ static const char s_shader[] =
     "#include <metal_stdlib>\n"
     "using namespace metal;\n"
     "struct Vertex { float4 position; float4 color; float4 texcoord; };\n"
-    "struct Uniforms { float4 surface_texture; float4 depth; };\n"
+    "struct Uniforms { float4 surface_texture; float4 depth; float4 alpha; };\n"
     "struct Varying { float4 position [[position]]; float4 color; float2 uv; };\n"
     "vertex Varying vertex_main(uint i [[vertex_id]],\n"
     "    const device Vertex *vertices [[buffer(0)]],\n"
@@ -59,10 +68,23 @@ static const char s_shader[] =
     "  out.uv = v.texcoord.xy / u.surface_texture.zw;\n"
     "  return out;\n"
     "}\n"
-    "fragment float4 color_main(Varying in [[stage_in]]) { return in.color; }\n"
+    /* Match the D3D11 basic path, including its equality tolerance. */
+    "float4 alpha_test(float4 color, constant Uniforms &u) {\n"
+    "  if (u.alpha.z > 0.5) {\n"
+    "    float a = color.a, r = u.alpha.y; int f = int(u.alpha.x);\n"
+    "    bool ok = (f == 7) || (f == 1 && a < r) || (f == 2 && abs(a-r) < 0.002)\n"
+    "           || (f == 3 && a <= r) || (f == 4 && a > r)\n"
+    "           || (f == 5 && abs(a-r) >= 0.002) || (f == 6 && a >= r);\n"
+    "    if (!ok) discard_fragment();\n"
+    "  }\n"
+    "  return color;\n"
+    "}\n"
+    "fragment float4 color_main(Varying in [[stage_in]],\n"
+    "    constant Uniforms &u [[buffer(1)]]) { return alpha_test(in.color, u); }\n"
     "fragment float4 texture_main(Varying in [[stage_in]],\n"
+    "    constant Uniforms &u [[buffer(1)]],\n"
     "    texture2d<float> tex [[texture(0)]], sampler samp [[sampler(0)]]) {\n"
-    "  return in.color * tex.sample(samp, in.uv);\n"
+    "  return alpha_test(in.color * tex.sample(samp, in.uv), u);\n"
     "}\n";
 
 static int metal_fail(const char *format, ...)
@@ -191,10 +213,14 @@ static int validate_state(const Nv2aRenderState *rs)
 {
     if (!rs)
         return metal_fail("missing render state");
-    if (rs->blend_enable || rs->alpha_test_enable || rs->depth_test_enable ||
-        rs->depth_write || rs->stencil_enable || rs->cull_enable ||
-        rs->color_mask != 0x01010101u)
-        return metal_fail("unsupported blend, alpha, depth, stencil, cull or colour-mask state");
+    if (rs->depth_test_enable || rs->depth_write || rs->stencil_enable)
+        return metal_fail("unsupported depth or stencil state");
+    if (rs->cull_enable &&
+        ((rs->cull_face != 0x404u && rs->cull_face != 0x405u && rs->cull_face != 0x408u) ||
+         (rs->front_face != 0x900u && rs->front_face != 0x901u)))
+        return metal_fail("unsupported cull face or winding");
+    if (rs->alpha_test_enable && (rs->alpha_func < 0x200u || rs->alpha_func > 0x207u))
+        return metal_fail("unsupported alpha comparison 0x%08x", rs->alpha_func);
     if (bw_backend_reg(0x02A4u) || bw_backend_reg(0x0338u) ||
         bw_backend_reg(0x17F8u) || bw_backend_combiner_seen() ||
         bw_backend_reg(0x1E70u))
@@ -209,6 +235,103 @@ static int validate_state(const Nv2aRenderState *rs)
             return metal_fail("texture stages 1-3 are unsupported");
     }
     return 1;
+}
+
+static int blend_factor(uint32_t factor, int alpha, MTLBlendFactor *result)
+{
+    switch (factor) {
+    case 0: *result = MTLBlendFactorZero; break;
+    case 1: *result = MTLBlendFactorOne; break;
+    case 0x300: *result = alpha ? MTLBlendFactorSourceAlpha : MTLBlendFactorSourceColor; break;
+    case 0x301: *result = alpha ? MTLBlendFactorOneMinusSourceAlpha
+                                : MTLBlendFactorOneMinusSourceColor; break;
+    case 0x302: *result = MTLBlendFactorSourceAlpha; break;
+    case 0x303: *result = MTLBlendFactorOneMinusSourceAlpha; break;
+    case 0x304: *result = MTLBlendFactorDestinationAlpha; break;
+    case 0x305: *result = MTLBlendFactorOneMinusDestinationAlpha; break;
+    case 0x306: *result = alpha ? MTLBlendFactorDestinationAlpha
+                                : MTLBlendFactorDestinationColor; break;
+    case 0x307: *result = alpha ? MTLBlendFactorOneMinusDestinationAlpha
+                                : MTLBlendFactorOneMinusDestinationColor; break;
+    case 0x308: *result = alpha ? MTLBlendFactorOne : MTLBlendFactorSourceAlphaSaturated; break;
+    case 0x8001: *result = alpha ? MTLBlendFactorBlendAlpha : MTLBlendFactorBlendColor; break;
+    case 0x8002: *result = alpha ? MTLBlendFactorOneMinusBlendAlpha
+                                 : MTLBlendFactorOneMinusBlendColor; break;
+    case 0x8003: *result = MTLBlendFactorBlendAlpha; break;
+    case 0x8004: *result = MTLBlendFactorOneMinusBlendAlpha; break;
+    default: return metal_fail("unsupported blend factor 0x%08x", factor);
+    }
+    return 1;
+}
+
+static int blend_operation(uint32_t equation, MTLBlendOperation *result)
+{
+    switch (equation) {
+    /* The executor's unwritten equation is zero; the D3D11 path treats it as ADD. */
+    case 0:
+    case 0x8006: *result = MTLBlendOperationAdd; break;
+    case 0x8007: *result = MTLBlendOperationMin; break;
+    case 0x8008: *result = MTLBlendOperationMax; break;
+    case 0x800A: *result = MTLBlendOperationSubtract; break;
+    case 0x800B: *result = MTLBlendOperationReverseSubtract; break;
+    default: return metal_fail("unsupported blend equation 0x%08x", equation);
+    }
+    return 1;
+}
+
+static id<MTLRenderPipelineState> draw_pipeline(int textured, const Nv2aRenderState *rs)
+{
+    MetalPipelineKey key = {
+        .textured = textured != 0,
+        .color_mask = rs->color_mask & 0x01010101u,
+        .blend_enable = rs->blend_enable != 0,
+        .blend_src = rs->blend_enable ? rs->blend_src : 0,
+        .blend_dst = rs->blend_enable ? rs->blend_dst : 0,
+        .blend_eq = rs->blend_enable ? rs->blend_eq : 0,
+    };
+    MTLBlendFactor src_rgb, dst_rgb, src_alpha, dst_alpha;
+    MTLBlendOperation operation;
+    if (key.blend_enable) {
+        if (key.blend_dst == 0x308u)
+            return metal_fail("unsupported destination blend factor 0x%08x", key.blend_dst), nil;
+        if (!blend_factor(key.blend_src, 0, &src_rgb) ||
+            !blend_factor(key.blend_dst, 0, &dst_rgb) ||
+            !blend_factor(key.blend_src, 1, &src_alpha) ||
+            !blend_factor(key.blend_dst, 1, &dst_alpha) ||
+            !blend_operation(key.blend_eq, &operation))
+            return nil;
+    }
+    NSData *cache_key = [NSData dataWithBytes:&key length:sizeof key];
+    id<MTLRenderPipelineState> state = s_pipelines[cache_key];
+    if (state)
+        return state;
+    MTLRenderPipelineDescriptor *pipeline = [MTLRenderPipelineDescriptor new];
+    pipeline.vertexFunction = s_vertex_function;
+    pipeline.fragmentFunction = textured ? s_texture_function : s_color_function;
+    MTLRenderPipelineColorAttachmentDescriptor *attachment = pipeline.colorAttachments[0];
+    attachment.pixelFormat = MTLPixelFormatBGRA8Unorm;
+    attachment.writeMask = MTLColorWriteMaskNone;
+    if (key.color_mask & 0x00010000u) attachment.writeMask |= MTLColorWriteMaskRed;
+    if (key.color_mask & 0x00000100u) attachment.writeMask |= MTLColorWriteMaskGreen;
+    if (key.color_mask & 0x00000001u) attachment.writeMask |= MTLColorWriteMaskBlue;
+    if (key.color_mask & 0x01000000u) attachment.writeMask |= MTLColorWriteMaskAlpha;
+    if (key.blend_enable) {
+        attachment.blendingEnabled = YES;
+        attachment.sourceRGBBlendFactor = src_rgb;
+        attachment.destinationRGBBlendFactor = dst_rgb;
+        attachment.sourceAlphaBlendFactor = src_alpha;
+        attachment.destinationAlphaBlendFactor = dst_alpha;
+        attachment.rgbBlendOperation = operation;
+        attachment.alphaBlendOperation = operation;
+    }
+    NSError *error = nil;
+    state = [s_device newRenderPipelineStateWithDescriptor:pipeline error:&error];
+    if (!state)
+        return metal_fail("draw pipeline creation failed: %s", metal_error_text(error)), nil;
+    if (s_pipelines.count >= METAL_TEST_MAX_PIPELINES)
+        [s_pipelines removeAllObjects];
+    s_pipelines[cache_key] = state;
+    return state;
 }
 
 static id<MTLTexture> decode_texture(const Nv2aTexture *tex)
@@ -318,7 +441,10 @@ static void metal_draw(const Nv2aSurface *s, const Nv2aBatch *batch)
             metal_fail("invalid triangle batch");
             return;
         }
-        if (!validate_state(batch->state) || !prepare_surface(s))
+        if (!validate_state(batch->state))
+            return;
+        id<MTLRenderPipelineState> pipeline = draw_pipeline(batch->texture != NULL, batch->state);
+        if (!pipeline || !prepare_surface(s))
             return;
         if (!batch->texture && bw_backend_reg(0x1B00u)) {
             metal_fail("bound stage-0 texture was not supplied to the draw");
@@ -366,7 +492,13 @@ static void metal_draw(const Nv2aSurface *s, const Nv2aBatch *batch)
                                 texture ? (float)batch->texture->width : 1.0f,
                                 texture ? (float)batch->texture->height : 1.0f},
             .depth = {batch->state->depth_min, batch->state->depth_max, 0.0f, 0.0f},
+            .alpha = {batch->state->alpha_test_enable
+                          ? (float)(batch->state->alpha_func - 0x200u) : 7.0f,
+                      (float)(batch->state->alpha_ref & 0xFFu) / 255.0f,
+                      batch->state->alpha_test_enable ? 1.0f : 0.0f, 0.0f},
         };
+        if (batch->state->cull_enable && batch->state->cull_face == 0x408u)
+            return;
         MTLRenderPassDescriptor *pass = [MTLRenderPassDescriptor renderPassDescriptor];
         pass.colorAttachments[0].texture = s_surface;
         pass.colorAttachments[0].loadAction = MTLLoadActionLoad;
@@ -377,9 +509,22 @@ static void metal_draw(const Nv2aSurface *s, const Nv2aBatch *batch)
             metal_fail("could not create draw command");
             return;
         }
-        [encoder setRenderPipelineState:texture ? s_texture_pipeline : s_color_pipeline];
+        [encoder setRenderPipelineState:pipeline];
         [encoder setVertexBuffer:vertices offset:0 atIndex:0];
         [encoder setVertexBytes:&uniforms length:sizeof uniforms atIndex:1];
+        [encoder setFragmentBytes:&uniforms length:sizeof uniforms atIndex:1];
+        if (batch->state->cull_enable) {
+            [encoder setFrontFacingWinding:batch->state->front_face == 0x900u
+                                            ? MTLWindingClockwise : MTLWindingCounterClockwise];
+            [encoder setCullMode:batch->state->cull_face == 0x404u ? MTLCullModeFront : MTLCullModeBack];
+        }
+        if (batch->state->blend_enable) {
+            uint32_t color = batch->state->blend_color;
+            [encoder setBlendColorRed:((color >> 16) & 255u) / 255.0f
+                                green:((color >> 8) & 255u) / 255.0f
+                                 blue:(color & 255u) / 255.0f
+                                alpha:((color >> 24) & 255u) / 255.0f];
+        }
         if (texture) {
             [encoder setFragmentTexture:texture atIndex:0];
             [encoder setFragmentSamplerState:s_sampler atIndex:0];
@@ -428,21 +573,14 @@ static int initialize_metal(void)
     id<MTLLibrary> library = [s_device newLibraryWithSource:@(s_shader) options:nil error:&error];
     if (!library)
         return metal_fail("shader compilation failed: %s", metal_error_text(error));
-    MTLRenderPipelineDescriptor *pipeline = [MTLRenderPipelineDescriptor new];
-    pipeline.vertexFunction = [library newFunctionWithName:@"vertex_main"];
-    pipeline.fragmentFunction = [library newFunctionWithName:@"color_main"];
-    pipeline.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm;
-    if (!pipeline.vertexFunction || !pipeline.fragmentFunction)
-        return metal_fail("Metal colour shader entry point missing");
-    s_color_pipeline = [s_device newRenderPipelineStateWithDescriptor:pipeline error:&error];
-    if (!s_color_pipeline)
-        return metal_fail("colour pipeline creation failed: %s", metal_error_text(error));
-    pipeline.fragmentFunction = [library newFunctionWithName:@"texture_main"];
-    if (!pipeline.fragmentFunction)
-        return metal_fail("Metal texture shader entry point missing");
-    s_texture_pipeline = [s_device newRenderPipelineStateWithDescriptor:pipeline error:&error];
-    if (!s_texture_pipeline)
-        return metal_fail("texture pipeline creation failed: %s", metal_error_text(error));
+    s_vertex_function = [library newFunctionWithName:@"vertex_main"];
+    s_color_function = [library newFunctionWithName:@"color_main"];
+    s_texture_function = [library newFunctionWithName:@"texture_main"];
+    if (!s_vertex_function || !s_color_function || !s_texture_function)
+        return metal_fail("Metal shader entry point missing");
+    s_pipelines = [NSMutableDictionary new];
+    if (!s_pipelines)
+        return metal_fail("could not create draw pipeline cache");
     MTLSamplerDescriptor *sampler = [MTLSamplerDescriptor new];
     sampler.minFilter = MTLSamplerMinMagFilterNearest;
     sampler.magFilter = MTLSamplerMinMagFilterNearest;
@@ -487,8 +625,10 @@ void bw_metal_backend_stop(void)
     s_dirty = 0;
     s_surface = nil;
     s_sampler = nil;
-    s_color_pipeline = nil;
-    s_texture_pipeline = nil;
+    s_pipelines = nil;
+    s_vertex_function = nil;
+    s_color_function = nil;
+    s_texture_function = nil;
     s_queue = nil;
     s_device = nil;
     s_guest = NULL;
