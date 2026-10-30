@@ -23,7 +23,8 @@ extern int g_bw_fl_on;
 void bw_fl_init(void);
 void bw_fl_event_(unsigned type, unsigned a, unsigned b, unsigned c);
 #define bw_fl_event(t, a, b, c) do { if (g_bw_fl_on) bw_fl_event_((t), (a), (b), (c)); } while (0)
-/* Register the calling thread for the stack sampler: 0 the game thread, 1 the NV2A thread. */
+/* Register the calling thread for the stack sampler: 0 the game thread, 1 the NV2A thread.
+ * macOS uses frame-pointer walks, which can be incomplete in optimized/system code. */
 void bw_fl_thread(int role);
 unsigned long long bw_fl_ticks(void);           /* the host performance counter */
 unsigned bw_fl_us_since(unsigned long long t0); /* microseconds since a bw_fl_ticks() */

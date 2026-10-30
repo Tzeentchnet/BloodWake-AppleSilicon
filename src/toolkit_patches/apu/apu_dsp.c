@@ -24,6 +24,7 @@
 
 #include "apu_state.h"
 #include "fpconv.h"
+#include "../bw_shared_u8.h"
 
 #include <stdlib.h>
 #include <string.h>
@@ -91,8 +92,8 @@ static void bw_pagecheck(MCPXAPUState *d)
                     " window:rms=%.0f,zcr=%.2f\n",
                     frames / 1500, voice, idx, k, off, len & 0xFFFF,
                     mcpx_apu_phys_class(off),
-                    a < (64u << 20) ? xbox_PhysRamNameMap()[a >> 12] : 0,
-                    a < (64u << 20) ? xbox_ContiguousPageMap()[a >> 12] : 0,
+                    a < (64u << 20) ? bw_shared_u8_load(&xbox_PhysRamNameMap()[a >> 12]) : 0,
+                    a < (64u << 20) ? bw_shared_u8_load(&xbox_ContiguousPageMap()[a >> 12]) : 0,
                     rr, zr, rw, zw);
         }
     }
@@ -371,6 +372,7 @@ static uint32_t *dsp_ack_auto_slot(MCPXAPUState *d)
  * itself, so the stub's auto-ack stands down, and the DSP stage is its. */
 int bw_xdsp_enabled(void);
 void bw_xdsp_init(MCPXAPUState *d);
+void bw_xdsp_shutdown(void);
 int bw_xdsp_frame(MCPXAPUState *d, float mixbins[NUM_MIXBINS][NUM_SAMPLES_PER_FRAME]);
 
 void mcpx_apu_dsp_ack_poll(MCPXAPUState *d)
@@ -437,6 +439,7 @@ void mcpx_apu_dsp_init(MCPXAPUState *d)
  * Safe to call twice. */
 void mcpx_apu_dsp_finalize(MCPXAPUState *d)
 {
+    bw_xdsp_shutdown();
     free(d->gp.dsp);
     free(d->ep.dsp);
     d->gp.dsp = NULL;

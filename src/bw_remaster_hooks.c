@@ -25,12 +25,12 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <math.h>
-#include <windows.h>
 #include "bw_edition.h"
+#include "bw_hook_platform.h"
 #include "bw_widescreen.h"
 
 extern ptrdiff_t g_xbox_mem_offset;
-extern __declspec(thread) uint32_t g_eax, g_ecx, g_edx, g_esp;   /* RECOMP_TLS: TK-7 */
+extern BW_HOOK_TLS uint32_t g_eax, g_ecx, g_edx, g_esp;   /* RECOMP_TLS: TK-7 */
 
 #define RH_MEM32(va) (*(volatile uint32_t *)((uintptr_t)(uint32_t)(va) + g_xbox_mem_offset))
 #define RH_MEMF(va)  (*(volatile float *)((uintptr_t)(uint32_t)(va) + g_xbox_mem_offset))
@@ -91,13 +91,13 @@ void sub_00013180(void)
             bw_fix_note_hit(BW_FIX_BOAT_LANDING_WEIGHT);
         }
     }
-    n = InterlockedIncrement(&s_splash_calls);
+    n = bw_hook_increment(&s_splash_calls);
     if (n == 1)
         bw_edition_add_summary(splash_probe_summary);
     if (g_eax & 0xFFu) {
-        InterlockedIncrement(&s_splash_true);
+        bw_hook_increment(&s_splash_true);
         if (!item)
-            InterlockedIncrement(&s_splash_noitem);
+            bw_hook_increment(&s_splash_noitem);
         else if (bw_fix_enabled(BW_FIX_BOAT_SPLASH_RANGE))
             bw_fix_note_hit(BW_FIX_BOAT_SPLASH_RANGE);   /* a splash the fix made possible */
     }
@@ -141,6 +141,7 @@ static uint32_t s_camsys = CAMSYS_DEFAULT;
  * edx = value; appends the two words at the push pointer [0x133F70], making
  * space through D3D_MakeSpace when full; plain ret; seen), so it lands in
  * stream order with the draws around it. The caller's eax/ecx/edx are kept. */
+#if defined(_WIN32)
 extern void D3DDevice_SetRenderState_Simple_00126300(void);
 /* Built without names/bw_names.json (the public repo, D-019) the generated C
  * names this function by its address alone ("sub" "_" + 00126300): the linker
@@ -148,6 +149,7 @@ extern void D3DDevice_SetRenderState_Simple_00126300(void);
  * the hook scans (tools/bw_names.py, the recompiler's) don't count it as a
  * reference, which would rename the function in the named build. */
 #pragma comment(linker, "/alternatename:D3DDevice_SetRenderState_Simple_00126300=sub" "_00126300")
+#endif
 static volatile long s_ws_emitted[4];
 
 static void ws_emit_summary(void)
@@ -159,7 +161,7 @@ static void ws_emit_summary(void)
 static void ws_emit(uint32_t param)
 {
     uint32_t sa = g_eax, sc = g_ecx, sd = g_edx, op = (param >> 8) & 0xFFu;
-    if (op < 4 && InterlockedIncrement(&s_ws_emitted[op]) == 1 && op == 1)
+    if (op < 4 && bw_hook_increment(&s_ws_emitted[op]) == 1 && op == 1)
         bw_edition_add_summary(ws_emit_summary);
     /* Once. Before TK-38 (the pushbuffer walker lost commands at ring wraps;
      * fixed by D9, main 831bb19) about 1 in 1,000 markers went missing (runs
@@ -170,7 +172,11 @@ static void ws_emit(uint32_t param)
     RH_MEM32(g_esp) = 0x00126300u;          /* a return address for its ret to pop */
     g_ecx = BW_WS_NOP_HEADER;
     g_edx = param;
+#if defined(_WIN32)
     D3DDevice_SetRenderState_Simple_00126300();
+#else
+    bw_hook_call_guest(0x00126300u);
+#endif
     g_eax = sa; g_ecx = sc; g_edx = sd;
 }
 

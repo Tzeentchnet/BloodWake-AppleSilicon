@@ -1,7 +1,8 @@
 /*
  * Blood Wake carried patch of xboxrecomp v0.16.0 src/usb/ohci.c (MIT License,
  * Copyright (c) 2026 sp00nz -- see ../xboxrecomp/LICENSE). Built in place of the
- * toolkit's copy by our CMakeLists.txt; the only change is bus_resolve (TK-13).
+ * toolkit's copy by our CMakeLists.txt; includes bus_resolve (TK-13), POSIX
+ * register synchronization, and joinable worker/trap teardown.
  * ohci.c.diff beside this file is the exact difference from the pinned original.
  */
 /*
@@ -17,6 +18,7 @@
 #include "../platform/mmio_decode_a64.h"
 #include "../kernel/xbox_memory_layout.h"
 #include "../kernel/kernel.h"
+#include "../bw_shared_u8.h"
 #include "usb_gamepad.h"
 #include "../input/xinput_xbox.h"   /* xbox_InputSetState: rumble */
 
@@ -24,11 +26,18 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stddef.h>
+#if !defined(_WIN32)
+#include <limits.h>
+#include <pthread.h>
+#include <stdatomic.h>
+#include "../bw_runtime_lifecycle.h"
+#endif
 
 /* Where the registers can be trapped. They are answered by faulting on the
  * aperture and decoding the instruction that touched it: the x86-64 decoder
- * under a Win32 VEH, or the A64 decoder under a POSIX SIGBUS/SIGSEGV
- * handler. A host with neither leaves the model off (see xbox_OhciInit). */
+ * under a Win32 VEH, or the A64 decoder over a captured POSIX fault context.
+ * POSIX device callbacks must run outside the signal handler. A host with
+ * neither decoder leaves the model off (see xbox_OhciInit). */
 #if defined(_WIN32)
 #  define OHCI_TRAP_WIN32 1
 #elif defined(__aarch64__)
@@ -165,17 +174,27 @@ static void wr32(uint32_t va, uint32_t v);
  * cheap -- this thread does nothing but read a few guest dwords per pass. */
 #define OHCI_TICK_MS            4u
 
+#if defined(_WIN32)
+typedef uint32_t OhciRegister;
+typedef unsigned OhciCount;
+typedef volatile unsigned OhciAck;
+#else
+typedef _Atomic uint32_t OhciRegister;
+typedef _Atomic unsigned OhciCount;
+typedef _Atomic unsigned OhciAck;
+#endif
+
 typedef struct {
     uint32_t base;                      /* Xbox VA of the register block   */
-    uint32_t reg[OHCI_REG_MAX / 4];
-    unsigned reads, writes, decode_fail;
+    OhciRegister reg[OHCI_REG_MAX / 4];
+    OhciCount reads, writes, decode_fail;
     int      index;
     int      periodic_seen;
     int      ple_seen;
     /* Bumped every time the driver writes HcInterruptStatus. The interrupt
      * thread watches it to tell a source nobody is servicing from one that
      * is simply busy -- see the delivery loop. */
-    volatile unsigned ack_seq;
+    OhciAck ack_seq;
 } OhciController;
 
 static OhciController s_hc[2];
@@ -190,10 +209,31 @@ static unsigned s_ndp = OHCI_PORTS;
 static int s_npads = 1;          /* RECOMP_USB_PADS */
 static int s_enabled;
 static int s_trace;
+static int s_init_done;
+#if !defined(_WIN32)
+static pthread_t s_ohci_thread;
+static int s_ohci_thread_started;
+static volatile LONG s_ohci_stop;
+static unsigned s_ohci_trapped;
+#endif
 
-static uint32_t *reg_of(OhciController *hc, uint32_t off)
+static OhciRegister *reg_of(OhciController *hc, uint32_t off)
 {
     return (off < OHCI_REG_MAX) ? &hc->reg[off / 4] : NULL;
+}
+
+static void ohci_update_bits(OhciRegister *reg, uint32_t mask, uint32_t value)
+{
+#if defined(_WIN32)
+    *reg = (*reg & ~mask) | (value & mask);
+#else
+    uint32_t old = atomic_load_explicit(reg, memory_order_relaxed);
+    uint32_t replacement;
+    do {
+        replacement = (old & ~mask) | (value & mask);
+    } while (!atomic_compare_exchange_weak_explicit(
+        reg, &old, replacement, memory_order_seq_cst, memory_order_relaxed));
+#endif
 }
 
 /* ---- register semantics ------------------------------------------------ */
@@ -202,7 +242,7 @@ static uint64_t ohci_read(void *dev, uint32_t off, int size)
 {
     OhciController *hc = (OhciController *)dev;
     uint32_t aligned = off & ~3u;
-    uint32_t *r = reg_of(hc, aligned);
+    OhciRegister *r = reg_of(hc, aligned);
     uint32_t v = r ? *r : 0;
 
     hc->reads++;
@@ -226,7 +266,7 @@ static uint64_t ohci_read(void *dev, uint32_t off, int size)
     }
 
     if (s_trace) {
-        static unsigned n;
+        static OhciCount n;
         if (n++ < 600)
             fprintf(stderr, "  [OHCI%d] read  +0x%02X = %08X\n",
                     hc->index, off, (uint32_t)v);
@@ -238,7 +278,7 @@ static void ohci_write(void *dev, uint32_t off, uint64_t val, int size)
 {
     OhciController *hc = (OhciController *)dev;
     uint32_t aligned = off & ~3u;
-    uint32_t *r = reg_of(hc, aligned);
+    OhciRegister *r = reg_of(hc, aligned);
     uint32_t v = (uint32_t)val;
 
     hc->writes++;
@@ -246,7 +286,7 @@ static void ohci_write(void *dev, uint32_t off, uint64_t val, int size)
         return;
 
     if (s_trace) {
-        static unsigned n;
+        static OhciCount n;
         if (n++ < 600)
             fprintf(stderr, "  [OHCI%d] write +0x%02X = %08X\n",
                     hc->index, off, v);
@@ -305,7 +345,7 @@ static void ohci_write(void *dev, uint32_t off, uint64_t val, int size)
     case HcRhDescriptorA:
         /* NumberDownstreamPorts is ours; the driver may set the power and
          * over-current policy bits above it. */
-        *r = (*r & 0x000000FFu) | (v & ~0x000000FFu);
+        ohci_update_bits(r, 0xFFFFFF00u, v);
         return;
 
     case HcRhPortStatus1:
@@ -323,7 +363,7 @@ static void ohci_write(void *dev, uint32_t off, uint64_t val, int size)
          * raised. The driver reset it forever. A hub that reports N ports has
          * to give all N the same semantics. */
         unsigned port = (aligned - HcRhPortStatus1) / 4;
-        uint32_t *ps = &hc->reg[(HcRhPortStatus1 + port * 4) / 4];
+        OhciRegister *ps = &hc->reg[(HcRhPortStatus1 + port * 4) / 4];
 
         /* Write-1-to-clear first, because the change bits a write carries
          * refer to the state BEFORE it.
@@ -350,8 +390,8 @@ static void ohci_write(void *dev, uint32_t off, uint64_t val, int size)
              * reset-change bit says the reset finished.
              *
              * Only the status bit is set here. Delivering the interrupt is the
-             * controller thread's job, because this runs on the guest's own
-             * thread inside a fault handler, and pointing g_esp at a worker
+             * controller thread's job, because this may run on the guest's
+             * own thread while servicing a fault, and pointing g_esp at a worker
              * stack from here would overwrite the stack pointer of the thread
              * being interrupted. */
             if (*ps & PORT_CCS)
@@ -371,7 +411,7 @@ static void ohci_write(void *dev, uint32_t off, uint64_t val, int size)
     } else {
         unsigned shift = (off & 3u) * 8u;
         uint32_t mask = ((size == 1) ? 0xFFu : 0xFFFFu) << shift;
-        *r = (*r & ~mask) | ((v << shift) & mask);
+        ohci_update_bits(r, mask, v << shift);
     }
 }
 
@@ -412,6 +452,10 @@ static void ohci_write(void *dev, uint32_t off, uint64_t val, int size)
 #define TD_CC_NOERROR  0u
 #define TD_CC_STALL    4u
 #define TD_CC_DATAUNDERRUN 9u
+#if !defined(_WIN32)
+#define TD_CC_BUFFEROVERRUN 12u
+#define TD_CC_BUFFERUNDERRUN 13u
+#endif
 #define TD_ROUNDING    (1u << 18)   /* bufferRounding: a short packet is fine */
 
 
@@ -529,7 +573,8 @@ static uint32_t bus_resolve(uint32_t addr)
      * to the window copy (0x814430CA in run 20261025-234225-r4-input, START
      * seen there) while the driver read the heap one, and no button ever
      * reached the title. */
-    if (addr && addr < (64u << 20) && xbox_PhysRamNameMap()[addr >> 12])
+    if (addr && addr < (64u << 20) &&
+            bw_shared_u8_load(&xbox_PhysRamNameMap()[addr >> 12]))
         return addr;
     if (addr && addr < xbox_ContiguousAllocatedBytes())
         return OHCI_CONTIG_BASE + addr;
@@ -557,6 +602,35 @@ static uint8_t *guest_ptr(uint32_t va, uint32_t bytes)
          ? (uint8_t *)xbox_GetMemoryOffset() + va : NULL;
 }
 
+#if !defined(_WIN32)
+/* A linear host copy is valid only if every bus address in the span resolves
+ * to the corresponding byte of the same host mapping. */
+static int guest_dma_linear(uint32_t va, uint32_t bytes)
+{
+    uint32_t resolved = bus_resolve(va);
+    uint32_t high = xbox_ContiguousAllocatedBytes();
+    uint64_t end = (uint64_t)va + bytes;
+    uint64_t pos = va;
+
+    if (!bytes || end > UINT64_C(0x100000000) || !guest_ok(resolved, bytes))
+        return 0;
+    while (pos < end) {
+        uint64_t next = (pos | UINT64_C(4095)) + 1;
+        if ((uint64_t)bus_resolve((uint32_t)pos) !=
+                (uint64_t)resolved + pos - va)
+            return 0;
+        if (g_xbox_image_lo > pos && g_xbox_image_lo < next)
+            next = g_xbox_image_lo;
+        if (g_xbox_image_hi > pos && g_xbox_image_hi < next)
+            next = g_xbox_image_hi;
+        if (high > pos && high < next)
+            next = high;
+        pos = next;
+    }
+    return 1;
+}
+#endif
+
 /* Transfer counts for RECOMP_USB_STATS: input reports served, control
  * transfer stages, and OUT packets (rumble) by endpoint. */
 static unsigned long s_n_report, s_n_ctrl, s_n_out_ep0, s_n_out_other;
@@ -572,6 +646,19 @@ static uint32_t ohci_do_td(OhciController *hc, uint32_t ed0, uint32_t td)
     uint32_t endpoint = (ed0 >> 7) & 0xFu;
     int      moved = 0;
     int      pad = ohci_pad_for(ed0);
+
+#if !defined(_WIN32)
+    if (cbp) {
+        uint64_t bytes = be >= cbp ? (uint64_t)be - cbp + 1 : 0;
+        if (!bytes || bytes > INT_MAX ||
+                !guest_dma_linear(cbp, (uint32_t)bytes)) {
+            fprintf(stderr, "  [OHCI%d] invalid or non-linear TD DMA buffer "
+                    "%08X..%08X (TD %08X)\n", hc->index, cbp, be, td);
+            return dp == TD_DP_IN ? TD_CC_BUFFEROVERRUN : TD_CC_BUFFERUNDERRUN;
+        }
+        len = (int)bytes;
+    }
+#endif
 
     if (pad < 0)
         return TD_CC_NOERROR;   /* no device at that address: ignore */
@@ -1005,6 +1092,14 @@ static void ohci_raise(OhciController *hc, uint32_t source)
 static void ohci_reset(OhciController *hc, uint32_t base, int index)
 {
     memset(hc, 0, sizeof *hc);
+#if !defined(_WIN32)
+    for (unsigned i = 0; i < OHCI_REG_MAX / 4; i++)
+        atomic_init(&hc->reg[i], 0);
+    atomic_init(&hc->reads, 0);
+    atomic_init(&hc->writes, 0);
+    atomic_init(&hc->decode_fail, 0);
+    atomic_init(&hc->ack_seq, 0);
+#endif
     hc->base  = base;
     hc->index = index;
 
@@ -1101,7 +1196,15 @@ static DWORD WINAPI ohci_thread(LPVOID unused)
         uint32_t control, enable, status;
         uint32_t pass_done = 0;     /* this pass's done queue, newest first */
 
+#if !defined(_WIN32)
+        if (InterlockedCompareExchange(&s_ohci_stop, 0, 0))
+            break;
+#endif
         Sleep(OHCI_TICK_MS);
+#if !defined(_WIN32)
+        if (InterlockedCompareExchange(&s_ohci_stop, 0, 0))
+            break;
+#endif
         control = hc->reg[HcControl / 4];
         enable  = hc->reg[HcInterruptEnable / 4];
 
@@ -1342,13 +1445,78 @@ static DWORD WINAPI ohci_thread(LPVOID unused)
     return 0;
 }
 
+#if !defined(_WIN32)
+static void *ohci_thread_posix(void *unused)
+{
+    ohci_thread(unused);
+    return NULL;
+}
+
+static int ohci_unprotect_posix(void)
+{
+    ptrdiff_t off = xbox_GetMemoryOffset();
+    int failed = 0;
+    int i;
+
+    for (i = 0; i < 2; i++) {
+        DWORD old_protect;
+        if (!(s_ohci_trapped & (1u << i)))
+            continue;
+        if (!VirtualProtect((LPVOID)((uintptr_t)off + s_hc[i].base),
+                            XBOX_OHCI_SIZE, PAGE_READWRITE, &old_protect)) {
+            fprintf(stderr, "  OHCI: could not restore 0x%08X\n", s_hc[i].base);
+            failed = 1;
+        } else {
+            s_ohci_trapped &= ~(1u << i);
+        }
+    }
+    return failed ? -1 : 0;
+}
+
+/* 1: both traps armed, 0: failed and rolled back, -1: rollback failed. */
+static int ohci_protect_posix(ptrdiff_t off, uint32_t *failed_base)
+{
+    int i;
+
+    if (s_ohci_trapped)
+        return -1;
+    for (i = 0; i < 2; i++) {
+        DWORD old_protect;
+        LPVOID at = (LPVOID)((uintptr_t)off + s_hc[i].base);
+        if (!VirtualProtect(at, XBOX_OHCI_SIZE, PAGE_NOACCESS, &old_protect)) {
+            *failed_base = s_hc[i].base;
+            return ohci_unprotect_posix() == 0 ? 0 : -1;
+        }
+        s_ohci_trapped |= 1u << i;
+    }
+    return 1;
+}
+
+int bw_xbox_ohci_stop(void)
+{
+    if (s_ohci_thread_started) {
+        int rc;
+        InterlockedExchange(&s_ohci_stop, 1);
+        rc = pthread_join(s_ohci_thread, NULL);
+        if (rc != 0) {
+            fprintf(stderr, "  OHCI: could not join worker: %s\n", strerror(rc));
+            return -1;
+        }
+        s_ohci_thread_started = 0;
+    }
+    if (ohci_unprotect_posix() != 0)
+        return -1;
+    s_enabled = 0;
+    s_init_done = 0;
+    return 0;
+}
+#endif
+
 void xbox_OhciInit(void)
 {
-    static int done;
-
-    if (done)
+    if (s_init_done)
         return;
-    done = 1;
+    s_init_done = 1;
 
     /* Opt-in. Without a descriptor list walker behind it a driver that finds
      * a port has nothing to enumerate, so this must not change how a title
@@ -1358,6 +1526,10 @@ void xbox_OhciInit(void)
 
     s_enabled = 1;
     s_trace   = getenv("RECOMP_USB_TRACE") != NULL;
+#if !defined(_WIN32)
+    s_ndp = OHCI_PORTS;
+    s_npads = 1;
+#endif
     {
         const char *hcspec = getenv("RECOMP_USB_HC");
         const char *ndpspec = getenv("RECOMP_USB_NDP");
@@ -1390,8 +1562,8 @@ void xbox_OhciInit(void)
 
     /* The registers have to fault to be answered. The MCPX aperture is mapped
      * as plain committed memory, so both blocks are made inaccessible here and
-     * the title's fault handler (a VEH on Windows, a SIGBUS/SIGSEGV handler on
-     * POSIX) routes the faults back to xbox_OhciHandleMmio. On a host whose
+     * the title's fault handling routes the faults back to
+     * xbox_OhciHandleMmio. On a host whose
      * page is larger than a block (16 KB on macOS arm64) the protection covers
      * the whole page; nothing else lives in it.
      *
@@ -1400,13 +1572,14 @@ void xbox_OhciInit(void)
      * situation this exists to end, and it would look identical. */
     {
         ptrdiff_t off = xbox_GetMemoryOffset();
-        int i;
 
         if (!off) {
             s_enabled = 0;
             fprintf(stderr, "  OHCI: guest memory not mapped yet; disabled\n");
             return;
         }
+#if defined(_WIN32)
+        int i;
         for (i = 0; i < 2; i++) {
             DWORD old_protect;
             LPVOID at = (LPVOID)((uintptr_t)off + s_hc[i].base);
@@ -1419,6 +1592,21 @@ void xbox_OhciInit(void)
                 return;
             }
         }
+#else
+        uint32_t failed_base = 0;
+        int trapped = ohci_protect_posix(off, &failed_base);
+        if (trapped < 0) {
+            fprintf(stderr, "  OHCI: incomplete trap rollback; "
+                            "cannot safely continue\n");
+            abort();
+        }
+        if (!trapped) {
+            s_enabled = 0;
+            fprintf(stderr, "  OHCI: cannot trap 0x%08X; disabled\n",
+                    failed_base);
+            return;
+        }
+#endif
     }
 
     fprintf(stderr, "  OHCI: two controllers at 0x%08X and 0x%08X, "
@@ -1426,11 +1614,29 @@ void xbox_OhciInit(void)
             XBOX_OHCI0_BASE, XBOX_OHCI1_BASE, OHCI_PORTS);
     fflush(stderr);
 
+#if defined(_WIN32)
     {
         HANDLE th = CreateThread(NULL, 0, ohci_thread, NULL, 0, NULL);
         if (th)
             CloseHandle(th);
     }
+#else
+    InterlockedExchange(&s_ohci_stop, 0);
+    {
+        int rc = pthread_create(&s_ohci_thread, NULL, ohci_thread_posix, NULL);
+        if (rc == 0) {
+            s_ohci_thread_started = 1;
+        } else {
+            if (ohci_unprotect_posix() != 0) {
+                fprintf(stderr, "  OHCI: incomplete trap rollback; "
+                                "cannot safely continue\n");
+                abort();
+            }
+            s_enabled = 0;
+            fprintf(stderr, "  OHCI: cannot start worker: %s\n", strerror(rc));
+        }
+    }
+#endif
 }
 
 static OhciController *hc_for(uint32_t va)
@@ -1483,7 +1689,8 @@ int xbox_OhciHandleMmio(void *ctx, uint32_t xbox_va)
         return 0;
     ok = mmio_emulate_a64(uc, xbox_va - hc->base, hc,
                           ohci_read_split, ohci_write_split);
-    /* stdio in a signal handler, deliberately: see apu_mmio_hook.c. */
+    /* POSIX callers must dispatch in ordinary thread context: this trace and
+     * the register callbacks can use stdio and touch guest memory. */
     if (!ok && hc->decode_fail++ < 20) {
         fprintf(stderr, "  [OHCI%d] undecoded access at +0x%03X: insn %08X\n",
                 hc->index, xbox_va - hc->base,

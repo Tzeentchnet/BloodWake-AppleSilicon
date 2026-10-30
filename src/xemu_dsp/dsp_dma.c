@@ -206,15 +206,28 @@ static void dsp_dma_run(DSPDMAState *s)
             assert(!"Dsp dma offset out of range");
         }
 
-        size_t transfer_size = count * item_size;
-
-        // FIXME: Remove this intermediate buffer
-        static uint8_t *scratch_buf = NULL;
-        static ssize_t scratch_buf_size = -1;
-        if (count * item_size > scratch_buf_size) {
-            scratch_buf_size = count * item_size;
-            scratch_buf = malloc(scratch_buf_size);
+        size_t transfer_size = (size_t)count * item_size;
+        size_t capacity = transfer_size;
+        if (dsp_interleave) {
+            size_t interleaved_size = (size_t)block_count * channel_count * item_size;
+            if (capacity < interleaved_size)
+                capacity = interleaved_size;
         }
+        if (capacity == 0)
+            capacity = 1;
+        if (capacity > s->scratch_buf_size) {
+            uint8_t *new_buf = realloc(s->scratch_buf, capacity);
+            if (!new_buf) {
+                fprintf(stderr, "[APU-XDSP] unable to allocate DMA scratch buffer\n");
+                s->error = true;
+                s->control &= ~DMA_CONTROL_RUNNING;
+                s->control |= DMA_CONTROL_STOPPED;
+                return;
+            }
+            s->scratch_buf = new_buf;
+            s->scratch_buf_size = capacity;
+        }
+        uint8_t *scratch_buf = s->scratch_buf;
 
         if (direction) {
             if (dsp_interleave) {
@@ -382,4 +395,3 @@ void dsp_dma_write(DSPDMAState *s, DSPDMARegister reg, uint32_t v)
         assert(!"Invalid dma write register");
     }
 }
-

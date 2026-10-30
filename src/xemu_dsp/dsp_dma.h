@@ -61,6 +61,8 @@ typedef struct DSPDMAState {
 
     bool error;
     bool eol;
+    uint8_t *scratch_buf;
+    size_t scratch_buf_size;
 
     /* DMA completion timer: counts reads of DMA_CONTROL while RUNNING.
      * After 3 reads, transitions RUNNING -> STOPPED. */

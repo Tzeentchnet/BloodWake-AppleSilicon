@@ -251,6 +251,9 @@ static void dsp_c_sync_from_vm(DSPState *dsp)
 void dsp_c_init(DSPState *dsp)
 {
     dsp_core_t *core = g_new0(dsp_core_t, 1);
+    if (!core) {
+        return;
+    }
     core->opaque = dsp;
     core->read_peripheral = c_read_peripheral;
     core->write_peripheral = c_write_peripheral;

@@ -22,6 +22,7 @@
  *   - BW_HOST_BOOTS (default 200) caps the boots.
  *
  * The child inherits everything else in the environment. */
+#ifdef _WIN32
 #include <windows.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -374,3 +375,21 @@ int bw_host_main(void)
         DestroyWindow(s_host);
     return result;
 }
+#else
+#include <stdio.h>
+#include <stdlib.h>
+#include "bw_host.h"
+
+int bw_host_wanted(void)
+{
+    const char *e = getenv("BW_HOST");
+    return e && e[0] == '1';
+}
+
+int bw_host_main(void)
+{
+    fprintf(stderr, "[HOST] the embedded Windows host is unavailable on this platform; "
+                    "use the native boot supervisor\n");
+    return 1;
+}
+#endif

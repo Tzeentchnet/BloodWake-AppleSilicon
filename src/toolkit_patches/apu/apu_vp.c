@@ -22,6 +22,7 @@
 #include "apu_state.h"
 #include "apu.h"
 #include "fpconv.h"
+#include "../bw_shared_u8.h"
 #if defined(_WIN32)
 #include <process.h>
 #else
@@ -355,7 +356,7 @@ static uint32_t bw_tag_intent(uint32_t phys)
     }
     if (!on || a >= (64u << 20))
         return phys;
-    kind = bw_PhysLastTranslationMap()[a >> 12];
+    kind = bw_shared_u8_load(&bw_PhysLastTranslationMap()[a >> 12]);
     if (kind == 2) {
         if (++window_tags <= 3 || window_tags % 5000 == 0)
             fprintf(stderr, "[APU] BW posted %08X as a window page (%u so far)\n",

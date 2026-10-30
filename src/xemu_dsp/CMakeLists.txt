@@ -9,6 +9,8 @@ add_library(bw_xemu_dsp STATIC
     interp/dsp_cpu.c
     interp/debug.c
 )
+find_package(Threads REQUIRED)
+target_link_libraries(bw_xemu_dsp PUBLIC Threads::Threads)
 target_include_directories(bw_xemu_dsp PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/shim
     ${CMAKE_CURRENT_SOURCE_DIR}

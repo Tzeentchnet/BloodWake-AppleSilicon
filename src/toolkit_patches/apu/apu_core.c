@@ -25,6 +25,8 @@
 #include "apu_wav.h"
 #include "fpconv.h"
 #include "../kernel/xbox_memory_layout.h"   /* XBOX_WORKER_STACK_TOP */
+#include "../bw_shared_u8.h"
+#include "bw_apu_sync.h"
 #include <errno.h>
 
 /* Blood Wake carried patch (TK-14, docs/TOOLKIT_ISSUES.md): the sequencer
@@ -60,6 +62,24 @@ static int bw_ssl_tick_allowed(void)
 uint8_t *g_apu_ram_ptr = NULL;
 
 MCPXAPUState *g_state = NULL;
+static BwApuMutex g_instance_lock = BW_APU_MUTEX_INITIALIZER;
+static BwApuThread g_frame_thread;
+static int g_instance_busy;
+
+/* The toolkit's Win32-shaped condition variable owns a pthread allocation
+ * on POSIX, whereas qemu_cond_destroy is a Win32-only no-op. */
+static void apu_cond_destroy(QemuCond *cond)
+{
+#if defined(_WIN32)
+    qemu_cond_destroy(cond);
+#else
+    if (cond->cv.Ptr) {
+        pthread_cond_destroy((pthread_cond_t *)cond->cv.Ptr);
+        free(cond->cv.Ptr);
+        cond->cv.Ptr = NULL;
+    }
+#endif
+}
 
 /* Forward declarations for software mixer */
 static void mixer_init(void);
@@ -162,7 +182,7 @@ uint8_t *mcpx_apu_phys(uint64_t addr)
      * from the window, effects played whatever the window held there (white
      * noise) and the stream played zeros. Only heap pages are recorded, so
      * the voice-array case below still holds for the image. */
-    if (xbox_PhysRamNameMap()[a >> 12])
+    if (bw_shared_u8_load(&xbox_PhysRamNameMap()[a >> 12]))
         return g_apu_ram_ptr + a;
     /* A page the contiguous allocator handed out is the window, even where
      * it overlaps the image's physical range: an image whose BSS runs past
@@ -182,7 +202,7 @@ uint8_t *mcpx_apu_phys(uint64_t addr)
      * the window first again. */
     if (bw_apu_image_first() && a >= g_xbox_image_lo && a < g_xbox_image_hi)
         return g_apu_ram_ptr + a;
-    if (xbox_ContiguousPageMap()[a >> 12])
+    if (bw_shared_u8_load(&xbox_ContiguousPageMap()[a >> 12]))
         return g_apu_ram_ptr + 0x80000000u + a;
     if (a >= g_xbox_image_lo && a < g_xbox_image_hi)
         return g_apu_ram_ptr + a;
@@ -210,11 +230,11 @@ const char *mcpx_apu_phys_class(uint64_t addr)
     }
     if (a >= (64u << 20))
         return a < apu_mapped_ram() ? "ram" : "wrap";
-    if (xbox_PhysRamNameMap()[a >> 12])
+    if (bw_shared_u8_load(&xbox_PhysRamNameMap()[a >> 12]))
         return "named";
     if (bw_apu_image_first() && a >= g_xbox_image_lo && a < g_xbox_image_hi)
         return "img";
-    if (xbox_ContiguousPageMap()[a >> 12])
+    if (bw_shared_u8_load(&xbox_ContiguousPageMap()[a >> 12]))
         return "win";
     if (a >= g_xbox_image_lo && a < g_xbox_image_hi)
         return "img";
@@ -475,6 +495,12 @@ static void apu_deliver_irq(MCPXAPUState *d)
  * MMIO Read / Write
  * ============================================================ */
 
+uint32_t bw_xdsp_sge_read(MCPXAPUState *d, uint32_t addr);
+void bw_xdsp_sge_write(MCPXAPUState *d, uint32_t addr, uint32_t value);
+int bw_xdsp_is_fifo_reg(uint32_t addr);
+uint32_t bw_xdsp_fifo_read(MCPXAPUState *d, uint32_t addr);
+void bw_xdsp_fifo_write(MCPXAPUState *d, uint32_t addr, uint32_t value);
+
 uint64_t mcpx_apu_read(void *opaque, hwaddr addr, unsigned int size)
 {
     MCPXAPUState *d = (MCPXAPUState *)opaque;
@@ -486,11 +512,25 @@ uint64_t mcpx_apu_read(void *opaque, hwaddr addr, unsigned int size)
          * advanced by the frame thread while the sequencer runs. It used to
          * return the host clock divided by 100, which advances far too fast
          * and in the wrong units for a title comparing it against SSL. */
+        qemu_mutex_lock(&d->lock);
         r = d->sample_count;
+        qemu_mutex_unlock(&d->lock);
+        break;
+    case NV_PAPU_GPSADDR:
+    case NV_PAPU_GPFADDR:
+    case NV_PAPU_EPSADDR:
+    case NV_PAPU_EPFADDR:
+    case NV_PAPU_GPSMAXSGE:
+    case NV_PAPU_GPFMAXSGE:
+    case NV_PAPU_EPSMAXSGE:
+    case NV_PAPU_EPFMAXSGE:
+        r = bw_xdsp_sge_read(d, (uint32_t)addr);
         break;
     default:
         if (addr < 0x20000) {
-            r = qatomic_read(&d->regs[addr]);
+            r = bw_xdsp_is_fifo_reg((uint32_t)addr)
+                ? bw_xdsp_fifo_read(d, (uint32_t)addr)
+                : qatomic_read(&d->regs[addr]);
         }
         break;
     }
@@ -523,13 +563,17 @@ void mcpx_apu_write(void *opaque, hwaddr addr, uint64_t val,
     case NV_PAPU_XGSCNT:
         /* Writing XGSCNT resets the sequencer's sample counter; the value
          * the title writes (0, so far, always) becomes the new start. */
+        qemu_mutex_lock(&d->lock);
         qatomic_set(&d->regs[addr], (uint32_t)val);
         d->sample_count = val;
+        qemu_mutex_unlock(&d->lock);
         break;
     case NV_PAPU_ISTS:
+        qemu_mutex_lock(&d->lock);
         qatomic_and(&d->regs[NV_PAPU_ISTS], ~(uint32_t)val);
         update_irq(d);
         qemu_cond_broadcast(&d->cond);
+        qemu_mutex_unlock(&d->lock);
         break;
     case NV_PAPU_FECTL:
     case NV_PAPU_SECTL:
@@ -546,6 +590,7 @@ void mcpx_apu_write(void *opaque, hwaddr addr, uint64_t val,
                                 " (%u so far, %u ticks raised)\n",
                         s_bw_seq_stops, s_bw_ticks);
         }
+        qemu_mutex_lock(&d->lock);
         qatomic_set(&d->regs[addr], (uint32_t)val);
         /* Starting the APU has to start the frame thread.
          *
@@ -574,6 +619,7 @@ void mcpx_apu_write(void *opaque, hwaddr addr, uint64_t val,
             }
         }
         qemu_cond_broadcast(&d->cond);
+        qemu_mutex_unlock(&d->lock);
         break;
     case NV_PAPU_FEMEMDATA:
         /* 'magic write' - value written to FEMEMADDR on notify completion */
@@ -588,18 +634,18 @@ void mcpx_apu_write(void *opaque, hwaddr addr, uint64_t val,
     case NV_PAPU_GPFMAXSGE:
     case NV_PAPU_EPSMAXSGE:
     case NV_PAPU_EPFMAXSGE:
-        /* D-012 (Blood Wake carried patch): with the DSPs on, their SGE
-         * entries get their copy (window or RAM, TK-17) decided now, right
-         * after DirectSound's translations (bw_apu_xdsp.c). */
-        qatomic_set(&d->regs[addr], (uint32_t)val);
-        {
-            extern void bw_xdsp_sge_written(MCPXAPUState *d, uint32_t addr);
-            bw_xdsp_sge_written(d, (uint32_t)addr);
-        }
+        /* The frame thread reads these registers under d->lock; the DSP
+         * worker snapshots them under its SGE cache lock. */
+        qemu_mutex_lock(&d->lock);
+        bw_xdsp_sge_write(d, (uint32_t)addr, (uint32_t)val);
+        qemu_mutex_unlock(&d->lock);
         break;
     default:
         if (addr < 0x20000) {
-            qatomic_set(&d->regs[addr], (uint32_t)val);
+            if (bw_xdsp_is_fifo_reg((uint32_t)addr))
+                bw_xdsp_fifo_write(d, (uint32_t)addr, (uint32_t)val);
+            else
+                qatomic_set(&d->regs[addr], (uint32_t)val);
         }
         break;
     }
@@ -642,6 +688,7 @@ typedef struct {
     WAVEHDR  hdrs[WAVEOUT_NUM_BUFS];
     int16_t  bufs[WAVEOUT_NUM_BUFS][WAVEOUT_BUF_SAMPLES][2];
     int      next_buf;
+    int      fill;
     bool     initialized;
     int      frames_written;
 } WaveOutState;
@@ -946,6 +993,7 @@ void mcpx_apu_monitor_init(MCPXAPUState *d, Error **errp)
                             " expect underruns\n");
         return;
     }
+#if defined(_WIN32)
     fprintf(stderr, "[APU] %s unavailable, falling back to waveOut\n", XA2_BACKEND_NAME);
 
     WAVEFORMATEX wfx = { 0 };
@@ -961,6 +1009,7 @@ void mcpx_apu_monitor_init(MCPXAPUState *d, Error **errp)
     if (mr != MMSYSERR_NOERROR) {
         fprintf(stderr, "[APU] waveOutOpen failed (error %u)\n", mr);
         g_waveout.initialized = false;
+        error_setg(errp, "no audio output device is available");
         return;
     }
 
@@ -973,11 +1022,16 @@ void mcpx_apu_monitor_init(MCPXAPUState *d, Error **errp)
     }
 
     g_waveout.next_buf = 0;
+    g_waveout.fill = 0;
     g_waveout.initialized = true;
     g_waveout.frames_written = 0;
 
     fprintf(stderr, "[APU] waveOut audio output initialized (48kHz stereo 16-bit, %d buffers)\n",
             WAVEOUT_NUM_BUFS);
+#else
+    fprintf(stderr, "[APU] %s unavailable; cannot start audio\n", XA2_BACKEND_NAME);
+    error_setg(errp, "%s audio output is unavailable", XA2_BACKEND_NAME);
+#endif
 }
 
 void mcpx_apu_monitor_finalize(MCPXAPUState *d)
@@ -1247,7 +1301,7 @@ static void mix_into(int16_t dst[][2], const int16_t src[][2], int n)
  * written once, none is rendered twice. */
 static void waveout_submit(MCPXAPUState *d, const int16_t period[][2])
 {
-    static int fill;                     /* samples already in next_buf */
+    int fill = g_waveout.fill;           /* samples already in next_buf */
     int idx = g_waveout.next_buf;
     WAVEHDR *hdr = &g_waveout.hdrs[idx];
 
@@ -1265,14 +1319,16 @@ static void waveout_submit(MCPXAPUState *d, const int16_t period[][2])
     memcpy(g_waveout.bufs[idx][fill], period,
            MIXER_FRAME_SAMPLES * 2 * sizeof(int16_t));
     fill += MIXER_FRAME_SAMPLES;
-    if (fill < WAVEOUT_BUF_SAMPLES)
+    if (fill < WAVEOUT_BUF_SAMPLES) {
+        g_waveout.fill = fill;
         return;
+    }
 
     hdr->dwFlags &= ~WHDR_DONE;
     waveOutWrite(g_waveout.hwo, hdr, sizeof(WAVEHDR));
     g_waveout.next_buf = (idx + 1) % WAVEOUT_NUM_BUFS;
     g_waveout.frames_written++;
-    fill = 0;
+    g_waveout.fill = 0;
 }
 
 /* Called once per 32-sample frame; acts on the last frame of each EP period
@@ -1668,22 +1724,28 @@ static void apu_irq_stats_line(void)
 static void bw_apu_thread_priority(void)
 {
     const char *e = getenv("BW_APU_THREAD_PRIORITY");
-    int p = THREAD_PRIORITY_HIGHEST;
+    int p = 2;
     const char *name = "highest";
     if (e && *e) {
         if (e[0] == 'n') {
-            p = THREAD_PRIORITY_NORMAL;
+            p = 0;
             name = "normal";
         } else if (e[0] == 'a') {
-            p = THREAD_PRIORITY_ABOVE_NORMAL;
+            p = 1;
             name = "above normal";
         } else if (e[0] == 'c' || e[0] == 't') {
-            p = THREAD_PRIORITY_TIME_CRITICAL;
+            p = 3;
             name = "time critical";
         }
     }
-    if (p != THREAD_PRIORITY_NORMAL && !SetThreadPriority(GetCurrentThread(), p))
-        name = "normal (SetThreadPriority failed)";
+    if (!bw_apu_set_priority(p))
+        name = "normal (priority request failed)";
+#if defined(__APPLE__)
+    else if (p == 1)
+        name = "user-initiated QoS";
+    else if (p >= 2)
+        name = "user-interactive QoS";
+#endif
     fprintf(stderr, "[APU] BW frame thread priority: %s (BW_APU_THREAD_PRIORITY)\n", name);
 }
 
@@ -1694,7 +1756,8 @@ static void *mcpx_apu_frame_thread(void *arg)
     qemu_mutex_lock(&d->lock);
 
     while (!qatomic_read(&d->exiting)) {
-        if (d->pause_requested && !g_test_tone.active && !g_mixer_active_count) {
+        if (d->pause_requested && !g_test_tone.active &&
+            !InterlockedCompareExchange((volatile LONG *)&g_mixer_active_count, 0, 0)) {
             d->is_idle = true;
             if (xa2_is_active())
                 xa2_expect_drain();     /* a pause, not an underrun */
@@ -1709,6 +1772,8 @@ static void *mcpx_apu_frame_thread(void *arg)
          * need continuous frame delivery regardless of APU register state.
          * The VP/DSP pipeline (se_frame) only runs when registers allow it. */
         throttle(d);
+        if (qatomic_read(&d->exiting))
+            break;
         int64_t bw_t_work = bw_pacestat_on() ? qemu_clock_get_us(QEMU_CLOCK_REALTIME) : 0;
         int div0 = d->ep_frame_div;
 
@@ -1900,18 +1965,43 @@ static void apu_diag_reset(void)
     memset(&apu_irq_stats, 0, sizeof(apu_irq_stats));
     s_irq_trace = -1;
     s_irq_next_ns = 0;
+    s_bw_tick_mode = -1;
+    s_bw_ticks = s_bw_seq_stops = 0;
+    s_bq_mode = -1;
+    s_bq_base = s_bq_cap = s_bq_step = 0;
+    s_bq_last_u = 0;
+    s_bq_calm_since = s_bq_start = 0;
+    s_bq_logged = 0;
+    s_bwg_on = -1;
+    memset(&s_lim2, 0, sizeof(s_lim2));
+    memset(&s_lim6, 0, sizeof(s_lim6));
+    memset(&s_ps, 0, sizeof(s_ps));
+    s_ps.on = -1;
 }
 
 MCPXAPUState *mcpx_apu_init_standalone(uint8_t *ram_ptr)
 {
-    MCPXAPUState *d = (MCPXAPUState *)calloc(1, sizeof(MCPXAPUState));
+    MCPXAPUState *d;
+    if (!ram_ptr) {
+        fprintf(stderr, "[APU] Cannot initialize without guest RAM\n");
+        return NULL;
+    }
+    bw_apu_mutex_lock(&g_instance_lock);
+    if (g_state || g_instance_busy) {
+        bw_apu_mutex_unlock(&g_instance_lock);
+        fprintf(stderr, "[APU] An APU instance is already active or changing state\n");
+        return NULL;
+    }
+    g_instance_busy = 1;
+    bw_apu_mutex_unlock(&g_instance_lock);
+
+    d = (MCPXAPUState *)calloc(1, sizeof(MCPXAPUState));
     if (!d) {
         fprintf(stderr, "[APU] Failed to allocate MCPXAPUState\n");
-        return NULL;
+        goto fail_reservation;
     }
 
     g_apu_ram_ptr = ram_ptr;
-    g_state = d;
     d->ram_ptr = ram_ptr;
     /* A line left up by a previous instance would call the guest ISR
      * against this one's empty ISTS. */
@@ -1951,22 +2041,45 @@ MCPXAPUState *mcpx_apu_init_standalone(uint8_t *ram_ptr)
     /* Init monitor (waveOut output) */
     Error *local_err = NULL;
     mcpx_apu_monitor_init(d, &local_err);
-    if (local_err) {
+    if (local_err)
         warn_reportf_err(local_err, "mcpx_apu_monitor_init failed: ");
-    }
+    if (!xa2_is_active() && !g_waveout.initialized)
+        goto fail_initialized;
 
     /* Start background frame thread */
-    qemu_thread_create(&d->apu_thread, "mcpx.apu_thread",
-                       mcpx_apu_frame_thread, d, QEMU_THREAD_JOINABLE);
+    if (!bw_apu_thread_create(&g_frame_thread, mcpx_apu_frame_thread, d)) {
+        fprintf(stderr, "[APU] Failed to start the frame thread\n");
+        goto fail_initialized;
+    }
     mcpx_apu_wait_for_idle(d);
     qemu_mutex_unlock(&d->lock);
 
+    bw_apu_mutex_lock(&g_instance_lock);
+    g_state = d;
+    g_instance_busy = 0;
+    bw_apu_mutex_unlock(&g_instance_lock);
     fprintf(stderr, "[APU] MCPX APU initialized (standalone)\n");
     fprintf(stderr, "[APU]   RAM pointer: %p\n", (void *)ram_ptr);
     fprintf(stderr, "[APU]   MMIO base: 0xFE800000 (512KB)\n");
     fprintf(stderr, "[APU]   VP: %d max voices, %d samples/frame\n",
             MCPX_HW_MAX_VOICES, NUM_SAMPLES_PER_FRAME);
     return d;
+
+fail_initialized:
+    qemu_mutex_unlock(&d->lock);
+    mcpx_apu_vp_finalize(d);
+    mcpx_apu_dsp_finalize(d);
+    mcpx_apu_monitor_finalize(d);
+    apu_cond_destroy(&d->idle_cond);
+    apu_cond_destroy(&d->cond);
+    qemu_mutex_destroy(&d->lock);
+    g_apu_ram_ptr = NULL;
+    free(d);
+fail_reservation:
+    bw_apu_mutex_lock(&g_instance_lock);
+    g_instance_busy = 0;
+    bw_apu_mutex_unlock(&g_instance_lock);
+    return NULL;
 }
 
 void mcpx_apu_shutdown(MCPXAPUState *d)
@@ -1975,26 +2088,39 @@ void mcpx_apu_shutdown(MCPXAPUState *d)
 
     fprintf(stderr, "[APU] Shutting down MCPX APU...\n");
 
+    bw_apu_mutex_lock(&g_instance_lock);
+    if (g_state != d) {
+        bw_apu_mutex_unlock(&g_instance_lock);
+        return;
+    }
+    g_state = NULL;
+    g_instance_busy = 1;
+    bw_apu_mutex_unlock(&g_instance_lock);
+
     qemu_mutex_lock(&d->lock);
-    mcpx_apu_wait_for_idle(d);
+    d->pause_requested = true;
+    g_test_tone.active = false;
     qatomic_set(&d->exiting, true);
-    qemu_cond_signal(&d->cond);
+    qemu_cond_broadcast(&d->cond);
     qemu_mutex_unlock(&d->lock);
 
-    /* Everything below is freed only once the frame thread has returned.
-     * g_state is cleared before the teardown, so a mixer start that begins
-     * after this point finds no instance; a play already in flight is not
-     * serialised against shutdown. */
-    qemu_thread_join(&d->apu_thread);
-    g_state = NULL;
+    bw_apu_thread_join(&g_frame_thread);
     mcpx_apu_vp_finalize(d);
     mcpx_apu_dsp_finalize(d);
     mcpx_apu_monitor_finalize(d);
 
-    qemu_cond_destroy(&d->idle_cond);
-    qemu_cond_destroy(&d->cond);
+    EnterCriticalSection(&g_mixer_cs);
+    memset(g_mixer_voices, 0, sizeof(g_mixer_voices));
+    InterlockedExchange((volatile LONG *)&g_mixer_active_count, 0);
+    LeaveCriticalSection(&g_mixer_cs);
+    apu_cond_destroy(&d->idle_cond);
+    apu_cond_destroy(&d->cond);
     qemu_mutex_destroy(&d->lock);
+    g_apu_ram_ptr = NULL;
     free(d);
+    bw_apu_mutex_lock(&g_instance_lock);
+    g_instance_busy = 0;
+    bw_apu_mutex_unlock(&g_instance_lock);
     fprintf(stderr, "[APU] Shutdown complete\n");
 }
 
@@ -2072,9 +2198,11 @@ void mcpx_apu_play_test_tone(MCPXAPUState *d)
         return;
     }
 
+    qemu_mutex_lock(&d->lock);
     if (g_test_tone.active) {
         /* Toggle off */
         g_test_tone.active = false;
+        qemu_mutex_unlock(&d->lock);
         fprintf(stderr, "[APU-TEST] Test tone OFF\n");
         return;
     }
@@ -2086,7 +2214,6 @@ void mcpx_apu_play_test_tone(MCPXAPUState *d)
     g_test_tone.active = true;
 
     /* Make sure waveOut is running - enable SECTL and resume APU thread */
-    qemu_mutex_lock(&d->lock);
     d->regs[NV_PAPU_SECTL] = NV_PAPU_SECTL_XCNTMODE & ~NV_PAPU_SECTL_XCNTMODE_OFF;
     d->regs[NV_PAPU_FECTL] = NV_PAPU_FECTL_FEMETHMODE_FREE_RUNNING;
     /* Initialize empty voice lists so VP frame doesn't crash */
@@ -2096,8 +2223,7 @@ void mcpx_apu_play_test_tone(MCPXAPUState *d)
     mcpx_apu_resume(d);
     qemu_mutex_unlock(&d->lock);
 
-    fprintf(stderr, "[APU-TEST] Test tone ON - 440Hz sine, amplitude=%d\n",
-            g_test_tone.amplitude);
+    fprintf(stderr, "[APU-TEST] Test tone ON - 440Hz sine, amplitude=6000\n");
 }
 
 /* ============================================================
@@ -2110,15 +2236,18 @@ void mcpx_apu_play_test_tone(MCPXAPUState *d)
 
 static void mixer_init(void)
 {
-    if (g_mixer_initialized) return;
-    InitializeCriticalSection(&g_mixer_cs);
-    memset(g_mixer_voices, 0, sizeof(g_mixer_voices));
-    g_mixer_initialized = true;
+    bw_apu_mutex_lock(&g_instance_lock);
+    if (!g_mixer_initialized) {
+        InitializeCriticalSection(&g_mixer_cs);
+        memset(g_mixer_voices, 0, sizeof(g_mixer_voices));
+        g_mixer_initialized = true;
+    }
+    bw_apu_mutex_unlock(&g_instance_lock);
 }
 
 int apu_mixer_alloc_voice(void)
 {
-    if (!g_mixer_initialized) mixer_init();
+    mixer_init();
     EnterCriticalSection(&g_mixer_cs);
     for (int i = 0; i < APU_MIXER_MAX_VOICES; i++) {
         if (!g_mixer_voices[i].active && !g_mixer_voices[i].pcm_data) {
@@ -2203,13 +2332,14 @@ void apu_mixer_play(int slot, int looping)
     LeaveCriticalSection(&g_mixer_cs);
 
     /* The frame thread takes the APU lock before the mixer lock. */
-    extern MCPXAPUState *g_state;
+    bw_apu_mutex_lock(&g_instance_lock);
     if (g_state) {
         qemu_mutex_lock(&g_state->lock);
         g_state->pause_requested = false;
         qemu_cond_signal(&g_state->cond);
         qemu_mutex_unlock(&g_state->lock);
     }
+    bw_apu_mutex_unlock(&g_instance_lock);
 }
 
 void apu_mixer_stop(int slot)

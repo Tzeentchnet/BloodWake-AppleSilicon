@@ -1,6 +1,7 @@
 #ifndef BW_WAIT_H
 #define BW_WAIT_H
-/* A ~200 us wait that does not spin (bw_wait.c). */
+/* A ~200 us wait that does not spin (bw_wait.c); host scheduling may wake
+ * later. The macOS event waits are wakeable, with a retained wake signal. */
 void bw_short_wait(void);
 
 /* The toolkit's NV2A thread (carried xbox_memory_layout.c), once per pass:

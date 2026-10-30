@@ -72,10 +72,12 @@
  *   BW_STEPLOG=<file>    every edition: one line per game step (test aid)
  *   BW_RAINLOG=1         every edition: rain spawn and fall rates (test aid)
  *
+ * On macOS the NV2A flip hold is host-paced, but the current Metal backend
+ * does not implement the D3D11 vsync, tearing, present-wait or latency knobs.
+ *
  * Addresses are seen in code (120fps.md §1-§6, and the generated C read
  * again for this file) unless a comment says otherwise.
  */
-#include <windows.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -83,12 +85,17 @@
 #include <math.h>
 
 #include "bw_edition.h"
+#include "bw_hook_platform.h"
+#if defined(_WIN32)
 #include "gpu/bw_d3d11.h"
+#elif defined(__APPLE__)
+#include <CoreGraphics/CoreGraphics.h>
+#endif
 #include "bw_framelog.h"   /* P2b: BW_FRAMELOG test aid */
 
 extern ptrdiff_t g_xbox_mem_offset;
-extern __declspec(thread) uint32_t g_eax, g_ecx, g_edx, g_esp;   /* RECOMP_TLS (TK-7) */
-extern __declspec(thread) uint32_t g_ebp, g_seh_ebp;
+extern BW_HOOK_TLS uint32_t g_eax, g_ecx, g_edx, g_esp;   /* RECOMP_TLS (TK-7) */
+extern BW_HOOK_TLS uint32_t g_ebp, g_seh_ebp;
 extern void bw_set_host_flip_pace(unsigned hz);                  /* carried nv2a_pb_exec.c */
 
 #define HP(va)    ((void *)((uintptr_t)(uint32_t)(va) + g_xbox_mem_offset))
@@ -186,10 +193,10 @@ static unsigned env_u(const char *name, unsigned dflt)
     return e && *e ? (unsigned)strtoul(e, NULL, 10) : dflt;
 }
 
-/* The refresh rate of the monitor the game's window will be on: the play
- * host's window (BW_PARENT_HWND, bw_host.c) or the primary monitor. */
+/* Windows uses the play host's monitor; macOS uses the main display. */
 static unsigned display_refresh(void)
 {
+#if defined(_WIN32)
     DEVMODEA dm;
     const char *e = getenv("BW_PARENT_HWND");
     const char *dev = NULL;
@@ -207,12 +214,26 @@ static unsigned display_refresh(void)
     if (!EnumDisplaySettingsA(dev, ENUM_CURRENT_SETTINGS, &dm) || dm.dmDisplayFrequency <= 1)
         return 0;
     return (unsigned)dm.dmDisplayFrequency;
+#elif defined(__APPLE__)
+    CGDisplayModeRef mode = CGDisplayCopyDisplayMode(CGMainDisplayID());
+    double hz;
+    if (!mode)
+        return 0;
+    hz = CGDisplayModeGetRefreshRate(mode);
+    CGDisplayModeRelease(mode);
+    return isfinite(hz) && hz > 1.0 && hz < 10000.0 ? (unsigned)(hz + 0.5) : 0;
+#else
+    return 0;
+#endif
 }
 
 unsigned bw_hifps_boot(int gameplay)
 {
     const char *e = getenv("BW_HIFPS");
-    unsigned refresh, hz, vsync, tear;
+    unsigned refresh, hz, tear;
+#if defined(_WIN32)
+    unsigned vsync;
+#endif
 
     if (!gameplay || !bw_edition_at_least(BW_ED_REMASTERED) || !bw_fix_enabled(BW_FIX_HIFPS))
         return 0;
@@ -221,8 +242,12 @@ unsigned bw_hifps_boot(int gameplay)
         return 0;
     }
     refresh = display_refresh();
+#if defined(_WIN32)
     vsync = env_u("BW_HIFPS_VSYNC", 0) == 1;
     tear = !vsync && env_u("BW_HIFPS_TEAR", 1) != 0;
+#else
+    tear = 0; /* The native backend cannot request either presentation mode. */
+#endif
     hz = e && *e ? (unsigned)atoi(e) : 0;
     if (!hz) {
         hz = refresh ? refresh : 120;
@@ -266,6 +291,7 @@ unsigned bw_hifps_boot(int gameplay)
         bw_segwalk_default(1);
     }
     bw_set_host_flip_pace(hz);
+#if defined(_WIN32)
     bw_d3d11_present_config(vsync, tear, 0);
     /* P2b: at most 2 flipped frames unfinished on the GPU. Nothing in the
      * present path waits for the GPU (D7's never-blocking present), so when
@@ -275,10 +301,27 @@ unsigned bw_hifps_boot(int gameplay)
      * 0 = no limit as before. */
     bw_d3d11_latency_config(2);
     bw_d3d11_pace_config(hz);
+#else
+    {
+        const char *pace = getenv("RECOMP_FLIP_PACING");
+        if (pace && (!*pace || !strcmp(pace, "0")))
+            fprintf(stderr, "[BW] high frame rate: RECOMP_FLIP_PACING is off, "
+                            "so the target is not enforced\n");
+        else
+            fprintf(stderr, "[BW] high frame rate: flips use host timing\n");
+        fprintf(stderr, "[BW] high frame rate: renderer-specific vsync, tearing "
+                        "and GPU latency controls are unavailable\n");
+    }
+#endif
     s_on = 1;
     fprintf(stderr, "[BW] high frame rate (%s): up to %u fps (display %u Hz%s), "
             "fixed 30 Hz game step, %s%s%s\n", bw_edition_title(bw_edition()),
-            hz, refresh, vsync ? ", vsync" : tear ? ", variable refresh" : "",
+            hz, refresh,
+#if defined(_WIN32)
+            vsync ? ", vsync" : tear ? ", variable refresh" : "",
+#else
+            "",
+#endif
             !s_interp ? "no interpolation" : s_extrap ? "camera extrapolated" : "interpolated",
             s_lightning ? "" : ", lightning per frame", s_randsplit ? "" : ", shared rand()");
     {
@@ -302,7 +345,7 @@ static void steplog_step(void)
             s_steplog = fopen(p, "a");
             if (s_steplog)
                 fprintf(s_steplog, "# boot %lu: wclk qpc_ms x y height throttle rudder revs turbo\n",
-                        (unsigned long)GetCurrentProcessId());
+                        bw_hook_process_id());
         }
     }
     if (!s_steplog)
@@ -321,10 +364,8 @@ static void steplog_step(void)
                 HF32(boat + 0x474));
     {
         /* the host counter in ms, tagged, last: matches BW_KICKLOG's t= */
-        LARGE_INTEGER c, f;
-        QueryPerformanceCounter(&c);
-        QueryPerformanceFrequency(&f);
-        fprintf(s_steplog, " h=%.1f", (double)c.QuadPart * 1000.0 / (double)f.QuadPart);
+        fprintf(s_steplog, " h=%.1f", (double)bw_hook_counter() * 1000.0
+                / (double)bw_hook_counter_frequency());
     }
     fputc('\n', s_steplog);
 }
@@ -444,7 +485,7 @@ static void look_at_lh(const float *eye, const float *at, const float *up, float
 /* Fraction of a step since the step clock: (now - clock) / (freq / 30). The
  * last step simulated up to `clock`; drawing it at `now` shows the state
  * one step behind, blended (120fps.md "Display delay"). */
-static LARGE_INTEGER s_host_at_update;  /* host QPC when Game_Update read its clock */
+static uint64_t s_host_at_update;  /* host counter when Game_Update read its clock */
 
 static float step_alpha(void)
 {
@@ -455,16 +496,13 @@ static float step_alpha(void)
      * that ran a step draws a few ms later than one that didn't, and showing
      * both at their own Game_Update time made the steps' frames lag (a 30 Hz
      * judder). The game's clock is advanced by the host time since then. */
-    if (s_host_at_update.QuadPart && freq) {
+    if (s_host_at_update && freq) {
         static double host_freq;
-        LARGE_INTEGER t;
-        if (!host_freq) {
-            LARGE_INTEGER f;
-            QueryPerformanceFrequency(&f);
-            host_freq = (double)f.QuadPart;
-        }
-        QueryPerformanceCounter(&t);
-        gnow += (double)(t.QuadPart - s_host_at_update.QuadPart) * (double)freq / host_freq;
+        uint64_t t;
+        if (!host_freq)
+            host_freq = (double)bw_hook_counter_frequency();
+        t = bw_hook_counter();
+        gnow += (double)(t - s_host_at_update) * (double)freq / host_freq;
     }
     if (tick <= 0.0 || gnow < (double)clk)
         return 1.0f;
@@ -872,7 +910,7 @@ static uint32_t *s_aud_pre;
 static AudStat *s_aud;
 static uint32_t s_aud_frames;
 static double s_aud_dt_sum;
-static ULONGLONG s_aud_last;
+static uint64_t s_aud_last;
 
 static int aud_float_ok(uint32_t u)
 {
@@ -930,7 +968,7 @@ static void audit_post(uint32_t dt)
         }
     }
     {
-        ULONGLONG t = GetTickCount64();
+        uint64_t t = bw_hook_milliseconds();
         if (!s_aud_last)
             s_aud_last = t;
         if (t - s_aud_last >= 15000 && s_aud_frames >= 20) {
@@ -1002,20 +1040,20 @@ static void rain_count(uint32_t sky)
     static int on = -1;
     static double live_sum, fall_sum, fall_n, t_prev;
     static unsigned long frames, spawned;
-    static ULONGLONG last;
-    static LARGE_INTEGER f0;
-    LARGE_INTEGER now;
+    static uint64_t last;
+    static uint64_t f0;
+    uint64_t now;
     double t, dt;
     uint32_t n = 0, p, i;
     int c, pv;
     if (on < 0) {
         on = env_u("BW_RAINLOG", 0) == 1;
-        QueryPerformanceFrequency(&f0);
+        f0 = bw_hook_counter_frequency();
     }
     if (!on)
         return;
-    QueryPerformanceCounter(&now);
-    t = (double)now.QuadPart / (double)f0.QuadPart;
+    now = bw_hook_counter();
+    t = (double)now / (double)f0;
     dt = t_prev > 0 ? t - t_prev : 0;
     t_prev = t;
     c = s_rd_cur ^= 1;
@@ -1039,7 +1077,7 @@ static void rain_count(uint32_t sky)
     live_sum += n;
     frames++;
     {
-        ULONGLONG tk = GetTickCount64();
+        uint64_t tk = bw_hook_milliseconds();
         if (!last)
             last = tk;
         if (tk - last >= 1000) {
@@ -1086,7 +1124,7 @@ void sub_00091380(void)
 {
     if (s_on) {
         HU32(GAME_VA + GAME_SPEED_MODE) = GAME_SPEED_FIXED;
-        QueryPerformanceCounter(&s_host_at_update);   /* about when it reads its clock */
+        s_host_at_update = bw_hook_counter();   /* about when it reads its clock */
     }
     s_in_update = 1;
     bw_fl_event(BW_FL_G_UPD, 0, 0, 0);
@@ -1209,8 +1247,8 @@ void sub_00028600(void)
     s_steps_since_draw = 0;
     s_st_frames++;
     if (s_log) {
-        static ULONGLONG last;
-        ULONGLONG now = GetTickCount64();
+        static uint64_t last;
+        uint64_t now = bw_hook_milliseconds();
         if (!last)
             last = now;
         if (now - last >= 1000) {

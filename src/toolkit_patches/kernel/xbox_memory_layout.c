@@ -13,19 +13,22 @@
  */
 
 #if !defined(_WIN32) && !defined(_GNU_SOURCE)
-#define _GNU_SOURCE   /* glibc declares dladdr/Dl_info (RECOMP_WATCH) only under it */
+#define _GNU_SOURCE
 #endif
 #include "xbox_memory_layout.h"
 #include "kernel.h"
 #include "guest_vmem.h"
 #include "kernel_missing.h"
 #include "nv2a_flip_hold.h"
+#include "../bw_shared_u8.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <setjmp.h>
 #if !defined(_WIN32)
+#include <pthread.h>
 #include <unistd.h>   /* _exit */
+#include "../bw_runtime_lifecycle.h"
 #endif
 
 /* XBE header field offsets (per xboxdevwiki.net/Xbe) */
@@ -110,6 +113,16 @@ static void *g_tiled_view = NULL;
  * XBOX_CONTIG_BASE / XBOX_CONTIG_SIZE come from kernel.h - the bridges need
  * the same numbers for MmClaimGpuInstanceMemory. */
 static void *g_contig_memory = NULL;
+
+int bw_xbox_contiguous_memory_region(void **host, uint32_t *guest_va, size_t *bytes)
+{
+    if (!g_contig_memory || !host || !guest_va || !bytes)
+        return 0;
+    *host = g_contig_memory;
+    *guest_va = XBOX_CONTIG_BASE;
+    *bytes = XBOX_CONTIG_SIZE;
+    return 1;
+}
 
 /* NV2A GPU register aperture (see MemoryLayoutInit). Backed as plain RAM so
  * that D3D8 code linked into the title can poke it without faulting. */
@@ -411,7 +424,12 @@ static size_t xbox_TiledApertureSize(void)
     return g_memory_size < max ? g_memory_size : max;
 }
 
+#if defined(_WIN32)
 static HANDLE g_nv2a_ack_thread = NULL;
+#else
+static pthread_t g_nv2a_ack_thread;
+static int g_nv2a_ack_started;
+#endif
 static volatile LONG g_nv2a_ack_stop = 0;
 
 /*
@@ -573,12 +591,11 @@ static const struct { uint32_t offset; uint32_t idle_mask; } NV2A_IDLE[] = {
  * register itself reads 0. The bit has to be clear at the moment of the read,
  * which means the write must never deposit it.
  *
- * So the page is PAGE_READONLY: reads run at full speed and see plain memory,
- * writes fault. The fault handler makes the page writable, single-steps the
- * faulting instruction, then masks RR out of the three control bytes and
- * re-protects. No instruction decoding, which matters because the write forms
- * a compiler emits here are not worth enumerating -- and being wrong about
- * one would corrupt a register rather than fail visibly.
+ * The page is read-only: reads see plain memory, and writes fault. On Windows,
+ * the VEH temporarily opens the page, single-steps and clears RR. On macOS
+ * arm64, a shared writable alias lets the store be decoded and masked without
+ * opening the guest mapping. Unsupported instructions fail rather than
+ * silently corrupting a register.
  *
  * Only RR. Bit 0 is RPBM, run/pause bus master, which software owns.
  */
@@ -659,96 +676,213 @@ static LONG CALLBACK ac97_write_veh(PEXCEPTION_POINTERS ep)
 #if !defined(_WIN32) && defined(__aarch64__)
 #include "../platform/mmio_decode_a64.h"
 #include <sys/mman.h>
-static size_t g_ac97_hsize;    /* host page: 16 KB on arm64 Darwin */
+
+#if defined(__APPLE__)
+#include <mach/mach.h>
+#include <mach/mach_vm.h>
+#include <stdatomic.h>
+
+typedef struct {
+    uintptr_t guest;
+    uintptr_t writable;
+    size_t size;
+} Ac97PosixPage;
+
+static Ac97PosixPage g_ac97_posix_page;
+static _Atomic(Ac97PosixPage *) g_ac97_posix_active;
+_Static_assert(ATOMIC_POINTER_LOCK_FREE == 2,
+               "the AC97 signal handler needs lock-free pointer loads");
+
+typedef struct __attribute__((packed, may_alias)) { uint16_t v; } Ac97U16;
+typedef struct __attribute__((packed, may_alias)) { uint32_t v; } Ac97U32;
+typedef struct __attribute__((packed, may_alias)) { uint64_t v; } Ac97U64;
 
 static uint64_t ac97_posix_rd(void *dev, uint32_t off, int size)
 {
-    uint64_t v = 0;
-    memcpy(&v, (char *)dev + off, size > 8 ? 8 : size);
-    return v;
+    uintptr_t p = ((Ac97PosixPage *)dev)->writable + off;
+    switch (size) {
+    case 1: return *(volatile uint8_t *)p;
+    case 2: return ((volatile Ac97U16 *)p)->v;
+    case 4: return ((volatile Ac97U32 *)p)->v;
+    case 8: return ((volatile Ac97U64 *)p)->v;
+    default: return 0;
+    }
 }
 
 static void ac97_posix_wr(void *dev, uint32_t off, uint64_t v, int size)
 {
-    memcpy((char *)dev + off, &v, size > 8 ? 8 : size);
+    uintptr_t p = ((Ac97PosixPage *)dev)->writable + off;
+    uint32_t control;
+
+    /* Mask reset before publishing the store: readers can access the guest
+     * mapping concurrently, and must never observe a transient set bit. */
+    for (control = 0x10B; control < 0x180; control += 0x10) {
+        if (control >= off && control - off < (uint32_t)size)
+            v &= ~((uint64_t)AC97_RR << (8 * (control - off)));
+    }
+    switch (size) {
+    case 1: *(volatile uint8_t *)p = (uint8_t)v; break;
+    case 2: ((volatile Ac97U16 *)p)->v = (uint16_t)v; break;
+    case 4: ((volatile Ac97U32 *)p)->v = (uint32_t)v; break;
+    case 8: ((volatile Ac97U64 *)p)->v = v; break;
+    }
 }
 
-/* POSIX arm64 half of the AC'97 write trap: the page is PROT_READ, so a
- * write arrives as SIGBUS/SIGSEGV; the title's fault handler reaches this
- * through xbox_PosixMmioFault before reporting. The store is emulated onto
- * the page (open for the moment), the controller's reaction applied, and the
- * page closed again. Returns 1 when the fault was this trap and the access
- * was serviced. */
-static volatile int g_ac97_posix_lock;
-
-int xbox_Ac97PosixFault(void *ucv, uintptr_t fault)
+static int64_t ac97_sign_extend(uint32_t value, unsigned bits)
 {
-    int ok;
+    int64_t v = value;
+    return (value & (1u << (bits - 1))) ? v - (1LL << bits) : v;
+}
 
-    if (!g_ac97_page || fault < (uintptr_t)g_ac97_page
-            || fault >= (uintptr_t)g_ac97_page + g_ac97_hsize)
-        return 0;
-    /* One trap at a time. The page is open process-wide while the store is
-     * emulated, so a second thread trapping in that window would have its
-     * page closed under it by the first thread's mprotect and fault inside
-     * the emulation. Spin: the window is a few hundred instructions, and a
-     * plain store from another thread while the page is open is still
-     * caught by the sweep below if it lands before it; one landing between
-     * the sweep and the close keeps its RR bit until the next trap. That
-     * residual needs two threads resetting channels at once, which
-     * DirectSound's single-threaded init never does. */
-    while (__atomic_exchange_n(&g_ac97_posix_lock, 1, __ATOMIC_ACQUIRE))
-        ;
-    /* Not opened: the emulated store would fault again on this thread,
-     * which holds the lock it would then spin on. Let it be reported. */
-    if (mprotect(g_ac97_page, g_ac97_hsize, PROT_READ | PROT_WRITE) != 0) {
-        __atomic_store_n(&g_ac97_posix_lock, 0, __ATOMIC_RELEASE);
+/* The shared decoder assumes si_addr is the start of the access. Verify that
+ * assumption and its entire span, especially for accesses crossing a page:
+ * si_addr may instead name the second part of a paired/unaligned store. */
+static int ac97_store_span(ucontext_t *uc, uintptr_t fault,
+                           const Ac97PosixPage *page, uint32_t *offset)
+{
+    uint32_t esr = uc->uc_mcontext->__es.__esr;
+    uint32_t fault_status = esr & 0x3fu;
+    uint32_t insn, op, rn, rt;
+    uint64_t address, base;
+    unsigned bytes;
+
+    if (((esr >> 26) & 0x3fu) != 0x24u || !(esr & (1u << 6))
+            || (esr & ((1u << 10) | (1u << 7)))
+            || !((fault_status >= 4 && fault_status <= 7)
+                 || (fault_status >= 13 && fault_status <= 15)))
+        return 0; /* not a valid, user-mode translation/permission store fault */
+    insn = *(const uint32_t *)(uintptr_t)A64_CTX_PC(uc);
+    op = (insn >> 27) & 7;
+    rn = (insn >> 5) & 31;
+    rt = insn & 31;
+    base = *mmio_a64_xreg(uc, (int)rn);
+
+    if (op == 7) {
+        unsigned size = (insn >> 30) & 3;
+        unsigned opc = (insn >> 22) & 3;
+        unsigned vector = (insn >> 26) & 1;
+        unsigned form = (insn >> 24) & 3;
+        unsigned scale;
+
+        if ((vector && (opc & 1)) || (!vector && opc != 0))
+            return 0;
+        if (vector && (opc & 2)) {
+            if (size != 0)
+                return 0;
+            bytes = 16;
+            scale = 4;
+        } else {
+            bytes = 1u << size;
+            scale = size;
+        }
+        if (form == 1) {
+            address = base + (((insn >> 10) & 0xfffu) << scale);
+        } else if (form == 0) {
+            unsigned sub = (insn >> 10) & 3;
+            if ((insn >> 21) & 1) {
+                unsigned rm = (insn >> 16) & 31;
+                unsigned option = (insn >> 13) & 7;
+                uint64_t reg = rm == 31 ? 0 : *mmio_a64_xreg(uc, (int)rm);
+                switch (option) {
+                case 2: reg = (uint32_t)reg; break; /* UXTW */
+                case 3: break;                     /* LSL */
+                case 6: reg = (uint64_t)(int64_t)(int32_t)reg; break;
+                case 7: break;                     /* SXTX */
+                default: return 0;
+                }
+                if (sub != 2)
+                    return 0;
+                address = base + (reg << (((insn >> 12) & 1) ? scale : 0));
+            } else {
+                int64_t imm = ac97_sign_extend((insn >> 12) & 0x1ffu, 9);
+                if (sub == 2 || (sub != 0 && !vector && rn != 31 && rn == rt))
+                    return 0;
+                address = base + (sub == 1 ? 0 : (uint64_t)imm);
+            }
+        } else {
+            return 0;
+        }
+    } else if (op == 5) {
+        unsigned opc = (insn >> 30) & 3;
+        unsigned vector = (insn >> 26) & 1;
+        unsigned mode = (insn >> 23) & 7;
+        unsigned rt2 = (insn >> 10) & 31;
+        unsigned element;
+        int64_t imm = ac97_sign_extend((insn >> 15) & 0x7fu, 7);
+
+        if ((insn & (1u << 22)) || mode < 1 || mode > 3)
+            return 0;
+        if (vector) {
+            if (opc > 1)
+                return 0;
+            element = 4u << opc;
+        } else {
+            if (opc != 0 && opc != 2)
+                return 0;
+            element = opc == 0 ? 4 : 8;
+            if (mode != 2 && rn != 31 && (rn == rt || rn == rt2))
+                return 0;
+        }
+        bytes = 2 * element;
+        address = base + (mode == 1 ? 0 : (uint64_t)(imm * element));
+    } else {
         return 0;
     }
-    ok = mmio_emulate_a64((ucontext_t *)ucv, (uint32_t)(fault - (uintptr_t)g_ac97_page),
-                          g_ac97_page, ac97_posix_rd, ac97_posix_wr);
-    if (ok)
-        ac97_clear_reset_bits();
-    mprotect(g_ac97_page, g_ac97_hsize, PROT_READ);
-    __atomic_store_n(&g_ac97_posix_lock, 0, __ATOMIC_RELEASE);
-    return ok;
+
+    if (address != fault || address < page->guest || bytes > page->size
+            || address - page->guest > page->size - bytes)
+        return 0;
+    *offset = (uint32_t)(address - page->guest);
+    return 1;
 }
+
+/* The guest mapping stays read-only. This separate shared mapping is never
+ * protected, so concurrent writes cannot slip through an mprotect window.
+ * The callback does not call libc, wait, allocate, or log in signal context. */
+int xbox_Ac97PosixFault(void *ucv, uintptr_t fault)
+{
+    Ac97PosixPage *page = atomic_load_explicit(&g_ac97_posix_active,
+                                                memory_order_acquire);
+    ucontext_t *uc = (ucontext_t *)ucv;
+    uint32_t offset;
+
+    if (!page || !uc || !uc->uc_mcontext || fault < page->guest
+            || fault - page->guest >= page->size
+            || !ac97_store_span(uc, fault, page, &offset))
+        return 0;
+    return mmio_emulate_a64(uc, offset, page, ac97_posix_rd, ac97_posix_wr);
+}
+
+static void ac97_posix_disarm(void)
+{
+    Ac97PosixPage *page = atomic_exchange_explicit(&g_ac97_posix_active, NULL,
+                                                    memory_order_acq_rel);
+    if (page)
+        munmap((void *)page->writable, page->size);
+    g_ac97_page = NULL;
+}
+#else
+int xbox_Ac97PosixFault(void *ucv, uintptr_t fault)
+{
+    (void)ucv;
+    (void)fault;
+    return 0;
+}
+#endif /* __APPLE__ */
 #endif
 
 /* Arm the trap. Called once the MCPX aperture exists, and only alongside the
  * rest of RECOMP_AC97_READY: a title that never gets as far as resetting a
  * channel has nothing to gain from it, and the page fault costs something. */
-static void ac97_arm_write_trap(void)
+static int ac97_arm_write_trap(void)
 {
+    if (!g_mcpx_memory)
+        return 0;
+    if (g_ac97_page)
+        return 1;
+#if defined(_WIN32)
     DWORD old;
-
-    if (!g_mcpx_memory || g_ac97_page)
-        return;
-#if !defined(_WIN32) && !defined(__aarch64__)
-    /* No POSIX decoder for this host's stores: a trapped write would be a
-     * fault nothing services. Leave the page writable. */
-    (void)old;
-    fprintf(stderr, "  AC97: bus-master write trap not available on this"
-                    " host; a channel reset will spin\n");
-    return;
-#endif
     g_ac97_page = (char *)g_mcpx_memory + AC97_NABM_OFFSET;
-#if !defined(_WIN32) && defined(__aarch64__)
-    (void)old;
-    g_ac97_hsize = (size_t)sysconf(_SC_PAGESIZE);
-    if (g_ac97_hsize < AC97_TRAP_BYTES)
-        g_ac97_hsize = AC97_TRAP_BYTES;
-    if (mprotect(g_ac97_page, g_ac97_hsize, PROT_READ) != 0) {
-        g_ac97_page = NULL;
-        fprintf(stderr, "  AC97: could not arm the bus-master write trap;"
-                        " a channel reset will spin\n");
-        return;
-    }
-    fprintf(stderr, "  AC97: bus-master writes trapped at 0x%08X"
-                    " (POSIX; channel reset completes on write)\n",
-            XBOX_MCPX_BASE + AC97_NABM_OFFSET);
-    return;
-#endif
     /* First, so it runs before the game target's own crash reporter, which
      * would otherwise print the write as an access violation. */
     g_ac97_veh = AddVectoredExceptionHandler(1, ac97_write_veh);
@@ -762,11 +896,56 @@ static void ac97_arm_write_trap(void)
         g_ac97_page = NULL;
         fprintf(stderr, "  AC97: could not arm the bus-master write trap;"
                         " a channel reset will spin\n");
-        return;
+        return 0;
     }
     fprintf(stderr, "  AC97: bus-master writes trapped at 0x%08X"
                     " (channel reset completes on write)\n",
             XBOX_MCPX_BASE + AC97_NABM_OFFSET);
+    return 1;
+#elif defined(__APPLE__) && defined(__aarch64__)
+    long host_page = sysconf(_SC_PAGESIZE);
+    mach_vm_address_t alias = 0;
+    vm_prot_t current, maximum;
+    kern_return_t rc;
+
+    if (host_page <= 0 || (uint64_t)host_page > UINT32_MAX) {
+        fprintf(stderr, "  AC97: cannot determine the host page size;"
+                        " refusing AC97 initialization\n");
+        return 0;
+    }
+    g_ac97_page = (char *)g_mcpx_memory + AC97_NABM_OFFSET;
+    g_ac97_posix_page.guest = (uintptr_t)g_ac97_page;
+    g_ac97_posix_page.size = (size_t)host_page < AC97_TRAP_BYTES
+                           ? AC97_TRAP_BYTES : (size_t)host_page;
+    rc = mach_vm_remap(mach_task_self(), &alias, g_ac97_posix_page.size, 0,
+                       VM_FLAGS_ANYWHERE, mach_task_self(),
+                       (mach_vm_address_t)g_ac97_posix_page.guest, FALSE,
+                       &current, &maximum, VM_INHERIT_NONE);
+    if (rc != KERN_SUCCESS || !(current & VM_PROT_WRITE)) {
+        if (rc == KERN_SUCCESS)
+            munmap((void *)(uintptr_t)alias, g_ac97_posix_page.size);
+        g_ac97_page = NULL;
+        fprintf(stderr, "  AC97: cannot create writable register alias"
+                        " (Mach error %d)\n", rc);
+        return 0;
+    }
+    g_ac97_posix_page.writable = (uintptr_t)alias;
+    atomic_store_explicit(&g_ac97_posix_active, &g_ac97_posix_page,
+                          memory_order_release);
+    if (mprotect(g_ac97_page, g_ac97_posix_page.size, PROT_READ) != 0) {
+        ac97_posix_disarm();
+        fprintf(stderr, "  AC97: cannot protect the bus-master page\n");
+        return 0;
+    }
+    fprintf(stderr, "  AC97: bus-master writes trapped at 0x%08X"
+                    " (shared alias; channel reset completes on write)\n",
+            XBOX_MCPX_BASE + AC97_NABM_OFFSET);
+    return 1;
+#else
+    fprintf(stderr, "  AC97: safe bus-master write trapping is unavailable"
+                    " on this host\n");
+    return 0;
+#endif
 }
 
 /*
@@ -836,11 +1015,10 @@ extern bool apu_hook_handle_mmio_posix(void *ucv, uintptr_t fault_addr,
                                        uint32_t fault_xbox_va, int is_write);
 #endif
 
-/* POSIX: call from the title's SIGBUS/SIGSEGV handler (SA_SIGINFO) with its
- * ucontext_t * and si_addr; on 1, return from the handler and the thread
- * resumes after the emulated instruction. APU, then AC'97, then OHCI. Only
- * arm64 hosts have a decoder; elsewhere nothing is trapped and this returns
- * 0. */
+/* POSIX: service a captured fault in ordinary thread context. APU and OHCI
+ * callbacks can use locks, condition variables and stdio, so this dispatcher
+ * must not be called directly from a signal handler. AC'97 alone has a
+ * signal-safe entry point, xbox_Ac97PosixFault. */
 int xbox_PosixMmioFault(void *ucv, uintptr_t fault)
 {
 #if defined(__aarch64__)
@@ -1720,14 +1898,48 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
     return 0;
 }
 
+#if !defined(_WIN32)
+static void *nv2a_ack_thread_posix(void *param)
+{
+    nv2a_ack_thread(param);
+    return NULL;
+}
+
+int bw_xbox_nv2a_stop(void)
+{
+    if (g_nv2a_ack_started) {
+        int rc;
+        InterlockedExchange(&g_nv2a_ack_stop, 1);
+        rc = pthread_join(g_nv2a_ack_thread, NULL);
+        if (rc != 0) {
+            fprintf(stderr, "  NV2A: could not join ack worker: %s\n", strerror(rc));
+            return -1;
+        }
+        g_nv2a_ack_started = 0;
+    }
+    return 0;
+}
+#endif
+
 static void xbox_Nv2aAckStart(void)
 {
     dsp_ack_init();
     poke_init();
     g_nv2a_ack_stop = 0;
+#if defined(_WIN32)
     g_nv2a_ack_thread = CreateThread(NULL, 0, nv2a_ack_thread,
                                      g_nv2a_memory, 0, NULL);
     if (g_nv2a_ack_thread) {
+#else
+    {
+        int rc = pthread_create(&g_nv2a_ack_thread, NULL, nv2a_ack_thread_posix,
+                                g_nv2a_memory);
+        g_nv2a_ack_started = (rc == 0);
+        if (rc != 0)
+            fprintf(stderr, "  NV2A: cannot start ack worker: %s\n", strerror(rc));
+    }
+    if (g_nv2a_ack_started) {
+#endif
         fprintf(stderr, "  NV2A busy-bit ack: %zu register(s) acknowledged\n",
                 sizeof(NV2A_ACK) / sizeof(NV2A_ACK[0]));
     }
@@ -2081,9 +2293,7 @@ static LONG CALLBACK watch_veh(PEXCEPTION_POINTERS ep)
         }
     }
 #else
-    /* The non-Windows VEH shim never fires and EXCEPTION_POINTERS is
-     * opaque there, so there is nothing to decode. POSIX arms its own
-     * signal handler below and reports from it. */
+    /* The non-Windows VEH shim never fires and EXCEPTION_POINTERS is opaque. */
     (void)ep;
     (void)watch_report;
     (void)s_watch_stepping;
@@ -2092,182 +2302,11 @@ static LONG CALLBACK watch_veh(PEXCEPTION_POINTERS ep)
 }
 
 #if !defined(_WIN32)
-/* POSIX: no single-step from a signal handler on arm64, so the trap is
- * "fault, unprotect, re-protect later". The fault names the writer: lifted
- * calls are native calls, so the host stack at the fault is the guest call
- * chain (the lifted functions' frames). A helper thread re-protects the page a moment
- * later and prints which watched dwords changed in that window. A write by
- * another thread inside the window is seen in the diff but not attributed.
- *
- * RECOMP_WATCH_LEN=<bytes> (default 4, clamped to the host page) widens the range,
- * so the fields of one heap object can be watched at once. Writes through
- * the contiguous-window alias go to a different host mapping and are not
- * trapped. */
-#include <signal.h>
-#include <sys/mman.h>
-#include <dlfcn.h>
-#include <pthread.h>
-#include <time.h>
-
-static uint32_t g_watch_len = 4;
-static uintptr_t g_watch_hpage, g_watch_hsize;   /* host page (16 KB on arm64 Darwin) */
-static uint32_t g_watch_snap[4096];
-static volatile int g_watch_open;     /* page is RW, re-protect pending */
-static struct sigaction g_watch_prev_bus, g_watch_prev_segv;
-
-static void watch_sym(void *pc, const char *tag, int n)
-{
-    Dl_info di;
-    if (pc && dladdr(pc, &di) && di.dli_sname)
-        fprintf(stderr, "         %s%-2d %s+0x%lX\n", tag, n, di.dli_sname,
-                (unsigned long)((uintptr_t)pc - (uintptr_t)di.dli_saddr));
-    else
-        fprintf(stderr, "         %s%-2d %p\n", tag, n, pc);
-}
-
-static void watch_posix_stack(void *ucv)
-{
-#if defined(__APPLE__) && defined(__aarch64__)
-    ucontext_t *uc = (ucontext_t *)ucv;
-    uintptr_t fp = (uintptr_t)uc->uc_mcontext->__ss.__fp;
-    uintptr_t prev = 0;
-    int n = 0, reps = 0, depth = 0;
-    watch_sym((void *)(uintptr_t)uc->uc_mcontext->__ss.__pc, "#", n++);
-    watch_sym((void *)(uintptr_t)uc->uc_mcontext->__ss.__lr, "#", n++);
-    /* RECOMP_WATCH_DEPTH frames (default 14); identical consecutive return
-     * addresses (recursion) are folded into one line with a count. */
-    {
-        const char *dv = getenv("RECOMP_WATCH_DEPTH");
-        depth = dv && *dv ? atoi(dv) : 14;
-    }
-    while (n < depth && fp && (fp & 7) == 0) {
-        uintptr_t next = ((const uintptr_t *)fp)[0];
-        uintptr_t ret = ((const uintptr_t *)fp)[1];
-        if (ret && ret == prev) {
-            reps++;
-        } else if (ret) {
-            if (reps)
-                fprintf(stderr, "            (previous frame x%d more)\n",
-                        reps);
-            reps = 0;
-            watch_sym((void *)ret, "#", n++);
-            prev = ret;
-        }
-        if (next <= fp)
-            break;
-        fp = next;
-    }
-    if (reps)
-        fprintf(stderr, "            (previous frame x%d more)\n", reps);
-#else
-    (void)ucv;
-    fprintf(stderr, "         (host stack not available on this host)\n");
-#endif
-}
-
-static void watch_posix_handler(int sig, siginfo_t *si, void *ucv)
-{
-    uintptr_t fault = (uintptr_t)si->si_addr;
-    uintptr_t page = g_watch_hpage;
-    struct sigaction *prev;
-
-    if (g_watch_page && fault >= page && fault < page + g_watch_hsize) {
-        uintptr_t lo = (uintptr_t)g_memory_offset + g_watch_va;
-        if (fault >= lo && fault < lo + g_watch_len) {
-            fprintf(stderr, "[WATCH] write to %08X (+0x%X) esp=%08X\n",
-                    (uint32_t)(fault - (uintptr_t)g_memory_offset),
-                    (unsigned)(fault - lo), g_esp);
-            watch_posix_stack(ucv);
-            fflush(stderr);
-        }
-        mprotect((void *)g_watch_hpage, g_watch_hsize, PROT_READ | PROT_WRITE);
-        g_watch_open = 1;
-        return;   /* re-executes the store, now allowed */
-    }
-
-    prev = sig == SIGBUS ? &g_watch_prev_bus : &g_watch_prev_segv;
-    if (prev->sa_flags & SA_SIGINFO) {
-        if (prev->sa_sigaction) {
-            prev->sa_sigaction(sig, si, ucv);
-            return;
-        }
-    } else if (prev->sa_handler != SIG_DFL && prev->sa_handler != SIG_IGN) {
-        prev->sa_handler(sig);
-        return;
-    }
-    signal(sig, SIG_DFL);   /* returning re-faults and dies by the signal */
-}
-
-static void watch_posix_diff(void)
-{
-    const uint32_t *cur = (const uint32_t *)((const uint8_t *)g_memory_offset
-                                             + g_watch_va);
-    uint32_t i, n = (g_watch_len + 3) / 4;
-    for (i = 0; i < n; i++) {
-        if (cur[i] != g_watch_snap[i]) {
-            fprintf(stderr, "[WATCH] [%08X] %08X -> %08X\n",
-                    g_watch_va + i * 4, g_watch_snap[i], cur[i]);
-            g_watch_snap[i] = cur[i];
-        }
-    }
-    fflush(stderr);
-}
-
-static void *watch_posix_reprotect(void *unused)
-{
-    struct timespec ts = { 0, 200 * 1000 };   /* 200 us window */
-    (void)unused;
-    for (;;) {
-        nanosleep(&ts, NULL);
-        if (!g_watch_open)
-            continue;
-        mprotect((void *)g_watch_hpage, g_watch_hsize, PROT_READ);
-        g_watch_open = 0;
-        watch_posix_diff();
-    }
-    return NULL;
-}
-
 static int watch_posix_arm(void)
 {
-    struct sigaction sa;
-    pthread_t th;
-    const char *len = getenv("RECOMP_WATCH_LEN");
-    uint32_t room;
-
-    g_watch_hsize = (uintptr_t)sysconf(_SC_PAGESIZE);
-    g_watch_hpage = ((uintptr_t)g_memory_offset + g_watch_va)
-                    & ~(g_watch_hsize - 1);
-    room = (uint32_t)(g_watch_hpage + g_watch_hsize
-                      - ((uintptr_t)g_memory_offset + g_watch_va));
-    if (room > sizeof g_watch_snap)
-        room = sizeof g_watch_snap;
-    if (len && *len)
-        g_watch_len = (uint32_t)strtoul(len, NULL, 0);
-    if (!g_watch_len)
-        g_watch_len = 4;
-    if (g_watch_len > room)
-        g_watch_len = room;
-    memcpy(g_watch_snap, (const uint8_t *)g_memory_offset + g_watch_va,
-           (g_watch_len + 3) & ~3u);
-
-    memset(&sa, 0, sizeof sa);
-    sa.sa_sigaction = watch_posix_handler;
-    sa.sa_flags = SA_SIGINFO | SA_ONSTACK | SA_NODEFER;
-    sigemptyset(&sa.sa_mask);
-    if (sigaction(SIGBUS, &sa, &g_watch_prev_bus) != 0
-            || sigaction(SIGSEGV, &sa, &g_watch_prev_segv) != 0)
-        return 0;
-    if (pthread_create(&th, NULL, watch_posix_reprotect, NULL) != 0)
-        return 0;
-    pthread_detach(th);
-    if (mprotect((void *)g_watch_hpage, g_watch_hsize, PROT_READ) != 0)
-        return 0;
-    fprintf(stderr, "  WATCH: writes to %u bytes at 0x%08X are trapped "
-                    "(POSIX, current %08X)\n", g_watch_len, g_watch_va,
-            g_watch_last);
-    fflush(stderr);
-    return 1;
+    fprintf(stderr, "  WATCH: unavailable on POSIX; the previous signal "
+                    "handler was not async-signal-safe\n");
+    return 0;
 }
 #endif /* !_WIN32 */
 
@@ -2327,6 +2366,11 @@ static DWORD WINAPI watch_resolver(LPVOID unused)
 void xbox_WatchInit(void)
 {
     const char *spec = getenv("RECOMP_WATCH");
+#if !defined(_WIN32)
+    if (spec && *spec)
+        fprintf(stderr, "  WATCH: unavailable on POSIX; the previous signal "
+                        "handler was not async-signal-safe\n");
+#else
     const char *q;
     char *endp;
 
@@ -2348,6 +2392,7 @@ void xbox_WatchInit(void)
         return;
     }
     watch_arm(g_watch_root + g_watch_off);
+#endif
 }
 
 static int watch_arm(uint32_t va)
@@ -3396,7 +3441,16 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
                     |= MCPX_AC97_CODEC_READY;
                 /* Before the trap is armed: this write would otherwise be
                  * the first thing to fault. */
-                ac97_arm_write_trap();
+#if defined(_WIN32)
+                (void)ac97_arm_write_trap();
+#else
+                if (!ac97_arm_write_trap()) {
+                    fprintf(stderr, "  AC97: cannot provide reset semantics; "
+                                    "refusing memory initialization\n");
+                    xbox_MemoryLayoutShutdown();
+                    return FALSE;
+                }
+#endif
                 fprintf(stderr, "  AC97: codec reported ready at 0x%08X"
                                 " (DirectSound will initialise)\n",
                         XBOX_MCPX_BASE + MCPX_AC97_CODEC_STATUS);
@@ -3715,16 +3769,22 @@ void xbox_ProtectMirrorsForDebug(void)
 
 void xbox_MemoryLayoutShutdown(void)
 {
+#if !defined(_WIN32)
+    if (bw_xbox_nv2a_stop() != 0)
+        return;
+#endif
     if (g_kernel_memory) {
         VirtualFree(g_kernel_memory, 0, MEM_RELEASE);
         g_kernel_memory = NULL;
     }
+#if defined(_WIN32)
     if (g_nv2a_ack_thread) {
         InterlockedExchange(&g_nv2a_ack_stop, 1);
         WaitForSingleObject(g_nv2a_ack_thread, 1000);
         CloseHandle(g_nv2a_ack_thread);
         g_nv2a_ack_thread = NULL;
     }
+#endif
     if (g_nv2a_memory) {
         VirtualFree(g_nv2a_memory, 0, MEM_RELEASE);
         g_nv2a_memory = NULL;
@@ -3766,10 +3826,18 @@ void xbox_MemoryLayoutShutdown(void)
         g_contig_mapping = NULL;
     }
 #endif
+#if !defined(_WIN32) && defined(__APPLE__) && defined(__aarch64__)
+    /* All guest/device threads and fault dispatch must already be stopped. */
+    ac97_posix_disarm();
+#endif
     if (g_mcpx_memory) {
         VirtualFree(g_mcpx_memory, 0, MEM_RELEASE);
         g_mcpx_memory = NULL;
     }
+#if !defined(_WIN32)
+    g_mcpx_regs = NULL;
+    g_apu_mmio_trapped = 0;
+#endif
     if (g_flash_memory) {
         VirtualFree(g_flash_memory, 0, MEM_RELEASE);
         g_flash_memory = NULL;
@@ -3896,12 +3964,30 @@ static SRWLOCK g_heap_lock = SRWLOCK_INIT;
  * uses it. Fixing that changes which address every later allocation gets, in
  * every title that ever frees, so it is off unless asked for. Read once: the
  * heap is hit constantly and the answer does not change. */
+#if !defined(_WIN32)
+static pthread_once_t g_heap_reclaim_once = PTHREAD_ONCE_INIT;
+static int g_heap_reclaim_on;
+
+static void heap_reclaim_init(void)
+{
+    g_heap_reclaim_on = getenv("RECOMP_HEAP_RECLAIM") != NULL;
+}
+#endif
+
 int xbox_HeapReclaimEnabled(void)
 {
+#if defined(_WIN32)
     static int on = -1;
     if (on < 0)
         on = getenv("RECOMP_HEAP_RECLAIM") != NULL;
     return on;
+#else
+    if (pthread_once(&g_heap_reclaim_once, heap_reclaim_init) != 0) {
+        fprintf(stderr, "[HEAP] failed to initialize reclaim setting\n");
+        abort();
+    }
+    return g_heap_reclaim_on;
+#endif
 }
 
 /* Insert a free block at index `at`, keeping address order. Reuses an empty
@@ -4168,6 +4254,29 @@ static uint32_t g_contig_peak_pages;
 static DWORD    g_contig_t0;
 static volatile LONG g_contig_lock;
 
+static uint32_t contig_high_load(void)
+{
+#if defined(_WIN32)
+    return g_contig_high;
+#else
+    return __atomic_load_n(&g_contig_high, __ATOMIC_ACQUIRE);
+#endif
+}
+
+static void contig_high_store(uint32_t value)
+{
+#if defined(_WIN32)
+    g_contig_high = value;
+#else
+    __atomic_store_n(&g_contig_high, value, __ATOMIC_RELEASE);
+#endif
+}
+
+#if !defined(_WIN32)
+_Static_assert(__atomic_always_lock_free(sizeof(g_contig_high), 0),
+               "the contiguous high-water mark must not require a lock");
+#endif
+
 static void contig_lock(void)
 {
     while (InterlockedCompareExchange(&g_contig_lock, 1, 0) != 0)
@@ -4199,7 +4308,7 @@ static void contig_report(const char *what, uint32_t va, uint32_t pages)
             pages * (CONTIG_PAGE / 1024),
             g_contig_pages_in_use * (CONTIG_PAGE / 1024),
             g_contig_peak_pages * (CONTIG_PAGE / 1024),
-            g_contig_high / 1024, g_contig_allocs, g_contig_frees);
+            contig_high_load() / 1024, g_contig_allocs, g_contig_frees);
     fflush(stderr);
 }
 
@@ -4207,15 +4316,15 @@ static void contig_take(uint32_t first, uint32_t n)
 {
     uint32_t end = (first + n) * CONTIG_PAGE;
 
-    memset(&g_contig_used[first], 1, n);
+    bw_shared_u8_fill(&g_contig_used[first], 1, n);
     g_contig_len[first] = n;
     g_contig_pages_in_use += n;
     if (g_contig_pages_in_use > g_contig_peak_pages)
         g_contig_peak_pages = g_contig_pages_in_use;
-    if (end > g_contig_high)
-        g_contig_high = end;
+    if (end > contig_high_load())
+        contig_high_store(end);
     while (g_contig_first_free < CONTIG_PAGES
-           && g_contig_used[g_contig_first_free])
+           && bw_shared_u8_load(&g_contig_used[g_contig_first_free]))
         g_contig_first_free++;
 }
 
@@ -4246,7 +4355,7 @@ static int contig_avoid_image(void)
 
 static int contig_page_free(uint32_t q, int avoid_image)
 {
-    if (g_contig_used[q])
+    if (bw_shared_u8_load(&g_contig_used[q]))
         return 0;
     return !(avoid_image && g_xbox_image_hi
              && q >= g_xbox_image_lo / CONTIG_PAGE
@@ -4303,7 +4412,7 @@ uint32_t xbox_ContiguousAllocEx(uint32_t size, uint32_t alignment,
     } else {
         uint32_t best = 0, run = 0;
         for (q = 0; q < CONTIG_USABLE; q++) {
-            run = g_contig_used[q] ? 0 : run + 1;
+            run = bw_shared_u8_load(&g_contig_used[q]) ? 0 : run + 1;
             if (run > best) best = run;
         }
         fprintf(stderr, "  [CONTIG] arena exhausted (%u requested, align %u, "
@@ -4346,8 +4455,9 @@ void xbox_ContiguousClaim(uint32_t va, uint32_t size)
         return;
     contig_lock();
     for (q = first; q < first + n; q += run) {
-        if (g_contig_used[q]) { run = 1; continue; }
-        for (run = 0; q + run < first + n && !g_contig_used[q + run]; run++)
+        if (bw_shared_u8_load(&g_contig_used[q])) { run = 1; continue; }
+        for (run = 0; q + run < first + n &&
+                !bw_shared_u8_load(&g_contig_used[q + run]); run++)
             ;
         contig_take(q, run);
         g_contig_allocs++;
@@ -4384,7 +4494,7 @@ int xbox_ContiguousFree(uint32_t va)
         }
         return 0;
     }
-    memset(&g_contig_used[first], 0, n);
+    bw_shared_u8_fill(&g_contig_used[first], 0, n);
     g_contig_len[first] = 0;
     g_contig_pages_in_use -= n;
     if (first < g_contig_first_free)
@@ -4407,7 +4517,7 @@ uint32_t xbox_ContiguousBlockSize(uint32_t va)
         return 0;
     page = (va - XBOX_CONTIG_BASE) / CONTIG_PAGE;
     contig_lock();
-    if (g_contig_used[page] == 1) {             /* not the reserved page 0 */
+    if (bw_shared_u8_load(&g_contig_used[page]) == 1) { /* not reserved page 0 */
         first = page;
         while (first > 0 && !g_contig_len[first])
             first--;
@@ -4427,7 +4537,7 @@ uint32_t xbox_ContiguousBlockSize(uint32_t va)
  * Never decreases, so a freed-and-reused texture stays addressable. */
 uint32_t xbox_ContiguousAllocatedBytes(void)
 {
-    return g_contig_high;
+    return contig_high_load();
 }
 
 /* The in-use map, one byte per 4 KB page of the window: for a device model
@@ -4466,16 +4576,14 @@ uint32_t xbox_ContiguousInUseBytes(void)
  * page holds live sound data in both copies, the APU picks RAM; this record
  * cannot tell them apart.
  *
- * Plain byte stores and loads. The APU thread may see a mark a voice-processor
- * pass late (or a cleared one a pass early); the title fills a buffer after
- * naming it and frees it after stopping the voice, so a stale read costs at
- * most one pass of one voice. */
+ * On POSIX, device readers and allocator writers use atomic byte accesses.
+ * The marks alone do not pin a mapping for the duration of a device transfer. */
 static volatile uint8_t g_phys_ram_named[CONTIG_PAGES];
 
 void xbox_PhysNoteRamName(uint32_t va)
 {
     if (va >= XBOX_HEAP_BASE && va < XBOX_HEAP_TOP && va < XBOX_CONTIG_SIZE)
-        g_phys_ram_named[va / CONTIG_PAGE] = 1;
+        bw_shared_u8_store(&g_phys_ram_named[va / CONTIG_PAGE], 1);
 }
 
 /* Heap block m is free (and merged with any free neighbours): its pages name
@@ -4516,7 +4624,7 @@ static void heap_forget_ram_names(int m)
     if (last >= (int64_t)CONTIG_PAGES)
         last = (int64_t)CONTIG_PAGES - 1;
     for (int64_t p = first; p <= last; p++)
-        g_phys_ram_named[p] = 0;
+        bw_shared_u8_store(&g_phys_ram_named[p], 0);
 }
 
 const volatile uint8_t *xbox_PhysRamNameMap(void)

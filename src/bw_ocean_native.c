@@ -13,8 +13,9 @@
  *
  * tools/bw_ocean_xlate.py translates those six functions (the batch,
  * VertexHeightNormal, HeightAndSlopeAt, GridSlopeAt, GetBezierPatch,
- * GetCell) from the generated C into src/recomp/gen/bw_ocean_native.inc, with
- * the x87 stack depth and the frame offsets resolved at translation time:
+ * GetCell) from the generated C into bw_ocean_native.inc (the generated folder
+ * on Windows, the build tree on macOS), with the x87 stack depth and frame
+ * offsets resolved at translation time:
  * the same operations on the same values in the same order, so the result is
  * bit-identical by construction. This file supplies what the translation
  * uses, runs it for the render-vertex batches only, and checks the
@@ -28,6 +29,8 @@
  *     marked built); if either is set, the native work is thrown away, the
  *     state it changed is put back and the game's own function runs;
  *   - the x87's trigonometric range (|x| < 2^63) holds, likewise.
+ * macOS saves/restores the host floating-point environment and builds this
+ * translation with contraction disabled and floating-point rounding observed.
  *
  * Only the batch Ocean_FillVertices calls (return address 0x37CC2, mode
  * 0x1D) comes here. Every other caller of the water (boats, hulls,
@@ -48,21 +51,22 @@
  *                             mismatches, and the time spent (every edition:
  *                             in Original it times the game's own code)
  */
-#ifndef WIN32_LEAN_AND_MEAN
-#define WIN32_LEAN_AND_MEAN
-#endif
-#include <windows.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
+#include <float.h>
 #include <setjmp.h>
-#include <intrin.h>
-#include <xmmintrin.h>
+#if !defined(_WIN32)
+#include <fenv.h>
+#pragma STDC FENV_ACCESS ON
+#pragma STDC FP_CONTRACT OFF
+#endif
 
 #include "recomp_types.h"           /* the generated C's (BW_GEN_DIR, CMakeLists.txt) */
 #include "bw_edition.h"
+#include "bw_hook_platform.h"
 
 #ifdef _MSC_VER
 #pragma warning(disable: 4102 4189 4101 4100 4702)  /* the translation's labels and locals */
@@ -112,8 +116,29 @@ typedef struct {
 /* Before a Bezier patch is marked built (the only shared state the
  * translation commits besides its outputs): no result may have left float's
  * range so far, or the whole native batch is thrown away. */
-#define MX_RANGE (_MM_EXCEPT_OVERFLOW | _MM_EXCEPT_UNDERFLOW)
-#define NB_COMMIT_CHECK() do { if (_mm_getcsr() & MX_RANGE) NB_BAIL(); } while (0)
+#if defined(_WIN32)
+#define NB_RANGE_EXCEPTIONS() (_mm_getcsr() & (_MM_EXCEPT_OVERFLOW | _MM_EXCEPT_UNDERFLOW))
+#else
+#define NB_RANGE_EXCEPTIONS() fetestexcept(FE_OVERFLOW | FE_UNDERFLOW)
+#endif
+#define NB_COMMIT_CHECK() do { if (NB_RANGE_EXCEPTIONS()) NB_BAIL(); } while (0)
+
+#if defined(_WIN32)
+#define NB_ROUND24(ctx, x) ((double)(float)(x))
+#else
+/* A tiny value can round up to FLT_MIN without setting FE_UNDERFLOW. The
+ * generated x87 model keeps its wider exponent, so conservatively run the
+ * generated body for any finite, nonzero value outside float's normal range. */
+static inline double nb_round24(NbCtx *ctx, double value)
+{
+    double magnitude = fabs(value);
+    if (magnitude != 0.0 && isfinite(magnitude) &&
+        (magnitude < FLT_MIN || magnitude > FLT_MAX))
+        longjmp(ctx->jb, 1);
+    return (double)(float)value;
+}
+#define NB_ROUND24(ctx, x) nb_round24((ctx), (double)(x))
+#endif
 
 /* Guest memory, not volatile (this code is the only thing running on the
  * game thread while it runs, as the generated code is). */
@@ -152,7 +177,7 @@ static void nbx_ftol2(NbCtx *NBC, NbRegs *NBR, uint32_t SP, double x)
     {
         double dd = x - fi;                                 /* fsubp st(1) (RECOMP_FP_PC) */
         if (NBC->pc24)
-            dd = (double)(float)dd;
+            dd = NB_ROUND24(NBC, dd);
         df = (float)dd;                                     /* fstp [esp] */
     }
     memcpy(&db, &df, 4);
@@ -184,7 +209,7 @@ done:
 
 /* The translation at 24-bit precision (the Xbox's D3D-era default; what
  * Water_Update itself sets for its run) ... */
-#define NB_R(x) ((double)(float)(x))
+#define NB_R(x) NB_ROUND24(NBC, (x))
 #include "bw_ocean_native.inc"
 #undef NB_R
 /* ... and at 53/64 bits (the runtime's initial control word 0x037F), as
@@ -235,10 +260,21 @@ static unsigned env_u(const char *name, unsigned dflt)
     return e && *e ? (unsigned)strtoul(e, NULL, 10) : dflt;
 }
 
+static unsigned long long nb_ticks(void)
+{
+#if defined(_WIN32)
+    return __rdtsc();
+#else
+    return bw_hook_counter();
+#endif
+}
+
 static void nb_init(void)
 {
+#if defined(_WIN32)
     LARGE_INTEGER f, q0, q1;
     unsigned long long t0, t1;
+#endif
     s_init = 1;
     s_log = env_u("BW_OCEAN_NATIVE_LOG", 0) == 1;
     s_on = bw_edition_at_least(BW_ED_REMASTERED) && bw_fix_enabled(BW_FIX_OCEAN_NATIVE)
@@ -252,13 +288,18 @@ static void nb_init(void)
     s_seamtest = bw_edition_at_least(BW_ED_REMASTERED) && env_u("BW_OCEAN_SEAM_TEST", 0) == 1;
     s_tiledump = getenv("BW_OCEAN_TILEDUMP") && *getenv("BW_OCEAN_TILEDUMP");
     if (s_log) {
+#if defined(_WIN32)
         QueryPerformanceFrequency(&f);
         QueryPerformanceCounter(&q0);
-        t0 = __rdtsc();
+        t0 = nb_ticks();
         do QueryPerformanceCounter(&q1); while ((q1.QuadPart - q0.QuadPart) * 1000 < f.QuadPart * 20);
-        t1 = __rdtsc();
+        t1 = nb_ticks();
         s_tsc_per_ms = (double)(t1 - t0) * (double)f.QuadPart / (double)(q1.QuadPart - q0.QuadPart) / 1000.0;
         s_t_last = t1;
+#else
+        s_tsc_per_ms = (double)bw_hook_counter_frequency() / 1000.0;
+        s_t_last = nb_ticks();
+#endif
     }
     if (s_on || s_log)
         fprintf(stderr, "[BW] native ocean: %s%s (render-vertex batches; docs/day1/P2a.md)\n",
@@ -271,21 +312,39 @@ static void nb_init(void)
 static int nb_run(NbRegs *r, uint32_t sp)
 {
     NbCtx c;
+#if defined(_WIN32)
     unsigned int mx = _mm_getcsr();
+#else
+    fenv_t saved_env;
+#endif
     volatile int ok = 0;
     c.cw = g_fp_control_word;
     c.pc24 = (c.cw & 0x300u) == 0;
     c.cov = s_verify ? s_cov : NULL;
     c.mo = (uintptr_t)g_xbox_mem_offset;
+#if defined(_WIN32)
     _mm_setcsr(mx & ~0x3Fu);
+#else
+    if (feholdexcept(&saved_env) != 0) {
+        s_n_fb_bail++;
+        return 0;
+    }
+#endif
     if (!setjmp(c.jb)) {
         if (c.pc24)
             nbx_batch(&c, r, sp, (unsigned)g_fp_top & 7u);
         else
             nbx64_batch(&c, r, sp, (unsigned)g_fp_top & 7u);
-        ok = (_mm_getcsr() & MX_RANGE) == 0 ? 1 : 2;
+        ok = NB_RANGE_EXCEPTIONS() == 0 ? 1 : 2;
     }
+#if defined(_WIN32)
     _mm_setcsr(mx);
+#else
+    if (fesetenv(&saved_env) != 0) {
+        fprintf(stderr, "[BW] native ocean: could not restore host floating-point state\n");
+        abort();
+    }
+#endif
     if (ok == 2) s_n_fb_range++;
     else if (!ok) s_n_fb_bail++;
     return ok == 1;
@@ -465,7 +524,7 @@ static void nb_fuzz(uint32_t sp, uint32_t nv, unsigned kind)
 
 static void nb_log(void)
 {
-    unsigned long long now = __rdtsc();
+    unsigned long long now = nb_ticks();
     double el = (double)(now - s_t_last) / s_tsc_per_ms;
     if (el < 5000.0)
         return;
@@ -515,7 +574,7 @@ static unsigned s_td_n;
 static unsigned long long s_td_t0;
 static void nb_tiledump(uint32_t sp)
 {
-    unsigned long long now = GetTickCount64();
+    unsigned long long now = bw_hook_milliseconds();
     uint32_t base = GU32(WW_VA + 0xCCBCu), stride = GU32(WW_VA + 0xCCD8u);
     float x0, z0, x1, z1, ex, ey, ez;
     if (!s_td_t0)
@@ -596,7 +655,7 @@ static void nb_eval(void)
     unsigned long long t0 = 0;
     NbRegs r;
     if (s_log)
-        t0 = __rdtsc();
+        t0 = nb_ticks();
     if (s_seamtest)                              /* diagnostic: bicubic heights for every tile */
         GU32(sp + 4) &= ~0x80u;
     if (s_tiledump)
@@ -633,7 +692,7 @@ static void nb_eval(void)
             restore_regs_ok(&r, sp);
             s_n_native++;
             if (s_log) {
-                s_t_native += __rdtsc() - t0;
+                s_t_native += nb_ticks() - t0;
                 nb_log();
             }
             return;
@@ -651,7 +710,7 @@ static void nb_eval(void)
 timed_game:
     s_n_game++;
     if (s_log) {
-        s_t_game += __rdtsc() - t0;
+        s_t_game += nb_ticks() - t0;
         nb_log();
     }
 }

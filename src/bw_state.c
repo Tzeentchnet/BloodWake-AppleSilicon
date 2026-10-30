@@ -22,7 +22,13 @@
  * The section hitpoints read 0 on the player's speedboat (only big ships
  * have sections, inferred); hp_int is the health the HUD bar shows.
  */
+#ifdef _WIN32
 #include <windows.h>
+#define BW_BAD_PAGE (PAGE_NOACCESS | PAGE_GUARD)
+#else
+#include "platform/win32_compat.h"
+#define BW_BAD_PAGE PAGE_NOACCESS
+#endif
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -124,6 +130,18 @@ static void obj_pos(uint32_t obj, float out[3])
  * memory only), to find the game's object lists. Read-only like the rest. */
 static unsigned s_scan_after;
 
+static uint32_t scan_region_len(uintptr_t host, const MEMORY_BASIC_INFORMATION *mbi,
+                                uint32_t va, uint32_t limit)
+{
+    uintptr_t base = (uintptr_t)mbi->BaseAddress;
+    size_t available = host >= base && host - base < mbi->RegionSize
+                     ? mbi->RegionSize - (size_t)(host - base) : 0;
+    uint32_t remaining = limit - va;
+    if (!available)
+        return remaining < 0x1000u ? remaining : 0x1000u;
+    return available < remaining ? (uint32_t)available : remaining;
+}
+
 static void scan_for_pointer(uint32_t target)
 {
     uint32_t va = 0x00010000u, hits = 0;
@@ -134,8 +152,8 @@ static void scan_for_pointer(uint32_t target)
         uint32_t len, k;
         if (!VirtualQuery((void *)host, &mbi, sizeof mbi))
             break;
-        len = (uint32_t)((uintptr_t)mbi.BaseAddress + mbi.RegionSize - host);
-        if (mbi.State == MEM_COMMIT && !(mbi.Protect & (PAGE_NOACCESS | PAGE_GUARD))) {
+        len = scan_region_len(host, &mbi, va, 0x04000000u);
+        if (mbi.State == MEM_COMMIT && !(mbi.Protect & BW_BAD_PAGE)) {
             for (k = 0; k + 4 <= len && va + k < 0x04000000u; k += 4)
                 if (*(volatile uint32_t *)(host + k) == target) {
                     fprintf(s_out, "# hit %08X\n", va + k);
@@ -165,11 +183,9 @@ static void list_objects(ULONGLONG t)
         uint32_t len, k;
         if (!VirtualQuery((void *)host, &mbi, sizeof mbi))
             break;
-        len = (uint32_t)((uintptr_t)mbi.BaseAddress + mbi.RegionSize - host);
+        len = scan_region_len(host, &mbi, va, 0x04000000u);
         regions++;
-        if (len > 0x04000000u - va)
-            len = 0x04000000u - va;
-        if (mbi.State == MEM_COMMIT && !(mbi.Protect & (PAGE_NOACCESS | PAGE_GUARD))) {
+        if (mbi.State == MEM_COMMIT && !(mbi.Protect & BW_BAD_PAGE)) {
             committed += len;
             for (k = 0x10; k + 0x90 <= len; k += 4) {
                 uint32_t obj = va + k - 0x10, hp, hpmax, j;
@@ -452,8 +468,13 @@ void bw_state_start(void)
         return;
     fprintf(s_out, "# boot %lu\n", (unsigned long)GetCurrentProcessId());
     h = CreateThread(NULL, 0, state_thread, NULL, 0, NULL);
-    if (h)
-        CloseHandle(h);
+    if (!h) {
+        fprintf(stderr, "[BW] could not start the state readout thread\n");
+        fclose(s_out);
+        s_out = NULL;
+        return;
+    }
+    CloseHandle(h);
     fprintf(stderr, "[BW] state readout every %u ms -> %s%s\n", s_ms, path,
             s_dump ? " (with boat dump)" : "");
 }

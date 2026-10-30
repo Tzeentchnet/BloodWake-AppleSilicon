@@ -14,7 +14,11 @@
  * inside that block are accepted; anything else is refused and logged. Off
  * unless the variable is set, so a normal run plays exactly as shipped.
  */
+#ifdef _WIN32
 #include <windows.h>
+#else
+#include "platform/win32_compat.h"
+#endif
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -68,8 +72,11 @@ void bw_debugflags_start(void)
     if (!s_n)
         return;
     h = CreateThread(NULL, 0, debugflags_thread, NULL, 0, NULL);
-    if (h)
-        CloseHandle(h);
+    if (!h) {
+        fprintf(stderr, "[BW] could not start the debug-byte thread\n");
+        return;
+    }
+    CloseHandle(h);
     for (i = 0; i < s_n; i++)
         fprintf(stderr, "[BW] debug byte 0x%08X = %u\n", s_set[i].va, s_set[i].val);
 }

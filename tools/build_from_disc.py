@@ -11,7 +11,7 @@ a full disc image. This script checks that it is an unmodified retail copy
 C on your PC with the xboxrecomp toolkit at its pinned commit, checks that the
 generated C is exactly what the maintainers get (hashes only,
 fingerprints/generated.json; the code itself is never published), and builds
-it with Microsoft's compiler. Nothing from the game leaves your PC.
+it for Windows x64 or macOS Apple Silicon. Nothing from the game leaves your PC.
 
 Steps (each prints one progress line with --progress json):
   identify     what --disc is: a folder, an XISO or a full (Redump) image
@@ -21,8 +21,8 @@ Steps (each prints one progress line with --progress json):
   fingerprint  every file against fingerprints/retail.json
   pipeline     tools/run_pipeline.py (no Ghidra) into <work-dir>/gen
   verify       the generated C against fingerprints/generated.json
-  build        CMake + Visual Studio 2022 (x64, Release)
-  stage        the exe, the launcher and the files it runs with, install.json
+  build        CMake + Visual Studio 2022 (Windows) or Apple Clang (macOS)
+  stage        the executable, Windows launcher if applicable, and install.json
   done
 
 --check-only stops after the fingerprint (nothing is unpacked or copied).
@@ -38,11 +38,10 @@ dependency (the message says which); 4 pipeline failed; 5 the generated code
 doesn't match ours; 6 build failed; 7 disk space or I/O.
 
 Needs: Python 3.13 (3.10+ runs; the fingerprints were made with 3.13) and
-capstone 5.0.9. A full build also needs CMake 3.20+ and Visual Studio
-2022 or its Build Tools with the C++ workload; about 2.6 GB free, and an
-internet connection for the toolkit unless --toolkit is given. No admin
-rights, no `py` launcher, paths with spaces are fine. About 15 minutes on a
-recent desktop (most of it the translation). Stdlib only.
+capstone 5.0.9. A full build also needs CMake 3.20+ and either Visual Studio
+2022 with the C++ workload or, on Apple Silicon, Xcode Command Line Tools,
+SDL2 and OpenSSL. Allow about 2.6 GB free and an internet connection for the
+toolkit unless --toolkit is given. Paths with spaces are fine.
 """
 import argparse
 import datetime as _dt
@@ -50,8 +49,10 @@ import glob
 import hashlib
 import json
 import os
+import platform
 import queue
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -245,6 +246,26 @@ def find_vs():
     return found[0].get("installationPath"), found[0].get("installationVersion")
 
 
+def build_host():
+    if sys.platform == "win32":
+        return "windows"
+    if sys.platform == "darwin":
+        if platform.machine().lower() not in ("arm64", "aarch64"):
+            raise Fail(EXIT_DEP, "identify", "A native Apple Silicon (arm64) Python and host "
+                       "are required for the macOS build.")
+        return "macos"
+    raise Fail(EXIT_DEP, "identify", "A full build requires Windows x64 or macOS on Apple "
+               "Silicon. Use --prepare-only to prepare the generated C on this host.")
+
+
+def find_apple_clang():
+    xcrun = shutil.which("xcrun")
+    if not xcrun:
+        return None
+    clang = run_text([xcrun, "--find", "clang"], REPO)
+    return clang if clang and os.path.isfile(clang) else None
+
+
 def find_cmake(vs_path):
     cands = [shutil.which("cmake")]
     if vs_path:
@@ -262,13 +283,28 @@ def find_cmake(vs_path):
     return None, None
 
 
-def check_space(path, need, step, what):
+def existing_ancestor(path):
     probe = os.path.abspath(path)
     while not os.path.exists(probe):
         parent = os.path.dirname(probe)
         if parent == probe:
             break
         probe = parent
+    return probe
+
+
+def same_storage_volume(first, second):
+    if sys.platform == "darwin":
+        try:
+            return (os.stat(existing_ancestor(first)).st_dev ==
+                    os.stat(existing_ancestor(second)).st_dev)
+        except OSError as e:
+            raise Fail(EXIT_IO, "identify", "Can't compare install and work volumes: %s" % e)
+    return os.path.splitdrive(first)[0].lower() == os.path.splitdrive(second)[0].lower()
+
+
+def check_space(path, need, step, what):
+    probe = existing_ancestor(path)
     try:
         free = shutil.disk_usage(probe).free
     except OSError as e:
@@ -681,14 +717,20 @@ def verify_gen(repo, gen, prog):
     return total
 
 
-def build(repo, tk, gen, work, cmake, jobs, prog):
+def build(repo, tk, gen, work, cmake, jobs, prog, host="windows"):
     bdir = os.path.join(work, "build")
     logc = os.path.join(work, "logs", "cmake_configure.log")
     logb = os.path.join(work, "logs", "cmake_build.log")
-    cfg = [cmake, "-S", repo, "-B", bdir, "-G", "Visual Studio 17 2022", "-A", "x64",
-           "-DXBOXRECOMP_DIR=" + tk.replace("\\", "/"), "-DBW_GEN_DIR=" + gen.replace("\\", "/"),
-           "-DPython3_EXECUTABLE=" + sys.executable.replace("\\", "/")]
-    prog("build", 0, "configuring (CMake, Visual Studio 2022 x64)")
+    cfg = [cmake, "-S", repo, "-B", bdir]
+    if host == "macos":
+        cfg += ["-G", "Unix Makefiles", "-DCMAKE_BUILD_TYPE=Release", "-DCMAKE_OSX_ARCHITECTURES=arm64"]
+        description = "CMake, Apple Clang arm64"
+    else:
+        cfg += ["-G", "Visual Studio 17 2022", "-A", "x64"]
+        description = "CMake, Visual Studio 2022 x64"
+    cfg += ["-DXBOXRECOMP_DIR=" + tk.replace("\\", "/"), "-DBW_GEN_DIR=" + gen.replace("\\", "/"),
+            "-DPython3_EXECUTABLE=" + sys.executable.replace("\\", "/")]
+    prog("build", 0, "configuring (%s)" % description)
     if run_logged(cfg, logc, cwd=repo) != 0:
         raise Fail(EXIT_BUILD, "build", "CMake couldn't configure the build. Log: %s\n%s" % (logc, tail(logc)))
     srcs = (len(glob.glob(os.path.join(gen, "*.c"))) + len(glob.glob(os.path.join(repo, "src", "*.c")))
@@ -698,7 +740,8 @@ def build(repo, tk, gen, work, cmake, jobs, prog):
     state = {"n": 0, "t0": time.time()}
 
     def on_line(line):
-        if re.match(r"^\s+[\w.-]+\.c\s*$", line):
+        if (re.match(r"^\s+[\w.-]+\.c\s*$", line) or
+                (host == "macos" and re.search(r"\bBuilding (?:C|OBJC) object .*\.(?:c|m)\.o\s*$", line))):
             state["n"] += 1
             if state["n"] % 10 == 0:
                 prog("build", min(0.95, state["n"] / float(srcs or 1)),
@@ -709,11 +752,15 @@ def build(repo, tk, gen, work, cmake, jobs, prog):
              "compiling (%d of about %d files, %d s)" % (state["n"], srcs, time.time() - state["t0"]))
 
     cmd = [cmake, "--build", bdir, "--config", "Release", "--parallel", str(jobs)]
+    if host == "macos":
+        cmd += ["--target", "bloodwake"]
     if run_logged(cmd, logb, cwd=repo, on_line=on_line, tick=tick) != 0:
         raise Fail(EXIT_BUILD, "build", "The build failed. Log: %s\n%s" % (logb, tail(logb, 20)))
-    exe = os.path.join(bdir, "Release", "bloodwake.exe")
+    exe = (os.path.join(bdir, "bloodwake") if host == "macos"
+           else os.path.join(bdir, "Release", "bloodwake.exe"))
     if not os.path.isfile(exe):
-        raise Fail(EXIT_BUILD, "build", "The build finished without bloodwake.exe. Log: %s" % logb)
+        raise Fail(EXIT_BUILD, "build", "The build finished without %s. Log: %s"
+                   % (os.path.basename(exe), logb))
     prog("build", 1, "built in %d s" % (time.time() - state["t0"]))
     return exe, time.time() - state["t0"]
 
@@ -735,9 +782,15 @@ if "%%~1"=="" (
 """
 
 
-def stage(repo, exe, inst, record, prog):
+def stage(repo, exe, inst, record, prog, host="windows"):
     rel = os.path.join(inst, "build", "Release")
     os.makedirs(rel, exist_ok=True)
+    if host == "macos":
+        shutil.copy2(exe, os.path.join(rel, "bloodwake"))
+        with open(os.path.join(inst, "install.json"), "w", encoding="utf-8") as f:
+            json.dump(record, f, indent=2)
+        prog("stage", 1, "staged the native executable and install.json")
+        return
     for src in (exe, os.path.splitext(exe)[0] + ".pdb"):
         if os.path.isfile(src):
             shutil.copy2(src, os.path.join(rel, os.path.basename(src)))
@@ -783,15 +836,24 @@ def main(argv=None):
         if not a.check_only:
             load_json(os.path.join(FINGERPRINTS, "generated.json"), "fingerprints/generated.json")
             if not a.prepare_only:
-                vs, vs_ver = find_vs()
-                if not vs:
-                    raise Fail(EXIT_DEP, "identify", "Visual Studio 2022 (or the Build Tools for Visual "
-                               "Studio 2022) with the 'Desktop development with C++' workload is needed.")
+                host = build_host()
+                vs = vs_ver = clang = None
+                if host == "windows":
+                    vs, vs_ver = find_vs()
+                    if not vs:
+                        raise Fail(EXIT_DEP, "identify", "Visual Studio 2022 (or the Build Tools for Visual "
+                                   "Studio 2022) with the 'Desktop development with C++' workload is needed.")
+                else:
+                    clang = find_apple_clang()
+                    if not clang:
+                        raise Fail(EXIT_DEP, "identify", "Apple Clang and the Xcode Command Line Tools "
+                                   "are needed (install them with xcode-select --install).")
                 cmake, cmake_ver = find_cmake(vs)
                 if not cmake:
-                    raise Fail(EXIT_DEP, "identify", "CMake 3.20 or newer is needed (Visual Studio's "
-                               "C++ CMake tools component, or cmake.org).")
-            if os.path.splitdrive(inst)[0].lower() == os.path.splitdrive(work)[0].lower():
+                    hint = ("Visual Studio's C++ CMake tools component, or cmake.org"
+                            if host == "windows" else "install it with Homebrew or from cmake.org")
+                    raise Fail(EXIT_DEP, "identify", "CMake 3.20 or newer is needed (%s)." % hint)
+            if same_storage_volume(inst, work):
                 check_space(inst, NEED_INSTALL + NEED_WORK, "identify", "the game's files and the build")
             else:
                 check_space(inst, NEED_INSTALL, "identify", "the game's files")
@@ -823,26 +885,37 @@ def main(argv=None):
             prog("done", 1, "Preparation complete; generated C is in %s. No executable was built." % gen,
                  disc=disc, generated_total_sha256=gen_total)
             return EXIT_OK
-        exe, times["build"] = build(REPO, tk, gen, work, cmake, a.jobs, prog)
+        exe, times["build"] = build(REPO, tk, gen, work, cmake, a.jobs, prog, host=host)
+        installed_exe = os.path.join(inst, "build", "Release",
+                                     "bloodwake" if host == "macos" else "bloodwake.exe")
+        build_tools = {"python": sys.version.split()[0], "python_exe": sys.executable,
+                       "capstone": module_version("capstone"), "cmake": cmake_ver}
+        if host == "macos":
+            build_tools["apple_clang"] = clang
+        else:
+            build_tools["visual_studio"] = vs_ver
         record = {
             "format": 1,
             "installed": _dt.datetime.now().isoformat(timespec="seconds"),
-            "editions": ["original", "remastered"],
+            "editions": ["original"] if host == "macos" else ["original", "remastered"],
             "source": {"commit": run_text(["git", "rev-parse", "HEAD"], REPO)
                        if os.path.exists(os.path.join(REPO, ".git")) else None,
                        "generated_inputs": gen_inputs(REPO)},
             "toolkit": {"commit": TOOLKIT_COMMIT, "path": tk},
-            "tools": {"python": sys.version.split()[0], "python_exe": sys.executable,
-                      "capstone": module_version("capstone"), "cmake": cmake_ver,
-                      "visual_studio": vs_ver},
+            "tools": build_tools,
             "disc": disc,
             "generated_total_sha256": gen_total,
-            "paths": {"game": game_dir, "work": work, "exe": os.path.join(inst, "build", "Release", "bloodwake.exe")},
+            "paths": {"game": game_dir, "work": work, "exe": installed_exe},
             "seconds": {k: round(v) for k, v in times.items()},
         }
-        stage(REPO, exe, inst, record, prog)
-        prog("done", 1, "Blood Wake is built. Start it with \"Blood Wake.cmd\" in %s (%d min)."
-             % (inst, (time.time() - t_start) / 60))
+        stage(REPO, exe, inst, record, prog, host=host)
+        if host == "macos":
+            prog("done", 1, "Experimental native build complete (gameplay not validated). "
+                 "Run from the install folder: cd %s && ./build/Release/bloodwake (%d min)."
+                 % (shlex.quote(inst), (time.time() - t_start) / 60))
+        else:
+            prog("done", 1, "Blood Wake is built. Start it with \"Blood Wake.cmd\" in %s (%d min)."
+                 % (inst, (time.time() - t_start) / 60))
         return EXIT_OK
     except Fail as f:
         prog(f.step, 0, f.msg, error=True, exit=f.code)

@@ -1,9 +1,10 @@
 --- xboxrecomp/src/apu/apu_vp.c
 +++ src/toolkit_patches/apu/apu_vp.c
-@@ -22,7 +22,22 @@
+@@ -22,7 +22,23 @@
  #include "apu_state.h"
  #include "apu.h"
  #include "fpconv.h"
++#include "../bw_shared_u8.h"
 +#if defined(_WIN32)
 +#include <process.h>
 +#else
@@ -23,7 +24,7 @@
  /* #define DEBUG_MCPX */
  
  #ifdef DEBUG_MCPX
-@@ -47,9 +62,11 @@
+@@ -47,9 +63,11 @@
   * Notify status helper
   * ============================================================ */
  
@@ -35,7 +36,7 @@
      hwaddr notify_offset = d->regs[NV_PAPU_FENADDR];
      notify_offset += 16 * (MCPX_HW_NOTIFIER_BASE_OFFSET +
                             v * MCPX_HW_NOTIFIER_COUNT + notifier);
-@@ -67,9 +84,17 @@
+@@ -67,9 +85,17 @@
   * Filter helpers
   * ============================================================ */
  
@@ -53,7 +54,7 @@
      memset(&d->vp.filters[v].svf, 0, sizeof(d->vp.filters[v].svf));
      d->vp.filters[v].gain_valid = false;     /* a new voice starts at its level */
      hrtf_filter_clear_history(&d->vp.filters[v].hrtf);
-@@ -78,6 +103,7 @@
+@@ -78,6 +104,7 @@
      }
      d->vp.filters[v].rs_have = 0;
      d->vp.filters[v].rs_pos = 0.0f;
@@ -61,7 +62,7 @@
  }
  
  static bool voice_should_mute(uint16_t v)
-@@ -86,6 +112,36 @@
+@@ -86,6 +113,36 @@
      return m || mcpx_apu_debug_is_muted(v);
  }
  
@@ -98,7 +99,7 @@
  /* ============================================================
   * Utility functions
   * ============================================================ */
-@@ -178,23 +234,816 @@
+@@ -178,23 +235,816 @@
   * HRIR coefficient setter
   * ============================================================ */
  
@@ -224,7 +225,7 @@
 +    }
 +    if (!on || a >= (64u << 20))
 +        return phys;
-+    kind = bw_PhysLastTranslationMap()[a >> 12];
++    kind = bw_shared_u8_load(&bw_PhysLastTranslationMap()[a >> 12]);
 +    if (kind == 2) {
 +        if (++window_tags <= 3 || window_tags % 5000 == 0)
 +            fprintf(stderr, "[APU] BW posted %08X as a window page (%u so far)\n",
@@ -546,7 +547,7 @@
 +} BwAudit;
 +static BwAudit *s_aud;
 +static int s_aud_on = -1;
-+
+ 
 +static int bw_audit_on(void)
 +{
 +    if (s_aud_on < 0) {
@@ -754,7 +755,7 @@
 +        if (voice_get_mask(d, v, (uint32_t)k * 4, 0xFFFFFFFF))
 +            s_aud->word_nz[k]++;
 +}
- 
++
 +static void bw_audit_frame(void)
 +{
 +    FILE *f;
@@ -918,11 +919,34 @@
      unsigned int selected_handle, list;
  
      switch (method) {
-@@ -211,33 +1060,31 @@
- 
+@@ -212,32 +1062,30 @@
          bool locked = is_voice_locked(d, (uint16_t)selected_handle);
          if (!locked) voice_lock(d, (uint16_t)selected_handle, true);
-+
+ 
+-        list = GET_MASK(d->regs[NV_PAPU_FEAV], NV_PAPU_FEAV_LST);
+-        if (list != NV1BA0_PIO_SET_ANTECEDENT_VOICE_LIST_INHERIT) {
+-            unsigned int top_reg = voice_list_regs[list - 1].top;
+-            voice_set_mask(d, (uint16_t)selected_handle,
+-                           NV_PAVS_VOICE_TAR_PITCH_LINK,
+-                           NV_PAVS_VOICE_TAR_PITCH_LINK_NEXT_VOICE_HANDLE,
+-                           d->regs[top_reg]);
+-            d->regs[top_reg] = selected_handle;
+-        } else {
+-            unsigned int antecedent_voice =
+-                GET_MASK(d->regs[NV_PAPU_FEAV], NV_PAPU_FEAV_VALUE);
+-            assert(antecedent_voice != 0xFFFF);
+-
+-            uint32_t next_handle = voice_get_mask(
+-                d, (uint16_t)antecedent_voice, NV_PAVS_VOICE_TAR_PITCH_LINK,
+-                NV_PAVS_VOICE_TAR_PITCH_LINK_NEXT_VOICE_HANDLE);
+-            voice_set_mask(d, (uint16_t)selected_handle,
+-                           NV_PAVS_VOICE_TAR_PITCH_LINK,
+-                           NV_PAVS_VOICE_TAR_PITCH_LINK_NEXT_VOICE_HANDLE,
+-                           next_handle);
+-            voice_set_mask(d, (uint16_t)antecedent_voice,
+-                           NV_PAVS_VOICE_TAR_PITCH_LINK,
+-                           NV_PAVS_VOICE_TAR_PITCH_LINK_NEXT_VOICE_HANDLE,
+-                           selected_handle);
 +        /* Blood Wake carried patch (TK-45, docs/TOOLKIT_ISSUES.md): this runs
 +         * on the title's thread, beside the frame thread's walk of the voice
 +         * lists, with nothing in between (in xemu both run under the BQL). It
@@ -939,42 +963,18 @@
 +        if (link_first < 0) {
 +            const char *e = getenv("BW_APU_VOICEON_ORDER");
 +            link_first = e && !strcmp(e, "toolkit");
-+        }
+         }
  
-         list = GET_MASK(d->regs[NV_PAPU_FEAV], NV_PAPU_FEAV_LST);
--        if (list != NV1BA0_PIO_SET_ANTECEDENT_VOICE_LIST_INHERIT) {
--            unsigned int top_reg = voice_list_regs[list - 1].top;
--            voice_set_mask(d, (uint16_t)selected_handle,
--                           NV_PAVS_VOICE_TAR_PITCH_LINK,
--                           NV_PAVS_VOICE_TAR_PITCH_LINK_NEXT_VOICE_HANDLE,
--                           d->regs[top_reg]);
--            d->regs[top_reg] = selected_handle;
--        } else {
--            unsigned int antecedent_voice =
--                GET_MASK(d->regs[NV_PAPU_FEAV], NV_PAPU_FEAV_VALUE);
--            assert(antecedent_voice != 0xFFFF);
++        list = GET_MASK(d->regs[NV_PAPU_FEAV], NV_PAPU_FEAV_LST);
 +        if (link_first)
 +            voice_on_link(d, selected_handle, list);
- 
--            uint32_t next_handle = voice_get_mask(
--                d, (uint16_t)antecedent_voice, NV_PAVS_VOICE_TAR_PITCH_LINK,
--                NV_PAVS_VOICE_TAR_PITCH_LINK_NEXT_VOICE_HANDLE);
--            voice_set_mask(d, (uint16_t)selected_handle,
--                           NV_PAVS_VOICE_TAR_PITCH_LINK,
--                           NV_PAVS_VOICE_TAR_PITCH_LINK_NEXT_VOICE_HANDLE,
--                           next_handle);
--            voice_set_mask(d, (uint16_t)antecedent_voice,
--                           NV_PAVS_VOICE_TAR_PITCH_LINK,
--                           NV_PAVS_VOICE_TAR_PITCH_LINK_NEXT_VOICE_HANDLE,
--                           selected_handle);
--        }
--
++
 +        if (fe_spin_on())
 +            voice_spin_lock(d, (uint16_t)selected_handle);
          voice_set_mask(d, (uint16_t)selected_handle, NV_PAVS_VOICE_PAR_OFFSET,
                         NV_PAVS_VOICE_PAR_OFFSET_CBO, 0);
          d->vp.ssl[selected_handle].ssl_seg = 0;
-@@ -286,6 +1133,12 @@
+@@ -286,6 +1134,12 @@
          voice_reset_filters(d, (uint16_t)selected_handle);
          voice_set_mask(d, (uint16_t)selected_handle, NV_PAVS_VOICE_PAR_STATE,
                         NV_PAVS_VOICE_PAR_STATE_ACTIVE_VOICE, 1);
@@ -987,7 +987,7 @@
  
          if (!locked) voice_lock(d, (uint16_t)selected_handle, false);
          break;
-@@ -298,6 +1151,8 @@
+@@ -298,6 +1152,8 @@
          if (!locked) voice_lock(d, (uint16_t)selected_handle, true);
  
          uint16_t rr;
@@ -996,7 +996,7 @@
          rr = (uint16_t)voice_get_mask(d, (uint16_t)selected_handle,
              NV_PAVS_VOICE_TAR_LFO_ENV, NV_PAVS_VOICE_TAR_LFO_ENV_EA_RELEASERATE);
          voice_set_mask(d, (uint16_t)selected_handle, NV_PAVS_VOICE_CUR_ECNT,
-@@ -313,20 +1168,33 @@
+@@ -313,20 +1169,33 @@
          voice_set_mask(d, (uint16_t)selected_handle, NV_PAVS_VOICE_PAR_STATE,
                         NV_PAVS_VOICE_PAR_STATE_EFCUR,
                         NV_PAVS_VOICE_PAR_STATE_EFCUR_RELEASE);
@@ -1035,7 +1035,7 @@
  
      case NV1BA0_PIO_SET_CURRENT_HRTF_ENTRY:
          d->vp.hrtf.current_entry =
-@@ -375,9 +1243,9 @@
+@@ -375,9 +1244,9 @@
          if (current_voice < MCPX_HW_MAX_3D_VOICES &&
              handle != HRTF_NULL_HANDLE) {
              assert(handle < HRTF_ENTRY_COUNT);
@@ -1048,7 +1048,7 @@
          }
          break;
      }
-@@ -441,7 +1309,8 @@
+@@ -441,7 +1310,8 @@
          hwaddr sge_address =
              d->regs[NV_PAPU_VPSGEADDR] + d->vp.inbuf_sge_handle * 8;
          stl_le_phys(address_space_memory, sge_address,
@@ -1058,7 +1058,7 @@
          break;
      }
  
-@@ -533,13 +1402,63 @@
+@@ -533,13 +1403,63 @@
              set_hrir_coeff_tar(d, 0, 30, left30);
              set_hrir_coeff_tar(d, 1, 30, right30);
              d->vp.hrtf.entries[d->vp.hrtf.current_entry].itd = s6p9_to_float(itd);
@@ -1123,7 +1123,7 @@
          } else if (method >= NV1BA0_PIO_SET_SUBMIX_HEADROOM &&
                     method <= NV1BA0_PIO_SET_SUBMIX_HEADROOM + 4 * (NUM_MIXBINS - 1)) {
              assert((method & 3) == 0);
-@@ -690,6 +1609,21 @@
+@@ -690,6 +1610,21 @@
                                                     4096.0f / decay_rate);
          }
          if (value <= (sustain_level + 0.2f) || (value > 255.0f)) {
@@ -1145,10 +1145,18 @@
              cur++;
              voice_set_mask(d, v, NV_PAVS_VOICE_PAR_STATE, cur_mask, cur);
          } else {
-@@ -1406,6 +2340,175 @@
- }
- 
- /* ============================================================
+@@ -1398,6 +2333,175 @@
+         /* Nothing new and nothing left to interpolate: the voice has stopped
+          * or its stream is empty. voice_process treats 0 as an underrun and
+          * a negative as the end; the voice's active bit says which. */
++        int active = voice_get_mask(d, v, NV_PAVS_VOICE_PAR_STATE,
++                                    NV_PAVS_VOICE_PAR_STATE_ACTIVE_VOICE);
++        return active ? 0 : -1;
++    }
++    return out;
++}
++
++/* ============================================================
 + * Blood Wake carried patch (Remastered, BW_FIX AUDIO_SINC_RESAMPLE, D-016):
 + * a windowed-sinc resampler in place of the linear one.
 + *
@@ -1310,18 +1318,10 @@
 +    }
 +
 +    if (out == 0 && got == 0) {
-+        int active = voice_get_mask(d, v, NV_PAVS_VOICE_PAR_STATE,
-+                                    NV_PAVS_VOICE_PAR_STATE_ACTIVE_VOICE);
-+        return active ? 0 : -1;
-+    }
-+    return out;
-+}
-+
-+/* ============================================================
-  * Voice processing (main per-voice function)
-  * ============================================================ */
- 
-@@ -1443,6 +2546,15 @@
+         int active = voice_get_mask(d, v, NV_PAVS_VOICE_PAR_STATE,
+                                     NV_PAVS_VOICE_PAR_STATE_ACTIVE_VOICE);
+         return active ? 0 : -1;
+@@ -1443,6 +2547,15 @@
                                          NV_PAVS_VOICE_CFG_ENV0_EF_PITCHSCALE);
      float rate = 1.0f / powf(2.0f, (p + ps * 32 * ef_value) / 4096.0f);
      dbg->rate = rate;
@@ -1337,7 +1337,7 @@
  
      /* Step amplitude envelope */
      float ea_value = voice_step_envelope(
-@@ -1471,6 +2583,16 @@
+@@ -1471,6 +2584,16 @@
          }
          bool clear_mix = voice_get_mask(d, v, NV_PAVS_VOICE_CFG_FMT,
                                          NV_PAVS_VOICE_CFG_FMT_CLEAR_MIX) != 0;
@@ -1354,7 +1354,7 @@
          if (clear_mix) {
              memset(&mixbins[mp_bin][0], 0, sizeof(mixbins[0]));
          }
-@@ -1480,8 +2602,11 @@
+@@ -1480,8 +2603,11 @@
              int active = voice_get_mask(d, v, NV_PAVS_VOICE_PAR_STATE,
                                          NV_PAVS_VOICE_PAR_STATE_ACTIVE_VOICE);
              if (!active) return;
@@ -1368,7 +1368,7 @@
              if (count < 0) break;
              /* An active voice that keeps producing nothing is an underrun,
               * not a reason to spin. Asking it again at once cannot change the
-@@ -1532,6 +2657,39 @@
+@@ -1532,6 +2658,39 @@
          dbg->bin[i] = (uint8_t)bin[i];
          dbg->vol[i] = vol[i];
      }
@@ -1408,7 +1408,7 @@
      if (s_vstat_on > 0) {
          s_vstat[v].ea = ea_value;
          s_vstat[v].rate = rate;
-@@ -1539,11 +2697,12 @@
+@@ -1539,11 +2698,12 @@
          s_vstat[v].bin0 = (uint8_t)bin[0]; s_vstat[v].bin1 = (uint8_t)bin[1];
      }
  
@@ -1422,7 +1422,7 @@
      bool lpf = false;
      if (v < MCPX_HW_MAX_3D_VOICES) {
          lpf = (fmode == 1);
-@@ -1564,9 +2723,69 @@
+@@ -1564,9 +2724,69 @@
              setup_svf(filter, fc_f, q_f, F_LP);
              for (int i = 0; i < NUM_SAMPLES_PER_FRAME; i++) {
                  samples[i][ch] = run_svf(filter, samples[i][ch]);
@@ -1492,7 +1492,7 @@
      }
  
      /* HRTF processing for 3D voices. RECOMP_APU_HRTF=0 turns it off: it is
-@@ -1576,14 +2795,57 @@
+@@ -1576,14 +2796,57 @@
          const char *e = getenv("RECOMP_APU_HRTF");
          hrtf_on = !(e && e[0] == '0');
      }
@@ -1550,7 +1550,7 @@
  
      /* Mix into bins */
      for (int b = 0; b < 8; b++) {
-@@ -1605,7 +2867,21 @@
+@@ -1605,7 +2868,21 @@
          float step = (g - g0) / NUM_SAMPLES_PER_FRAME;
          f->gain_prev[b] = g;
          for (int i = 0; i < NUM_SAMPLES_PER_FRAME; i++) {
@@ -1573,7 +1573,7 @@
          }
      }
      d->vp.filters[v].gain_valid = true;
-@@ -1668,6 +2944,9 @@
+@@ -1668,6 +2945,9 @@
  void mcpx_apu_vp_frame(MCPXAPUState *d,
                          float mixbins[NUM_MIXBINS][NUM_SAMPLES_PER_FRAME])
  {
@@ -1583,7 +1583,7 @@
      memset(d->vp.sample_buf, 0, sizeof(d->vp.sample_buf));
  
      for (int list = 0; list < 3; list++) {
-@@ -1685,6 +2964,8 @@
+@@ -1685,6 +2965,8 @@
              }
  
              uint16_t v = (uint16_t)d->regs[current];
@@ -1592,7 +1592,7 @@
              d->regs[next] = voice_get_mask(d, v, NV_PAVS_VOICE_TAR_PITCH_LINK,
                                 NV_PAVS_VOICE_TAR_PITCH_LINK_NEXT_VOICE_HANDLE);
  
-@@ -1706,9 +2987,12 @@
+@@ -1706,9 +2988,12 @@
              d->regs[current] = d->regs[next];
          }
      }

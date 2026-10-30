@@ -30,6 +30,9 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#if !defined(_WIN32)
+#include <stdatomic.h>
+#endif
 #include "kernel.h"   /* XBOX_CONTIG_BASE / XBOX_CONTIG_SIZE */
 #include "xbox_memory_layout.h"   /* xbox_Nv2aFrameCounterFlip */
 #include "nv2a_flip_hold.h"
@@ -41,6 +44,7 @@
 #include "nv2a_combiner.h"
 #include "nv2a_backend.h"
 #include "bw_backend_ext.h"   /* Blood Wake carried patch: extended back end */
+#include "../../gpu/bw_backend_sync.h"
 #include "../../gpu/bw_gpu_audit.h"   /* Blood Wake: BW_GPU_AUDIT=1 usage counts */
 extern int bw_ab_off(const char *fix);  /* Blood Wake: BW_GPU_AB (src/gpu/bw_ab.c) */
 #if defined(_WIN32)
@@ -301,13 +305,14 @@ static struct {
      * the time the flip arrives, so dumping the current one dumps the frame
      * that has not been drawn yet -- which is how a correctly rendered
      * sequence came out as 12 black BMPs. */
-    uint32_t drawn_offset;
+    uint32_t drawn_offset, drawn_resolved;
     /* ...and the shape of that surface. A title also draws into small
      * render targets (Burnout 3: 128x128 shadow/reflection maps, pitch 512),
      * often after the main scene, so "last surface drawn" alone picked one of
      * those and read it with the framebuffer's pitch: horizontal noise. The
      * biggest surface drawn since the last flip is the one being presented. */
     uint32_t drawn_pitch, drawn_x, drawn_y, drawn_w, drawn_h, drawn_bpp;
+    uint32_t drawn_aa_sx, drawn_aa_sy, drawn_format;
     int drawn_stale;      /* set at a flip: the next draw starts a new frame */
     uint64_t pixels;
     uint32_t pixel_max;   /* brightest value any pixel write carried */
@@ -368,6 +373,8 @@ static struct {
     uint32_t batches_ffp;
 } s_gpu;
 
+static int (*s_backend_present_sync)(uint32_t color_va, uint32_t pitch);
+
 /* The last value written to every Kelvin method, as the GPU's register file
  * would hold it. State the executor does not model explicitly (lights,
  * material colours, cull and clip state handed to a back end) is read from
@@ -380,9 +387,23 @@ static float reg_f(uint32_t method)
     return f;
 }
 
-/* Where BACK_END_WRITE_SEMAPHORE_RELEASE lands; see nv2a_backend.h. */
+/* Where BACK_END_WRITE_SEMAPHORE_RELEASE lands; see nv2a_backend.h.
+ * The native guest publishes the target to the executor's poll thread. */
+#if defined(_WIN32)
 static uint32_t s_sem_va;
 void nv2a_pb_set_semaphore_target(uint32_t guest_va) { s_sem_va = guest_va; }
+static uint32_t semaphore_target(void) { return s_sem_va; }
+#else
+static _Atomic(uint32_t) s_sem_va;
+void nv2a_pb_set_semaphore_target(uint32_t guest_va)
+{
+    atomic_store_explicit(&s_sem_va, guest_va, memory_order_release);
+}
+static uint32_t semaphore_target(void)
+{
+    return atomic_load_explicit(&s_sem_va, memory_order_acquire);
+}
+#endif
 
 /* Unhandled methods, ranked. The interesting output is not that something was
  * skipped but which things dominate, because that is the order to implement
@@ -626,17 +647,27 @@ static int fetch_attr(const VertexAttr *a, uint32_t index, float out[4])
 
 static uint32_t surface_bpp(void);
 
-static void note_drawn(void)
+static void note_drawn_at(uint32_t resolved)
 {
     if (!s_gpu.drawn_stale && s_gpu.drawn_offset
         && s_gpu.clip_w * s_gpu.clip_h < s_gpu.drawn_w * s_gpu.drawn_h)
         return;
     s_gpu.drawn_stale = 0;
     s_gpu.drawn_offset = s_gpu.color_offset;
+    /* DMA resolution can change if the contiguous allocator grows before flip. */
+    s_gpu.drawn_resolved = resolved;
     s_gpu.drawn_pitch = s_gpu.pitch;
     s_gpu.drawn_bpp = surface_bpp();
+    s_gpu.drawn_aa_sx = s_gpu.aa_sx > 1.5f ? 2 : 1;
+    s_gpu.drawn_aa_sy = s_gpu.aa_sy > 1.5f ? 2 : 1;
+    s_gpu.drawn_format = s_gpu.format;
     s_gpu.drawn_x = s_gpu.clip_x; s_gpu.drawn_y = s_gpu.clip_y;
     s_gpu.drawn_w = s_gpu.clip_w; s_gpu.drawn_h = s_gpu.clip_h;
+}
+
+static void note_drawn(void)
+{
+    note_drawn_at(s_backend_present_sync ? dma_resolve(s_gpu.color_offset) : 0);
 }
 
 static uint32_t surface_bpp(void)
@@ -683,7 +714,7 @@ static int s_flip_dumping;
  * back synchronously, so the dump is the frame presented). */
 int nv2a_pb_exec_flip_dumping(void) { return s_flip_dumping; }
 
-static void dump_surface_bmp(void)
+static void dump_surface_bmp_at(uint32_t resolved)
 {
     const char *prefix = getenv("RECOMP_FB_DUMP");
     const uint8_t *mem = (const uint8_t *)xbox_GetMemoryOffset();
@@ -726,7 +757,7 @@ static void dump_surface_bmp(void)
 
     /* BMP rows run bottom-up. */
     for (y = h; y-- > 0; ) {
-        const uint8_t *row = mem + dma_resolve(offset)
+        const uint8_t *row = mem + (resolved ? resolved : dma_resolve(offset))
                            + (size_t)(cy + y) * pitch;
         for (x = 0; x < w; x++) {
             uint8_t bgr[3];
@@ -752,6 +783,11 @@ static void dump_surface_bmp(void)
     if (seq == 1)
         fprintf(stderr, "  [GPU] framebuffer dump: %s (%ux%u from 0x%08X %ubpp)\n",
                 path, w, h, s_gpu.color_offset, bpp);
+}
+
+static void dump_surface_bmp(void)
+{
+    dump_surface_bmp_at(0);
 }
 
 /* Defined below, next to the rest of the rasteriser; the clear path uses it
@@ -787,9 +823,39 @@ static void surface_apply_clip(void)
 
 static const Nv2aBackend *s_backend;
 
-void nv2a_backend_register(const Nv2aBackend *backend)
+void bw_backend_register_with_present_sync(
+    const Nv2aBackend *backend, int (*present_sync)(uint32_t, uint32_t))
 {
     s_backend = backend;
+    s_backend_present_sync = backend ? present_sync : NULL;
+}
+
+void nv2a_backend_register(const Nv2aBackend *backend)
+{
+    bw_backend_register_with_present_sync(backend, NULL);
+}
+
+void bw_backend_unregister_if_current(const Nv2aBackend *backend)
+{
+    if (backend && s_backend == backend)
+        nv2a_backend_register(NULL);
+}
+
+static int backend_prepare_snapshot(uint32_t *resolved, uint32_t *pitch, uint32_t *aa_sy)
+{
+    uint32_t done;
+    *resolved = 0;
+    *pitch = 0;
+    *aa_sy = s_gpu.aa_sy > 1.5f ? 2 : 1;
+    if (!s_backend_present_sync)
+        return 1;
+    done = s_gpu.drawn_offset ? s_gpu.drawn_offset : s_gpu.color_offset;
+    *pitch = s_gpu.drawn_offset ? s_gpu.drawn_pitch : s_gpu.pitch;
+    if (s_gpu.drawn_offset)
+        *aa_sy = s_gpu.drawn_aa_sy;
+    *resolved = s_gpu.drawn_offset ? s_gpu.drawn_resolved
+                : done ? dma_resolve(done) : 0;
+    return s_backend_present_sync(*resolved, *pitch);
 }
 
 static int backend_draws(void)
@@ -806,6 +872,27 @@ static void current_surface(Nv2aSurface *out)
     out->bytes_per_pixel = surface_bpp();
     out->aa_sx           = s_gpu.aa_sx > 1.5f ? 2 : 1;
     out->aa_sy           = s_gpu.aa_sy > 1.5f ? 2 : 1;
+}
+
+void bw_backend_snapshot_surface(BwBackendSnapshotSurface *snapshot)
+{
+    if (s_gpu.drawn_offset) {
+        snapshot->surface.color_va = s_gpu.drawn_resolved;
+        snapshot->surface.width = s_gpu.drawn_w;
+        snapshot->surface.height = s_gpu.drawn_h;
+        snapshot->surface.pitch = s_gpu.drawn_pitch;
+        snapshot->surface.bytes_per_pixel = s_gpu.drawn_bpp;
+        snapshot->surface.aa_sx = s_gpu.drawn_aa_sx;
+        snapshot->surface.aa_sy = s_gpu.drawn_aa_sy;
+        snapshot->format = s_gpu.drawn_format;
+        snapshot->clip_x = s_gpu.drawn_x;
+        snapshot->clip_y = s_gpu.drawn_y;
+    } else {
+        current_surface(&snapshot->surface);
+        snapshot->format = s_gpu.format;
+        snapshot->clip_x = s_gpu.clip_x;
+        snapshot->clip_y = s_gpu.clip_y;
+    }
 }
 
 /* Render state in the NV2A's own values, gathered from what the executor
@@ -957,6 +1044,11 @@ static void clear_surface(uint32_t param)
         }
         s_backend->clear(&surf, &rs, param, s_gpu.clear_color,
                          s_gpu.zstencil_clear);
+        /* An opt-in readback backend must snapshot the surface it cleared,
+         * even when a frame contains no triangles or the title rebinds before
+         * flipping. Keep legacy backends' selection unchanged. */
+        if (s_backend_present_sync && (param & NV097_CLEAR_COLOR_MASK))
+            note_drawn_at(surf.color_va);
         s_gpu.clears++;
         return;
     }
@@ -2121,6 +2213,12 @@ void bw_backend_ext_register(const BwXBackend *backend)
     s_xbackend = backend;
 }
 
+void bw_backend_ext_unregister_if_current(const BwXBackend *backend)
+{
+    if (backend && s_xbackend == backend)
+        s_xbackend = NULL;
+}
+
 static float fog_factor(float d);
 static float fog_factor_raw(float d);   /* Blood Wake: unclamped (bw_persp_on) */
 static int bw_persp_on(void);
@@ -2239,7 +2337,7 @@ static void backend_flush(int textured)
             s_xbackend->draw(&surf, &xb);
             s_gpu.tris_drawn += s_bcount / 3;
             s_bcount = 0;
-            note_drawn();
+            note_drawn_at(surf.color_va);
             return;
         }
     }
@@ -2262,7 +2360,7 @@ static void backend_flush(int textured)
     s_backend->draw(&surf, &batch);
     s_gpu.tris_drawn += s_bcount / 3;
     s_bcount = 0;
-    note_drawn();
+    note_drawn_at(surf.color_va);
 }
 
 /* One triangle by vertex index: gather position and, if the batch has one,
@@ -4007,7 +4105,7 @@ bw_tris:
     note_blend_pair();
     note_xf_formats();
     s_gpu.tris_drawn += ni / 3;
-    note_drawn();
+    note_drawn_at(surf.color_va);
     return 1;
 }
 
@@ -5162,6 +5260,8 @@ static void bw_present_immediate(void)
 {
     static int on = -1;
     static unsigned shown;
+    int snapshot_ok;
+    uint32_t snapshot_va, snapshot_pitch, snapshot_aa_sy;
     if (on < 0) {
         const char *e = getenv("BW_IMMEDIATE_PRESENT");
         on = !(e && e[0] == '0');
@@ -5174,14 +5274,18 @@ static void bw_present_immediate(void)
         fflush(stderr);
     }
     s_bw_flipno++;
-    if (s_gpu.pitch) {
+    snapshot_ok = backend_prepare_snapshot(&snapshot_va, &snapshot_pitch, &snapshot_aa_sy);
+    if (snapshot_ok && (s_gpu.pitch || (s_backend_present_sync &&
+                                       s_gpu.drawn_offset && s_gpu.drawn_pitch))) {
         extern void xbox_FramebufferWindowPresent(uint32_t, uint32_t);
         uint32_t done = s_gpu.drawn_offset ? s_gpu.drawn_offset : s_gpu.color_offset;
-        uint32_t pitch = s_gpu.drawn_offset ? s_gpu.drawn_pitch : s_gpu.pitch;
+        uint32_t pitch = s_backend_present_sync ? snapshot_pitch
+                         : s_gpu.drawn_offset ? s_gpu.drawn_pitch : s_gpu.pitch;
         if (done) {
-            xbox_FramebufferWindowSet(dma_resolve(done), pitch);
-            xbox_FramebufferWindowSetAA(s_gpu.aa_sy > 1.5f ? 2 : 1);
-            xbox_FramebufferWindowPresent(dma_resolve(done), pitch);
+            xbox_FramebufferWindowSet(s_backend_present_sync ? snapshot_va : dma_resolve(done), pitch);
+            xbox_FramebufferWindowSetAA(s_backend_present_sync ? snapshot_aa_sy
+                                                               : (s_gpu.aa_sy > 1.5f ? 2 : 1));
+            xbox_FramebufferWindowPresent(s_backend_present_sync ? snapshot_va : dma_resolve(done), pitch);
         }
     }
     {
@@ -5195,8 +5299,12 @@ static void bw_present_immediate(void)
                 if (f) { fclose(f); dump = 1; }
             }
             s_flip_dumping = dump;
-            if (dump)
-                dump_surface_bmp();
+            if (dump && snapshot_ok) {
+                if (s_backend_present_sync)
+                    dump_surface_bmp_at(snapshot_va);
+                else
+                    dump_surface_bmp();
+            }
         }
     }
     s_gpu.drawn_stale = 1;
@@ -5215,10 +5323,13 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
     /* BACK_END_WRITE_SEMAPHORE_RELEASE. The title's pointer already names the
      * semaphore word; SET_SEMAPHORE_OFFSET is not added (in X-Men Legends it
      * held 0xFF000000 at times, which put the write outside guest memory). */
-    if (subch == 0 && method == 0x1D70 && s_sem_va) {
-        uint8_t *mem = (uint8_t *)xbox_GetMemoryOffset();
-        *(volatile uint32_t *)(mem + s_sem_va) = param;
-        return;
+    if (subch == 0 && method == 0x1D70) {
+        uint32_t sem_va = semaphore_target();
+        if (sem_va) {
+            uint8_t *mem = (uint8_t *)xbox_GetMemoryOffset();
+            *(volatile uint32_t *)(mem + sem_va) = param;
+            return;
+        }
     }
     if (!inited) {
         inited = 1;
@@ -5309,7 +5420,7 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
 
         if (!r)
             return;
-        if (!s_sem_va) {
+        if (!semaphore_target()) {
             uint32_t va = xbox_Nv2aFenceWordVa();
 
             if (va) {
@@ -5549,6 +5660,8 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
          * host frame, and that time counts against the hold. */
         uint64_t stall_ns = xbox_HostNowNs();
         int clock_ok;
+        int snapshot_ok, synchronized;
+        uint32_t snapshot_va, snapshot_pitch, snapshot_aa_sy;
         uint32_t stall_vbl;
         (void)flip_clock(stall_ns, &clock_ok);
         stall_vbl = s_walk_vbl;
@@ -5565,6 +5678,8 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
          * counter counts -- see xbox_Nv2aFrameCounterFlip. */
         xbox_Nv2aFrameCounterFlip();
         s_bw_flipno++;
+        synchronized = s_backend_present_sync != NULL;
+        snapshot_ok = backend_prepare_snapshot(&snapshot_va, &snapshot_pitch, &snapshot_aa_sy);
         /* Hand the window a copy of the frame just finished.
          *
          * The buffer the title has finished is the one the last batch drew
@@ -5579,26 +5694,23 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
             xbox_FramebufferWindowFrameStats(s_gpu.draws - draws_at_flip);
             draws_at_flip = s_gpu.draws;
         }
-        if (s_gpu.pitch) {
+        if (snapshot_ok && (s_gpu.pitch || (synchronized &&
+                                           s_gpu.drawn_offset && s_gpu.drawn_pitch))) {
             extern void xbox_FramebufferWindowPresent(uint32_t, uint32_t);
             uint32_t done = s_gpu.drawn_offset ? s_gpu.drawn_offset
                                                : s_gpu.color_offset;
-            uint32_t pitch = s_gpu.drawn_offset ? s_gpu.drawn_pitch
-                                                : s_gpu.pitch;
+            uint32_t pitch = synchronized ? snapshot_pitch
+                             : s_gpu.drawn_offset ? s_gpu.drawn_pitch : s_gpu.pitch;
             if (done) {
-                xbox_FramebufferWindowSet(dma_resolve(done), pitch);
-                xbox_FramebufferWindowSetAA(s_gpu.aa_sy > 1.5f ? 2 : 1);
-                xbox_FramebufferWindowPresent(dma_resolve(done), pitch);
+                xbox_FramebufferWindowSet(synchronized ? snapshot_va : dma_resolve(done), pitch);
+                xbox_FramebufferWindowSetAA(synchronized ? snapshot_aa_sy
+                                                        : (s_gpu.aa_sy > 1.5f ? 2 : 1));
+                xbox_FramebufferWindowPresent(synchronized ? snapshot_va : dma_resolve(done), pitch);
             }
         }
-        /* Blood Wake carried patch (TK-39): with a GPU back end, guest memory
-         * holds a frame only once the back end's flip has read it back, so
-         * a dump taken before that flip saved the previous frame (and, with
-         * Remastered's readback that doesn't wait, one 2-3 frames old). The
-         * dump now comes after the back end's flip, which also reads the
-         * frame back synchronously when it is being dumped
-         * (nv2a_pb_exec_flip_dumping): the dump is exactly the frame
-         * presented. BW_DUMP_AFTER_FLIP=0 restores the old order. */
+        /* Legacy GPU backends read back in flip, so TK-39 keeps their dump
+         * after flip unless BW_DUMP_AFTER_FLIP=0. An opt-in sync callback has
+         * already populated guest memory, so its dump precedes flip. */
         static int dump_after = -1;
         int dump_now = 0;
         if (dump_after < 0) {
@@ -5623,14 +5735,20 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
                 }
                 s_flip_dumping = on;
                 dump_now = on;
-                if (on && !(dump_after && s_backend && s_backend->flip))
-                    dump_surface_bmp();
+                if (on && snapshot_ok &&
+                    (synchronized || !(dump_after && s_backend && s_backend->flip))) {
+                    if (synchronized)
+                        dump_surface_bmp_at(snapshot_va);
+                    else
+                        dump_surface_bmp();
+                }
             }
         }
         s_gpu.drawn_stale = 1;
         if (s_backend && s_backend->flip)
             s_backend->flip();
-        if (dump_now && dump_after && s_backend && s_backend->flip)
+        if (snapshot_ok && !synchronized && dump_now && dump_after &&
+            s_backend && s_backend->flip)
             dump_surface_bmp();             /* TK-39: the frame just presented */
 
         if (verbose) {

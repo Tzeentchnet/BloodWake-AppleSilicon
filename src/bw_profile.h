@@ -1,4 +1,5 @@
-/* bw_profile.h - Blood Wake sampling profiler (BW_PROFILE). See bw_profile.c. */
+/* bw_profile.h - Blood Wake sampling profiler (BW_PROFILE). See bw_profile.c.
+ * macOS caller stacks use frame pointers; source lines need external atos. */
 #ifndef BW_PROFILE_H
 #define BW_PROFILE_H
 

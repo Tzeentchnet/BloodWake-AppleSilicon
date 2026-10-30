@@ -8,8 +8,30 @@
  * save folder exactly as the toolkit picks it. The only things it does there
  * are log one line and (with the XBE buffer) count image bytes.
  */
+#if defined(__linux__) && !defined(_GNU_SOURCE)
+#define _GNU_SOURCE
+#endif
+#ifdef _WIN32
 #include <windows.h>
 #include <shlobj.h>
+#else
+#include "platform/win32_compat.h"
+#include <dirent.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <stdarg.h>
+#include <sys/file.h>
+#include <sys/stat.h>
+#include <sys/types.h>
+#include <time.h>
+#include <unistd.h>
+#ifdef __APPLE__
+#include <sys/stdio.h>
+#elif defined(__linux__)
+#include <linux/fs.h>
+#endif
+#define _snprintf snprintf
+#endif
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -33,7 +55,7 @@ unsigned char g_bw_fix_on[BW_FIX_COUNT + 1];         /* zero: Original */
 
 static bw_edition_t s_edition = BW_ED_ORIGINAL;
 static const char *s_from = "default";
-static volatile long s_hits[BW_FIX_COUNT + 1];
+static volatile LONG s_hits[BW_FIX_COUNT + 1];
 static unsigned char s_refused[BW_FIX_COUNT + 1];
 
 static const char *const s_names[BW_ED_COUNT]  = { "original", "remastered" };
@@ -302,8 +324,10 @@ void bw_edition_apply_image_fixes(const void *xbe, size_t xbe_size)
  * (no marker file and no UDATA in its folder) Original's UDATA and TDATA are
  * copied in: a plain one-way file copy between our own folders, through a
  * temporary folder renamed into place, so a second process starting at the
- * same moment can't see half a copy. */
+ * same moment can't see half a copy. POSIX uses the toolkit's XDG root; a
+ * locked, resumable import also protects against interrupted first boots. */
 
+#ifdef _WIN32
 static int dir_exists(const char *p)
 {
     DWORD a = GetFileAttributesA(p);
@@ -454,6 +478,387 @@ const char *bw_edition_prepare_saves(void)
     fflush(stderr);
     return root;
 }
+#else /* POSIX: follow the toolkit's XDG save-root convention. */
+
+static int save_path(char *out, size_t cap, const char *fmt, ...)
+{
+    va_list ap;
+    int n;
+    va_start(ap, fmt);
+    n = vsnprintf(out, cap, fmt, ap);
+    va_end(ap);
+    if (n < 0 || (size_t)n >= cap) {
+        fprintf(stderr, "[ED] saves: path is too long\n");
+        return 0;
+    }
+    return 1;
+}
+
+static void save_fatal(void)
+{
+    fprintf(stderr, "[ED] saves: cannot initialize the isolated edition; refusing to boot\n");
+    exit(EXIT_FAILURE);
+}
+
+static int dir_exists(const char *p)
+{
+    struct stat st;
+    return stat(p, &st) == 0 && S_ISDIR(st.st_mode);
+}
+
+static int mkdir_parents(const char *path)
+{
+    char copy[MAX_PATH];
+    char *p;
+    if (!save_path(copy, sizeof copy, "%s", path) || !*copy)
+        return 0;
+    for (p = copy + 1; ; p++) {
+        if (*p == '/' || !*p) {
+            char end = *p;
+            *p = 0;
+            if (mkdir(copy, 0700) != 0 && (errno != EEXIST || !dir_exists(copy))) {
+                fprintf(stderr, "[ED] saves: cannot create %s: %s\n", copy, strerror(errno));
+                return 0;
+            }
+            *p = end;
+            if (!end)
+                return 1;
+        }
+    }
+}
+
+static int copy_file(const char *src, const char *dst, mode_t mode)
+{
+    char buf[16384];
+    struct stat st;
+    int in = -1, out = -1, ok = 0;
+    ssize_t n;
+    in = open(src, O_RDONLY | O_NOFOLLOW);
+    if (in < 0 || fstat(in, &st) || !S_ISREG(st.st_mode))
+        goto done;
+    out = open(dst, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW, mode & 0777);
+    if (out < 0)
+        goto done;
+    for (;;) {
+        n = read(in, buf, sizeof buf);
+        if (n == 0) {
+            ok = 1;
+            break;
+        }
+        if (n < 0) {
+            if (errno == EINTR)
+                continue;
+            break;
+        }
+        for (ssize_t off = 0; off < n;) {
+            ssize_t wrote = write(out, buf + off, (size_t)(n - off));
+            if (wrote < 0 && errno == EINTR)
+                continue;
+            if (wrote <= 0)
+                goto done;
+            off += wrote;
+        }
+    }
+done:
+    if (out >= 0 && close(out) != 0)
+        ok = 0;
+    if (in >= 0)
+        close(in);
+    return ok;
+}
+
+/* Destination is newly created and is not visible as UDATA/TDATA until the
+ * complete tree is published. Never follow a source symlink into another save. */
+static int copy_tree(const char *from, const char *to, int *files, int *created)
+{
+    DIR *dir;
+    struct dirent *entry;
+    int ok = 1, fd;
+    if (mkdir(to, 0700) != 0)
+        return 0;
+    if (created)
+        *created = 1;
+    fd = open(from, O_RDONLY | O_DIRECTORY | O_NOFOLLOW);
+    if (fd < 0)
+        return 0;
+    dir = fdopendir(fd);
+    if (!dir) {
+        close(fd);
+        return 0;
+    }
+    errno = 0;
+    while ((entry = readdir(dir)) != NULL) {
+        char src[MAX_PATH], dst[MAX_PATH];
+        struct stat st;
+        if (!strcmp(entry->d_name, ".") || !strcmp(entry->d_name, ".."))
+            continue;
+        if (!save_path(src, sizeof src, "%s/%s", from, entry->d_name) ||
+            !save_path(dst, sizeof dst, "%s/%s", to, entry->d_name) ||
+            lstat(src, &st) != 0) {
+            ok = 0;
+            break;
+        }
+        if (S_ISDIR(st.st_mode))
+            ok = copy_tree(src, dst, files, NULL);
+        else if (S_ISREG(st.st_mode)) {
+            ok = copy_file(src, dst, st.st_mode);
+            if (ok)
+                (*files)++;
+        } else {
+            errno = EINVAL;
+            ok = 0;
+        }
+        if (!ok)
+            break;
+        errno = 0;
+    }
+    if (errno)
+        ok = 0;
+    if (closedir(dir) != 0)
+        ok = 0;
+    return ok;
+}
+
+static void remove_tree(const char *path)
+{
+    int fd = open(path, O_RDONLY | O_DIRECTORY | O_NOFOLLOW);
+    DIR *dir = fd >= 0 ? fdopendir(fd) : NULL;
+    struct dirent *entry;
+    if (!dir && fd >= 0)
+        close(fd);
+    if (dir) {
+        while ((entry = readdir(dir)) != NULL) {
+            char child[MAX_PATH];
+            struct stat st;
+            if (!strcmp(entry->d_name, ".") || !strcmp(entry->d_name, ".."))
+                continue;
+            if (!save_path(child, sizeof child, "%s/%s", path, entry->d_name) ||
+                lstat(child, &st) != 0)
+                continue;
+            if (S_ISDIR(st.st_mode))
+                remove_tree(child);
+            else
+                unlink(child);
+        }
+        closedir(dir);
+    }
+    rmdir(path);
+}
+
+static int publish_tree(const char *from, const char *to)
+{
+#ifdef __APPLE__
+    return renamex_np(from, to, RENAME_EXCL) == 0;
+#else
+    /* A nonempty destination cannot be replaced. On Linux, renameat2's
+     * RENAME_NOREPLACE additionally protects an empty destination. */
+#if defined(__linux__)
+    return renameat2(AT_FDCWD, from, AT_FDCWD, to, RENAME_NOREPLACE) == 0;
+#else
+    if (dir_exists(to)) {
+        errno = EEXIST;
+        return 0;
+    }
+    return rename(from, to) == 0;
+#endif
+#endif
+}
+
+static int import_original(const char *from, const char *to, const char *game_dir)
+{
+    static const char *subs[] = { "UDATA", "TDATA" };
+    char marker[MAX_PATH], pending[MAX_PATH], lockpath[MAX_PATH];
+    char src[MAX_PATH], dst[MAX_PATH], scratch[MAX_PATH];
+    struct stat st;
+    int files = 0, moved = 0, ok = 0, partial, lockfd;
+    if (!save_path(marker, sizeof marker, "%s/bw_edition_saves.txt", to) ||
+        !save_path(pending, sizeof pending, "%s/.bw_edition_importing", to) ||
+        !save_path(lockpath, sizeof lockpath, "%s/.bw_edition_import.lock", to) ||
+        !save_path(dst, sizeof dst, "%s/UDATA", to))
+        return 0;
+    lockfd = open(lockpath, O_RDWR | O_CREAT | O_NOFOLLOW, 0644);
+    if (lockfd < 0) {
+        fprintf(stderr, "[ED] saves: cannot open import lock: %s\n", strerror(errno));
+        return 0;
+    }
+    while (flock(lockfd, LOCK_EX) != 0) {
+        if (errno == EINTR)
+            continue;
+        fprintf(stderr, "[ED] saves: cannot acquire import lock: %s\n", strerror(errno));
+        close(lockfd);
+        return 0;
+    }
+    if (lstat(marker, &st) == 0) {
+        if (!S_ISREG(st.st_mode)) {
+            errno = EINVAL;
+            goto failed;
+        }
+        fprintf(stderr, "[ED] saves: %s (this edition's own)\n", to);
+        ok = 1;
+        goto done;
+    }
+    if (errno != ENOENT)
+        goto failed;
+    partial = lstat(pending, &st) == 0;
+    if (partial && !S_ISREG(st.st_mode)) {
+        errno = EINVAL;
+        goto failed;
+    }
+    if (!partial && errno != ENOENT)
+        goto failed;
+    if (lstat(dst, &st) == 0) {
+        if (!S_ISDIR(st.st_mode)) {
+            errno = EINVAL;
+            goto failed;
+        }
+        if (!partial) {
+            fprintf(stderr, "[ED] saves: %s (this edition's own)\n", to);
+            ok = 1;
+            goto done;
+        }
+    } else if (errno != ENOENT)
+        goto failed;
+    if (!partial) {
+        int fd = open(pending, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW, 0644);
+        if (fd < 0)
+            goto failed;
+        if (close(fd) != 0)
+            goto failed;
+    }
+    for (size_t i = 0; i < sizeof subs / sizeof subs[0]; i++) {
+        int src_status, created = 0;
+        if (!save_path(src, sizeof src, "%s/%s", from, subs[i]) ||
+            !save_path(dst, sizeof dst, "%s/%s", to, subs[i]) ||
+            !save_path(scratch, sizeof scratch, "%s/%s.import-%lu", to, subs[i],
+                       (unsigned long)getpid()))
+            goto done;
+        src_status = lstat(src, &st);
+        if (src_status != 0 && errno == ENOENT && game_dir && *game_dir) {
+            if (!save_path(src, sizeof src, "%s/%s", game_dir, subs[i]))
+                goto done;
+            src_status = lstat(src, &st);
+        }
+        if (src_status != 0) {
+            if (errno != ENOENT) {
+                fprintf(stderr, "[ED] saves: cannot inspect %s: %s\n", src, strerror(errno));
+                goto done;
+            }
+            continue;
+        }
+        if (!S_ISDIR(st.st_mode)) {
+            fprintf(stderr, "[ED] saves: refusing non-directory %s\n", src);
+            goto done;
+        }
+        if (lstat(dst, &st) == 0) {
+            if (!S_ISDIR(st.st_mode)) {
+                errno = EINVAL;
+                goto failed;
+            }
+            continue;
+        } else if (errno != ENOENT) {
+            goto failed;
+        }
+        if (lstat(scratch, &st) == 0) {
+            fprintf(stderr, "[ED] saves: import path already exists: %s\n", scratch);
+            goto done;
+        } else if (errno != ENOENT) {
+            goto failed;
+        }
+        if (copy_tree(src, scratch, &files, &created) && publish_tree(scratch, dst)) {
+            moved++;
+        } else {
+            int error = errno ? errno : EIO;
+            if (created)
+                remove_tree(scratch);
+            fprintf(stderr, "[ED] saves: could not import %s: %s\n", src, strerror(error));
+            goto done;
+        }
+    }
+    {
+        int fd = open(marker, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW, 0644);
+        FILE *f;
+        time_t now = time(NULL);
+        struct tm local = {0};
+        int wrote;
+        if (fd < 0)
+            goto failed;
+        f = fdopen(fd, "w");
+        if (!f) {
+            close(fd);
+            unlink(marker);
+            goto failed;
+        }
+        localtime_r(&now, &local);
+        wrote = fprintf(f, "Blood Wake %s saves. First boot %04d-%02d-%02d %02d:%02d:%02d.\n"
+                           "Imported from Original (one-way copy, Original untouched): %s, "
+                           "%d files, %d folders.\n",
+                        s_titles[s_edition], local.tm_year + 1900, local.tm_mon + 1,
+                        local.tm_mday, local.tm_hour, local.tm_min, local.tm_sec,
+                        from, files, moved);
+        if (fclose(f) != 0 || wrote < 0) {
+            unlink(marker);
+            goto failed;
+        }
+    }
+    if (unlink(pending) != 0)
+        fprintf(stderr, "[ED] saves: could not remove completed import marker: %s\n",
+                strerror(errno));
+    fprintf(stderr, "[ED] saves: %s import from %s to %s (%d files, %d folders)\n",
+            s_titles[s_edition], from, to, files, moved);
+    ok = 1;
+    goto done;
+failed:
+    fprintf(stderr, "[ED] saves: import failed: %s\n", strerror(errno));
+done:
+    flock(lockfd, LOCK_UN);
+    close(lockfd);
+    return ok;
+}
+
+const char *bw_edition_prepare_saves(void)
+{
+    static char root[MAX_PATH];
+    char base[MAX_PATH], orig[MAX_PATH], user[MAX_PATH];
+    const char *ov = getenv("BW_EDITION_SAVE_ROOT");
+    const char *rs = getenv("RECOMP_SAVE_DIR");
+    const char *xdg = getenv("XDG_DATA_HOME");
+    const char *home = getenv("HOME");
+    const char *game_dir = getenv("BW_GAME_DIR");
+    int has_override = rs && *rs;
+    if (s_edition == BW_ED_ORIGINAL) {
+        if (has_override)
+            fprintf(stderr, "[ED] saves: Original uses RECOMP_SAVE_DIR=%s\n", rs);
+        else
+            fprintf(stderr, "[ED] saves: Original uses the toolkit's default\n");
+        return NULL;
+    }
+    if (xdg && *xdg) {
+        if (!save_path(orig, sizeof orig, "%s/xboxrecomp", xdg))
+            save_fatal();
+    } else if (!save_path(orig, sizeof orig, "%s/.local/share/xboxrecomp",
+                          home && *home ? home : "."))
+        save_fatal();
+    if (!save_path(base, sizeof base, "%s", ov && *ov ? ov : orig) ||
+        !save_path(root, sizeof root, "%s/editions/%s", base, s_names[s_edition]) ||
+        !mkdir_parents(root))
+        save_fatal();
+    if (has_override) {
+        if (!save_path(orig, sizeof orig, "%s", rs) ||
+            !save_path(user, sizeof user, "%s/editions/%s", rs, s_names[s_edition]) ||
+            !mkdir_parents(user) || setenv("RECOMP_SAVE_DIR", user, 1) != 0) {
+            fprintf(stderr, "[ED] saves: could not isolate RECOMP_SAVE_DIR\n");
+            save_fatal();
+        }
+    } else if (!save_path(user, sizeof user, "%s", root))
+        save_fatal();
+    if (!import_original(orig, user, has_override ? NULL :
+                         game_dir && *game_dir ? game_dir : "game/disc"))
+        save_fatal();
+    fprintf(stderr, "[ED] saves: %s disk %s (saves and settings in %s)\n",
+            s_titles[s_edition], root, user);
+    return root;
+}
+#endif
 
 /* ── Counters and the summary ──────────────────────────────────────────── */
 
@@ -478,14 +883,14 @@ void bw_edition_add_summary(void (*fn)(void))
 
 void bw_edition_summary(void)
 {
-    static volatile long done;
+    static volatile LONG done;
     int i;
     if (InterlockedExchange(&done, 1))
         return;
     for (i = 0; i < BW_FIX_COUNT; i++)
         fprintf(stderr, "[ED] summary %s: %s %s, %ld hits\n", s_names[s_edition],
                 g_bw_fixes[i].name, s_refused[i] ? "REFUSED" : g_bw_fix_on[i] ? "on" : "off",
-                s_hits[i]);
+                (long)s_hits[i]);
     for (i = 0; i < s_nsum; i++)
         s_summaries[i]();
     fflush(stderr);

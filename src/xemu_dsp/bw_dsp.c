@@ -31,6 +31,10 @@ BwDsp *bw_dsp_new(void *opaque, bw_dsp_scratch_rw scratch, bw_dsp_fifo_rw fifo, 
     if (!b)
         return NULL;
     b->dsp = dsp_init(opaque, (dsp_scratch_rw_func)scratch, (dsp_fifo_rw_func)fifo, is_gp);
+    if (!b->dsp) {
+        free(b);
+        return NULL;
+    }
     dsp_set_halt_requested(b->dsp, false);
     dsp_set_cycle_count(b->dsp, 0);
     return b;

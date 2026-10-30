@@ -21,14 +21,12 @@
  */
 #include "apu_state.h"
 #include "fpconv.h"
+#include "../bw_shared_u8.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
-#ifndef WIN32_LEAN_AND_MEAN
-#define WIN32_LEAN_AND_MEAN
-#endif
-#include <windows.h>
+#include "bw_apu_sync.h"
 #include "bw_dsp.h"
 
 #define GP_WIN 0xFE830000u
@@ -57,13 +55,15 @@ extern const volatile uint8_t *xbox_ContiguousPageMap(void);
  * scenes, no dropouts, clicks or level change against the fold-down. */
 #define BW_XDSP_DEFAULT 1
 
-static int s_on = -1;
+static volatile LONG s_on = -1;
 static int s_survey;                        /* BW_APU_XDSP_SURVEY=1 */
 static BwDsp *s_gp, *s_ep;
 static uint32_t s_gprst, s_eprst;           /* last reset words seen */
 static long s_frames, s_gp_runs, s_ep_runs, s_sink_frames;
 static uint64_t s_gp_cycles, s_ep_cycles;
 static uint32_t s_gp_max, s_ep_max;
+static int s_gp_cap_shown, s_gp_cap_run, s_ep_cap_shown, s_ep_cap_run;
+static int s_surround_out;
 /* Host time spent here (QueryPerformanceCounter ticks), per 5 s line. */
 static int64_t s_qpf, s_t_all, s_t_gp, s_t_ep, s_t_sync, s_t_frame_max;
 
@@ -92,34 +92,38 @@ static int64_t qpc(void)
 #define BW_XDSP_FALLBACK_MS 500.0
 extern int xa2_is_active(void);
 extern unsigned xa2_underruns(void);
-static int s_fallback_pending;
+static volatile LONG s_fallback_pending;
+static int s_fallback_armed = -1, s_fallback_bad;
+static unsigned s_fallback_last_underruns;
+static double s_fallback_limit = BW_XDSP_FALLBACK_MS;
+
+static int request_fallback(void)
+{
+    return InterlockedCompareExchange(&s_fallback_pending, 1, 0) == 0;
+}
 
 /* Called with each 5 s line: ms = DSP stage host time per second of audio. */
 static void fallback_check(double ms)
 {
-    static int armed = -1, bad;
-    static unsigned last_u;
-    static double limit = BW_XDSP_FALLBACK_MS;
     unsigned u, dry;
 
-    if (armed < 0) {
+    if (s_fallback_armed < 0) {
         const char *e = getenv("BW_APU_DSP_FALLBACK");
         const char *m = getenv("BW_APU_DSP_FALLBACK_MS");   /* for tests */
-        armed = !(e && e[0] == '0');
+        s_fallback_armed = !(e && e[0] == '0');
         if (m && *m)
-            limit = atof(m);
+            s_fallback_limit = atof(m);
     }
-    if (!armed || !xa2_is_active())
+    if (!s_fallback_armed || !xa2_is_active())
         return;
     u = xa2_underruns();
-    dry = u - last_u;
-    last_u = u;
-    if (ms >= limit && dry >= 3)
-        bad++;
+    dry = u - s_fallback_last_underruns;
+    s_fallback_last_underruns = u;
+    if (ms >= s_fallback_limit && dry >= 3)
+        s_fallback_bad++;
     else
-        bad = 0;
-    if (bad >= 2 && !s_fallback_pending) {
-        s_fallback_pending = 1;
+        s_fallback_bad = 0;
+    if (s_fallback_bad >= 2 && request_fallback()) {
         fprintf(stderr, "[APU-XDSP] the DSP stage took %.0f ms per second of audio and the"
                         " device ran dry %u times in 5 s: the DSPs can't keep real time on"
                         " this machine now, so this boot switches to the fold-down"
@@ -132,18 +136,21 @@ static void fallback_check(double ms)
  * Unset: BW_XDSP_DEFAULT. Read once per boot. */
 int bw_xdsp_enabled(void)
 {
-    if (s_on < 0) {
+    LONG on = InterlockedCompareExchange(&s_on, 0, 0);
+    if (on < 0) {
         const char *e = getenv("BW_APU_DSP");
-        if (e && *e)
-            s_on = e[0] == 'x' || e[0] == '1' || e[0] == 'd';
-        else
-            s_on = BW_XDSP_DEFAULT;
-        fprintf(stderr, "[APU-XDSP] audio DSP stage: %s (BW_APU_DSP=%s)\n",
-                s_on ? "the GP/EP DSPs run DirectSound's programs (xemu DSP56300)"
-                     : "the stub's stereo fold-down (TK-16)",
-                e && *e ? e : "unset");
+        LONG wanted = e && *e ? (e[0] == 'x' || e[0] == '1' || e[0] == 'd')
+                              : BW_XDSP_DEFAULT;
+        on = InterlockedCompareExchange(&s_on, wanted, -1);
+        if (on < 0) {
+            on = wanted;
+            fprintf(stderr, "[APU-XDSP] audio DSP stage: %s (BW_APU_DSP=%s)\n",
+                    on ? "the GP/EP DSPs run DirectSound's programs (xemu DSP56300)"
+                       : "the stub's stereo fold-down (TK-16)",
+                    e && *e ? e : "unset");
+        }
     }
-    return s_on;
+    return (int)on;
 }
 
 static uint8_t *win(uint32_t guest)
@@ -188,8 +195,9 @@ static int s_pages_mode = -1;               /* 'w': pinned to the window */
 static int page_copy(uint32_t pa, int prev_copy, uint32_t prev_pa, int *why)
 {
     uint32_t pg = (pa & 0x03FFFFFFu) >> 12;
-    uint8_t kind = bw_PhysLastTranslationMap()[pg];
-    uint8_t c = xbox_ContiguousPageMap()[pg], n = xbox_PhysRamNameMap()[pg];
+    uint8_t kind = bw_shared_u8_load(&bw_PhysLastTranslationMap()[pg]);
+    uint8_t c = bw_shared_u8_load(&xbox_ContiguousPageMap()[pg]);
+    uint8_t n = bw_shared_u8_load(&xbox_PhysRamNameMap()[pg]);
 
     if (s_pages_mode < 0) {
         const char *e = getenv("BW_APU_XDSP_PAGES");
@@ -234,7 +242,7 @@ static SgeCache s_sgc[4] = {
     { "EP-scratch", NV_PAPU_EPSADDR, NV_PAPU_EPSMAXSGE },
     { "EP-fifo",    NV_PAPU_EPFADDR, NV_PAPU_EPFMAXSGE },
 };
-static SRWLOCK s_sgc_lock = SRWLOCK_INIT;
+static BwApuMutex s_sgc_lock = BW_APU_MUTEX_INITIALIZER;
 
 /* The table itself: its copy decided when its address first appears. */
 static void sgc_table(SgeCache *c, uint32_t base)
@@ -297,10 +305,15 @@ static void sgc_scan_locked(MCPXAPUState *d)
             size_t n = 0;
             c->max_seen = max > c->max_seen ? max : c->max_seen;
             c->reported = c->resolved;
-            for (w = 0; w < WHY_COUNT; w++)
-                if (c->by_why[w])
-                    n += _snprintf(line + n, sizeof line - n, "%s%u %s", n ? ", " : "",
-                                   c->by_why[w], s_why_name[w]);
+            for (w = 0; w < WHY_COUNT; w++) {
+                if (c->by_why[w] && n < sizeof line - 1) {
+                    int written = snprintf(line + n, sizeof line - n, "%s%u %s",
+                                           n ? ", " : "", c->by_why[w], s_why_name[w]);
+                    if (written > 0)
+                        n += (size_t)written < sizeof line - n
+                           ? (size_t)written : sizeof line - n - 1;
+                }
+            }
             line[sizeof line - 1] = 0;
             fprintf(stderr, "[APU-XDSP] SGE %s: entries 0..%u resolved (%s)\n", c->name, max,
                     n ? line : "none");
@@ -308,25 +321,35 @@ static void sgc_scan_locked(MCPXAPUState *d)
     }
 }
 
-/* apu_core.c: DirectSound wrote an SGE address or count register. */
-void bw_xdsp_sge_written(MCPXAPUState *d, uint32_t addr)
+/* SGE register updates and table snapshots share the DSP's cache lock. */
+void bw_xdsp_sge_write(MCPXAPUState *d, uint32_t addr, uint32_t value)
 {
-    (void)addr;
-    if (!bw_xdsp_enabled())
-        return;
-    AcquireSRWLockExclusive(&s_sgc_lock);
-    sgc_scan_locked(d);
-    ReleaseSRWLockExclusive(&s_sgc_lock);
+    bw_apu_mutex_lock(&s_sgc_lock);
+    d->regs[addr] = value;
+    if (bw_xdsp_enabled())
+        sgc_scan_locked(d);
+    bw_apu_mutex_unlock(&s_sgc_lock);
+}
+
+uint32_t bw_xdsp_sge_read(MCPXAPUState *d, uint32_t addr)
+{
+    uint32_t value;
+    bw_apu_mutex_lock(&s_sgc_lock);
+    value = d->regs[addr];
+    bw_apu_mutex_unlock(&s_sgc_lock);
+    return value;
 }
 
 static void sg_rw(MCPXAPUState *d, int which, uint8_t *ptr, uint32_t addr, size_t len, bool dir)
 {
     SgeCache *c = &s_sgc[which];
-    uint32_t sge_base = d->regs[c->base_reg], max_sge = d->regs[c->max_reg];
+    uint32_t sge_base, max_sge;
     uint32_t entry = addr / SG_PAGE, off = addr % SG_PAGE, n = SG_PAGE - off;
     static int warned;
 
-    AcquireSRWLockExclusive(&s_sgc_lock);
+    bw_apu_mutex_lock(&s_sgc_lock);
+    sge_base = d->regs[c->base_reg];
+    max_sge = d->regs[c->max_reg];
     if (sge_base)
         sgc_table(c, sge_base);
     while (len > 0) {
@@ -360,7 +383,7 @@ static void sg_rw(MCPXAPUState *d, int which, uint8_t *ptr, uint32_t addr, size_
         off = 0;
         n = SG_PAGE;
     }
-    ReleaseSRWLockExclusive(&s_sgc_lock);
+    bw_apu_mutex_unlock(&s_sgc_lock);
 }
 
 /* Diagnostic: one SGE table's pages, as runs of entries with the same
@@ -383,8 +406,10 @@ static void page_desc(uint32_t pa, char *out, size_t cap)
     uint32_t pg = (pa & 0x03FFFFFFu) >> 12;
     const uint8_t *ram = mcpx_apu_phys((uint64_t)(pg << 12) | 0x10000000u);
     const uint8_t *wnd = mcpx_apu_phys((uint64_t)(pg << 12) | 0x20000000u);
-    _snprintf(out, cap, "%s%s t%u %s%s", xbox_ContiguousPageMap()[pg] ? "c" : "-",
-              xbox_PhysRamNameMap()[pg] ? "n" : "-", bw_PhysLastTranslationMap()[pg],
+    snprintf(out, cap, "%s%s t%u %s%s",
+              bw_shared_u8_load(&xbox_ContiguousPageMap()[pg]) ? "c" : "-",
+              bw_shared_u8_load(&xbox_PhysRamNameMap()[pg]) ? "n" : "-",
+              bw_shared_u8_load(&bw_PhysLastTranslationMap()[pg]),
               page_zero(ram) ? "zR" : "..", page_zero(wnd) ? "zW" : "..");
     out[cap - 1] = 0;
 }
@@ -430,10 +455,12 @@ static void sge_survey(const char *name, uint32_t base, uint32_t max)
 static void sge_survey_all(MCPXAPUState *d, const char *when)
 {
     fprintf(stderr, "[APU-XDSP] SGE survey (%s)\n", when);
+    bw_apu_mutex_lock(&s_sgc_lock);
     sge_survey("GP-scratch", d->regs[NV_PAPU_GPSADDR], d->regs[NV_PAPU_GPSMAXSGE]);
     sge_survey("GP-fifo", d->regs[NV_PAPU_GPFADDR], d->regs[NV_PAPU_GPFMAXSGE]);
     sge_survey("EP-scratch", d->regs[NV_PAPU_EPSADDR], d->regs[NV_PAPU_EPSMAXSGE]);
     sge_survey("EP-fifo", d->regs[NV_PAPU_EPFADDR], d->regs[NV_PAPU_EPFMAXSGE]);
+    bw_apu_mutex_unlock(&s_sgc_lock);
 }
 
 static void gp_scratch_rw(void *opaque, uint8_t *ptr, uint32_t addr, size_t len, bool dir)
@@ -448,17 +475,58 @@ static void ep_scratch_rw(void *opaque, uint8_t *ptr, uint32_t addr, size_t len,
     sg_rw(d, 2, ptr, addr, len, dir);
 }
 
+static BwApuMutex s_fifo_lock = BW_APU_MUTEX_INITIALIZER;
+
+static int fifo_reg_in_range(uint32_t addr, uint32_t first, unsigned count)
+{
+    uint32_t offset;
+    if (addr < first)
+        return 0;
+    offset = addr - first;
+    return offset / 0x10 < count && (offset % 0x10 == 0 ||
+           offset % 0x10 == 4 || offset % 0x10 == 8);
+}
+
+int bw_xdsp_is_fifo_reg(uint32_t addr)
+{
+    return fifo_reg_in_range(addr, NV_PAPU_GPOFBASE0, GP_OUTPUT_FIFO_COUNT) ||
+           fifo_reg_in_range(addr, NV_PAPU_GPIFBASE0, GP_INPUT_FIFO_COUNT) ||
+           fifo_reg_in_range(addr, NV_PAPU_EPOFBASE0, EP_OUTPUT_FIFO_COUNT) ||
+           fifo_reg_in_range(addr, NV_PAPU_EPIFBASE0, EP_INPUT_FIFO_COUNT);
+}
+
+uint32_t bw_xdsp_fifo_read(MCPXAPUState *d, uint32_t addr)
+{
+    uint32_t value;
+    bw_apu_mutex_lock(&s_fifo_lock);
+    value = d->regs[addr];
+    bw_apu_mutex_unlock(&s_fifo_lock);
+    return value;
+}
+
+void bw_xdsp_fifo_write(MCPXAPUState *d, uint32_t addr, uint32_t value)
+{
+    bw_apu_mutex_lock(&s_fifo_lock);
+    d->regs[addr] = value;
+    bw_apu_mutex_unlock(&s_fifo_lock);
+}
+
 /* A FIFO is a circular range [base, end) of a scatter-gather buffer, with its
  * position in a register (xemu circular_scatter_gather_rw). */
 static void fifo_rw(MCPXAPUState *d, int which, uint32_t base_reg,
                     uint32_t end_reg, uint32_t cur_reg, uint8_t *ptr, size_t len, bool dir)
 {
-    uint32_t base = d->regs[base_reg] & FIFO_MASK, end = d->regs[end_reg] & FIFO_MASK;
-    uint32_t cur = d->regs[cur_reg] & FIFO_MASK;
+    uint32_t base, end, cur;
+
+    bw_apu_mutex_lock(&s_fifo_lock);
+    base = d->regs[base_reg] & FIFO_MASK;
+    end = d->regs[end_reg] & FIFO_MASK;
+    cur = d->regs[cur_reg] & FIFO_MASK;
 
     if (end <= base) {                    /* not set up: nothing moves */
         if (!dir)
             memset(ptr, 0, len);
+        bw_apu_mutex_unlock(&s_fifo_lock);
         return;
     }
     if (cur >= end)
@@ -477,6 +545,7 @@ static void fifo_rw(MCPXAPUState *d, int which, uint32_t base_reg,
             cur = base;
     }
     d->regs[cur_reg] = (d->regs[cur_reg] & ~FIFO_MASK) | cur;
+    bw_apu_mutex_unlock(&s_fifo_lock);
 }
 
 /* Diagnostic, BW_APU_XDSP_FIFOSTAT=1: every 5 s of audio, per DSP and FIFO
@@ -520,9 +589,13 @@ static void fifo_report(void)
                 size_t n = 0;
                 if (!f->n)
                     continue;
-                for (k = 0; k < 8; k++)
-                    n += _snprintf(lanes + n, sizeof lanes - n, " %.0f",
-                                   f->cnt[k] ? 20.0 * log10(sqrt(f->sq[k] / f->cnt[k]) / 8388608.0 + 1e-12) : -999.0);
+                for (k = 0; k < 8 && n < sizeof lanes - 1; k++) {
+                    int written = snprintf(lanes + n, sizeof lanes - n, " %.0f",
+                                           f->cnt[k] ? 20.0 * log10(sqrt(f->sq[k] / f->cnt[k]) / 8388608.0 + 1e-12) : -999.0);
+                    if (written > 0)
+                        n += (size_t)written < sizeof lanes - n
+                           ? (size_t)written : sizeof lanes - n - 1;
+                }
                 lanes[sizeof lanes - 1] = 0;
                 fprintf(stderr, "[APU-FIFO] %c%c%d: %ld transfers, %.0f bytes each; lane dBFS%s\n",
                         a ? 'E' : 'G', b ? 'o' : 'i', c, f->n, (double)f->bytes / f->n, lanes);
@@ -611,57 +684,69 @@ static WinRange s_ep_ranges[] = {
     { EP_WIN + NV_PAPU_EPPMEM,   0x1000, 0,                  'P', NULL },
 };
 
-/* Both syncs go 16 words (64 bytes) at a time and skip a block with nothing
- * to do: the windows are about 19,000 words a frame each way, 1,500 frames a
- * second, and word by word the two syncs were about 8% of the DSP stage. */
-#define SYNC_BLOCK 16
+/* Guest words are aligned 32-bit memory. A single input snapshot and a
+ * compare/exchange on output prevent the DSP from erasing a guest write
+ * which arrives while that frame is running. */
+static uint32_t guest_word_load(uint32_t *p)
+{
+#if defined(_WIN32)
+    return (uint32_t)InterlockedCompareExchange((volatile LONG *)p, 0, 0);
+#else
+    return __atomic_load_n(p, __ATOMIC_RELAXED);
+#endif
+}
+
+static int guest_word_replace(uint32_t *p, uint32_t expected, uint32_t value)
+{
+#if defined(_WIN32)
+    return (uint32_t)InterlockedCompareExchange((volatile LONG *)p, (LONG)value,
+                                                (LONG)expected) == expected;
+#else
+    return __atomic_compare_exchange_n(p, &expected, value, false,
+                                       __ATOMIC_RELAXED, __ATOMIC_RELAXED);
+#endif
+}
 
 /* CPU -> DSP: words the CPU changed since the last sync. */
 static void sync_in(BwDsp *dsp, WinRange *r, int n)
 {
     int k;
     for (k = 0; k < n; k++) {
-        uint32_t *w = (uint32_t *)win(r[k].va), i, j;
-        for (i = 0; i < r[k].words; i += SYNC_BLOCK) {
-            if (!memcmp(w + i, r[k].shadow + i, SYNC_BLOCK * 4))
+        uint32_t *w = (uint32_t *)win(r[k].va);
+        for (uint32_t j = 0; j < r[k].words; j++) {
+            uint32_t observed = guest_word_load(&w[j]);
+            if (observed == r[k].shadow[j])
                 continue;
-            for (j = i; j < i + SYNC_BLOCK; j++) {
-                if (w[j] == r[k].shadow[j])
-                    continue;
-                if (r[k].space == 'M')
-                    bw_dsp_write(dsp, 'X', 0x1400 + j, w[j] & 0xFFFFFF);
-                else
-                    bw_dsp_write(dsp, r[k].space, r[k].dsp_off + j, w[j] & 0xFFFFFF);
-                r[k].shadow[j] = w[j];
-            }
+            if (r[k].space == 'M')
+                bw_dsp_write(dsp, 'X', 0x1400 + j, observed & 0xFFFFFF);
+            else
+                bw_dsp_write(dsp, r[k].space, r[k].dsp_off + j, observed & 0xFFFFFF);
+            r[k].shadow[j] = observed;
         }
     }
 }
 
 /* DSP -> CPU: the DSP's memory, except words the CPU wrote while it ran.
  * The DSP memories hold 24-bit words only (bw_xdsp_init masks xemu's 0xCA
- * fill), so a block where window, shadow and DSP agree has nothing to do. */
+ * fill). A failed exchange leaves the guest's word for the next sync_in. */
 static void sync_out(BwDsp *dsp, WinRange *r, int n)
 {
     int k;
     for (k = 0; k < n; k++) {
-        uint32_t *w = (uint32_t *)win(r[k].va), words, i, j, e;
+        uint32_t *w = (uint32_t *)win(r[k].va), words;
         uint32_t *m = bw_dsp_mem(dsp, r[k].space, &words);
         if (!m)
             continue;
         m += r[k].dsp_off;
         if (words > r[k].words)
             words = r[k].words;
-        for (i = 0; i < words; i += SYNC_BLOCK) {
-            e = i + SYNC_BLOCK < words ? i + SYNC_BLOCK : words;
-            if (!memcmp(w + i, m + i, (e - i) * 4) && !memcmp(w + i, r[k].shadow + i, (e - i) * 4))
+        for (uint32_t j = 0; j < words; j++) {
+            uint32_t expected = r[k].shadow[j];
+            uint32_t value = m[j] & 0x00FFFFFFu;
+            if (expected == value)
                 continue;
-            for (j = i; j < e; j++) {
-                if (w[j] != r[k].shadow[j])
-                    continue;             /* the CPU's, pushed next frame */
-                w[j] = m[j] & 0x00FFFFFFu;
-                r[k].shadow[j] = w[j];
-            }
+            if (guest_word_replace(&w[j], expected, value))
+                r[k].shadow[j] = value;
         }
     }
 }
@@ -678,13 +763,24 @@ static void mask_mem(BwDsp *dsp)
     }
 }
 
-static void ranges_init(WinRange *r, int n)
+static int ranges_init(WinRange *r, int n)
 {
     int k;
     for (k = 0; k < n; k++) {
-        r[k].shadow = (uint32_t *)calloc(r[k].words, 4);
+        r[k].shadow = (uint32_t *)calloc(r[k].words, sizeof(*r[k].shadow));
+        if (!r[k].shadow)
+            return 0;
         /* Start from what the window holds: anything already there goes in
          * on the first sync_in only if it differs from zero. */
+    }
+    return 1;
+}
+
+static void ranges_free(WinRange *r, int n)
+{
+    for (int k = 0; k < n; k++) {
+        free(r[k].shadow);
+        r[k].shadow = NULL;
     }
 }
 
@@ -703,7 +799,7 @@ enum { ACT_NONE, ACT_RESET, ACT_BOOT };
  * ep_write does (its FIXME: frame sync). */
 static int poll_reset(MCPXAPUState *d, uint32_t rst_va, uint32_t *last, int is_ep)
 {
-    uint32_t v = *(volatile uint32_t *)win(rst_va);
+    uint32_t v = guest_word_load((uint32_t *)win(rst_va));
     int act = ACT_NONE;
     if (v == *last)
         return ACT_NONE;
@@ -753,9 +849,9 @@ static void dsp_do_frame(MCPXAPUState *d, const XFrame *f)
     /* New SGE entries get their copy decided while the translations that
      * made them are fresh (also on DirectSound's register writes). */
     if (f->div % 8 == 0) {
-        AcquireSRWLockExclusive(&s_sgc_lock);
+        bw_apu_mutex_lock(&s_sgc_lock);
         sgc_scan_locked(d);
-        ReleaseSRWLockExclusive(&s_sgc_lock);
+        bw_apu_mutex_unlock(&s_sgc_lock);
     }
 
     sync_in(s_gp, s_gp_ranges, 4);
@@ -775,18 +871,16 @@ static void dsp_do_frame(MCPXAPUState *d, const XFrame *f)
             s_gp_max = c;
         {
             /* The GP never reached its end of frame: the cap stopped it. */
-            static int shown, run;
             if (c >= BW_GP_MAX_CYCLES) {
-                if (shown++ < 5)
+                if (s_gp_cap_shown++ < 5)
                     fprintf(stderr, "[APU-XDSP] GP ran %u cycles without finishing its frame"
                                     " (frame %ld)\n", c, s_frames);
-                if (++run == BW_CAP_FALLBACK * 8 && !s_fallback_pending) {
-                    s_fallback_pending = 1;
+                if (++s_gp_cap_run == BW_CAP_FALLBACK * 8 && request_fallback()) {
                     fprintf(stderr, "[APU-XDSP] the GP program never finishes a frame: this boot"
                                     " switches to the fold-down\n");
                 }
             } else {
-                run = 0;
+                s_gp_cap_run = 0;
             }
         }
         if (!f->ep_on) {
@@ -809,19 +903,17 @@ static void dsp_do_frame(MCPXAPUState *d, const XFrame *f)
             s_ep_max = c;
         {
             /* The EP never reached its end of frame: the cap stopped it. */
-            static int shown, run;
             if (c >= BW_EP_MAX_CYCLES) {
-                if (shown++ < 5)
+                if (s_ep_cap_shown++ < 5)
                     fprintf(stderr, "[APU-XDSP] EP ran %u cycles without finishing its frame"
                                     " (frame %ld)\n", c, s_frames);
-                if (++run == BW_CAP_FALLBACK && !s_fallback_pending) {
-                    s_fallback_pending = 1;
+                if (++s_ep_cap_run == BW_CAP_FALLBACK && request_fallback()) {
                     fprintf(stderr, "[APU-XDSP] the EP program never finishes a frame (DirectSound's"
                                     " Dolby encoder, in surround or AC3 mode): this boot switches to"
                                     " the fold-down\n");
                 }
             } else {
-                run = 0;
+                s_ep_cap_run = 0;
             }
         }
     }
@@ -888,10 +980,13 @@ static void dsp_do_frame(MCPXAPUState *d, const XFrame *f)
 static int s_thread_mode = -1;
 static XFrame s_ring[XRING];
 static int16_t s_blocks[XBLOCKS][256][2];
-static volatile LONG64 s_produced, s_done;     /* frames queued / finished */
-static SRWLOCK s_ring_lock = SRWLOCK_INIT;
-static CONDITION_VARIABLE s_ring_cv = CONDITION_VARIABLE_INIT;
-static int64_t s_period_seq = -1, s_period_first;  /* frame thread's view */
+static int64_t s_produced, s_done;             /* protected by s_ring_lock */
+static BwApuMutex s_ring_lock = BW_APU_MUTEX_INITIALIZER;
+static BwApuCond s_ring_cv = BW_APU_COND_INITIALIZER;
+static BwApuThread s_thread;
+static int s_stop;
+static int64_t s_period_seq = -1, s_period_output_last = -1;
+static int64_t s_block_last[XBLOCKS] = { -1, -1, -1, -1 };
 static int64_t s_wait_us, s_wait_max_us;           /* frame thread waiting */
 static long s_waits, s_apu_periods;
 
@@ -906,6 +1001,7 @@ static int thread_mode(void)
 
 static int dsp_frame_guarded(MCPXAPUState *d, const XFrame *f)
 {
+#if defined(_WIN32) && defined(_MSC_VER)
     __try {
         dsp_do_frame(d, f);
     } __except (EXCEPTION_EXECUTE_HANDLER) {
@@ -915,43 +1011,52 @@ static int dsp_frame_guarded(MCPXAPUState *d, const XFrame *f)
                             " frame skipped\n", GetExceptionCode(), s_frames, f->div);
         return 0;
     }
+#else
+    dsp_do_frame(d, f);
+#endif
     return 1;
 }
 
-static DWORD WINAPI dsp_thread(LPVOID arg)
+static void *dsp_thread(void *arg)
 {
     MCPXAPUState *d = arg;
-    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
-    fprintf(stderr, "[APU-XDSP] DSP thread %lu running\n", GetCurrentThreadId());
+    int elevated = bw_apu_set_priority(2);
+    fprintf(stderr, "[APU-XDSP] DSP thread running%s\n",
+            elevated ? "" : " (default priority)");
     for (;;) {
         int64_t n;
-        AcquireSRWLockExclusive(&s_ring_lock);
-        while (s_done >= s_produced)
-            SleepConditionVariableSRW(&s_ring_cv, &s_ring_lock, INFINITE, 0);
+        bw_apu_mutex_lock(&s_ring_lock);
+        while (!s_stop && s_done >= s_produced)
+            bw_apu_cond_wait(&s_ring_cv, &s_ring_lock);
+        if (s_stop) {
+            bw_apu_mutex_unlock(&s_ring_lock);
+            break;
+        }
         n = s_done;
-        ReleaseSRWLockExclusive(&s_ring_lock);
+        bw_apu_mutex_unlock(&s_ring_lock);
 
-        dsp_frame_guarded(d, &s_ring[n % XRING]);
+        if (!dsp_frame_guarded(d, &s_ring[n % XRING]))
+            request_fallback();
 
-        AcquireSRWLockExclusive(&s_ring_lock);
+        bw_apu_mutex_lock(&s_ring_lock);
         s_done = n + 1;
-        WakeAllConditionVariable(&s_ring_cv);
-        ReleaseSRWLockExclusive(&s_ring_lock);
+        bw_apu_cond_broadcast(&s_ring_cv);
+        bw_apu_mutex_unlock(&s_ring_lock);
     }
-    return 0;
+    return NULL;
 }
 
 /* The frame thread waits until the DSP thread has finished frame n. */
 static void wait_done(int64_t n)
 {
     int64_t t0 = 0;
-    AcquireSRWLockExclusive(&s_ring_lock);
+    bw_apu_mutex_lock(&s_ring_lock);
     if (s_done <= n) {
         t0 = qemu_clock_get_us(QEMU_CLOCK_REALTIME);
         while (s_done <= n)
-            SleepConditionVariableSRW(&s_ring_cv, &s_ring_lock, INFINITE, 0);
+            bw_apu_cond_wait(&s_ring_cv, &s_ring_lock);
     }
-    ReleaseSRWLockExclusive(&s_ring_lock);
+    bw_apu_mutex_unlock(&s_ring_lock);
     if (t0) {
         int64_t w = qemu_clock_get_us(QEMU_CLOCK_REALTIME) - t0;
         s_wait_us += w;
@@ -969,30 +1074,85 @@ void bw_xdsp_init(MCPXAPUState *d)
         return;
     s_gp = bw_dsp_new(d, gp_scratch_rw, gp_fifo_rw, true);
     s_ep = bw_dsp_new(d, ep_scratch_rw, ep_fifo_rw, false);
+    if (!s_gp || !s_ep || !ranges_init(s_gp_ranges, 4) || !ranges_init(s_ep_ranges, 3)) {
+        fprintf(stderr, "[APU-XDSP] unable to allocate DSP state; using the fold-down\n");
+        ranges_free(s_gp_ranges, 4);
+        ranges_free(s_ep_ranges, 3);
+        bw_dsp_free(s_gp);
+        bw_dsp_free(s_ep);
+        s_gp = s_ep = NULL;
+        InterlockedExchange(&s_on, 0);
+        return;
+    }
     {
         const char *e = getenv("BW_APU_XDSP_SURVEY");
         s_survey = e && e[0] == '1';
     }
     mask_mem(s_gp);
     mask_mem(s_ep);
-    ranges_init(s_gp_ranges, 4);
-    ranges_init(s_ep_ranges, 3);
     if (thread_mode()) {
-        HANDLE h = CreateThread(NULL, 0, dsp_thread, d, 0, NULL);
-        if (h)
-            CloseHandle(h);
-        else
+        if (!bw_apu_thread_create(&s_thread, dsp_thread, d)) {
+            fprintf(stderr, "[APU-XDSP] unable to start DSP worker; running on the frame thread\n");
             s_thread_mode = 0;
+        }
     }
     fprintf(stderr, "[APU-XDSP] GP and EP on xemu's DSP56300 interpreter, %s\n",
             s_thread_mode ? "on their own thread (BW_APU_DSP_THREAD=0: on the frame thread)"
                           : "on the frame thread");
 }
 
+/* Called after the APU frame thread has stopped. */
+void bw_xdsp_shutdown(void)
+{
+    bw_apu_mutex_lock(&s_ring_lock);
+    s_stop = 1;
+    bw_apu_cond_broadcast(&s_ring_cv);
+    bw_apu_mutex_unlock(&s_ring_lock);
+    bw_apu_thread_join(&s_thread);
+
+    bw_dsp_free(s_gp);
+    bw_dsp_free(s_ep);
+    s_gp = s_ep = NULL;
+    ranges_free(s_gp_ranges, 4);
+    ranges_free(s_ep_ranges, 3);
+    bw_apu_mutex_lock(&s_sgc_lock);
+    for (int k = 0; k < 4; k++)
+        memset(&s_sgc[k].base, 0, sizeof(s_sgc[k]) - offsetof(SgeCache, base));
+    bw_apu_mutex_unlock(&s_sgc_lock);
+
+    s_produced = s_done = 0;
+    s_stop = 0;
+    s_thread_mode = -1;
+    s_period_seq = -1;
+    s_period_output_last = -1;
+    for (int k = 0; k < XBLOCKS; k++)
+        s_block_last[k] = -1;
+    memset(s_blocks, 0, sizeof(s_blocks));
+    memset(s_fs, 0, sizeof(s_fs));
+    s_fifostat = s_pages_mode = -1;
+    s_sink_target = NULL;
+    s_gprst = s_eprst = 0;
+    s_frames = s_gp_runs = s_ep_runs = s_sink_frames = 0;
+    s_gp_cycles = s_ep_cycles = 0;
+    s_gp_max = s_ep_max = 0;
+    s_gp_cap_shown = s_gp_cap_run = s_ep_cap_shown = s_ep_cap_run = 0;
+    s_qpf = s_t_all = s_t_gp = s_t_ep = s_t_sync = s_t_frame_max = 0;
+    s_wait_us = s_wait_max_us = 0;
+    s_waits = s_apu_periods = 0;
+    s_surround_out = 0;
+    s_fallback_armed = -1;
+    s_fallback_bad = 0;
+    s_fallback_last_underruns = 0;
+    s_fallback_limit = BW_XDSP_FALLBACK_MS;
+    InterlockedExchange(&s_fallback_pending, 0);
+    InterlockedExchange(&s_on, -1);
+}
+
 /* One 32-sample frame. Returns 1 when it handled the DSP stage. */
 int bw_xdsp_frame(MCPXAPUState *d, float mixbins[NUM_MIXBINS][NUM_SAMPLES_PER_FRAME])
 {
     XFrame *f, local;
+    int64_t n = 0;
     int b, i, div;
 
     if (!bw_xdsp_enabled())
@@ -1002,17 +1162,28 @@ int bw_xdsp_frame(MCPXAPUState *d, float mixbins[NUM_MIXBINS][NUM_SAMPLES_PER_FR
     if (!s_gp || !s_ep)
         return 0;
     if (d->ep_frame_div % 8 == 0) {
-        if (s_fallback_pending)
-            s_on = 0;                   /* switch at a period boundary */
-        if (!s_on)
+        if (InterlockedCompareExchange(&s_fallback_pending, 0, 0)) {
+            if (s_thread_mode) {
+                bw_apu_mutex_lock(&s_ring_lock);
+                n = s_produced;
+                bw_apu_mutex_unlock(&s_ring_lock);
+                if (n)
+                    wait_done(n - 1);
+            }
+            InterlockedExchange(&s_on, 0);  /* switch at a period boundary */
+        }
+        if (!bw_xdsp_enabled())
             return 0;
     }
 
     if (s_thread_mode) {
         /* a free slot: the DSP thread is at most XRING frames behind */
-        if (s_produced - s_done >= XRING)
-            wait_done(s_produced - XRING);
-        f = &s_ring[s_produced % XRING];
+        bw_apu_mutex_lock(&s_ring_lock);
+        while (s_produced - s_done >= XRING)
+            bw_apu_cond_wait(&s_ring_cv, &s_ring_lock);
+        n = s_produced;
+        bw_apu_mutex_unlock(&s_ring_lock);
+        f = &s_ring[n % XRING];
     } else {
         f = &local;
     }
@@ -1038,21 +1209,27 @@ int bw_xdsp_frame(MCPXAPUState *d, float mixbins[NUM_MIXBINS][NUM_SAMPLES_PER_FR
     /* the period this frame belongs to, and its output block */
     if (div % 8 == 0 || s_period_seq < 0) {
         s_period_seq++;
-        s_period_first = s_produced;
+        s_period_output_last = -1;
+        if (s_block_last[s_period_seq % XBLOCKS] >= 0)
+            wait_done(s_block_last[s_period_seq % XBLOCKS]);
         memset(s_blocks[s_period_seq % XBLOCKS], 0, sizeof s_blocks[0]);
     }
     f->out = s_blocks[s_period_seq % XBLOCKS];
+    if ((!f->ep_on && f->gp_on) || (f->ep_on && div % 8 == 0))
+        s_period_output_last = n;
 
-    AcquireSRWLockExclusive(&s_ring_lock);
+    bw_apu_mutex_lock(&s_ring_lock);
     s_produced++;
-    WakeAllConditionVariable(&s_ring_cv);
-    ReleaseSRWLockExclusive(&s_ring_lock);
+    bw_apu_cond_broadcast(&s_ring_cv);
+    bw_apu_mutex_unlock(&s_ring_lock);
+    s_block_last[s_period_seq % XBLOCKS] = n;
 
-    /* The period's last frame: monitor_frame hands frame_buf to the device
-     * right after this, so the period's output must be in it. With the EP
-     * that is the block its run at the period's first frame filled. */
+    /* Wait for every frame that can write this block, including a period
+     * that changes between GP and EP output. The other EP-on frames can
+     * continue running in parallel. */
     if ((div + 1) % 8 == 0) {
-        wait_done(f->ep_on ? s_period_first : s_produced - 1);
+        if (s_period_output_last >= 0)
+            wait_done(s_period_output_last);
         memcpy(d->monitor.frame_buf, s_blocks[s_period_seq % XBLOCKS], sizeof s_blocks[0]);
         if (++s_apu_periods % 938 == 0) {
             /* every 5 s, from the frame thread */
@@ -1082,8 +1259,6 @@ int bw_xdsp_frame(MCPXAPUState *d, float mixbins[NUM_MIXBINS][NUM_SAMPLES_PER_FR
  * Called by the carried apu_xaudio2.c at init, before any audio frame. */
 #include "../../bw_edition.h"
 
-static int s_surround_out;
-
 int bw_surround_output_wanted(int device_channels)
 {
     const char *e = getenv("BW_AUDIO_SURROUND");
@@ -1096,7 +1271,7 @@ int bw_surround_output_wanted(int device_channels)
     }
     s_surround_out = want;
     if (want) {
-        s_on = 0;                                 /* no frame has run yet */
+        InterlockedExchange(&s_on, 0);             /* no frame has run yet */
         fprintf(stderr, "[APU-XDSP] 5.1 output: the game is told surround; the DSP stage stands"
                         " down (DirectSound's Dolby EP path doesn't run here) and the speaker"
                         " and 3D bins become the six channels\n");

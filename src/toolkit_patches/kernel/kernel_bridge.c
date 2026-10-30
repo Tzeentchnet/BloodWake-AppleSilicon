@@ -46,6 +46,12 @@
 #include <ctype.h>
 #include <wctype.h>
 
+#if defined(__APPLE__)
+#include "../../bw_posix_ke_event.h"
+#include "../bw_runtime_lifecycle.h"
+#include <pthread.h>
+#endif
+
 /* Access to recompiled code registers. Per-thread: RECOMP_TLS comes from
  * xbox_memory_layout.h and must match the definitions there -- a plain extern
  * here binds to the TLS template rather than the calling thread's copy, which
@@ -2058,13 +2064,211 @@ static void bridge_NtCreateEvent(void)
     g_eax = (uint32_t)status;
 }
 
+#if !defined(__APPLE__)
 static HANDLE ke_shadow_lookup(uint32_t guest_va);
+#endif
 static void ke_shadow_insert(uint32_t guest_va, HANDLE host);
 static HANDLE bridge_resolve_handle(uint32_t token);
+#if !defined(__APPLE__)
 static HANDLE ke_guest_event(uint32_t guest_va, int *type);
+#endif
+
+#if defined(__APPLE__)
+static HANDLE ke_shadow_acquire(uint32_t guest_va);
+static HANDLE bridge_tagged_acquire(uint32_t token);
+static BwKeResult ke_initialize_guest_event(const BwPosixGuestMem *mem,
+                                            uint32_t guest_va, uint32_t type,
+                                            uint32_t state);
+static int bridge_run_io_apcs(uint32_t alertable, uint32_t wait_mode);
+
+static void bridge_close_retained(void *context)
+{
+    HANDLE h = *(HANDLE *)context;
+    if (h)
+        CloseHandle(h);
+}
+
+static HANDLE bridge_restore_cancel_state(HANDLE h, int state)
+{
+    pthread_cleanup_push(bridge_close_retained, &h);
+    pthread_setcancelstate(state, NULL);
+    pthread_cleanup_pop(0);
+    return h;
+}
+
+typedef struct BridgeKeAlert {
+    uint32_t wait_mode;
+    int user_apc;
+} BridgeKeAlert;
+
+static BwPosixGuestMem bridge_ke_memory(void)
+{
+    BwPosixGuestMem mem = {(uintptr_t)g_xbox_mem_offset,
+                           g_xbox_map_size ? g_xbox_map_size : g_xbox_total_ram,
+                           0, 0, 0};
+    void *host;
+    uint32_t va;
+    size_t bytes;
+
+    if (bw_xbox_contiguous_memory_region(&host, &va, &bytes)) {
+        mem.contig_base = (uintptr_t)host;
+        mem.contig_va = va;
+        mem.contig_size = bytes;
+    }
+    return mem;
+}
+
+static uint32_t bridge_ke_status(BwKeResult result, const BridgeKeAlert *alert)
+{
+    switch (result) {
+    case BW_KE_OK:           return 0;
+    case BW_KE_TIMEOUT:      return (uint32_t)STATUS_TIMEOUT;
+    case BW_KE_ALERTED:      return alert && alert->user_apc
+                                    ? 0x000000C0u : (uint32_t)STATUS_ALERTED;
+    case BW_KE_INACCESSIBLE: return 0xC0000005u;
+    case BW_KE_NOT_EVENT:    return 0xC0000024u;
+    case BW_KE_INVALID:      return (uint32_t)STATUS_INVALID_PARAMETER;
+    case BW_KE_EXHAUSTED:    return 0xC000009Au;
+    case BW_KE_CHANGED:      return (uint32_t)STATUS_UNSUCCESSFUL;
+    }
+    return (uint32_t)STATUS_UNSUCCESSFUL;
+}
+
+static void bridge_ke_report(const char *operation, BwKeResult result)
+{
+    static volatile LONG reported;
+    if (result != BW_KE_OK && result != BW_KE_TIMEOUT &&
+        result != BW_KE_ALERTED && InterlockedIncrement(&reported) <= 16) {
+        const char *reason = result == BW_KE_INACCESSIBLE ? "inaccessible memory" :
+                             result == BW_KE_NOT_EVENT ? "unsupported dispatcher header" :
+                             result == BW_KE_INVALID ? "invalid argument" :
+                             result == BW_KE_EXHAUSTED ? "event capacity exhausted" :
+                             "object changed";
+        fprintf(stderr, "  [KERNEL] %s: %s\n", operation, reason);
+    }
+}
+
+static int bridge_ke_timeout(const BwPosixGuestMem *mem, uint32_t timeout_va,
+                             int64_t *value, const int64_t **timeout)
+{
+    *timeout = NULL;
+    if (!timeout_va)
+        return 1;
+    if (!bw_posix_guest_read(mem, timeout_va, value, sizeof *value))
+        return 0;
+    *timeout = value;
+    return 1;
+}
+
+static int bridge_ke_alert_poll(void *context)
+{
+    BridgeKeAlert *alert = context;
+    if (bridge_run_io_apcs(1, alert->wait_mode)) {
+        alert->user_apc = 1;
+        return 1;
+    }
+    return SleepEx(0, TRUE) == WAIT_IO_COMPLETION;
+}
+
+static HANDLE bridge_ke_acquire(uint32_t object)
+{
+    HANDLE h = ke_shadow_acquire(object);
+    return h ? h : bridge_tagged_acquire(object);
+}
+
+typedef struct BridgeKeHandles {
+    HANDLE *handles;
+    uint32_t count;
+} BridgeKeHandles;
+
+static void bridge_close_ke_handles(void *context)
+{
+    BridgeKeHandles *owned = context;
+    pthread_setcancelstate(PTHREAD_CANCEL_DISABLE, NULL);
+    for (uint32_t i = 0; i < owned->count; i++)
+        if (owned->handles[i])
+            CloseHandle(owned->handles[i]);
+}
+
+/* The POSIX compatibility wait owns an internal mutex across a cancellation
+ * point. Limit each real wait and allow cancellation between calls, after
+ * that mutex is released; retained handles are then safe to close. */
+static uint32_t bridge_native_wait_owned(HANDLE *handles, uint32_t count,
+                                         uint32_t wait_type, uint32_t wait_mode,
+                                         uint32_t alertable, const int64_t *timeout,
+                                         int entry_cancel_state)
+{
+    BridgeKeHandles owned = {handles, count};
+    uint64_t deadline = bw_posix_ke_deadline_ns(timeout);
+    uint32_t status = (uint32_t)STATUS_UNSUCCESSFUL;
+    int previous_type, exit_cancel_state;
+    int first = 1;
+
+    if (pthread_setcanceltype(PTHREAD_CANCEL_DEFERRED, &previous_type) != 0) {
+        bridge_close_ke_handles(&owned);
+        pthread_setcancelstate(entry_cancel_state, NULL);
+        return (uint32_t)STATUS_UNSUCCESSFUL;
+    }
+    pthread_cleanup_push(bridge_close_ke_handles, &owned);
+    pthread_setcancelstate(entry_cancel_state, NULL);
+    if (bridge_run_io_apcs(alertable, wait_mode)) {
+        status = g_eax;
+    } else {
+        for (;;) {
+            uint64_t now = bw_posix_ke_monotonic_ns();
+            DWORD ms = 10, result;
+            int cancel_state;
+            if (deadline != UINT64_MAX) {
+                if (!first && now >= deadline) {
+                    status = (uint32_t)STATUS_TIMEOUT;
+                    break;
+                }
+                uint64_t remaining = deadline > now ? deadline - now : 0;
+                if (remaining < UINT64_C(10000000))
+                    ms = (DWORD)((remaining + UINT64_C(999999)) /
+                                 UINT64_C(1000000));
+            }
+            if (alertable && SleepEx(0, TRUE) == WAIT_IO_COMPLETION) {
+                status = (uint32_t)STATUS_ALERTED;
+                break;
+            }
+            pthread_setcancelstate(PTHREAD_CANCEL_DISABLE, &cancel_state);
+            result = count == 1
+                ? WaitForSingleObjectEx(handles[0], ms, FALSE)
+                : WaitForMultipleObjectsEx(count, handles, wait_type == 0,
+                                           ms, FALSE);
+            pthread_setcancelstate(cancel_state, NULL);
+            first = 0;
+            if (result >= WAIT_OBJECT_0 && result < WAIT_OBJECT_0 + count) {
+                status = (uint32_t)(result - WAIT_OBJECT_0);
+                break;
+            }
+            if (result == WAIT_IO_COMPLETION) {
+                status = (uint32_t)STATUS_ALERTED;
+                break;
+            }
+            if (result == WAIT_ABANDONED_0) {
+                status = (uint32_t)STATUS_ABANDONED;
+                break;
+            }
+            if (result != WAIT_TIMEOUT) {
+                status = (uint32_t)STATUS_UNSUCCESSFUL;
+                break;
+            }
+            pthread_testcancel();
+        }
+    }
+    pthread_setcancelstate(PTHREAD_CANCEL_DISABLE, &exit_cancel_state);
+    pthread_cleanup_pop(1);
+    pthread_setcanceltype(previous_type, NULL);
+    pthread_setcancelstate(exit_cancel_state, NULL);
+    return status;
+}
+#endif
 
 /* Bring a header-owned host event in line with guest SignalState before a
  * wait. Explicitly initialized shadows keep their existing host-state policy. */
+#if !defined(__APPLE__)
 static HANDLE ke_guest_event_prepare(uint32_t guest_va, int *type)
 {
     HANDLE h = ke_guest_event(guest_va, type);
@@ -2079,10 +2283,19 @@ static HANDLE ke_guest_event_prepare(uint32_t guest_va, int *type)
     }
     return h;
 }
+#endif
 
 /* ── KeSetEvent (ordinal 145) ────────────────────────────── */
 static void bridge_KeSetEvent(void)
 {
+#if defined(__APPLE__)
+    BwPosixGuestMem mem = bridge_ke_memory();
+    uint32_t previous = 0;
+    BwKeResult result = bw_posix_ke_modify(&mem, STACK_ARG(0), BW_KE_SET,
+                                           &previous);
+    bridge_ke_report("KeSetEvent", result);
+    g_eax = result == BW_KE_OK ? previous : bridge_ke_status(result, NULL);
+#else
     uint32_t guest_va = STACK_ARG(0);
     uint32_t increment = STACK_ARG(1);
     uint32_t wait = STACK_ARG(2);
@@ -2110,11 +2323,46 @@ static void bridge_KeSetEvent(void)
         g_eax = (uint32_t)SetEvent(h);
     else
         g_eax = 0;
+#endif
 }
 
 /* ── KeWaitForSingleObject (ordinal 159) ─────────────────── */
 static void bridge_KeWaitForSingleObject(void)
 {
+#if defined(__APPLE__)
+    uint32_t object = STACK_ARG(0);
+    uint32_t wait_reason = STACK_ARG(1);
+    uint32_t wait_mode = STACK_ARG(2);
+    uint32_t alertable = STACK_ARG(3);
+    uint32_t timeout_va = STACK_ARG(4);
+    BwPosixGuestMem mem = bridge_ke_memory();
+    BridgeKeAlert alert = {wait_mode, 0};
+    int64_t value;
+    const int64_t *timeout;
+    uint32_t selected = 0;
+    HANDLE h;
+    BwKeResult result;
+    int cancel_state;
+
+    if (!bridge_ke_timeout(&mem, timeout_va, &value, &timeout)) {
+        g_eax = 0xC0000005u;
+        return;
+    }
+    (void)wait_reason;
+    pthread_setcancelstate(PTHREAD_CANCEL_DISABLE, &cancel_state);
+    h = bridge_ke_acquire(object);
+    if (h) {
+        g_eax = bridge_native_wait_owned(&h, 1, 1, wait_mode, alertable,
+                                         timeout, cancel_state);
+        return;
+    }
+    pthread_setcancelstate(cancel_state, NULL);
+    result = bw_posix_ke_wait(&mem, &object, 1, 0, timeout,
+                              alertable ? bridge_ke_alert_poll : NULL, &alert,
+                              &selected);
+    bridge_ke_report("KeWaitForSingleObject", result);
+    g_eax = bridge_ke_status(result, &alert);
+#else
     uint32_t object = STACK_ARG(0);
     uint32_t wait_reason = STACK_ARG(1);
     uint32_t wait_mode = STACK_ARG(2);
@@ -2153,6 +2401,7 @@ static void bridge_KeWaitForSingleObject(void)
                  (unsigned long)err, g_xbox_kernel_caller,
                  (unsigned long)GetCurrentThreadId());
     }
+#endif
 }
 
 /* ── NtWaitForSingleObject (ordinal 233) ─────────────────── */
@@ -3842,10 +4091,17 @@ static int kernel_fire_timers(long long now, long long *next_due_ms)
         /* Wake anyone parked on the timer's shadow event; a timer with no
          * DPC is just a kernel sleep. */
         {
+#if defined(__APPLE__)
+            HANDLE ev = ke_shadow_acquire(fired_va);
+#else
             HANDLE ev = ke_shadow_lookup(fired_va);
+#endif
             if (ev) {
                 SetEvent(ev);
                 BRIDGE_MEM32(fired_va + 4) = 1;   /* SignalState */
+#if defined(__APPLE__)
+                CloseHandle(ev);
+#endif
             }
         }
     }
@@ -3995,9 +4251,17 @@ static void kernel_set_timer(uint32_t timer_va, long long due_100ns,
 
     /* A freshly set timer starts unsignaled, like the real KeSetTimer. */
     {
+#if defined(__APPLE__)
+        HANDLE ev = ke_shadow_acquire(timer_va);
+#else
         HANDLE ev = ke_shadow_lookup(timer_va);
+#endif
         if (ev)
             ResetEvent(ev);
+#if defined(__APPLE__)
+        if (ev)
+            CloseHandle(ev);
+#endif
     }
     g_eax = was_set;
 }
@@ -4201,6 +4465,28 @@ static void handle_lock(void)
 }
 
 static void handle_unlock(void) { InterlockedExchange(&s_handle_lock, 0); }
+
+#if defined(__APPLE__)
+static HANDLE bridge_tagged_acquire(uint32_t token)
+{
+    HANDLE retained = NULL;
+    uint32_t i;
+    int cancel_state;
+    if ((token & 0xFF000000u) != BRIDGE_HANDLE_TAG)
+        return NULL;
+    i = token & BRIDGE_HANDLE_MASK;
+    if (!i || i >= BRIDGE_HANDLE_MAX)
+        return NULL;
+    pthread_setcancelstate(PTHREAD_CANCEL_DISABLE, &cancel_state);
+    handle_lock();
+    if (s_handle_table[i])
+        (void)DuplicateHandle(GetCurrentProcess(), s_handle_table[i],
+                              GetCurrentProcess(), &retained, 0, FALSE,
+                              DUPLICATE_SAME_ACCESS);
+    handle_unlock();
+    return bridge_restore_cancel_state(retained, cancel_state);
+}
+#endif
 
 /* A token for h. The same HANDLE normally gets the same token. A duplicate
  * must not: on POSIX, DuplicateHandle returns its source pointer with one
@@ -4717,6 +5003,7 @@ static void bridge_complete_file_io(uint32_t event_token, uint32_t apc_routine,
  *
  * The queue is copied out first: a completion routine may issue the next read,
  * which queues again, and that one belongs to the next wait. */
+#if !defined(BW_KE_BRIDGE_TESTING)
 static int bridge_run_io_apcs(uint32_t alertable, uint32_t wait_mode)
 {
     uint32_t q[IO_APC_QUEUE][3];
@@ -4731,6 +5018,7 @@ static int bridge_run_io_apcs(uint32_t alertable, uint32_t wait_mode)
     g_eax = 0x000000C0u;                 /* STATUS_USER_APC */
     return 1;
 }
+#endif
 
 /* -- XeLoadSection / XeUnloadSection (ordinals 327/328, 1 arg = 4 bytes) --
  *
@@ -6072,6 +6360,79 @@ static void bridge_KeAlertThread(void)
 
 static void bridge_KeWaitForMultipleObjects(void)
 {
+#if defined(__APPLE__)
+    uint32_t count = STACK_ARG(0);
+    uint32_t objects_va = STACK_ARG(1);
+    uint32_t wait_type = STACK_ARG(2);
+    uint32_t wait_reason = STACK_ARG(3);
+    uint32_t wait_mode = STACK_ARG(4);
+    uint32_t alertable = STACK_ARG(5);
+    uint32_t timeout_va = STACK_ARG(6);
+    uint32_t objects[BRIDGE_MAXIMUM_WAIT_OBJECTS];
+    HANDLE handles[BRIDGE_MAXIMUM_WAIT_OBJECTS] = {0};
+    BwPosixGuestMem mem = bridge_ke_memory();
+    BridgeKeAlert alert = {wait_mode, 0};
+    int64_t value;
+    const int64_t *timeout;
+    uint32_t selected = 0, native_count = 0, event_count = 0;
+    BwKeResult result = BW_KE_OK;
+    int cancel_state, cancel_disabled = 0;
+
+    if (!count || count > BRIDGE_MAXIMUM_WAIT_OBJECTS || wait_type > 1) {
+        g_eax = (uint32_t)STATUS_INVALID_PARAMETER;
+        return;
+    }
+    if (!bw_posix_guest_read(&mem, objects_va, objects, count * sizeof *objects) ||
+        !bridge_ke_timeout(&mem, timeout_va, &value, &timeout)) {
+        g_eax = 0xC0000005u;
+        return;
+    }
+    (void)wait_reason;
+    pthread_setcancelstate(PTHREAD_CANCEL_DISABLE, &cancel_state);
+    cancel_disabled = 1;
+    for (uint32_t i = 0; i < count; i++) {
+        for (uint32_t j = 0; j < i; j++) {
+            if (objects[i] == objects[j]) {
+                result = BW_KE_INVALID;
+                goto done;
+            }
+        }
+        handles[i] = bridge_ke_acquire(objects[i]);
+        if (handles[i]) {
+            native_count++;
+        } else {
+            result = bw_posix_ke_probe(&mem, objects[i], NULL);
+            if (result != BW_KE_OK)
+                goto done;
+            event_count++;
+        }
+    }
+    /* The compatibility wait-all consumes partial native signals, so it
+     * cannot safely implement an atomic multi-object wait-all. */
+    if (native_count && (event_count || (wait_type == 0 && count > 1))) {
+        g_eax = 0xC00000BBu;
+        goto release;
+    }
+    if (native_count) {
+        g_eax = bridge_native_wait_owned(handles, count, wait_type, wait_mode,
+                                         alertable, timeout, cancel_state);
+        return;
+    }
+    pthread_setcancelstate(cancel_state, NULL);
+    cancel_disabled = 0;
+    result = bw_posix_ke_wait(&mem, objects, count, wait_type == 0, timeout,
+                              alertable ? bridge_ke_alert_poll : NULL, &alert,
+                              &selected);
+done:
+    bridge_ke_report("KeWaitForMultipleObjects", result);
+    g_eax = result == BW_KE_OK ? selected : bridge_ke_status(result, &alert);
+release:
+    for (uint32_t i = 0; i < count; i++)
+        if (handles[i])
+            CloseHandle(handles[i]);
+    if (cancel_disabled)
+        pthread_setcancelstate(cancel_state, NULL);
+#else
     uint32_t count      = STACK_ARG(0);
     uint32_t objects_va = STACK_ARG(1);
     uint32_t wait_type  = STACK_ARG(2);
@@ -6114,6 +6475,7 @@ static void bridge_KeWaitForMultipleObjects(void)
              (wait_type != 0 && g_eax < count && g_eax == i)))
             BRIDGE_MEM32(guest_events[i] + 4) = 0;
     }
+#endif
 }
 
 #undef BRIDGE_MAXIMUM_WAIT_OBJECTS
@@ -7734,16 +8096,50 @@ static void bridge_RtlCaptureStackBackTrace(void)
 typedef struct { uint32_t guest_va; HANDLE host_handle; uint32_t in_use; } KE_SHADOW_SLOT;
 static KE_SHADOW_SLOT g_ke_shadow[KE_SHADOW_SIZE];
 static CRITICAL_SECTION g_ke_shadow_cs;
+#if defined(__APPLE__)
+static pthread_once_t g_ke_shadow_once = PTHREAD_ONCE_INIT;
+
+static void ke_shadow_init_once(void)
+{
+    InitializeCriticalSection(&g_ke_shadow_cs);
+}
+#else
 static int g_ke_shadow_init;
+#endif
 
 static void ke_shadow_init(void)
 {
+#if defined(__APPLE__)
+    (void)pthread_once(&g_ke_shadow_once, ke_shadow_init_once);
+#else
     if (g_ke_shadow_init)
         return;
     InitializeCriticalSection(&g_ke_shadow_cs);
     /* Wipe any stale pointers from a prior lifecycle (defensive). */
     memset(g_ke_shadow, 0, sizeof(g_ke_shadow));
     g_ke_shadow_init = 1;
+#endif
+}
+
+static int ke_shadow_enter(void)
+{
+    int cancel_state = 0;
+#if defined(__APPLE__)
+    pthread_setcancelstate(PTHREAD_CANCEL_DISABLE, &cancel_state);
+#endif
+    ke_shadow_init();
+    EnterCriticalSection(&g_ke_shadow_cs);
+    return cancel_state;
+}
+
+static void ke_shadow_leave(int cancel_state)
+{
+    LeaveCriticalSection(&g_ke_shadow_cs);
+#if defined(__APPLE__)
+    pthread_setcancelstate(cancel_state, NULL);
+#else
+    (void)cancel_state;
+#endif
 }
 
 /* Insert a mapping guest_va -> host HANDLE. Replaces any prior mapping for
@@ -7751,13 +8147,15 @@ static void ke_shadow_init(void)
 static void ke_shadow_insert(uint32_t guest_va, HANDLE host)
 {
     uint32_t i;
+    int cancel_state;
 
     if (!guest_va || !host)
         return;
 
-    ke_shadow_init();
-
-    EnterCriticalSection(&g_ke_shadow_cs);
+    cancel_state = ke_shadow_enter();
+#if defined(__APPLE__)
+    bw_posix_ke_invalidate(guest_va);
+#endif
 
     /* Reuse an existing slot for this VA, if present. */
     for (i = 0; i < KE_SHADOW_SIZE; i++) {
@@ -7765,7 +8163,7 @@ static void ke_shadow_insert(uint32_t guest_va, HANDLE host)
             if (g_ke_shadow[i].host_handle && g_ke_shadow[i].host_handle != host)
                 CloseHandle(g_ke_shadow[i].host_handle);
             g_ke_shadow[i].host_handle = host;
-            LeaveCriticalSection(&g_ke_shadow_cs);
+            ke_shadow_leave(cancel_state);
             return;
         }
     }
@@ -7776,7 +8174,7 @@ static void ke_shadow_insert(uint32_t guest_va, HANDLE host)
             g_ke_shadow[i].in_use      = 1;
             g_ke_shadow[i].guest_va    = guest_va;
             g_ke_shadow[i].host_handle = host;
-            LeaveCriticalSection(&g_ke_shadow_cs);
+            ke_shadow_leave(cancel_state);
             return;
         }
     }
@@ -7785,43 +8183,89 @@ static void ke_shadow_insert(uint32_t guest_va, HANDLE host)
      * waits will fall back to XBOX_TO_NATIVE and fail gracefully. */
     fprintf(stderr, "  [KERNEL] Ke shadow table full; dropping VA 0x%08X\n",
             guest_va);
-    LeaveCriticalSection(&g_ke_shadow_cs);
+#if defined(__APPLE__)
     CloseHandle(host);
+    ke_shadow_leave(cancel_state);
+#else
+    ke_shadow_leave(cancel_state);
+    CloseHandle(host);
+#endif
 }
 
 /* Look up the host HANDLE for a guest object VA. Returns NULL if not found. */
+#if !defined(__APPLE__)
 static HANDLE ke_shadow_lookup(uint32_t guest_va)
 {
     uint32_t i;
     HANDLE h = NULL;
+    int cancel_state;
 
     if (!guest_va)
         return NULL;
 
-    ke_shadow_init();
-
-    EnterCriticalSection(&g_ke_shadow_cs);
+    cancel_state = ke_shadow_enter();
     for (i = 0; i < KE_SHADOW_SIZE; i++) {
         if (g_ke_shadow[i].in_use && g_ke_shadow[i].guest_va == guest_va) {
             h = g_ke_shadow[i].host_handle;
             break;
         }
     }
-    LeaveCriticalSection(&g_ke_shadow_cs);
+    ke_shadow_leave(cancel_state);
     return h;
 }
+#endif
+
+#if defined(__APPLE__)
+static HANDLE ke_shadow_acquire(uint32_t guest_va)
+{
+    HANDLE retained = NULL;
+    int cancel_state;
+    if (!guest_va)
+        return NULL;
+    cancel_state = ke_shadow_enter();
+    for (uint32_t i = 0; i < KE_SHADOW_SIZE; i++) {
+        if (g_ke_shadow[i].in_use && g_ke_shadow[i].guest_va == guest_va) {
+            (void)DuplicateHandle(GetCurrentProcess(), g_ke_shadow[i].host_handle,
+                                  GetCurrentProcess(), &retained, 0, FALSE,
+                                  DUPLICATE_SAME_ACCESS);
+            break;
+        }
+    }
+    LeaveCriticalSection(&g_ke_shadow_cs);
+    return bridge_restore_cancel_state(retained, cancel_state);
+}
+
+static BwKeResult ke_initialize_guest_event(const BwPosixGuestMem *mem,
+                                            uint32_t guest_va, uint32_t type,
+                                            uint32_t state)
+{
+    BwKeResult result;
+    int cancel_state = ke_shadow_enter();
+    result = bw_posix_ke_initialize(mem, guest_va, type, state);
+    if (result == BW_KE_OK) {
+        for (uint32_t i = 0; i < KE_SHADOW_SIZE; i++) {
+            if (g_ke_shadow[i].in_use && g_ke_shadow[i].guest_va == guest_va) {
+                CloseHandle(g_ke_shadow[i].host_handle);
+                memset(&g_ke_shadow[i], 0, sizeof g_ke_shadow[i]);
+                break;
+            }
+        }
+    }
+    ke_shadow_leave(cancel_state);
+    return result;
+}
+#endif
 
 /* Remove (and close) the mapping for a guest object VA. */
 static void ke_shadow_remove(uint32_t guest_va)
 {
     uint32_t i;
+    int cancel_state;
 
     if (!guest_va)
         return;
 
-    ke_shadow_init();
-
-    EnterCriticalSection(&g_ke_shadow_cs);
+    cancel_state = ke_shadow_enter();
     for (i = 0; i < KE_SHADOW_SIZE; i++) {
         if (g_ke_shadow[i].in_use && g_ke_shadow[i].guest_va == guest_va) {
             if (g_ke_shadow[i].host_handle)
@@ -7832,7 +8276,7 @@ static void ke_shadow_remove(uint32_t guest_va)
             break;
         }
     }
-    LeaveCriticalSection(&g_ke_shadow_cs);
+    ke_shadow_leave(cancel_state);
 }
 
 /* Events a title initialises itself (RECOMP_TITLE_KEVENTS=1, off by default).
@@ -7855,6 +8299,7 @@ static void ke_shadow_remove(uint32_t guest_va)
  * once now blocks until the event is set, and on a title whose setter the
  * runtime does not model yet (a GPU interrupt, say) that turns a spin into a
  * hang. Turn it on for a title that waits on events it built itself. */
+#if !defined(__APPLE__)
 static HANDLE ke_guest_event(uint32_t guest_va, int *type)
 {
     static int enabled = -1;
@@ -7905,6 +8350,7 @@ static HANDLE ke_guest_event(uint32_t guest_va, int *type)
     }
     return h;
 }
+#endif
 
 /* ═══════════════════════════════════════════════════════════════════════════
  * Data Exports (102, 120, 154, 240, 245, 249)
@@ -8564,6 +9010,14 @@ static void bridge_KdDebuggerNotPresent(void)
 /* --- KeInitializeEvent (ordinal 108, 3 args = 12 bytes) --- */
 static void bridge_KeInitializeEvent(void)
 {
+#if defined(__APPLE__)
+    BwPosixGuestMem mem = bridge_ke_memory();
+    BwKeResult result = ke_initialize_guest_event(&mem, STACK_ARG(0),
+                                                  STACK_ARG(1),
+                                                  STACK_ARG(2) ? 1u : 0u);
+    bridge_ke_report("KeInitializeEvent", result);
+    g_eax = bridge_ke_status(result, NULL);
+#else
     uint32_t guest_va = STACK_ARG(0);
     uint32_t event_type = STACK_ARG(1); /* 0=Notification(manual-reset), 1=Synchronization(auto-reset) */
     uint32_t initial_state = STACK_ARG(2);
@@ -8593,6 +9047,7 @@ static void bridge_KeInitializeEvent(void)
     BRIDGE_MEM32(guest_va + 12) = 0; /* WaitListHead.Blink (self/empty) */
 
     g_eax = 0;
+#endif
 }
 
 /* --- KeInitializeMutant (ordinal 110, 2 args = 8 bytes) --- */
@@ -8622,6 +9077,9 @@ static void bridge_KeInitializeMutant(void)
     BRIDGE_MEM32(guest_va + 8) = 0;   /* WaitListHead */
     BRIDGE_MEM32(guest_va + 12) = 0;
 
+#if defined(__APPLE__)
+    bw_posix_ke_invalidate(guest_va);
+#endif
     g_eax = 0;
 }
 
@@ -8650,12 +9108,23 @@ static void bridge_KeInitializeSemaphore(void)
     BRIDGE_MEM32(guest_va + 8) = 0;   /* WaitListHead */
     BRIDGE_MEM32(guest_va + 12) = 0;
 
+#if defined(__APPLE__)
+    bw_posix_ke_invalidate(guest_va);
+#endif
     g_eax = 0;
 }
 
 /* --- KePulseEvent (ordinal 123, 3 args = 12 bytes) --- */
 static void bridge_KePulseEvent(void)
 {
+#if defined(__APPLE__)
+    BwPosixGuestMem mem = bridge_ke_memory();
+    uint32_t previous = 0;
+    BwKeResult result = bw_posix_ke_modify(&mem, STACK_ARG(0), BW_KE_PULSE,
+                                           &previous);
+    bridge_ke_report("KePulseEvent", result);
+    g_eax = result == BW_KE_OK ? previous : bridge_ke_status(result, NULL);
+#else
     uint32_t guest_va = STACK_ARG(0);
     uint32_t increment = STACK_ARG(1);
     uint32_t wait = STACK_ARG(2);
@@ -8681,11 +9150,22 @@ static void bridge_KePulseEvent(void)
         PulseEvent(h);
 
     g_eax = 0; /* previous state unknown */
+#endif
 }
 
 /* --- KeReleaseMutant (ordinal 131, 4 args = 16 bytes) --- */
 static void bridge_KeReleaseMutant(void)
 {
+#if defined(__APPLE__)
+    HANDLE h = ke_shadow_acquire(STACK_ARG(0));
+    if (!h) {
+        g_eax = 0xC0000008u;
+        return;
+    }
+    BOOL released = ReleaseMutex(h);
+    CloseHandle(h);
+    g_eax = released ? 0u : (uint32_t)STATUS_UNSUCCESSFUL;
+#else
     uint32_t guest_va = STACK_ARG(0);
     uint32_t increment = STACK_ARG(1);
     uint32_t wait = STACK_ARG(2);
@@ -8703,11 +9183,23 @@ static void bridge_KeReleaseMutant(void)
         ReleaseMutex(h);
 
     g_eax = 0;
+#endif
 }
 
 /* --- KeReleaseSemaphore (ordinal 132, 4 args = 16 bytes) --- */
 static void bridge_KeReleaseSemaphore(void)
 {
+#if defined(__APPLE__)
+    HANDLE h = ke_shadow_acquire(STACK_ARG(0));
+    LONG previous = 0;
+    if (!h) {
+        g_eax = 0xC0000008u;
+        return;
+    }
+    BOOL released = ReleaseSemaphore(h, (LONG)STACK_ARG(2), &previous);
+    CloseHandle(h);
+    g_eax = released ? (uint32_t)previous : (uint32_t)STATUS_UNSUCCESSFUL;
+#else
     uint32_t guest_va = STACK_ARG(0);
     uint32_t increment = STACK_ARG(1);
     uint32_t adjustment = STACK_ARG(2);  /* LONG */
@@ -8724,11 +9216,20 @@ static void bridge_KeReleaseSemaphore(void)
         ReleaseSemaphore(h, (LONG)adjustment, NULL);
 
     g_eax = 0;
+#endif
 }
 
 /* --- KeResetEvent (ordinal 138, 1 arg = 4 bytes) --- */
 static void bridge_KeResetEvent(void)
 {
+#if defined(__APPLE__)
+    BwPosixGuestMem mem = bridge_ke_memory();
+    uint32_t previous = 0;
+    BwKeResult result = bw_posix_ke_modify(&mem, STACK_ARG(0), BW_KE_RESET,
+                                           &previous);
+    bridge_ke_report("KeResetEvent", result);
+    g_eax = result == BW_KE_OK ? previous : bridge_ke_status(result, NULL);
+#else
     uint32_t guest_va = STACK_ARG(0);
     HANDLE h;
 
@@ -8749,6 +9250,7 @@ static void bridge_KeResetEvent(void)
         ResetEvent(h);
 
     g_eax = 0;
+#endif
 }
 
 /* --- KeResumeThread (ordinal 140, 1 arg = 4 bytes) --- */
@@ -8968,6 +9470,12 @@ static void bridge_KeRundownQueue(void)
 /* --- KeSetEventBoostPriority (ordinal 146, 2 args = 8 bytes) --- */
 static void bridge_KeSetEventBoostPriority(void)
 {
+#if defined(__APPLE__)
+    BwPosixGuestMem mem = bridge_ke_memory();
+    BwKeResult result = bw_posix_ke_modify(&mem, STACK_ARG(0), BW_KE_SET, NULL);
+    bridge_ke_report("KeSetEventBoostPriority", result);
+    g_eax = bridge_ke_status(result, NULL);
+#else
     uint32_t guest_va = STACK_ARG(0);
     uint32_t increment = STACK_ARG(1);
     HANDLE h;
@@ -8981,6 +9489,7 @@ static void bridge_KeSetEventBoostPriority(void)
         SetEvent(h);
 
     g_eax = 0;
+#endif
 }
 
 /* --- KeSetPriorityProcess (ordinal 147, 2 args = 8 bytes) --- */

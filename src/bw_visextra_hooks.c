@@ -77,7 +77,6 @@
  * inferred, unknown. Addresses are the XBE's (base 0x00010000).
  */
 
-#include <windows.h>
 #include <stdio.h>
 #include <stdint.h>
 #include <stddef.h>
@@ -85,14 +84,15 @@
 #include <string.h>
 
 #include "bw_edition.h"
+#include "bw_hook_platform.h"
 
 typedef void (*recomp_func_t)(void);
 extern recomp_func_t recomp_lookup(uint32_t xbox_va);
 extern ptrdiff_t g_xbox_mem_offset;
 /* The guest registers are thread-local in the runtime (TOOLKIT_ISSUES TK-7). */
-extern __declspec(thread) uint32_t g_eax, g_ecx, g_edx, g_esp;
-extern __declspec(thread) uint32_t g_ebx, g_esi, g_edi, g_ebp;
-extern __declspec(thread) uint32_t g_seh_ebp, g_eflags;
+extern BW_HOOK_TLS uint32_t g_eax, g_ecx, g_edx, g_esp;
+extern BW_HOOK_TLS uint32_t g_ebx, g_esi, g_edi, g_ebp;
+extern BW_HOOK_TLS uint32_t g_seh_ebp, g_eflags;
 
 #define V_MEM32(va) (*(volatile uint32_t *)((uintptr_t)(uint32_t)(va) + g_xbox_mem_offset))
 #define V_MEM16(va) (*(volatile uint16_t *)((uintptr_t)(uint32_t)(va) + g_xbox_mem_offset))
@@ -125,7 +125,7 @@ static volatile long s_sp_tiles[3];     /* tiles they recorded */
 static volatile long s_sp_lifted;       /* walks handed a smaller factor */
 static volatile long s_sp_anim_kept;    /* CheckSplitScreen flags put back */
 static volatile long s_sp_anim_runs;    /* AnimLib_Update calls let through */
-static DWORD s_sp_last_log;
+static uint32_t s_sp_last_log;
 
 static int split_on(void)
 {
@@ -156,9 +156,9 @@ static int split_water_mode(void)
         const char *e = getenv("BW_SPLIT_WATER");
         if (!e || !*e)
             s = SPLIT_WATER_DEFAULT;
-        else if (!_stricmp(e, "full") || !strcmp(e, "1"))
+        else if (!bw_hook_stricmp(e, "full") || !strcmp(e, "1"))
             s = SPLIT_WATER_FULL;
-        else if (!_stricmp(e, "balanced") || !strcmp(e, "2"))
+        else if (!bw_hook_stricmp(e, "balanced") || !strcmp(e, "2"))
             s = SPLIT_WATER_BALANCED;
         else
             s = SPLIT_WATER_OFF;
@@ -237,15 +237,15 @@ void sub_00038720(void)
     k = f > 3.0f ? 2 : (f > 1.5f ? 1 : 0);
     if (f > split_water_target(f)) {
         V_MEMF(g_esp + 0x14) = split_water_target(f);  /* the call's own argument; the body pops it */
-        InterlockedIncrement(&s_sp_lifted);
+        bw_hook_increment(&s_sp_lifted);
         bw_fix_note_hit(BW_FIX_SPLIT_FULL_DETAIL);
     }
     sub_00038720_gen();
     if (split_log()) {
         static int s_reg;
-        DWORD now = GetTickCount();
-        InterlockedIncrement(&s_sp_walks[k]);
-        InterlockedExchangeAdd(&s_sp_tiles[k], (long)V_MEM32(ocean + OCEAN_TILES));
+        uint32_t now = (uint32_t)bw_hook_milliseconds();
+        bw_hook_increment(&s_sp_walks[k]);
+        bw_hook_exchange_add(&s_sp_tiles[k], (long)V_MEM32(ocean + OCEAN_TILES));
         if (!s_reg) {
             s_reg = 1;
             s_sp_last_log = now;
@@ -272,7 +272,7 @@ void sub_00026040(void)
     sub_00026040_gen();
     if (V_MEM8(lib + ANIMLIB_DISABLED) != before) {
         V_MEM8(lib + ANIMLIB_DISABLED) = before;
-        InterlockedIncrement(&s_sp_anim_kept);
+        bw_hook_increment(&s_sp_anim_kept);
         bw_fix_note_hit(BW_FIX_SPLIT_FULL_DETAIL);
     }
 }
@@ -291,7 +291,7 @@ void sub_00026090(void)
     V_MEM32(X_PLAYER_COUNT) = 2u;
     sub_00026090_gen();
     V_MEM32(X_PLAYER_COUNT) = players;
-    InterlockedIncrement(&s_sp_anim_runs);
+    bw_hook_increment(&s_sp_anim_runs);
 }
 
 /* ════════════════════════════════════════════════════════════════════════
@@ -397,9 +397,10 @@ static int is_pow2(uint32_t v)
 static void pgm_dump(const char *dir, const char *tag, uint32_t frame, uint32_t level,
                      const uint8_t *img, uint32_t w, uint32_t h)
 {
-    char path[MAX_PATH];
+    char path[BW_HOOK_PATH_MAX];
     FILE *f;
-    _snprintf(path, sizeof path, "%s\\ocean%02u_L%u_%s.pgm", dir, frame, level, tag);
+    bw_hook_snprintf(path, sizeof path, "%s" BW_HOOK_PATH_SEP "ocean%02u_L%u_%s.pgm",
+                     dir, frame, level, tag);
     path[sizeof path - 1] = 0;
     f = fopen(path, "wb");
     if (!f)

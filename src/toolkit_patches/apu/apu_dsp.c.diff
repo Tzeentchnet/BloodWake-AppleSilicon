@@ -1,11 +1,15 @@
 --- xboxrecomp/src/apu/apu_dsp.c
 +++ src/toolkit_patches/apu/apu_dsp.c
-@@ -27,7 +27,218 @@
+@@ -24,10 +24,222 @@
+ 
+ #include "apu_state.h"
+ #include "fpconv.h"
++#include "../bw_shared_u8.h"
  
  #include <stdlib.h>
  #include <string.h>
 +#include <math.h>
-+
+ 
 +/* Blood Wake carried patch (docs/TOOLKIT_ISSUES.md TK-16): mixbin
 + * diagnostics. BW_APU_BINSTAT=1 prints, once per second of APU time, the RMS
 + * of every mixbin that carried anything and its submix headroom, and every
@@ -68,8 +72,8 @@
 +                    " window:rms=%.0f,zcr=%.2f\n",
 +                    frames / 1500, voice, idx, k, off, len & 0xFFFF,
 +                    mcpx_apu_phys_class(off),
-+                    a < (64u << 20) ? xbox_PhysRamNameMap()[a >> 12] : 0,
-+                    a < (64u << 20) ? xbox_ContiguousPageMap()[a >> 12] : 0,
++                    a < (64u << 20) ? bw_shared_u8_load(&xbox_PhysRamNameMap()[a >> 12]) : 0,
++                    a < (64u << 20) ? bw_shared_u8_load(&xbox_ContiguousPageMap()[a >> 12]) : 0,
 +                    rr, zr, rw, zw);
 +        }
 +    }
@@ -164,7 +168,7 @@
 +    }
 +    return on;
 +}
- 
++
 +static void bw_binstat_frame(MCPXAPUState *d,
 +                             float mixbins[NUM_MIXBINS][NUM_SAMPLES_PER_FRAME])
 +{
@@ -219,7 +223,7 @@
  /* ── DSP command doorbell acknowledgement ────────────────────────────────
   *
   * DirectSound does not stop at creating the device. It hands the audio DSP a
-@@ -155,8 +366,17 @@
+@@ -155,8 +367,18 @@
      return (uint32_t *)(mcpx_apu_phys(page) + GP_DOORBELL_OFFSET);
  }
  
@@ -228,6 +232,7 @@
 + * itself, so the stub's auto-ack stands down, and the DSP stage is its. */
 +int bw_xdsp_enabled(void);
 +void bw_xdsp_init(MCPXAPUState *d);
++void bw_xdsp_shutdown(void);
 +int bw_xdsp_frame(MCPXAPUState *d, float mixbins[NUM_MIXBINS][NUM_SAMPLES_PER_FRAME]);
 +
  void mcpx_apu_dsp_ack_poll(MCPXAPUState *d)
@@ -237,7 +242,7 @@
      int i;
  
      if (s_dsp_ack_count < 0)
-@@ -209,6 +429,7 @@
+@@ -209,6 +431,7 @@
      d->ep.realtime = false;
  
      fprintf(stderr, "[APU] DSP GP/EP initialized (STUBBED - passthrough mode)\n");
@@ -245,7 +250,15 @@
  }
  
  /* Called after the frame thread is joined. Only mcpx_apu_reset_locked
-@@ -229,6 +450,12 @@
+@@ -216,6 +439,7 @@
+  * Safe to call twice. */
+ void mcpx_apu_dsp_finalize(MCPXAPUState *d)
+ {
++    bw_xdsp_shutdown();
+     free(d->gp.dsp);
+     free(d->ep.dsp);
+     d->gp.dsp = NULL;
+@@ -229,6 +453,12 @@
      (void)d;
  }
  
@@ -258,7 +271,7 @@
  void mcpx_apu_dsp_frame(MCPXAPUState *d,
                           float mixbins[NUM_MIXBINS][NUM_SAMPLES_PER_FRAME])
  {
-@@ -247,7 +474,61 @@
+@@ -247,7 +477,61 @@
       */
  
      int off = (d->ep_frame_div % 8) * NUM_SAMPLES_PER_FRAME;
@@ -320,7 +333,7 @@
      if (d->monitor.point != MCPX_APU_DEBUG_MON_VP) {
          for (int i = 0; i < NUM_SAMPLES_PER_FRAME; i++) {
              /* Bins 2..31 used to be computed and then dropped on the floor.
-@@ -278,7 +559,24 @@
+@@ -278,7 +562,24 @@
               * counts. This is not what a real EP does; it is the cheapest
               * mixdown that stops discarding audio. */
              float left, right;
@@ -346,7 +359,7 @@
                  left = 0.0f;
                  right = 0.0f;
                  for (int b = 0; b < NUM_MIXBINS; ++b) {
-@@ -299,6 +597,24 @@
+@@ -299,6 +600,24 @@
               * Each of the 8 sub-frames writes its own 32-sample slice. */
              d->monitor.frame_buf[off + i][0] = (int16_t)(left * 32767.0f);
              d->monitor.frame_buf[off + i][1] = (int16_t)(right * 32767.0f);

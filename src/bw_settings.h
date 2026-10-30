@@ -4,6 +4,9 @@
  * The player picks the edition, display, frame rate, graphics, audio and other
  * options in the launcher (tools/launcher.pyw), which writes
  *   %LOCALAPPDATA%\BloodWake\settings.ini
+ * On macOS/POSIX the default is
+ *   $XDG_CONFIG_HOME/BloodWake/settings.ini, or
+ *   $HOME/.config/BloodWake/settings.ini when XDG_CONFIG_HOME is unset.
  * Every boot reads it first thing and turns each choice into the switches
  * the port already has (BW_EDITION, BW_FIX tokens, BW_VFX_*, BW_HIFPS,
  * BW_ASPECT, RECOMP_WINDOW_SCALE, ...), each only where the environment

@@ -59,8 +59,9 @@ clear, draw and flip callbacks return `void`. After calling draw, the
 [`pushbuffer executor`](https://github.com/sp00nznet/xboxrecomp/blob/f0f8a461496a4f23d9b0aeaa284b8d70ba7ab82b/src/kernel/nv2a_pb_exec.c)
 counts and clears the batch without receiving a success or failure result.
 An unsupported operation or GPU error therefore cannot be propagated through
-this interface. The local synthetic Metal backend records a sticky error that
-its test harness checks; it is not enabled for the game.
+this interface. The local Metal backend records a sticky error; its synthetic
+tests check it, and the experimental native host monitors it and terminates on
+failure. In-game rendering is not yet verified.
 
 A versioned error-reporting interface could let a host stop or report a
 failed frame. A per-draw CPU fallback would additionally need a defined
@@ -82,7 +83,9 @@ earlier may not be affected.
 An upstream regression can use synthetic guest memory and a backend that
 writes a distinctive value during `flip`, then assert that the snapshot and
 dump observe the new value. Fixing the ordering must preserve CPU-renderer
-behavior and avoid presenting twice.
+behavior and avoid presenting twice. The fork now carries an opt-in
+pre-snapshot synchronization hook and tests its ordering; the proposal is
+tracked upstream in [#285](https://github.com/sp00nznet/xboxrecomp/pull/285).
 
 ### macOS video decoding
 
@@ -173,13 +176,90 @@ needed.
 
 ### Host and renderer
 
-The game entry point, window host and D3D11 renderer include Windows headers and
-use Windows APIs. Four carried APU source files now compile individually on
-macOS, and a synthetic SDL dummy-device test checks their stereo output
-adapter. The complete carried APU still fails to build because its DSP
-integration uses Windows-specific APIs. Its worker synchronization and
-lifetime need a real portable implementation, not no-op substitutes. These
-are porting tasks in this fork, not defects proven in the Windows build.
+The original game entry point, window host and D3D11 renderer use Windows
+APIs. This fork now builds an experimental macOS host, Metal backend and
+portable APU/DSP integration; synthetic tests exercise their components.
+Guest USB and APU MMIO remain disabled until device callbacks can be
+dispatched safely, and no playable frame has been verified. These are porting
+tasks in this fork, not defects proven in the Windows build.
+
+On POSIX, the carried OHCI model now rejects invalid or non-linear transfer
+buffers with an error instead of reporting an uncopied transfer as successful.
+Its descriptor and DMA paths still need a complete safety audit; this check
+does not make trapped USB dispatch safe to enable. A ThreadSanitizer probe
+also reproduced a race between physical-page ownership updates and device
+reads. On POSIX, the carried allocator, APU, and OHCI now use atomic byte
+accesses to the ownership and translation maps, and focused concurrent tests
+pass under ThreadSanitizer. These atomic accesses do not pin a DMA span's
+mapping, so mapping lifetime still requires a separate solution.
+The POSIX allocator also initializes its presence-based heap-reclaim setting
+with `pthread_once`; a concurrent first-use test reproduced the previous race
+and verifies enabled, `0`, empty, and unset settings under ThreadSanitizer.
+
+#### POSIX device IRQ shutdown
+
+**Confirmed lifecycle blocker; no safe in-process retirement is implemented
+after guest entry.**
+Joining a device's producer does not retire an IRQ already posted to the
+dispatch-gate holder, an executing callback, or guest DPCs queued by that
+callback. Pending IRQ bits can also be coalesced or taken into a dispatcher
+local before invocation, so clearing or inspecting those bits is not a drain.
+Waiting for the gate is not generally safe either: a gate-holding DirectSound
+DPC can wait for the APU frame worker. Safe retirement needs a broader,
+fallible admission and quiescence contract covering guest workers, DPCs, IRQs,
+device access and guest-memory lifetime while keeping required workers alive.
+The native host consequently retains guest resources until process exit after
+guest entry; USB and APU MMIO must remain disabled.
+
+The manual synthetic probes in `tests/mmio_host/test_irq_shutdown_*` reproduce
+queued, executing, coalesced and concurrent shutdown counterexamples. The OHCI
+probe uses a synthetic callback and producer with the real gate and stop; it
+intercepts concurrent joins instead of performing an undefined double join.
+The APU probe uses synthetic guest memory, dummy audio, and the real APU ISR and
+shutdown; its expected post-shutdown memory fault is contained in a child.
+Neither probe enables a device MMIO trap or uses game data.
+Queued and coalesced APU callbacks fault after shutdown clears its guest-RAM
+pointer; an executing callback can outlive that shutdown. The concurrent
+cases show an APU shutdown returning before another finishes and two OHCI
+calls attempting the same worker join. The OHCI queued and executing
+callbacks also outlive stop. These observations do not establish game-specific
+behavior.
+
+To reproduce with the pinned toolkit and a usable macOS SDK:
+
+```sh
+mkdir -p build/irq-probe-scratch
+export TMPDIR="$PWD/build/irq-probe-scratch"
+cmake -S tests/mmio_host -B build/irq-shutdown-probes \
+  -DCMAKE_OSX_SYSROOT=/Library/Developer/CommandLineTools/SDKs/MacOSX26.5.sdk
+cmake --build build/irq-shutdown-probes --target \
+  bw_ohci_irq_shutdown_probe bw_apu_irq_shutdown_probe
+(
+  ulimit -c 0
+  env -i TMPDIR="$TMPDIR" build/irq-shutdown-probes/bw_ohci_irq_shutdown_probe &&
+  env -i TMPDIR="$TMPDIR" build/irq-shutdown-probes/bw_apu_irq_shutdown_probe
+)
+```
+
+Select a locally installed SDK if the example path differs. These are manual
+counterexamples, excluded from the default build and CTest: exit status zero
+means the known unsafe behavior was reproduced, **not** that shutdown is safe.
+If a counterexample stops reproducing, review and replace it with a genuine
+retirement regression; disappearance of one failure is not proof of safety.
+
+#### Test-only MMIO dispatch experiment
+
+The macOS MMIO test suite also has a test-only same-thread trampoline
+experiment. It defers a trapped access outside the signal handler and uses a
+second signal return to restore the interrupted state. Synthetic tests include
+real APU and OHCI register callbacks, but registration, cancellation,
+reentrancy, address coverage and lifecycle safety are not established for the
+game. A bounded counterexample also shows that masking fault signals inside a
+callback can make nested device DMA hang. In a separate crossing-access probe,
+the fault address did not match the first word of the ARM64 pair instruction;
+the experimental handler rejected it. Any production dispatcher must validate
+the instruction's complete effective span, not just the reported address. The
+experiment is not connected to the native host.
 
 ## Local toolchain note
 

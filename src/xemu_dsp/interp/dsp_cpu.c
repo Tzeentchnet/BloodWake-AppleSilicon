@@ -29,6 +29,12 @@
 #include "debug.h"
 #include "trace.h"
 
+#if defined(_WIN32)
+#include <windows.h>
+#else
+#include <pthread.h>
+#endif
+
 #define BITMASK(x)  ((1<<(x))-1)
 
 #define TRACE_DSP_DISASM 0
@@ -339,8 +345,38 @@ static const OpcodeEntry nonparallel_opcodes[] = {
     { "000000000000000010000110", "wait", NULL, emu_wait },
 };
 
-static bool matches_initialised;
 static uint32_t nonparallel_matches[ARRAY_SIZE(nonparallel_opcodes)][2];
+
+static void init_nonparallel_matches(void)
+{
+    for (size_t i = 0; i < ARRAY_SIZE(nonparallel_opcodes); i++) {
+        const OpcodeEntry t = nonparallel_opcodes[i];
+        assert(strlen(t.template) == 24);
+
+        uint32_t mask = 0;
+        uint32_t match = 0;
+        for (int j = 0; j < 24; j++) {
+            if (t.template[j] == '0' || t.template[j] == '1') {
+                mask |= 1 << (24-j-1);
+                match |= (t.template[j] - '0') << (24-j-1);
+            }
+        }
+        nonparallel_matches[i][0] = mask;
+        nonparallel_matches[i][1] = match;
+    }
+}
+
+#if defined(_WIN32)
+static INIT_ONCE matches_once = INIT_ONCE_STATIC_INIT;
+static BOOL CALLBACK init_matches_once(PINIT_ONCE once, PVOID param, PVOID *context)
+{
+    (void)once; (void)param; (void)context;
+    init_nonparallel_matches();
+    return TRUE;
+}
+#else
+static pthread_once_t matches_once = PTHREAD_ONCE_INIT;
+#endif
 
 /**********************************
  *  Emulator kernel
@@ -349,26 +385,11 @@ static uint32_t nonparallel_matches[ARRAY_SIZE(nonparallel_opcodes)][2];
 void dsp56k_reset_cpu(dsp_core_t* dsp)
 {
     int i;
-    if (!matches_initialised) {
-        matches_initialised = true;
-        for (i=0; i<ARRAY_SIZE(nonparallel_opcodes); i++) {
-            const OpcodeEntry t = nonparallel_opcodes[i];
-            assert(strlen(t.template) == 24);
-
-            uint32_t mask = 0;
-            uint32_t match = 0;
-            int j;
-            for (j=0; j<24; j++) {
-                if (t.template[j] == '0' || t.template[j] == '1') {
-                    mask |= 1 << (24-j-1);
-                    match |= (t.template[j] - '0') << (24-j-1);
-                }
-            }
-
-            nonparallel_matches[i][0] = mask;
-            nonparallel_matches[i][1] = match;
-        }
-    }
+#if defined(_WIN32)
+    InitOnceExecuteOnce(&matches_once, init_matches_once, NULL, NULL);
+#else
+    pthread_once(&matches_once, init_nonparallel_matches);
+#endif
 
     /* Memory */
     memset(dsp->periph, 0, sizeof(dsp->periph));
@@ -421,7 +442,11 @@ static const OpcodeEntry *lookup_opcode_slow(uint32_t op) {
 }
 
 static const OpcodeEntry *lookup_opcode(uint32_t op) {
-    static struct opcache_entry {
+#if defined(_MSC_VER)
+    static __declspec(thread) struct opcache_entry {
+#else
+    static _Thread_local struct opcache_entry {
+#endif
         uint32_t op;
         const OpcodeEntry *entry;
     } opcache[256];

@@ -112,6 +112,10 @@ void bw_edition_apply_image_fixes(const void *xbe, size_t xbe_size);
  * moved to <RECOMP_SAVE_DIR>\editions\<name> the same way. On the first boot
  * of an edition whose folder has no saves yet, Original's UDATA and TDATA are
  * copied in (one way; Original's files are only read). */
+/* On macOS/POSIX the default root is $XDG_DATA_HOME/xboxrecomp, or
+ * $HOME/.local/share/xboxrecomp, matching the toolkit's xbox_path_init. If
+ * Original's UDATA/TDATA are in BW_GAME_DIR (default game/disc), import
+ * follows the toolkit's game-directory fallback when RECOMP_SAVE_DIR is unset. */
 const char *bw_edition_prepare_saves(void);
 
 /* Counters for the exit summary: hooks call this when a fix changed

@@ -15,6 +15,22 @@ project(bloodwake C)
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
 
+if(APPLE)
+    if(NOT CMAKE_SYSTEM_NAME STREQUAL "Darwin")
+        message(FATAL_ERROR "The native target requires macOS on Apple Silicon.")
+    endif()
+    if(CMAKE_OSX_ARCHITECTURES AND NOT CMAKE_OSX_ARCHITECTURES STREQUAL "arm64")
+        message(FATAL_ERROR "The native target requires CMAKE_OSX_ARCHITECTURES=arm64.")
+    endif()
+    if(NOT CMAKE_OSX_ARCHITECTURES AND NOT CMAKE_SYSTEM_PROCESSOR MATCHES "^(arm64|aarch64)$")
+        message(FATAL_ERROR "The native target requires an Apple Silicon host or an arm64 toolchain.")
+    endif()
+    if(NOT CMAKE_OSX_ARCHITECTURES)
+        set(CMAKE_OSX_ARCHITECTURES "arm64" CACHE STRING "macOS build architecture" FORCE)
+    endif()
+    enable_language(OBJC)
+endif()
+
 # Common definitions
 add_compile_definitions(
     WIN32_LEAN_AND_MEAN
@@ -52,9 +68,26 @@ if(MSVC)
     string(APPEND CMAKE_EXE_LINKER_FLAGS_RELEASE " /DEBUG /OPT:REF /OPT:ICF")
 endif()
 
-# Add xboxrecomp as a subdirectory -- this builds all 6 runtime libraries
-# and provides the 'xboxrecomp' umbrella target to link against.
-add_subdirectory(${XBOXRECOMP_DIR} ${CMAKE_BINARY_DIR}/xboxrecomp)
+# The toolkit's top-level non-Windows build unconditionally selects its OpenGL
+# D3D8 renderer and libepoxy. The native host uses the project's Metal backend
+# instead, so bring in the other runtime libraries without that renderer.
+if(APPLE)
+    find_package(SDL2 2.0.14 REQUIRED)
+    add_subdirectory("${XBOXRECOMP_DIR}/src/platform" "${CMAKE_BINARY_DIR}/xboxrecomp/src/platform")
+    add_subdirectory("${XBOXRECOMP_DIR}/src/kernel" "${CMAKE_BINARY_DIR}/xboxrecomp/src/kernel")
+    add_library(xbox_d3d8 INTERFACE)
+    target_include_directories(xbox_d3d8 INTERFACE "${XBOXRECOMP_DIR}/src/d3d")
+    foreach(_component audio apu nv2a usb input video)
+        add_subdirectory("${XBOXRECOMP_DIR}/src/${_component}"
+                         "${CMAKE_BINARY_DIR}/xboxrecomp/src/${_component}")
+    endforeach()
+    add_library(xboxrecomp INTERFACE)
+    target_link_libraries(xboxrecomp INTERFACE
+        xbox_kernel xbox_dsound xbox_input xbox_usb xbox_apu xbox_nv2a xbox_video)
+else()
+    # Preserve the upstream Windows toolkit and all of its runtime libraries.
+    add_subdirectory(${XBOXRECOMP_DIR} ${CMAKE_BINARY_DIR}/xboxrecomp)
+endif()
 
 # ── Recompiled game executable ──────────────────────────────────
 
@@ -72,6 +105,34 @@ if(NOT RECOMP_GEN_SOURCES)
 endif()
 
 # Core game sources
+if(APPLE)
+set(GAME_SOURCES
+    src/bw_macos_main.c
+    src/bw_macos_boot.c
+    src/bw_posix_fault.c
+    src/recomp_manual.c
+    src/bw_profile.c
+    src/bw_framelog.c
+    src/bw_host.c
+    src/bw_wait.c
+    src/bw_state.c
+    src/bw_debugflags.c
+    src/bw_edition.c
+    src/bw_settings.c
+    src/bw_hifps_hooks.c
+    src/bw_widescreen.c
+    src/bw_remaster_hooks.c
+    src/bw_audio_hooks.c
+    src/bw_fix_hooks.c
+    src/bw_visextra_hooks.c
+    src/bw_ocean_native.c
+    src/gpu/bw_metal_backend.m
+    src/gpu/bw_gpu_audit.c
+    src/gpu/bw_ab.c
+    src/gpu/bw_gamma.c
+    src/gpu/bw_vfx_lod_native.c
+)
+else()
 set(BW_EDITION_EXTRA_SOURCES "")
 set(GAME_SOURCES
     src/main.c
@@ -106,6 +167,7 @@ set(GAME_SOURCES
     # src/asset_loader.c
     # src/custom_renderer.c
 )
+endif()
 
 # The recomp pipeline also generates a dispatch header and function declarations.
 # These are included by the generated .c files:
@@ -113,17 +175,29 @@ set(GAME_SOURCES
 #   src/recomp/recomp_dispatch.h     - binary search dispatch table
 #   src/recomp/recomp_types.h        - register model, ICALL macros, MEM helpers
 
-add_executable(${PROJECT_NAME} WIN32
-    ${GAME_SOURCES}
-    ${RECOMP_GEN_SOURCES}
-)
+if(APPLE)
+    add_executable(${PROJECT_NAME} ${GAME_SOURCES} ${RECOMP_GEN_SOURCES})
+    set_source_files_properties(src/gpu/bw_metal_backend.m PROPERTIES
+        COMPILE_OPTIONS "-fobjc-arc")
+    set_source_files_properties(src/bw_ocean_native.c PROPERTIES
+        COMPILE_OPTIONS "-ffp-contract=off;-frounding-math")
+else()
+    add_executable(${PROJECT_NAME} WIN32 ${GAME_SOURCES} ${RECOMP_GEN_SOURCES})
+endif()
 
 # The native ocean (docs/day1/P2a.md): tools/bw_ocean_xlate.py translates the
-# water's render-vertex functions from the generated C into
-# src/recomp/gen/bw_ocean_native.inc (git-ignored with the rest of the
-# generated C), which src/bw_ocean_native.c includes. Rebuilt whenever the
-# generated C or the translator changes.
-set(BW_OCEAN_NATIVE_INC ${BW_GEN_DIR}/bw_ocean_native.inc)
+# water's render-vertex functions from the generated C into an include consumed
+# by src/bw_ocean_native.c. Windows keeps it alongside the generated C; macOS
+# puts it in the build tree. Rebuilt whenever the generated C or translator changes.
+if(APPLE)
+    # Keep verified prepared C read-only; the derived translation is local
+    # to this build, not a new file under BW_GEN_DIR.
+    set(BW_OCEAN_GENERATED_DIR "${CMAKE_CURRENT_BINARY_DIR}/bw_ocean")
+    file(MAKE_DIRECTORY "${BW_OCEAN_GENERATED_DIR}")
+    set(BW_OCEAN_NATIVE_INC "${BW_OCEAN_GENERATED_DIR}/bw_ocean_native.inc")
+else()
+    set(BW_OCEAN_NATIVE_INC ${BW_GEN_DIR}/bw_ocean_native.inc)
+endif()
 add_custom_command(
     OUTPUT ${BW_OCEAN_NATIVE_INC}
     COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tools/bw_ocean_xlate.py
@@ -142,23 +216,36 @@ target_link_libraries(${PROJECT_NAME} PRIVATE xboxrecomp)
 target_include_directories(${PROJECT_NAME} PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/src
     ${CMAKE_CURRENT_SOURCE_DIR}/src/recomp
-    ${BW_GEN_DIR}                   # src/bw_ocean_native.c: recomp_types.h, bw_ocean_native.inc
+    ${BW_GEN_DIR}                   # recomp_types.h, and the ocean include on Windows
     ${XBOXRECOMP_DIR}/include
 )
 
 # Windows SDK libraries needed at link time
-target_link_libraries(${PROJECT_NAME} PRIVATE
-    d3d11
-    dxgi
-    dxguid
-    d3dcompiler     # src/gpu/bw_d3d11.c compiles its shaders at start-up
-    $<IF:$<BOOL:${MINGW}>,xinput1_4,xinput>   # see src/input/CMakeLists.txt
-    winmm
-    shell32         # src/bw_edition.c: SHGetFolderPathA, SHCreateDirectoryExA
-    # Lets the fault handler resolve the host RIP back to the generated
-    # function's symbol, i.e. to the guest function that faulted.
-    dbghelp
-)
+if(APPLE)
+    find_library(BW_FOUNDATION_FRAMEWORK Foundation REQUIRED)
+    find_library(BW_METAL_FRAMEWORK Metal REQUIRED)
+    find_library(BW_COREGRAPHICS_FRAMEWORK CoreGraphics REQUIRED)
+    target_include_directories(${PROJECT_NAME} BEFORE PRIVATE "${BW_OCEAN_GENERATED_DIR}")
+    target_include_directories(${PROJECT_NAME} PRIVATE
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/gpu"
+        "${XBOXRECOMP_DIR}/src"
+        "${XBOXRECOMP_DIR}/src/kernel")
+    target_link_libraries(${PROJECT_NAME} PRIVATE
+        "${BW_FOUNDATION_FRAMEWORK}" "${BW_METAL_FRAMEWORK}" "${BW_COREGRAPHICS_FRAMEWORK}")
+else()
+    target_link_libraries(${PROJECT_NAME} PRIVATE
+        d3d11
+        dxgi
+        dxguid
+        d3dcompiler     # src/gpu/bw_d3d11.c compiles its shaders at start-up
+        $<IF:$<BOOL:${MINGW}>,xinput1_4,xinput>   # see src/input/CMakeLists.txt
+        winmm
+        shell32         # src/bw_edition.c: SHGetFolderPathA, SHCreateDirectoryExA
+        # Lets the fault handler resolve the host RIP back to the generated
+        # function's symbol, i.e. to the guest function that faulted.
+        dbghelp
+    )
+endif()
 
 # MSVC-specific: large address aware, increase section limit for big generated files
 if(MSVC)
@@ -233,6 +320,17 @@ bw_carried_patch(xbox_usb "src/usb/ohci.c"
 bw_carried_patch(xbox_usb "src/usb/usb_gamepad.c"
                  "36a29f6c38739bf1b8aa31f299fef483f1d0cc6fe03ef1e65c46de80ae512424")
 
+if(APPLE)
+    # SDL controller hotplug wrapper includes the pinned source by name.
+    bw_carried_patch(xbox_input "src/input/xinput_device.c"
+                     "dba2708b822e5269748558e0d55898082d7478197324b52a56bd9224409ec05f")
+    bw_carried_patch(xbox_input "src/input/keyboard_sdl.c"
+                     "4c3d0c320f1e678fa3a1ae9db1052affe32f2ebe03489e14871a02af13e18bbe")
+    bw_carried_patch(xbox_input "src/input/keyboard.c"
+                     "cf4cc96718246341823e40e2ae276e49f1ec2fc550f2a115cabec81c1a1d1424")
+    target_include_directories(xbox_input PRIVATE "${XBOXRECOMP_DIR}/src/input")
+endif()
+
 # TK-14: the APU's sequencer sample-limit tick (ISTS bit 3) fires every 2048
 # samples; Blood Wake's DirectSound answers each one with a hardware restart,
 # leaving periods of silence in the audio ~20 times a second.
@@ -258,6 +356,10 @@ bw_carried_patch(xbox_apu "src/apu/apu_vp.c"
 # otherwise. Not a toolkit bug; an output feature, carried like the fixes.
 bw_carried_patch(xbox_apu "src/apu/apu_xaudio2.c"
                  "2ce2b436500784ac158fb2270190fd78f748c0b0ce9ca685f1d9e991f05f46c1")
+if(APPLE)
+    bw_carried_patch(xbox_apu "src/apu/apu_sdl2.c"
+                     "50fb404a92489a66d34d59447c6e16bf07d24c393dcb0a5afbba3b41f1d710d2")
+endif()
 
 # D-003 B: the executor hands transformed batches to the GPU back end with
 # everything its CPU combiner path reads (src/toolkit_patches/kernel/
@@ -296,12 +398,22 @@ target_link_libraries(xbox_apu PUBLIC bw_xemu_dsp)
 # Also the D3 wait/handle diagnostics ([BWD3] lines; BW_D3_DIAG=0 silences).
 bw_carried_patch(xbox_kernel "src/kernel/kernel_bridge.c"
                  "a065bdd6d96791f546e849d3d7b752e17a93a002f61234e36d1388a98b2de3b0")
+if(APPLE)
+    target_sources(xbox_kernel PRIVATE
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/bw_posix_guest_mem.c"
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/bw_posix_ke_event.c")
+endif()
 
 # One window for a play session (src/bw_host.c): with BW_PARENT_HWND set, the
 # frame window is a child of the launcher's host window, so the game's
 # self-reboots no longer open a new window each.
 bw_carried_patch(xbox_video "src/video/fb_present.c"
                  "f0a3f553ccf4afc2e1bcfc1020030bfe76a1fc584caefc3d2367ba87f8ed9782")
+
+if(APPLE)
+    bw_carried_patch(xbox_video "src/video/fb_present_sdl.c"
+                     "0a047f77977654eed6e6dd9164f37102144aab234470bd0bf2362addc9f2a66c")
+endif()
 
 option(BW_ICALL_FEEDBACK "Record indirect-call targets (icall_targets.dump)" ON)
 if(BW_ICALL_FEEDBACK)

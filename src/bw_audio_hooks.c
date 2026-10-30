@@ -14,9 +14,10 @@
 #include <string.h>
 
 #include "bw_edition.h"
+#include "bw_hook_platform.h"
 
 /* The guest registers are thread-local in the runtime (TOOLKIT_ISSUES TK-7). */
-extern __declspec(thread) uint32_t g_eax;
+extern BW_HOOK_TLS uint32_t g_eax;
 
 /* ── The speaker configuration ─────────────────────────────────────────────
  *

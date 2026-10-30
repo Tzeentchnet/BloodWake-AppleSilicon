@@ -25,8 +25,20 @@
  * Single-threaded: everything except bw_audit_gamma runs on the NV2A
  * executor's thread. The gamma hook copies into a slot the flip picks up.
  */
+#if defined(_WIN32)
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
+static SRWLOCK s_audit_gamma_lock = SRWLOCK_INIT;
+static void audit_gamma_lock(void) { AcquireSRWLockExclusive(&s_audit_gamma_lock); }
+static void audit_gamma_unlock(void) { ReleaseSRWLockExclusive(&s_audit_gamma_lock); }
+#else
+#include <pthread.h>
+#include <stdatomic.h>
+#include "platform/win32_compat.h"
+static pthread_mutex_t s_audit_gamma_lock = PTHREAD_MUTEX_INITIALIZER;
+static void audit_gamma_lock(void) { pthread_mutex_lock(&s_audit_gamma_lock); }
+static void audit_gamma_unlock(void) { pthread_mutex_unlock(&s_audit_gamma_lock); }
+#endif
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -36,16 +48,40 @@
 
 /* ---- switch -------------------------------------------------------------- */
 
-static int s_on = -1;
+#if defined(_WIN32)
+static volatile LONG s_on = -1;
 
 int bw_audit_on(void)
 {
-    if (s_on < 0) {
+    LONG on = InterlockedCompareExchange(&s_on, 0, 0);
+    if (on < 0) {
         const char *e = getenv("BW_GPU_AUDIT");
-        s_on = e && e[0] == '1';
+        LONG wanted = e && e[0] == '1';
+        LONG prior = InterlockedCompareExchange(&s_on, wanted, -1);
+        on = prior < 0 ? wanted : prior;
     }
-    return s_on;
+    return (int)on;
 }
+#else
+static _Atomic int s_on = -1;
+
+int bw_audit_on(void)
+{
+    int on = atomic_load_explicit(&s_on, memory_order_relaxed);
+    if (on < 0) {
+        const char *e = getenv("BW_GPU_AUDIT");
+        int wanted = e && e[0] == '1';
+        int expected = -1;
+        if (atomic_compare_exchange_strong_explicit(&s_on, &expected, wanted,
+                                                    memory_order_relaxed,
+                                                    memory_order_relaxed))
+            on = wanted;
+        else
+            on = expected;
+    }
+    return on;
+}
+#endif
 
 /* ---- method counts ------------------------------------------------------- */
 
@@ -664,12 +700,14 @@ void bw_audit_clear(uint32_t flags, uint32_t surf_w, uint32_t surf_h, const uint
 /* ---- gamma (from the D3DDevice_SetGammaRamp hook, the game's thread) ----- */
 
 static uint8_t s_gamma[768];
-static volatile LONG s_gamma_seq, s_gamma_taken;
+static uint32_t s_gamma_seq, s_gamma_taken;
 
 void bw_audit_gamma(const uint8_t ramp[768])
 {
+    audit_gamma_lock();
     memcpy(s_gamma, ramp, 768);
-    InterlockedIncrement(&s_gamma_seq);
+    s_gamma_seq++;
+    audit_gamma_unlock();
 }
 
 /* ---- report -------------------------------------------------------------- */
@@ -877,6 +915,8 @@ void bw_audit_flip(uint32_t offset, uint32_t surface_format)
 {
     static ULONGLONG last;
     static uint32_t every_ms;
+    uint8_t gamma[768];
+    int gamma_changed = 0;
     ULONGLONG now = GetTickCount64();
     (void)offset;
     if (!s_t0) {
@@ -890,11 +930,17 @@ void bw_audit_flip(uint32_t offset, uint32_t surface_format)
     }
     s_flips++;
     add(F_FLIP_FMT, surface_format, 0);
+    audit_gamma_lock();
     if (s_gamma_seq != s_gamma_taken) {
-        uint32_t k, dev = 0;
         s_gamma_taken = s_gamma_seq;
+        memcpy(gamma, s_gamma, sizeof gamma);
+        gamma_changed = 1;
+    }
+    audit_gamma_unlock();
+    if (gamma_changed) {
+        uint32_t k, dev = 0;
         for (k = 0; k < 768; k++) {
-            int dlt = (int)s_gamma[k] - (int)(k & 0xFF);
+            int dlt = (int)gamma[k] - (int)(k & 0xFF);
             if (dlt < 0) dlt = -dlt;
             if ((uint32_t)dlt > dev) dev = (uint32_t)dlt;
         }

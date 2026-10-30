@@ -23,6 +23,7 @@
 #include <stddef.h>   /* ptrdiff_t */
 #include <stdlib.h>   /* getenv */
 #include <string.h>   /* strcmp */
+#include "bw_hook_platform.h"
 
 /* ── ICALL trace ring buffer ───────────────────────────────── */
 
@@ -142,7 +143,7 @@ void recomp_icall_fail_log(uint32_t va)
  * Rate-limited per address: a spin can produce millions of these, and the
  * useful information is which addresses occur, not how often.
  */
-extern __declspec(thread) uint32_t g_esp;   /* the guest stack pointer (RECOMP_TLS) */
+extern BW_HOOK_TLS uint32_t g_esp;   /* the guest stack pointer (RECOMP_TLS) */
 
 void recomp_icall_not_code_log(uint32_t va)
 {
@@ -218,7 +219,7 @@ void recomp_icall_not_code_log(uint32_t va)
  * registers are plain memory, so the ramp never reached anything. This hands
  * a copy to the presenter (src/gpu/bw_gamma.c) and then runs the body as
  * before. The missions fade in through this ramp (see bw_gamma.c). */
-extern __declspec(thread) uint32_t g_esp;
+extern BW_HOOK_TLS uint32_t g_esp;
 extern void sub_00124F80_gen(void);
 extern void bw_gamma_from_title(const uint8_t *ramp);
 
@@ -297,7 +298,7 @@ void sub_0012CB40(void)
  * title's own code does all the waiting. BW_D3D_FARWAIT=event restores the
  * original reading (and the freeze). */
 extern void sub_0012C8D0_gen(void);
-extern __declspec(thread) uint32_t g_eax;   /* RECOMP_TLS: TK-7 */
+extern BW_HOOK_TLS uint32_t g_eax;   /* RECOMP_TLS: TK-7 */
 
 void sub_0012C8D0(void)
 {
@@ -326,7 +327,7 @@ void sub_0012C8D0(void)
  * same inputs can be compared exactly. Test aid only: unset, the game's own
  * seed passes through and Original is unchanged. */
 extern void sub_000E00B6_gen(void);
-extern __declspec(thread) uint32_t g_esp;
+extern BW_HOOK_TLS uint32_t g_esp;
 
 void sub_000E00B6(void)
 {
@@ -355,14 +356,14 @@ void sub_000E00B6(void)
  * Seen in run 20261025-222206-r2-pixels: after its first stage Blood Wake
  * relaunches its own default.xbe with launch data "SPLASH", 1 (the studio's
  * project name; see the XBE debug path). A console reboots into the title with
- * the launch data page intact. The toolkit prints the page and exits, so this
- * records the request in bw_relaunch.bin (working folder) before the game's
- * own code runs and exits. tools/bw_run.py then starts the next stage with
- * BW_LAUNCH_DATA_FILE, and main.c rebuilds the page from it.
+ * the launch data page intact. The toolkit prints the page and exits, so on
+ * Windows this records the request in bw_relaunch.bin before the game's own
+ * code runs and exits; tools/bw_run.py starts the next stage from that record.
+ * On macOS the same record goes to the supervising host's inherited descriptor.
  *
  * File: "BWRL", u32 version 1, u32 path length, path bytes, u32 data length
  * (3072, or 0 for no launch data), data bytes. */
-extern __declspec(thread) uint32_t g_esp;
+extern BW_HOOK_TLS uint32_t g_esp;
 extern void sub_000DB8B9_gen(void);
 #define BW_LAUNCH_DATA_SIZE 3072u
 
@@ -370,6 +371,11 @@ void sub_000DB8B9(void)
 {
     uint32_t path_va = BW_MEM32(g_esp + 4);
     uint32_t data_va = BW_MEM32(g_esp + 8);
+#if defined(__APPLE__)
+    extern int bw_macos_record_relaunch(uint32_t path_va, uint32_t data_va);
+    if (bw_macos_record_relaunch(path_va, data_va) != 0)
+        exit(EXIT_FAILURE);
+#else
     char path[260];
     uint32_t n = 0;
     FILE *f;
@@ -400,12 +406,15 @@ void sub_000DB8B9(void)
             data_va ? BW_MEM32(data_va) : 0, data_va ? BW_MEM32(data_va + 4) : 0,
             data_va ? BW_MEM32(data_va + 8) : 0);
     fflush(stderr);
-    /* The launch ends in HalReturnToFirmware -> ExitProcess, which skips
-     * atexit: write the sampling profile (BW_PROFILE) now. */
+#endif
+    /* Firmware exit may bypass normal shutdown, so dump evidence now. */
     {
         extern void bw_profile_dump(const char *why);
         extern void bw_edition_summary(void);
         bw_profile_dump("relaunch");
+#if defined(__APPLE__)
+        bw_fl_dump("relaunch");
+#endif
         bw_edition_summary();             /* "[ED] summary" lines (bw_edition.c) */
     }
     sub_000DB8B9_gen();
@@ -423,18 +432,18 @@ void sub_000DB8B9(void)
  * this thread runs (xbox_IrqSafePoint), as the CPU would take it; then the
  * game's own body runs, and returns at once. Without the gate there is
  * nothing posted and this adds one check. */
-extern __declspec(thread) uint32_t g_ecx;
+extern BW_HOOK_TLS uint32_t g_ecx;
 extern void sub_000FE041_gen(void);
 extern void xbox_IrqSafePoint(void);
-__declspec(dllimport) int __stdcall SwitchToThread(void);
-__declspec(dllimport) unsigned long long __stdcall GetTickCount64(void);
+#if defined(_WIN32)
 extern void DSound_ApuOnVoiceIdle_000FD27A(void);         /* generated (0xFD27A) */
 /* Without names/bw_names.json (the public build) it is the address name alone;
  * the linker falls back to it (split so the hook scans don't count it). */
 #pragma comment(linker, "/alternatename:DSound_ApuOnVoiceIdle_000FD27A=sub" "_000FD27A")
+#endif
 extern void xbox_DispatchGateEnter(void);
 extern void xbox_DispatchGateLeave(void);
-extern __declspec(thread) uint32_t g_edx;
+extern BW_HOOK_TLS uint32_t g_edx;
 extern void *g_state;                                     /* the APU (apu_core.c) */
 extern uint64_t mcpx_apu_mmio_read(void *d, uint64_t addr, unsigned int size);
 
@@ -539,7 +548,11 @@ static int bw_voice_wait_recover_locked(uint32_t obj, unsigned long long waited_
         g_esp -= 4; BW_MEM32(g_esp) = last;             /* the handle argument */
         g_esp -= 4; BW_MEM32(g_esp) = 0;                /* return address; ret 4 */
         g_ecx = apu;
+#if defined(_WIN32)
         DSound_ApuOnVoiceIdle_000FD27A();
+#else
+        bw_hook_call_guest(0x000FD27Au);
+#endif
         g_eax = s_eax; g_ecx = s_ecx; g_edx = s_edx; g_esp = s_esp;
         fprintf(stderr, "[BW] DirectSound voice-idle wait: voice 0x%08X (handle 0x%X) still "
                 "on hardware list %u after %llu ms with no idle report; delivered one "
@@ -595,11 +608,11 @@ void sub_000FE041(void)
     while ((BW_MEM32(obj + 8) & 1u) && (BW_MEM32(obj + 8) & 0x10000000u)) {
         xbox_IrqSafePoint();
         if (++spins > 64) {
-            SwitchToThread();
+            bw_hook_yield();
             if (!t0) {
-                t0 = GetTickCount64();
+                t0 = bw_hook_milliseconds();
             } else if ((spins & 63) == 0) {
-                unsigned long long w = GetTickCount64() - t0;
+                unsigned long long w = bw_hook_milliseconds() - t0;
                 if (w >= bw_voice_wait_ms(0) && bw_voice_wait_recover(obj, w))
                     break;
             }
@@ -633,10 +646,9 @@ extern void sub_00036540_gen(void);
  * with a safe point for posted interrupts each turn. The registers end as the
  * original leaves them (eax, edx; ecx and esp restored). BW_KICKOFF_SPIN=1
  * runs the original. */
-#include <immintrin.h>
 #include "bw_wait.h"
 #define BW_MEM8(va) (*(volatile uint8_t *)((uintptr_t)(uint32_t)(va) + g_xbox_mem_offset))
-extern __declspec(thread) uint32_t g_eax, g_edx;
+extern BW_HOOK_TLS uint32_t g_eax, g_edx;
 extern void sub_0012C9F0_gen(void);
 /* Segments the game may run ahead of the NV2A walk (TK-56); 0 = the KickOff
  * waits for its own flush, as the toolkit did. Set at boot by bw_hifps_boot
@@ -714,7 +726,7 @@ void sub_0012C9F0(void)
         BW_MEM32(dev + 0x18) = put;
         ring[++seq & 15u] = p;
         bw_put_queue_push(p);                    /* P1: the walk per segment (BW_PB_SEGWALK) */
-        _mm_sfence();
+        bw_hook_store_fence();
         BW_MEM32(regs + 0x100410) = BW_MEM32(regs + 0x100410) | 0x10000u;
         bw_ack_kick();
         for (;;) {
@@ -727,7 +739,7 @@ void sub_0012C9F0(void)
                 break;
             xbox_IrqSafePoint();
             if (++n < 64)
-                _mm_pause();
+                bw_hook_pause();
             else
                 bw_flush_wait();
         }
@@ -751,13 +763,13 @@ void sub_0012C9F0(void)
         }
         if (kicklog)
             k0 = bw_now_ms();
-        _mm_sfence();
+        bw_hook_store_fence();
         BW_MEM32(regs + 0x100410) = BW_MEM32(regs + 0x100410) | 0x10000u;
         bw_ack_kick();                            /* wake the NV2A thread if it naps */
         while (BW_MEM32(regs + 0x100410) & 0x10000u) {
             xbox_IrqSafePoint();
             if (++n < 64)
-                _mm_pause();
+                bw_hook_pause();
             else
                 bw_flush_wait();      /* the ack's event or 200 us, no spin; Sleep(1)
                                          overshot (34 -> 29 fps); bw_wait.c */
@@ -891,7 +903,6 @@ void sub_00036540(void)
  * RECOMP_UNIMPL_TRAP=1 aborts at the first hit, at the guest address of the
  * cause rather than wherever the damage surfaces. */
 #include <stdlib.h>
-#include <intrin.h>
 
 /* Blood Wake (M0.7): count every hit per site. The line below prints only the
  * first 50 hits in total, and FIRST_RUN_PLAN W2 needs the count of D3D's
@@ -923,20 +934,20 @@ static void bw_unimpl_count(const char *text, uint32_t va)
 {
     static volatile long registered;
     int i;
-    if (!_InterlockedCompareExchange(&registered, 1, 0))
+    if (!bw_hook_compare_exchange(&registered, 1, 0))
         atexit(bw_unimpl_summary);
     for (i = 0; i < BW_UNIMPL_SLOTS; i++) {
         long cur = s_unimpl_va[i];
         if (cur == (long)va) {
-            _InterlockedIncrement(&s_unimpl_n[i]);
+            bw_hook_increment(&s_unimpl_n[i]);
             return;
         }
         if (!cur) {
-            long was = _InterlockedCompareExchange(&s_unimpl_va[i], (long)va, 0);
+            long was = bw_hook_compare_exchange(&s_unimpl_va[i], (long)va, 0);
             if (was == 0)
                 s_unimpl_text[i] = text;
             if (was == 0 || was == (long)va) {
-                _InterlockedIncrement(&s_unimpl_n[i]);
+                bw_hook_increment(&s_unimpl_n[i]);
                 return;
             }
         }
@@ -978,8 +989,8 @@ void recomp_unimpl(const char *text, uint32_t va)
  * (and BW_FIX=-VFX_DRAW_DISTANCE): bw_vfx_lod_scale() is 1 and the game's
  * own result is returned untouched. */
 extern void sub_000308E0_gen(void);
-extern __declspec(thread) double g_fp_stack[8];
-extern __declspec(thread) int g_fp_top;
+extern BW_HOOK_TLS double g_fp_stack[8];
+extern BW_HOOK_TLS int g_fp_top;
 extern float bw_vfx_lod_scale(void);
 
 void sub_000308E0(void)

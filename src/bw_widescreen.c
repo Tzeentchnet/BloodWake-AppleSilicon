@@ -3,12 +3,15 @@
  * one place (bw_widescreen.h). Nothing here touches guest memory; the hooks
  * (bw_remaster_hooks.c) and the back end (gpu/bw_d3d11.c) read the result.
  */
-#include <windows.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include "bw_edition.h"
+#include "bw_hook_platform.h"
 #include "bw_widescreen.h"
+#if defined(__APPLE__)
+#include <CoreGraphics/CoreGraphics.h>
+#endif
 
 #define WS_ASPECT_43   (4.0f / 3.0f)
 #define WS_ASPECT_MAX  2.39f          /* 21:9 monitors (2560x1080 2.37, 3440x1440 2.39) */
@@ -23,19 +26,20 @@ float bw_ws_k(void)      { return s_k; }
 static float parse_aspect(const char *e)
 {
     float a = 0.0f, w, h;
-    if (!e || !*e || !_stricmp(e, "display"))
+    if (!e || !*e || !bw_hook_stricmp(e, "display"))
         return 0.0f;
     if (sscanf(e, "%f:%f", &w, &h) == 2 && w > 0.0f && h > 0.0f)
         a = w / h;
     else if (sscanf(e, "%f", &w) == 1)
         a = w;
-    if (!_stricmp(e, "21:9"))
+    if (!bw_hook_stricmp(e, "21:9"))
         a = 64.0f / 27.0f;           /* the marketing name for 2.37 */
     return a;
 }
 
 static float display_aspect(int *dw, int *dh)
 {
+#if defined(_WIN32)
     MONITORINFO mi;
     POINT origin = { 0, 0 };
     mi.cbSize = sizeof mi;
@@ -44,6 +48,13 @@ static float display_aspect(int *dw, int *dh)
         *dw = mi.rcMonitor.right - mi.rcMonitor.left;
         *dh = mi.rcMonitor.bottom - mi.rcMonitor.top;
     }
+#elif defined(__APPLE__)
+    CGDirectDisplayID display = CGMainDisplayID();
+    *dw = (int)CGDisplayPixelsWide(display);
+    *dh = (int)CGDisplayPixelsHigh(display);
+#else
+    *dw = *dh = 0;
+#endif
     return (*dw > 0 && *dh > 0) ? (float)*dw / (float)*dh : 16.0f / 9.0f;
 }
 
@@ -60,6 +71,11 @@ void bw_ws_init(int gameplay_boot, int log)
             fprintf(stderr, "[WS] off: 4:3 (BW_FIX=-WIDESCREEN)\n");
         return;                       /* Original: nothing, as shipped */
     }
+#if defined(__APPLE__)
+    fprintf(stderr, "[WS] off: the Metal renderer does not yet support widescreen targets and markers; using 4:3\n");
+    fflush(stderr);
+    return;
+#else
     {
         const char *g = getenv("BW_GPU");
         if (!g || strcmp(g, "d3d11")) {
@@ -68,6 +84,7 @@ void bw_ws_init(int gameplay_boot, int log)
             return;
         }
     }
+#endif
     a = want > 0.0f ? want : display_aspect(&dw, &dh);
     if (a < WS_ASPECT_43)
         a = WS_ASPECT_43;             /* a portrait or square screen: 4:3, letterboxed */

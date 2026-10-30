@@ -31,23 +31,26 @@
  * inferred, unknown. Addresses are the XBE's (base 0x00010000).
  */
 
-#include <windows.h>
 #include <stdio.h>
 #include <stdint.h>
 #include <stddef.h>
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
+#if !defined(_WIN32)
+#include <dirent.h>
+#endif
 
 #include "bw_edition.h"
+#include "bw_hook_platform.h"
 
 typedef void (*recomp_func_t)(void);
 extern recomp_func_t recomp_lookup(uint32_t xbox_va);
 extern ptrdiff_t g_xbox_mem_offset;
 /* The guest registers are thread-local in the runtime (TOOLKIT_ISSUES TK-7). */
-extern __declspec(thread) uint32_t g_eax, g_ecx, g_edx, g_esp;
-extern __declspec(thread) uint32_t g_ebx, g_esi, g_edi, g_ebp;
-extern __declspec(thread) uint32_t g_seh_ebp, g_eflags;
+extern BW_HOOK_TLS uint32_t g_eax, g_ecx, g_edx, g_esp;
+extern BW_HOOK_TLS uint32_t g_ebx, g_esi, g_edi, g_ebp;
+extern BW_HOOK_TLS uint32_t g_seh_ebp, g_eflags;
 
 #define F_MEM32(va) (*(volatile uint32_t *)((uintptr_t)(uint32_t)(va) + g_xbox_mem_offset))
 #define F_MEM16(va) (*(volatile uint16_t *)((uintptr_t)(uint32_t)(va) + g_xbox_mem_offset))
@@ -55,6 +58,9 @@ extern __declspec(thread) uint32_t g_seh_ebp, g_eflags;
 /* The runtime maps 128 MB of guest address space (main.c: "128 MB mapped (RAM
  * stays 64 MB)"), and the game's heap reaches above 64 MB: sound objects at
  * 0x0459B490 (seen: run -d11g12O3). */
+#ifdef F_OK
+#undef F_OK /* unistd.h's access() flag is unrelated to guest pointers */
+#endif
 #define F_OK(va)    ((uint32_t)(va) >= 0x00010000u && (uint32_t)(va) < 0x08000000u)
 /* Render matrices live in the contiguous window 0x80000000+ (seen: run
  * -d11m10dbg, 0x8077CFA0..), which the runtime maps at the same offset. */
@@ -242,9 +248,9 @@ static void impact_hook(int k, void (*gen)(void))
         f_regs_t r;
         uint32_t item, node, m;
         static volatile long once;
-        static ULONGLONG s_next_print;
-        ULONGLONG now = GetTickCount64();
-        if (!InterlockedExchange(&once, 1)) {
+        static uint64_t s_next_print;
+        uint64_t now = bw_hook_milliseconds();
+        if (!bw_hook_exchange(&once, 1)) {
             bw_edition_add_summary(impact_summary);
             s_next_print = now + 15000u;
         }
@@ -288,14 +294,14 @@ static void impact_hook(int k, void (*gen)(void))
 
     if (probe && have_m) {
         static volatile long s_land_lines;
-        if (InterlockedIncrement(&s_land_lines) <= 400) {
+        if (bw_hook_increment(&s_land_lines) <= 400) {
             float hv = sqrtf(fx * fx + fy * fy);
             uint32_t pick = F_MEM32(bs + im->last), eax0 = g_eax;
             int now_playing = -1, spray = 0, laps = 0;
             double wav_s = -1.0;
             f_regs_t r2;
             const char *wav = getenv("RECOMP_AUDIO_WAV");
-            WIN32_FILE_ATTRIBUTE_DATA fa;
+            uint64_t wav_size;
             /* Is the picked sound playing now (it can't without a buffer)?
              * And how many spray and lap sounds play. Sound_IsPlaying only. */
             f_save(&r2);
@@ -308,8 +314,8 @@ static void impact_hook(int k, void (*gen)(void))
             f_restore(&r2);
             /* Where this is in the run's recording: the recorder appends
              * 48 kHz s16 stereo after a 44-byte header (apu_core.c). */
-            if (wav && GetFileAttributesExA(wav, GetFileExInfoStandard, &fa) && fa.nFileSizeLow > 44)
-                wav_s = (double)(fa.nFileSizeLow - 44u) / (48000.0 * 4.0);
+            if (wav && bw_hook_file_size(wav, &wav_size) && wav_size > 44)
+                wav_s = (double)(wav_size - 44u) / (48000.0 * 4.0);
             fprintf(stderr, "[FIX] probe landing (%s): %s air %u ms v %.3f pitch %+.1f deg %s; "
                     "sound playing %s; spray %d, lap %d playing; wav %.2f s\n",
                     bw_edition_name(bw_edition()), im->name, air, hv, atan2f(fz, hv) * 57.29578f,
@@ -323,12 +329,12 @@ static void impact_hook(int k, void (*gen)(void))
     if (i > 3u || !F_MEM32(bs + im->own + 4u * i))
         return;
     if (probe) {
-        InterlockedIncrement(&im->reached);
-        InterlockedIncrement(&im->played_ok);
+        bw_hook_increment(&im->reached);
+        bw_hook_increment(&im->played_ok);
         if (lap_on[i])
-            InterlockedIncrement(&im->lap_on);
+            bw_hook_increment(&im->lap_on);
         if (own_on[i])
-            InterlockedIncrement(&im->own_on);
+            bw_hook_increment(&im->own_on);
     }
     if (fix) {
         int lap;
@@ -458,25 +464,25 @@ static void objsound_fix(uint32_t arg_n, uint32_t obj)
     s = F_MEM32(obj + 0xC8u + 4u * n);
     if (probe) {
         static volatile long once;
-        static ULONGLONG s_next;
-        ULONGLONG now = GetTickCount64();
-        if (!InterlockedExchange(&once, 1)) {
+        static uint64_t s_next;
+        uint64_t now = bw_hook_milliseconds();
+        if (!bw_hook_exchange(&once, 1)) {
             bw_edition_add_summary(objsound_summary);
             s_next = now + 15000u;
         }
-        if (InterlockedIncrement(&s_objs_calls) == 1) {
+        if (bw_hook_increment(&s_objs_calls) == 1) {
             fprintf(stderr, "[FIX] probe object sounds: first sound object at %08X\n", s);
             fflush(stderr);
         }
         if (F_OKM(s) && !F_MEM32(s + 8))
-            InterlockedIncrement(&s_objs_silent);
+            bw_hook_increment(&s_objs_silent);
         {
             uint32_t def = F_MEM32(obj + 0x54), ty = F_OK(def) ? F_MEM32(def + 0xA8) : 15u;
             if (ty > 15u)
                 ty = 15u;
-            InterlockedIncrement(&s_objs_bytype[ty][n]);
+            bw_hook_increment(&s_objs_bytype[ty][n]);
             if (!F_OKM(s) || !F_MEM32(s + 8))
-                InterlockedIncrement(&s_objs_emptytype[ty][n]);
+                bw_hook_increment(&s_objs_emptytype[ty][n]);
         }
         if (now >= s_next) {
             s_next = now + 15000u;
@@ -494,7 +500,7 @@ static void objsound_fix(uint32_t arg_n, uint32_t obj)
     if (!ng)
         return;
     F_MEM32(arg_n) = good[s_objs_alt++ % ng];
-    InterlockedIncrement(&s_objs_fixed);
+    bw_hook_increment(&s_objs_fixed);
     bw_fix_note_hit(BW_FIX_AUTOCANNON_HIT_SOUND);
 }
 
@@ -557,6 +563,65 @@ static uint32_t rd32(const uint8_t *p)
     return (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
 }
 
+#if !defined(_WIN32)
+/* Xbox and Windows paths ignore case; an extracted disc on a case-sensitive
+ * APFS volume may retain the disc's original spelling. */
+static int mission_component(const char *dir, const char *name, char *out, size_t cap)
+{
+    DIR *d = opendir(dir);
+    struct dirent *entry;
+    int found = 0;
+    if (!d)
+        return 0;
+    while ((entry = readdir(d)) != NULL) {
+        size_t n;
+        if (bw_hook_stricmp(entry->d_name, name))
+            continue;
+        n = strlen(entry->d_name);
+        if (n >= cap)
+            continue;
+        if (!found || !strcmp(entry->d_name, name)) {
+            memcpy(out, entry->d_name, n + 1);
+            found = 1;
+            if (!strcmp(entry->d_name, name))
+                break;
+        }
+    }
+    closedir(d);
+    return found;
+}
+#endif
+
+static FILE *open_mission_pak(const char *dir, int mission, int voice)
+{
+    char name[64], path[BW_HOOK_PATH_MAX];
+    int n = bw_hook_snprintf(name, sizeof name, voice ? "%02d_voice_english.pak" : "%02d.pak", mission);
+    FILE *f;
+    if (n < 0 || (size_t)n >= sizeof name)
+        return NULL;
+    n = bw_hook_snprintf(path, sizeof path, "%s" BW_HOOK_PATH_SEP "missions"
+                         BW_HOOK_PATH_SEP "%s", dir, name);
+    if (n < 0 || (size_t)n >= sizeof path)
+        return NULL;
+    f = fopen(path, "rb");
+#if !defined(_WIN32)
+    if (!f) {
+        char actual_dir[256], actual_name[256], folder[BW_HOOK_PATH_MAX];
+        if (!mission_component(dir, "missions", actual_dir, sizeof actual_dir))
+            return NULL;
+        n = bw_hook_snprintf(folder, sizeof folder, "%s/%s", dir, actual_dir);
+        if (n < 0 || (size_t)n >= sizeof folder ||
+            !mission_component(folder, name, actual_name, sizeof actual_name))
+            return NULL;
+        n = bw_hook_snprintf(path, sizeof path, "%s/%s", folder, actual_name);
+        if (n < 0 || (size_t)n >= sizeof path)
+            return NULL;
+        f = fopen(path, "rb");
+    }
+#endif
+    return f;
+}
+
 /* The bytes of the first non-empty wave item called `name` in the mission
  * voice packs, or NULL. *pak_out is the pack's mission number. */
 static uint8_t *voice_donor(const char *name, uint32_t *size_out, int *pak_out)
@@ -564,15 +629,12 @@ static uint8_t *voice_donor(const char *name, uint32_t *size_out, int *pak_out)
     const char *dir = getenv("BW_GAME_DIR");      /* as main.c finds the disc */
     int nn;
     if (!dir || !*dir)
-        dir = "game\\disc";
+        dir = BW_HOOK_GAME_DIR;
     for (nn = 1; nn <= 28; nn++) {
-        char path[MAX_PATH];
         uint8_t hdr[112], *tab = NULL, *data = NULL;
         uint32_t unp, pk, tsize, i, start, snd = 0, cnt, k;
         FILE *f;
-        _snprintf(path, sizeof path, "%s\\missions\\%02d_voice_english.pak", dir, nn);
-        path[sizeof path - 1] = 0;
-        f = fopen(path, "rb");
+        f = open_mission_pak(dir, nn, 1);
         if (!f)
             continue;
         if (fread(hdr, 1, sizeof hdr, f) != sizeof hdr || memcmp(hdr, "spak", 4))
@@ -893,21 +955,18 @@ static int wave_table_has(const char *name)
 static uint8_t *story_sound_section(int mission, uint32_t *len_out, double *ms_out)
 {
     const char *dir = getenv("BW_GAME_DIR");
-    char path[MAX_PATH];
     uint8_t hdr[112], head[4096], *snd = NULL, *fbuf = NULL;
     uint32_t unp, pk, z = 0, in = 0, out = 0, sz, total = 0, head_n = 0;
     uint32_t snd_start = 0, snd_end = 0, got_snd = 0, fpos = 0;
     int ok = 0, inited = 0, r;
     FILE *f;
-    LARGE_INTEGER t0, t1, fq;
+    uint64_t t0, t1;
     f_regs_t regs;
 
-    QueryPerformanceCounter(&t0);
+    t0 = bw_hook_counter();
     if (!dir || !*dir)
-        dir = "game\\disc";
-    _snprintf(path, sizeof path, "%s\\missions\\%02d.pak", dir, mission);
-    path[sizeof path - 1] = 0;
-    f = fopen(path, "rb");
+        dir = BW_HOOK_GAME_DIR;
+    f = open_mission_pak(dir, mission, 0);
     if (!f)
         return NULL;
     if (fread(hdr, 1, sizeof hdr, f) != sizeof hdr || memcmp(hdr, "spak", 4))
@@ -1017,9 +1076,8 @@ done:
         free(snd);
         return NULL;
     }
-    QueryPerformanceCounter(&t1);
-    QueryPerformanceFrequency(&fq);
-    *ms_out = (double)(t1.QuadPart - t0.QuadPart) * 1000.0 / (double)fq.QuadPart;
+    t1 = bw_hook_counter();
+    *ms_out = (double)(t1 - t0) * 1000.0 / (double)bw_hook_counter_frequency();
     *len_out = snd_end - snd_start;
     return snd;
 }
@@ -1182,8 +1240,8 @@ void sub_00080610(void)            /* Mission_ComputeVoiceDurations */
  * back; the sine branch reads +4 once and +0xC not at all (seen). */
 extern void sub_000B73D0_gen(void);
 /* The x87 stack of the runtime; the body returns its value in st(0). */
-extern __declspec(thread) double g_fp_stack[8];
-extern __declspec(thread) int g_fp_top;
+extern BW_HOOK_TLS double g_fp_stack[8];
+extern BW_HOOK_TLS int g_fp_top;
 #define X_AI_CLOCK 0x001F2E18u          /* the AI scheduler's clock (s), read by the body */
 
 /* BW_FIX_PROBE: the first 120 values of the first type-1 wave asked for, with
@@ -1525,7 +1583,7 @@ static void targets_report(uint32_t obj, uint32_t now)
         return;
     s_next = now + 5000u;
     n = (int)(int8_t)F_MEM8(obj + 0x58);
-    _snprintf(line, sizeof line, "[FIX] targets at %u ms:", now);
+    bw_hook_snprintf(line, sizeof line, "[FIX] targets at %u ms:", now);
     for (k = 0; k < n; k++) {
         uint32_t o = objective_target(obj, k), node, m;
         char nm[40], one[96];
@@ -1534,9 +1592,10 @@ static void targets_report(uint32_t obj, uint32_t now)
         node = F_MEM32(o + 4);
         m = F_OK(node) ? f_call(VA_NODE_WORLDMATRIX, node, 0, NULL) : 0;
         f_str(o + 0x34, nm, 16);
-        _snprintf(one, sizeof one, " %s hp %d%s (%.0f, %.0f)", nm, (int)F_MEM32(o + 0x20),
-                  obj_destroyed(o) ? " sunk" : "", F_OKM(m) ? f_f32(m + 0x30) : 0.0f,
-                  F_OKM(m) ? f_f32(m + 0x34) : 0.0f);
+        bw_hook_snprintf(one, sizeof one, " %s hp %d%s (%.0f, %.0f)", nm,
+                         (int)F_MEM32(o + 0x20), obj_destroyed(o) ? " sunk" : "",
+                         F_OKM(m) ? f_f32(m + 0x30) : 0.0f,
+                         F_OKM(m) ? f_f32(m + 0x34) : 0.0f);
         if (strlen(line) + strlen(one) + 1 < sizeof line)
             strcat(line, one);
     }

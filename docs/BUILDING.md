@@ -4,6 +4,88 @@ The installer does all of this for you. This page is for people who'd rather run
 
 Everything happens on your own PC. Your disc's files, the C code generated from them and the executable you build never leave it.
 
+## macOS on Apple Silicon (experimental)
+
+The native build is a work in progress, not a claim that the game or either
+edition is playable. It uses Apple Clang and the project's Metal backend
+rather than the toolkit's OpenGL renderer. Install Xcode Command Line Tools,
+CMake 3.20 or newer, SDL2 2.0.14 or newer, OpenSSL, and the Python
+requirements described in the [README](../README.md). CMake must be able to
+find the SDL2 and OpenSSL packages; with Homebrew, for example:
+
+```sh
+export CMAKE_PREFIX_PATH="$(brew --prefix sdl2):$(brew --prefix openssl@3)"
+```
+
+The native host currently refuses to start if `RECOMP_USB` or
+`RECOMP_AC97_READY` is present, even if its value is `0`: safe APU and OHCI
+MMIO dispatch is not implemented. Leave both unset for diagnostics; this does
+not provide working guest audio or a USB gamepad. Guest-created workers cannot
+all be joined yet, so after a guest return the host retains its resources and
+exits the boot process rather than attempting unsafe in-process teardown.
+
+When unset, the native host defaults `RECOMP_PB_EXEC=1` and
+`RECOMP_VBLANK=paced`. Existing values are preserved. Both switches are
+presence-based: even an empty value or `0` enables the executor or vblank.
+`RECOMP_PB_WALK=dma` remains an explicit opt-in.
+
+For supported Metal colour surfaces, the SDL presenter uses the surface's
+frozen pixel format, geometry and sampling dimensions. Supersampled frames
+use a rounded RGB box-average fallback before the gamma ramp; the
+title-selected NV2A reconstruction filter has not yet been implemented.
+Unsupported surface formats or sampling modes fail explicitly.
+
+For diagnostics with a freshly rebuilt native executable,
+`BW_METAL_QUINCUNX_APPROX=1` opts into a narrowly scoped legacy Gaussian
+approximation for quincunx-filtered pitch-linear XRGB textures. This is not
+verified NV2A filtering. The renderer logs a warning at startup and on first
+use; values other than `1`, including an unset or empty value, leave strict
+rejection enabled. Other unsupported texture states still fail explicitly.
+Synthetic tests cover the approximation, but it has not been validated in
+the game.
+
+For a complete build from your disc, use a **new** install directory:
+
+```sh
+build/venv/bin/python tools/build_from_disc.py \
+  --disc "/path/to/your/disc.iso" \
+  --install-dir "/path/to/new/install" \
+  --toolkit "$PWD/build/xboxrecomp"
+```
+
+An optional `--work-dir` may be on another volume; free space is checked
+separately for the work and install volumes.
+
+The script stages `build/Release/bloodwake` under the install directory.
+There is no native launcher yet; run the executable with the install directory
+as its working directory. The native install record lists Original only until
+the other edition and renderer features are validated.
+
+To compile an already verified preparation without replacing it, point CMake
+directly at its generated files and use a separate build directory:
+
+```sh
+cmake -S . -B build/bloodwake-macos \
+  -DCMAKE_BUILD_TYPE=Release -DCMAKE_OSX_ARCHITECTURES=arm64 \
+  -DXBOXRECOMP_DIR="$PWD/build/xboxrecomp" \
+  -DBW_GEN_DIR="$PWD/game/prepare/work/gen" \
+  -DPython3_EXECUTABLE="$PWD/build/venv/bin/python"
+cmake --build build/bloodwake-macos --target bloodwake --parallel
+```
+
+This keeps `game/prepare/work/gen` read-only: the ocean translation byproduct
+is written into the CMake build directory. Keep both generated inputs and
+build outputs private. If the default macOS SDK fails a compiler link test,
+select a compatible installed SDK before running either build command. For
+example, on the machine described in the
+[local toolchain note](UPSTREAM_ISSUES.md#local-toolchain-note):
+
+```sh
+export SDKROOT=/Library/Developer/CommandLineTools/SDKs/MacOSX26.5.sdk
+```
+
+## Windows
+
 ## 1. Install the tools
 | Tool | Version | Where from |
 |---|---|---|

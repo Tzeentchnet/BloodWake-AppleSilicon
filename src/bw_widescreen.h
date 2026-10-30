@@ -26,6 +26,8 @@
  *   BW_ASPECT=16:9 | 21:9 | 64:27 | 1.7778 | 4:3 | display (default: the
  *                          display's own aspect; 16:9 if it can't be read).
  *                          Capped at 2.39 (21:9 monitors); wider is pillarboxed.
+ * The current Metal backend lacks widened targets and marker handling, so
+ * macOS explicitly keeps 4:3 until those renderer capabilities are present.
  */
 #ifndef BW_WIDESCREEN_H
 #define BW_WIDESCREEN_H
@@ -35,7 +37,8 @@
 /* After bw_edition_init(). main.c calls it once the boot knows whether it is
  * a gameplay boot (launch data "SPLASH" mode 1) or the title and menus; the
  * host window (bw_host.c), which runs no game, calls it with 0 to size its
- * window. Logs one "[WS]" line when log is set. */
+ * window. Logs one "[WS]" line when log is set. On macOS an unavailable
+ * widescreen request is always reported, even when log is 0. */
 void  bw_ws_init(int gameplay_boot, int log);
 
 /* The picture's aspect (width / height) the window and the present use. 4/3

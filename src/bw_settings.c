@@ -13,14 +13,29 @@
  * edition that doesn't have that change (Original has none) are dropped, so
  * a file written for one edition can't stop another edition's boot.
  */
+#ifdef _WIN32
 #include <windows.h>
 #include <shlobj.h>
+#else
+#include "platform/win32_compat.h"
+#define _snprintf snprintf
+static int bw_putenv(const char *name, const char *value);
+#define _putenv_s bw_putenv
+#endif
 #include <ctype.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include "bw_edition.h"
 #include "bw_settings.h"
+
+#ifndef _WIN32
+/* Match _putenv_s: an empty value removes the variable. */
+static int bw_putenv(const char *name, const char *value)
+{
+    return *value ? setenv(name, value, 1) : unsetenv(name);
+}
+#endif
 
 typedef struct {
     const char *value, *label, *effect;
@@ -354,15 +369,38 @@ const char *bw_settings_path(void)
 {
     static char path[MAX_PATH];
     const char *e = getenv("BW_SETTINGS");
-    char base[MAX_PATH];
     if (e && *e) {
         if (!_stricmp(e, "none") || !strcmp(e, "0") || !_stricmp(e, "off"))
             return NULL;
+#ifndef _WIN32
+        if (strlen(e) >= sizeof path) {
+            fprintf(stderr, "[SET] settings path is too long\n");
+            return NULL;
+        }
+#endif
         _snprintf(path, sizeof path, "%s", e);
-    } else if (SUCCEEDED(SHGetFolderPathA(NULL, CSIDL_LOCAL_APPDATA, NULL, 0, base)))
+    } else {
+#ifdef _WIN32
+        char base[MAX_PATH];
+        if (!SUCCEEDED(SHGetFolderPathA(NULL, CSIDL_LOCAL_APPDATA, NULL, 0, base)))
+            return NULL;
         _snprintf(path, sizeof path, "%s\\BloodWake\\settings.ini", base);
-    else
-        return NULL;
+#else
+        const char *base = getenv("XDG_CONFIG_HOME");
+        const char *home = getenv("HOME");
+        int n;
+        if (base && *base)
+            n = snprintf(path, sizeof path, "%s/BloodWake/settings.ini", base);
+        else if (home && *home)
+            n = snprintf(path, sizeof path, "%s/.config/BloodWake/settings.ini", home);
+        else
+            return NULL;
+        if (n < 0 || (size_t)n >= sizeof path) {
+            fprintf(stderr, "[SET] settings path is too long\n");
+            return NULL;
+        }
+#endif
+    }
     path[sizeof path - 1] = 0;
     return path;
 }
@@ -398,7 +436,8 @@ static int read_file(const char *path, BwKv *kv, int max)
                 *c = 0;
                 _snprintf(sec, sizeof sec, "%s", line + 1);
                 sec[sizeof sec - 1] = 0;
-                _strlwr(sec);
+                for (char *p = sec; *p; p++)
+                    *p = (char)tolower((unsigned char)*p);
             }
             continue;
         }

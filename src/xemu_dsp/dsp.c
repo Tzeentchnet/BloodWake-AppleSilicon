@@ -35,8 +35,6 @@
 #define INTERRUPT_START_FRAME (1 << 1)
 #define INTERRUPT_DMA_EOL (1 << 7)
 
-static int g_gp_frame_count = 0;
-
 /*
  * Shared peripheral I/O helpers, used by both backends via callbacks.
  */
@@ -112,6 +110,9 @@ DSPState *dsp_init(void *rw_opaque, dsp_scratch_rw_func scratch_rw,
                    dsp_fifo_rw_func fifo_rw, bool is_gp)
 {
     DSPState *dsp = g_new0(DSPState, 1);
+    if (!dsp) {
+        return NULL;
+    }
     dsp->is_gp = is_gp;
     dsp->core.is_gp = is_gp;
 
@@ -125,6 +126,10 @@ DSPState *dsp_init(void *rw_opaque, dsp_scratch_rw_func scratch_rw,
         dsp_c_init(dsp);
     }
 
+    if (!dsp->backend || !dsp->ops) {
+        g_free(dsp);
+        return NULL;
+    }
     dsp_reset(dsp);
 
     return dsp;
@@ -133,6 +138,7 @@ DSPState *dsp_init(void *rw_opaque, dsp_scratch_rw_func scratch_rw,
 void dsp_destroy(DSPState *dsp)
 {
     dsp->ops->finalize(dsp);
+    g_free(dsp->dma.scratch_buf);
     g_free(dsp);
 }
 
@@ -158,9 +164,6 @@ void dsp_bootstrap(DSPState *dsp)
 
 void dsp_start_frame(DSPState *dsp)
 {
-    if (dsp->is_gp) {
-        g_gp_frame_count++;
-    }
     dsp->ops->start_frame(dsp);
 }
 
