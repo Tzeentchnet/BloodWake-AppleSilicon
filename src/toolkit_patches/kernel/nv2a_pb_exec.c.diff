@@ -10,18 +10,23 @@
  #include "kernel.h"   /* XBOX_CONTIG_BASE / XBOX_CONTIG_SIZE */
  #include "xbox_memory_layout.h"   /* xbox_Nv2aFrameCounterFlip */
  #include "nv2a_flip_hold.h"
-@@ -40,6 +43,10 @@
+@@ -40,6 +43,15 @@
  #include "nv2a_vsh_interp.h"
  #include "nv2a_combiner.h"
  #include "nv2a_backend.h"
 +#include "bw_backend_ext.h"   /* Blood Wake carried patch: extended back end */
 +#include "../../gpu/bw_backend_sync.h"
 +#include "../../gpu/bw_gpu_audit.h"   /* Blood Wake: BW_GPU_AUDIT=1 usage counts */
++#if defined(BW_GPU_CAPTURE_FIXTURE)
++#include <pthread.h>
++#include "../../gpu/bw_gpu_capture_fixture.h"
++#include "../../gpu/bw_gpu_capture_internal.h"
++#endif
 +extern int bw_ab_off(const char *fix);  /* Blood Wake: BW_GPU_AB (src/gpu/bw_ab.c) */
  #if defined(_WIN32)
  #include <windows.h>
  #define NV_TLS __declspec(thread)
-@@ -298,13 +305,14 @@
+@@ -298,13 +310,14 @@
       * the time the flip arrives, so dumping the current one dumps the frame
       * that has not been drawn yet -- which is how a correctly rendered
       * sequence came out as 12 black BMPs. */
@@ -37,7 +42,7 @@
      int drawn_stale;      /* set at a flip: the next draw starts a new frame */
      uint64_t pixels;
      uint32_t pixel_max;   /* brightest value any pixel write carried */
-@@ -334,6 +342,8 @@
+@@ -334,6 +347,8 @@
      Nv2aCombiner rc;
      int      rc_seen;
      uint32_t clip_plane_mode;           /* SET_SHADER_CLIP_PLANE_MODE */
@@ -46,7 +51,7 @@
      uint32_t alpha_test, alpha_func, alpha_ref;
      uint32_t fog_enable, fog_mode, fog_color;
      float    fog_param[2];
-@@ -363,6 +373,8 @@
+@@ -363,6 +378,8 @@
      uint32_t batches_ffp;
  } s_gpu;
  
@@ -55,22 +60,81 @@
  /* The last value written to every Kelvin method, as the GPU's register file
   * would hold it. State the executor does not model explicitly (lights,
   * material colours, cull and clip state handed to a back end) is read from
-@@ -375,9 +387,23 @@
+@@ -375,10 +392,115 @@
      return f;
  }
  
 -/* Where BACK_END_WRITE_SEMAPHORE_RELEASE lands; see nv2a_backend.h. */
+-static uint32_t s_sem_va;
+-void nv2a_pb_set_semaphore_target(uint32_t guest_va) { s_sem_va = guest_va; }
++#if defined(BW_GPU_CAPTURE_FIXTURE)
++static pthread_mutex_t s_capture_lock = PTHREAD_MUTEX_INITIALIZER;
++static pthread_t s_capture_owner;
++static BwGpuCapture *s_capture_fixture;
++static int s_capture_seen_method;
++
++static void capture_fixture_method(uint32_t subch, uint32_t method, uint32_t param)
++{
++    pthread_mutex_lock(&s_capture_lock);
++    s_capture_seen_method = 1;
++    if (s_capture_fixture) {
++        if (!pthread_equal(s_capture_owner, pthread_self()))
++            bw_gpu_capture_abort(s_capture_fixture, BW_GPU_CAPTURE_THREAD);
++        else
++            (void)bw_gpu_capture_method(s_capture_fixture, subch, method, param);
++    }
++    pthread_mutex_unlock(&s_capture_lock);
++}
++
++/* The caller holds s_capture_lock through the target store. */
++static void capture_fixture_target(uint32_t guest_va)
++{
++    if (s_capture_fixture) {
++        if (!pthread_equal(s_capture_owner, pthread_self()))
++            bw_gpu_capture_abort(s_capture_fixture, BW_GPU_CAPTURE_THREAD);
++        else
++            (void)bw_gpu_capture_semaphore_target(s_capture_fixture, guest_va);
++    }
++}
++
++static int capture_fixture_active(void)
++{
++    int active;
++    pthread_mutex_lock(&s_capture_lock);
++    active = s_capture_fixture != NULL;
++    pthread_mutex_unlock(&s_capture_lock);
++    return active;
++}
++#endif
++
 +/* Where BACK_END_WRITE_SEMAPHORE_RELEASE lands; see nv2a_backend.h.
 + * The native guest publishes the target to the executor's poll thread. */
 +#if defined(_WIN32)
- static uint32_t s_sem_va;
- void nv2a_pb_set_semaphore_target(uint32_t guest_va) { s_sem_va = guest_va; }
++static uint32_t s_sem_va;
++void nv2a_pb_set_semaphore_target(uint32_t guest_va)
++{
++#if defined(BW_GPU_CAPTURE_FIXTURE)
++    pthread_mutex_lock(&s_capture_lock);
++    capture_fixture_target(guest_va);
++#endif
++    s_sem_va = guest_va;
++#if defined(BW_GPU_CAPTURE_FIXTURE)
++    pthread_mutex_unlock(&s_capture_lock);
++#endif
++}
 +static uint32_t semaphore_target(void) { return s_sem_va; }
 +#else
 +static _Atomic(uint32_t) s_sem_va;
 +void nv2a_pb_set_semaphore_target(uint32_t guest_va)
 +{
++#if defined(BW_GPU_CAPTURE_FIXTURE)
++    pthread_mutex_lock(&s_capture_lock);
++    capture_fixture_target(guest_va);
++#endif
 +    atomic_store_explicit(&s_sem_va, guest_va, memory_order_release);
++#if defined(BW_GPU_CAPTURE_FIXTURE)
++    pthread_mutex_unlock(&s_capture_lock);
++#endif
 +}
 +static uint32_t semaphore_target(void)
 +{
@@ -78,9 +142,44 @@
 +}
 +#endif
  
++#if defined(BW_GPU_CAPTURE_FIXTURE)
++int bw_gpu_capture_fixture_begin(BwGpuCapture *capture)
++{
++    int ok = 0;
++    pthread_mutex_lock(&s_capture_lock);
++    if (!s_capture_fixture && !s_capture_seen_method && !semaphore_target() &&
++        bw_gpu_capture_set_attached(capture, 1)) {
++        s_capture_owner = pthread_self();
++        s_capture_fixture = capture;
++        ok = 1;
++    }
++    pthread_mutex_unlock(&s_capture_lock);
++    return ok;
++}
++
++BwGpuCaptureStatus bw_gpu_capture_fixture_end(void)
++{
++    BwGpuCaptureStatus status = BW_GPU_CAPTURE_ARGUMENT;
++    pthread_mutex_lock(&s_capture_lock);
++    if (s_capture_fixture) {
++        if (!pthread_equal(s_capture_owner, pthread_self())) {
++            bw_gpu_capture_abort(s_capture_fixture, BW_GPU_CAPTURE_THREAD);
++            status = BW_GPU_CAPTURE_THREAD;
++        } else {
++            status = bw_gpu_capture_status(s_capture_fixture);
++            (void)bw_gpu_capture_set_attached(s_capture_fixture, 0);
++            s_capture_fixture = NULL;
++        }
++    }
++    pthread_mutex_unlock(&s_capture_lock);
++    return status;
++}
++#endif
++
  /* Unhandled methods, ranked. The interesting output is not that something was
   * skipped but which things dominate, because that is the order to implement
-@@ -551,7 +577,11 @@
+  * them in. */
+@@ -551,7 +673,11 @@
   * caller sees a degenerate vertex rather than reading past the array. */
  static int fetch_attr(const VertexAttr *a, uint32_t index, float out[4])
  {
@@ -93,7 +192,7 @@
      const uint8_t *p;
      uint32_t i;
  
-@@ -617,17 +647,27 @@
+@@ -617,19 +743,29 @@
  
  static uint32_t surface_bpp(void);
  
@@ -114,15 +213,18 @@
 +    s_gpu.drawn_format = s_gpu.format;
      s_gpu.drawn_x = s_gpu.clip_x; s_gpu.drawn_y = s_gpu.clip_y;
      s_gpu.drawn_w = s_gpu.clip_w; s_gpu.drawn_h = s_gpu.clip_h;
-+}
+ }
+-
 +
 +static void note_drawn(void)
 +{
 +    note_drawn_at(s_backend_present_sync ? dma_resolve(s_gpu.color_offset) : 0);
- }
- 
++}
++
  static uint32_t surface_bpp(void)
-@@ -670,8 +710,11 @@
+ {
+     /* The surface format says it outright (NV097_SET_SURFACE_FORMAT_COLOR).
+@@ -670,8 +806,11 @@
   * after-draw dumps stand down then, or they would put duplicate frames into
   * the sequence. */
  static int s_flip_dumping;
@@ -135,7 +237,7 @@
  {
      const char *prefix = getenv("RECOMP_FB_DUMP");
      const uint8_t *mem = (const uint8_t *)xbox_GetMemoryOffset();
-@@ -714,7 +757,7 @@
+@@ -714,7 +853,7 @@
  
      /* BMP rows run bottom-up. */
      for (y = h; y-- > 0; ) {
@@ -144,19 +246,20 @@
                             + (size_t)(cy + y) * pitch;
          for (x = 0; x < w; x++) {
              uint8_t bgr[3];
-@@ -740,6 +783,11 @@
-     if (seq == 1)
-         fprintf(stderr, "  [GPU] framebuffer dump: %s (%ux%u from 0x%08X %ubpp)\n",
+@@ -742,6 +881,11 @@
                  path, w, h, s_gpu.color_offset, bpp);
-+}
+ }
+-
 +
 +static void dump_surface_bmp(void)
 +{
 +    dump_surface_bmp_at(0);
- }
- 
++}
++
  /* Defined below, next to the rest of the rasteriser; the clear path uses it
-@@ -775,11 +823,41 @@
+  * for RECOMP_RASTER_TEST. */
+ static void raster_triangle(const float a[2], const float b[2],
+@@ -775,9 +919,39 @@
  
  static const Nv2aBackend *s_backend;
  
@@ -166,8 +269,8 @@
  {
      s_backend = backend;
 +    s_backend_present_sync = backend ? present_sync : NULL;
- }
- 
++}
++
 +void nv2a_backend_register(const Nv2aBackend *backend)
 +{
 +    bw_backend_register_with_present_sync(backend, NULL);
@@ -194,12 +297,11 @@
 +    *resolved = s_gpu.drawn_offset ? s_gpu.drawn_resolved
 +                : done ? dma_resolve(done) : 0;
 +    return s_backend_present_sync(*resolved, *pitch);
-+}
+ }
+-
 +
  static int backend_draws(void)
- {
-     return s_backend && s_backend->draw;
-@@ -796,6 +874,27 @@
+@@ -796,6 +970,27 @@
      out->aa_sy           = s_gpu.aa_sy > 1.5f ? 2 : 1;
  }
  
@@ -227,17 +329,16 @@
  /* Render state in the NV2A's own values, gathered from what the executor
   * tracks and from the register mirror for what it does not (culling, the
   * depth range). */
-@@ -882,8 +981,24 @@
-         xbox_swizzle_masks(1u << ((s_gpu.format >> 16) & 0xF),
-                            1u << ((s_gpu.format >> 24) & 0xF),
+@@ -884,6 +1079,22 @@
                             &s_swz_mx, &s_swz_my);
-+}
+ }
+-
 +
 +uint32_t bw_backend_reg(uint32_t method)
 +{
 +    return s_reg[(method & 0x1FFCu) / 4];
- }
- 
++}
++
 +int bw_backend_clear_rect(uint32_t r[4])
 +{
 +    if ((s_gpu.clear_rect_set & 3) != 3)
@@ -252,7 +353,7 @@
  static void clear_surface(uint32_t param)
  {
      uint8_t *mem = (uint8_t *)xbox_GetMemoryOffset();
-@@ -900,8 +1015,40 @@
+@@ -900,8 +1111,40 @@
              return;
          current_surface(&surf);
          current_render_state(&rs);
@@ -293,7 +394,7 @@
          s_gpu.clears++;
          return;
      }
-@@ -1856,6 +2003,49 @@
+@@ -1856,6 +2099,49 @@
      return 1;
  }
  
@@ -343,7 +444,7 @@
  /* One fixed-function vertex, in the shape a vertex program produces. */
  static int ffp_vertex(uint32_t index, Nv2aVshOutput *out)
  {
-@@ -1891,6 +2081,7 @@
+@@ -1891,6 +2177,7 @@
      fetch_attr(texcoord_attr(), index, out->tex[0]);
      for (st = 1; st < 4; st++)
          fetch_attr(&s_gpu.attr[9 + st], index, out->tex[st]);
@@ -351,7 +452,7 @@
      return 1;
  }
  
-@@ -2005,6 +2196,50 @@
+@@ -2005,8 +2292,52 @@
      if (s_bcount + 3 > NV_BACKEND_MAX_VERTS)
          return NULL;
      return &s_bverts[s_bcount];
@@ -370,7 +471,8 @@
 +void bw_backend_ext_register(const BwXBackend *backend)
 +{
 +    s_xbackend = backend;
-+}
+ }
+-
 +
 +void bw_backend_ext_unregister_if_current(const BwXBackend *backend)
 +{
@@ -399,13 +501,17 @@
 +    for (i = 0; i < 4; i++)
 +        for (j = 0; j < 4; j++)
 +            o->tc[i][j] = v->tex[i][j];
- }
- 
++}
++
  static void backend_from_xf(const Nv2aVshOutput *v, Nv2aVertex *o)
-@@ -2024,6 +2259,59 @@
+ {
+     float su = 1.0f, sv = 1.0f;
+@@ -2022,6 +2353,59 @@
+     o->diffuse = pack_color(v->d0);
+     o->u = v->tex[0][0] * su;
      o->v = v->tex[0][1] * sv;
- }
- 
++}
++
 +/* Mip levels a back end may use. Only linear formats have a pitch and one
 + * level; swizzled and DXT formats carry their level count in FORMAT.
 + * CONTROL1's pitch stays set from earlier linear work while those are bound
@@ -457,12 +563,11 @@
 +    xb->clip_plane_mode = s_gpu.clip_plane_mode;
 +    xb->dot_rgbmapping = s_gpu.dot_rgbmapping;
 +    xb->other_stage_input = s_gpu.other_stage_input;
-+}
+ }
+-
 +
  /* `textured`: the batch carried texture coordinates, so the bound texture is
-  * part of it. */
- static void backend_flush(int textured)
-@@ -2037,6 +2325,22 @@
+@@ -2037,6 +2421,22 @@
          return;
      current_surface(&surf);
      current_render_state(&rs);
@@ -485,7 +590,7 @@
      batch.vertices = s_bverts;
      batch.count = s_bcount;
      batch.texture = NULL;
-@@ -2049,14 +2353,14 @@
+@@ -2049,14 +2449,14 @@
          tex.color  = s_gpu.texs[0].color;
          tex.addr_u = s_gpu.texs[0].addr_u;
          tex.addr_v = s_gpu.texs[0].addr_v;
@@ -502,7 +607,7 @@
  }
  
  /* One triangle by vertex index: gather position and, if the batch has one,
-@@ -2124,10 +2428,39 @@
+@@ -2124,10 +2524,39 @@
   * the title does reads it back, so a float buffer per zeta offset is enough. */
  #define NV_ZBUF_W 1280   /* 640x480 at 2x2 anti-aliasing */
  #define NV_ZBUF_H 1024
@@ -543,7 +648,7 @@
  static float zclear_value(void)
  {
      /* Zeta format in SURFACE_FORMAT bits 4-7: 1 is Z16, 2 is Z24S8. */
-@@ -2136,36 +2469,49 @@
+@@ -2136,36 +2565,49 @@
                     : (float)(s_gpu.zstencil_clear >> 8);
  }
  
@@ -605,7 +710,7 @@
  static int depth_pass(float z, float stored)
  {
      switch (s_gpu.depth_func) {                   /* GL enums, as the NV2A */
-@@ -2240,6 +2586,35 @@
+@@ -2240,6 +2682,35 @@
                       float out[4])
  {
      uint32_t texel, mag = (t->filter >> 24) & 0xF, min = (t->filter >> 16) & 0xFF;
@@ -641,11 +746,10 @@
      if (tex_size_from_format(t->color)) {
          u *= (float)t->width;
          v *= (float)t->height;
-@@ -2272,8 +2647,105 @@
-         nv2a_rc_unpack(texel, out);
-     else
+@@ -2274,6 +2745,103 @@
          out[0] = out[1] = out[2] = out[3] = 1.0f;
-+}
+ }
+-
 +
 +/* Cube map `t` in direction (x, y, z): D3D's face order (+X, -X, +Y, -Y, +Z,
 + * -Z) and face-coordinate rules. */
@@ -693,8 +797,8 @@
 +        in = 0;
 +    dot_map(t[in], (s_gpu.dot_rgbmapping >> ((j - 1) * 4)) & 0xF, v);
 +    return tcs[j][0] * v[0] + tcs[j][1] * v[1] + tcs[j][2] * v[2];
- }
- 
++}
++
 +static int dot_modes_on(void)
 +{
 +    static int v = -1;
@@ -747,7 +851,7 @@
  /* What texture stage `st` contributes, by its SHADER_STAGE_PROGRAM mode
   * (xemu psh.c). Returns 0 when a clip-plane stage kills the pixel. */
  static int rc_stage_fetch(int st, const float c[4], float out[4])
-@@ -2289,27 +2761,13 @@
+@@ -2289,27 +2857,13 @@
      case 1: case 2:                               /* PROJECT2D / 3D */
          rc_texel(t, 0, c[0] / q, c[1] / q, out);
          return 1;
@@ -777,7 +881,7 @@
      case 4:                                       /* PASSTHRU */
          for (j = 0; j < 4; j++)
              out[j] = c[j] < 0.0f ? 0.0f : (c[j] > 1.0f ? 1.0f : c[j]);
-@@ -2356,6 +2814,46 @@
+@@ -2356,6 +2910,46 @@
      return f < 0.0f ? 0.0f : (f > 1.0f ? 1.0f : f);
  }
  
@@ -824,7 +928,7 @@
  static int alpha_test_pass(float a)
  {
      int v = (int)(a * 255.0f + 0.5f), r = (int)(s_gpu.alpha_ref & 0xFF);
-@@ -2379,6 +2877,8 @@
+@@ -2379,6 +2973,8 @@
      const Nv2aVshOutput *va, *vb, *vc;
      const float *a, *b, *c;
      float iw[3], uv[3][2], stc[3][4][4], vfog[3], fogc[4], inv_area;
@@ -833,7 +937,7 @@
      float *zb;
      int minx, maxx, miny, maxy, use_rc, textured;
  } XfTri;
-@@ -2405,7 +2905,7 @@
+@@ -2405,7 +3001,7 @@
                  continue;
              /* w1 is opposite a, w2 opposite b, w0 opposite c. */
              l0 = w1 * T->inv_area; l1 = w2 * T->inv_area; l2 = w0 * T->inv_area;
@@ -842,7 +946,7 @@
              {
                  float *zp = T->zb ? &T->zb[(size_t)y * NV_ZBUF_W + x] : NULL;
                  int shade = (s_gpu.color_mask & 0x01010101u) || s_gpu.alpha_test;
-@@ -2418,26 +2918,39 @@
+@@ -2418,26 +3014,39 @@
                  }
                  argb = 0;
                  if (shade) {
@@ -891,10 +995,12 @@
                          }
                          if (!keep)
                              continue;
-@@ -2645,6 +3158,38 @@
+@@ -2643,6 +3252,38 @@
+     q->t.va = &q->v[0]; q->t.vb = &q->v[1]; q->t.vc = &q->v[2];
+     q->t.a = q->v[0].pos; q->t.b = q->v[1].pos; q->t.c = q->v[2].pos;
      s_xfq_px += (long)(T->maxx - T->minx) * (T->maxy - T->miny);
- }
- 
++}
++
 +/* Blood Wake carried patch: polygon offset (SET_POLY_OFFSET_FILL_ENABLE 0x0338,
 + * SET_POLYGON_OFFSET_SCALE_FACTOR 0x0384, _BIAS 0x0388), which the executor
 + * never applied. Blood Wake enables it for about 44% of mission draws
@@ -925,12 +1031,11 @@
 +    dzdx = fabsf(dzdx) * aa_scale_x();
 +    dzdy = fabsf(dzdy) * aa_scale_y();
 +    return units + factor * (dzdx > dzdy ? dzdx : dzdy);
-+}
+ }
+-
 +
  static void raster_xf_triangle(const Nv2aVshOutput *va, const Nv2aVshOutput *vb,
-                                const Nv2aVshOutput *vc)
- {
-@@ -2663,6 +3208,7 @@
+@@ -2663,6 +3304,7 @@
      T.bpp = surface_bpp();
      T.textured = s_gpu.texs[0].valid && !s_xf_no_tex;
      T.use_rc = s_gpu.rc_seen && !no_rc;
@@ -938,7 +1043,7 @@
      T.va = va; T.vb = vb; T.vc = vc;
  
      v[0] = va; v[1] = vb; v[2] = vc;
-@@ -2685,6 +3231,15 @@
+@@ -2685,6 +3327,15 @@
              backend_from_xf(va, &o[0]);
              backend_from_xf(vb, &o[1]);
              backend_from_xf(vc, &o[2]);
@@ -954,7 +1059,7 @@
              s_bcount += 3;
          }
          return;
-@@ -2715,7 +3270,7 @@
+@@ -2715,7 +3366,7 @@
              for (st = 0; st < 4; st++)
                  for (j = 0; j < 4; j++)
                      T.stc[k][st][j] = v[k]->tex[st][j] * T.iw[k];
@@ -963,7 +1068,7 @@
          }
          /* FOG_COLOR is R in bits 0-7, the reverse of a D3DCOLOR. */
          nv2a_rc_unpack(s_gpu.fog_color, T.fogc);
-@@ -2739,6 +3294,7 @@
+@@ -2739,6 +3390,7 @@
      }
      s_gpu.xf_drawn++;
      T.inv_area = 1.0f / area;
@@ -971,7 +1076,7 @@
  
      xf_queue_push(&T);
      (void)cnt;
-@@ -2911,6 +3467,15 @@
+@@ -2911,6 +3563,15 @@
       * keeps 1/w finite. -0 stays behind the eye and is clipped, as on xemu. */
      if (out->pos[3] == 0.0f && !signbit(out->pos[3]))
          out->pos[3] = 1.0f;
@@ -987,7 +1092,7 @@
      /* The program's viewport is in logical pixels; the surface may be larger
       * (anti-aliasing). */
      out->pos[0] *= s_gpu.aa_sx;
-@@ -2925,17 +3490,766 @@
+@@ -2925,17 +3586,766 @@
      s_xf_o[0] = of[0] * s_gpu.aa_sx;
      s_xf_o[1] = of[1] * s_gpu.aa_sy;
      s_xf_o[2] = of[2];
@@ -1014,8 +1119,8 @@
 +        if (j == s_gpu.blend_npairs && j < 16)
 +            s_gpu.blend_pairs[s_gpu.blend_npairs++] = pair;
 +    }
- }
- 
++}
++
 +static void note_xf_formats(void)
 +{
 +    uint32_t i;
@@ -1705,7 +1810,8 @@
 +            raster_xf_clipped(&q[1], &q[2], &q[3]);
 +        }
 +    }
-+}
+ }
+-
 +
  static void raster_batch_program(void)
  {
@@ -1713,12 +1819,9 @@
 +    static int vcache = -1;
 +    int use_cache;
  
--    if (!s_xf && !(s_xf = (Nv2aVshOutput *)calloc(NV_MAX_INDICES, sizeof *s_xf)))
 +    if (gpu_vsh_batch()) {
 +        s_bw_audit_path = 'G';
-         return;
--    for (i = 0; i < n; i++)
--        if (!transform_vertex(s_gpu.idx[i], &s_xf[i]))
++        return;
 +    }
 +    s_bw_audit_path = batch_uses_program() ? 'C' : 'F';
 +    /* Blood Wake test aid: BW_GPU_AB=hideffp leaves fixed-function batches
@@ -1726,8 +1829,10 @@
 +    if (s_bw_audit_path == 'F' && bw_ab_off("hideffp"))
 +        return;
 +
-+    if (!s_xf && !(s_xf = (Nv2aVshOutput *)calloc(NV_MAX_INDICES, sizeof *s_xf)))
-+        return;
+     if (!s_xf && !(s_xf = (Nv2aVshOutput *)calloc(NV_MAX_INDICES, sizeof *s_xf)))
+         return;
+-    for (i = 0; i < n; i++)
+-        if (!transform_vertex(s_gpu.idx[i], &s_xf[i]))
 +    if (vcache < 0) {
 +        const char *e = getenv("BW_VCACHE");
 +        vcache = !(e && e[0] == '0');
@@ -1757,7 +1862,7 @@
      xf_set_viewport();
      {
          const VertexAttr *tc = texcoord_attr();
-@@ -2975,14 +4289,7 @@
+@@ -2975,14 +4385,7 @@
              }
          }
      }
@@ -1773,7 +1878,7 @@
      {
          /* RECOMP_VSH_TRACE=<n>: print n program batches -- attribute setup,
           * raw inputs, key constants, and what came out. */
-@@ -3021,18 +4328,7 @@
+@@ -3021,18 +4424,7 @@
                          s_xf[i].pos[3]);
          }
      }
@@ -1793,7 +1898,7 @@
  
      switch (s_gpu.prim) {
      case NV_PRIM_TRIANGLES:
-@@ -3040,8 +4336,16 @@
+@@ -3040,8 +4432,16 @@
              raster_xf_clipped(&s_xf[i], &s_xf[i+1], &s_xf[i+2]);
          break;
      case NV_PRIM_TRIANGLE_STRIP:
@@ -1812,7 +1917,7 @@
          break;
      case NV_PRIM_TRIANGLE_FAN:
      case NV_PRIM_POLYGON:
-@@ -3060,13 +4364,20 @@
+@@ -3060,13 +4460,20 @@
              raster_xf_clipped(&s_xf[i], &s_xf[i+3], &s_xf[i+2]);
          }
          break;
@@ -1834,7 +1939,7 @@
  }
  
  static void raster_batch(void)
-@@ -3075,7 +4386,9 @@
+@@ -3075,7 +4482,9 @@
      uint32_t before = s_gpu.tris_drawn;
      int textured = 0;
  
@@ -1845,7 +1950,7 @@
          return;
      if (batch_uses_program() || batch_is_ffp()) {
          raster_batch_program();
-@@ -3083,8 +4396,10 @@
+@@ -3083,8 +4492,10 @@
      }
      if (!batch_is_screen_space()) {
          s_gpu.batches_untransformed++;
@@ -1856,7 +1961,7 @@
  
      /* Count why, once per batch: the texture stage cannot change inside one. */
      {
-@@ -3108,9 +4423,15 @@
+@@ -3108,9 +4519,15 @@
                             vertex_color(s_gpu.idx[i]));
          break;
      case NV_PRIM_TRIANGLE_STRIP:
@@ -1875,7 +1980,7 @@
          break;
      case NV_PRIM_TRIANGLE_FAN:
      case NV_PRIM_POLYGON:
-@@ -3204,6 +4525,55 @@
+@@ -3204,6 +4621,55 @@
      }
  }
  
@@ -1931,7 +2036,7 @@
  static void draw_primitive(void)
  {
      float v[4];
-@@ -3211,6 +4581,7 @@
+@@ -3211,6 +4677,7 @@
  
      if (!s_gpu.prim || !s_gpu.idx_count)
          return;
@@ -1939,7 +2044,7 @@
      s_gpu.draws++;
      if ((s_gpu.draws % 200) == 0)
          fprintf(stderr, "  [GPU] draw #%u\n", s_gpu.draws);
-@@ -3236,6 +4607,8 @@
+@@ -3236,6 +4703,8 @@
          uint32_t t0 = s_gpu.tris_drawn;
          uint64_t p0 = s_gpu.pixels;
          raster_batch();
@@ -1948,7 +2053,7 @@
          if (s_ftrace == 2) {
              fprintf(stderr, "[FTRACE] %s prim %u n %u surf %08X %ux%u+%u+%u"
                      " pitch %u | tex %s %08X %ux%u fmt %02X | blend %u %X/%X"
-@@ -3284,7 +4657,13 @@
+@@ -3284,7 +4753,13 @@
          }
      }
  
@@ -1963,7 +2068,7 @@
          static int shown;
          if (shown++ < 6) {
              fprintf(stderr, "  [GPU] prim %u, %u indices, pos attr:"
-@@ -3659,6 +5038,65 @@
+@@ -3659,6 +5134,65 @@
   * walks nothing, leaves DMA_GET behind PUT and the PFB flush unacknowledged.
   * Both run on the ack thread, so the state needs no lock. */
  static XboxFlipHold s_flip_hold;
@@ -2029,7 +2134,7 @@
  static uint32_t s_vbl_count;        /* the vblank count last seen to move */
  static uint64_t s_vbl_moved_ns;
  /* The vblank count when the walk that reaches a FLIP_STALL began, which is
-@@ -3671,7 +5109,7 @@
+@@ -3671,7 +5205,7 @@
  
  void nv2a_pb_exec_walk_begin(void)
  {
@@ -2038,7 +2143,7 @@
  }
  
  /* RECOMP_FLIP_PACING: unset or 0 off (flips complete at once and frame
-@@ -3705,7 +5143,12 @@
+@@ -3705,7 +5239,12 @@
   * would only ever end on its timeout. */
  static uint32_t flip_clock(uint64_t now_ns, int *ok)
  {
@@ -2052,7 +2157,7 @@
      if (c != s_vbl_count) {
          s_vbl_count = c;
          s_vbl_moved_ns = now_ns;
-@@ -3742,22 +5185,155 @@
+@@ -3742,22 +5281,162 @@
      h->holds = h->timeouts = h->clock_stops = h->nonop = 0;
      h->iv[0] = h->iv[1] = h->iv[2] = h->iv[3] = 0;
      h->held_ns = 0;
@@ -2094,7 +2199,11 @@
 +        const char *e = getenv("BW_PB_BULK");
 +        on = !(e && e[0] == '0');
 +    }
-+    if (!on || !n || !s_bw_exec_inited || s_bw_mtrace_on != 0 || bw_audit_on())
++    if (!on || !n || !s_bw_exec_inited || s_bw_mtrace_on != 0 || bw_audit_on()
++#if defined(BW_GPU_CAPTURE_FIXTURE)
++        || capture_fixture_active()
++#endif
++        )
 +        return 0;
 +    s_reg[NV097_ARRAY_ELEMENT16 / 4] = p[n - 1];
 +    s_bw_idx16_bulk += n;
@@ -2187,6 +2296,9 @@
  {
      static int inited;
  
++#if defined(BW_GPU_CAPTURE_FIXTURE)
++    capture_fixture_method(subch, method, param);
++#endif
 +    bw_mtrace(subch, method, param);
 +    if (bw_audit_on())                    /* Blood Wake: BW_GPU_AUDIT (src/gpu/bw_gpu_audit.c) */
 +        bw_audit_method(subch, method, param);
@@ -2212,7 +2324,7 @@
          s_gpu.aa_sx = s_gpu.aa_sy = 1.0f;
          /* Stencil state as the hardware resets it: GL_ALWAYS, masks 0xFF,
           * GL_KEEP, until the title says otherwise. */
-@@ -3844,7 +5420,7 @@
+@@ -3844,7 +5523,7 @@
  
          if (!r)
              return;
@@ -2221,7 +2333,7 @@
              uint32_t va = xbox_Nv2aFenceWordVa();
  
              if (va) {
-@@ -3913,6 +5489,8 @@
+@@ -3913,6 +5592,8 @@
          break;
      case 0x1E70: s_gpu.rc.stage_program = param; break;
      case 0x17F8: s_gpu.clip_plane_mode = param; break;
@@ -2230,7 +2342,7 @@
  
      /* Alpha test and fog. */
      case 0x0300: s_gpu.alpha_test = param; break;
-@@ -3959,6 +5537,11 @@
+@@ -3959,6 +5640,11 @@
              fprintf(stderr, "[FTRACE] clear %X surf %08X %ux%u colour %08X%c",
                      param, s_gpu.color_offset, s_gpu.clip_w, s_gpu.clip_h,
                      s_gpu.clear_color, 10);
@@ -2242,7 +2354,7 @@
          clear_surface(param);
          if (param & 0x01)                         /* Z */
              zbuf_clear();
-@@ -4015,6 +5598,7 @@
+@@ -4015,6 +5701,7 @@
  
      case NV097_ARRAY_ELEMENT16:
          /* Two 16-bit indices per parameter word. */
@@ -2250,7 +2362,7 @@
          if (s_gpu.prim && s_gpu.idx_count + 2 <= NV_MAX_INDICES) {
              s_gpu.idx[s_gpu.idx_count++] = (uint16_t)(param & 0xFFFF);
              s_gpu.idx[s_gpu.idx_count++] = (uint16_t)(param >> 16);
-@@ -4026,16 +5610,23 @@
+@@ -4026,16 +5713,23 @@
              s_gpu.idx[s_gpu.idx_count++] = param;
          break;
      case NV097_NO_OPERATION:
@@ -2276,7 +2388,7 @@
          return;
  
      case NV097_SET_FLIP_READ:
-@@ -4069,12 +5660,16 @@
+@@ -4069,12 +5763,16 @@
           * host frame, and that time counts against the hold. */
          uint64_t stall_ns = xbox_HostNowNs();
          int clock_ok;
@@ -2293,7 +2405,7 @@
          /* The stall ends when the buffer being read is the one just finished.
           * There is no scanout here to wait for, so that is now; when the
           * title may go on is the flip hold's (below). */
-@@ -4082,6 +5677,9 @@
+@@ -4082,6 +5780,9 @@
          /* And this is a completed swap, which is what a title's own swap
           * counter counts -- see xbox_Nv2aFrameCounterFlip. */
          xbox_Nv2aFrameCounterFlip();
@@ -2303,7 +2415,7 @@
          /* Hand the window a copy of the frame just finished.
           *
           * The buffer the title has finished is the one the last batch drew
-@@ -4096,18 +5694,29 @@
+@@ -4096,18 +5797,29 @@
              xbox_FramebufferWindowFrameStats(s_gpu.draws - draws_at_flip);
              draws_at_flip = s_gpu.draws;
          }
@@ -2315,13 +2427,12 @@
                                                 : s_gpu.color_offset;
 -            uint32_t pitch = s_gpu.drawn_offset ? s_gpu.drawn_pitch
 -                                                : s_gpu.pitch;
--            if (done) {
++            uint32_t pitch = synchronized ? snapshot_pitch
++                             : s_gpu.drawn_offset ? s_gpu.drawn_pitch : s_gpu.pitch;
+             if (done) {
 -                xbox_FramebufferWindowSet(dma_resolve(done), pitch);
 -                xbox_FramebufferWindowSetAA(s_gpu.aa_sy > 1.5f ? 2 : 1);
 -                xbox_FramebufferWindowPresent(dma_resolve(done), pitch);
-+            uint32_t pitch = synchronized ? snapshot_pitch
-+                             : s_gpu.drawn_offset ? s_gpu.drawn_pitch : s_gpu.pitch;
-+            if (done) {
 +                xbox_FramebufferWindowSet(synchronized ? snapshot_va : dma_resolve(done), pitch);
 +                xbox_FramebufferWindowSetAA(synchronized ? snapshot_aa_sy
 +                                                        : (s_gpu.aa_sy > 1.5f ? 2 : 1));
@@ -2340,7 +2451,7 @@
          {
              /* RECOMP_FB_DUMP_FLIPS: dump every presented frame, not one per
               * report -- a consecutive sequence, which is what a headless
-@@ -4125,13 +5734,22 @@
+@@ -4125,13 +5837,22 @@
                      if (f) { fclose(f); on = 1; }
                  }
                  s_flip_dumping = on;
@@ -2365,7 +2476,7 @@
  
          if (verbose) {
              static unsigned n;
-@@ -4151,6 +5769,14 @@
+@@ -4151,6 +5872,14 @@
           * early. */
          if (nv2a_pb_exec_flip_pacing()) {
              extern int nv2a_pb_scan_in_call(void);
@@ -2380,7 +2491,7 @@
              xbox_FlipHoldStall(&s_flip_hold, stall_vbl, stall_ns,
                                 clock_ok && !nv2a_pb_scan_in_call());
          }
-@@ -4162,13 +5788,16 @@
+@@ -4162,13 +5891,16 @@
          s_gpu.xf_mode = param;
          break;
      case 0x1E98:                                  /* _PROGRAM_CXT_WRITE_EN */
@@ -2397,7 +2508,7 @@
          break;
      case 0x1EA4:                                  /* _CONSTANT_LOAD */
          nv2a_vsh_set_constant_load(param);
-@@ -4244,6 +5873,7 @@
+@@ -4244,6 +5976,7 @@
          }
          if (method >= 0x0B00 && method < 0x0B80) {    /* TRANSFORM_PROGRAM(i) */
              nv2a_vsh_program_word(param);
@@ -2405,7 +2516,7 @@
              break;
          }
          if (method >= 0x0B80 && method < 0x0C00) {    /* TRANSFORM_CONSTANT(i) */
-@@ -4509,6 +6139,11 @@
+@@ -4509,6 +6242,11 @@
              fprintf(stderr, " v%u:%u/%u", s_gpu.xf_fmt[j] >> 8,
                      s_gpu.xf_fmt[j] & 15, (s_gpu.xf_fmt[j] >> 4) & 15);
          fprintf(stderr, "\n");
@@ -2417,7 +2528,7 @@
      }
  
      /* And of the batches that did rasterise, how many sampled anything. A menu
-@@ -4572,3 +6207,13 @@
+@@ -4572,3 +6310,13 @@
          s_unhandled_slot[(s_unhandled[i].method & 0x1FFC) / 4] = (uint16_t)(i + 1);
      fflush(stderr);
  }

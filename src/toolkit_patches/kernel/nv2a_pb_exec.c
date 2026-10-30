@@ -46,6 +46,11 @@
 #include "bw_backend_ext.h"   /* Blood Wake carried patch: extended back end */
 #include "../../gpu/bw_backend_sync.h"
 #include "../../gpu/bw_gpu_audit.h"   /* Blood Wake: BW_GPU_AUDIT=1 usage counts */
+#if defined(BW_GPU_CAPTURE_FIXTURE)
+#include <pthread.h>
+#include "../../gpu/bw_gpu_capture_fixture.h"
+#include "../../gpu/bw_gpu_capture_internal.h"
+#endif
 extern int bw_ab_off(const char *fix);  /* Blood Wake: BW_GPU_AB (src/gpu/bw_ab.c) */
 #if defined(_WIN32)
 #include <windows.h>
@@ -387,21 +392,112 @@ static float reg_f(uint32_t method)
     return f;
 }
 
+#if defined(BW_GPU_CAPTURE_FIXTURE)
+static pthread_mutex_t s_capture_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_t s_capture_owner;
+static BwGpuCapture *s_capture_fixture;
+static int s_capture_seen_method;
+
+static void capture_fixture_method(uint32_t subch, uint32_t method, uint32_t param)
+{
+    pthread_mutex_lock(&s_capture_lock);
+    s_capture_seen_method = 1;
+    if (s_capture_fixture) {
+        if (!pthread_equal(s_capture_owner, pthread_self()))
+            bw_gpu_capture_abort(s_capture_fixture, BW_GPU_CAPTURE_THREAD);
+        else
+            (void)bw_gpu_capture_method(s_capture_fixture, subch, method, param);
+    }
+    pthread_mutex_unlock(&s_capture_lock);
+}
+
+/* The caller holds s_capture_lock through the target store. */
+static void capture_fixture_target(uint32_t guest_va)
+{
+    if (s_capture_fixture) {
+        if (!pthread_equal(s_capture_owner, pthread_self()))
+            bw_gpu_capture_abort(s_capture_fixture, BW_GPU_CAPTURE_THREAD);
+        else
+            (void)bw_gpu_capture_semaphore_target(s_capture_fixture, guest_va);
+    }
+}
+
+static int capture_fixture_active(void)
+{
+    int active;
+    pthread_mutex_lock(&s_capture_lock);
+    active = s_capture_fixture != NULL;
+    pthread_mutex_unlock(&s_capture_lock);
+    return active;
+}
+#endif
+
 /* Where BACK_END_WRITE_SEMAPHORE_RELEASE lands; see nv2a_backend.h.
  * The native guest publishes the target to the executor's poll thread. */
 #if defined(_WIN32)
 static uint32_t s_sem_va;
-void nv2a_pb_set_semaphore_target(uint32_t guest_va) { s_sem_va = guest_va; }
+void nv2a_pb_set_semaphore_target(uint32_t guest_va)
+{
+#if defined(BW_GPU_CAPTURE_FIXTURE)
+    pthread_mutex_lock(&s_capture_lock);
+    capture_fixture_target(guest_va);
+#endif
+    s_sem_va = guest_va;
+#if defined(BW_GPU_CAPTURE_FIXTURE)
+    pthread_mutex_unlock(&s_capture_lock);
+#endif
+}
 static uint32_t semaphore_target(void) { return s_sem_va; }
 #else
 static _Atomic(uint32_t) s_sem_va;
 void nv2a_pb_set_semaphore_target(uint32_t guest_va)
 {
+#if defined(BW_GPU_CAPTURE_FIXTURE)
+    pthread_mutex_lock(&s_capture_lock);
+    capture_fixture_target(guest_va);
+#endif
     atomic_store_explicit(&s_sem_va, guest_va, memory_order_release);
+#if defined(BW_GPU_CAPTURE_FIXTURE)
+    pthread_mutex_unlock(&s_capture_lock);
+#endif
 }
 static uint32_t semaphore_target(void)
 {
     return atomic_load_explicit(&s_sem_va, memory_order_acquire);
+}
+#endif
+
+#if defined(BW_GPU_CAPTURE_FIXTURE)
+int bw_gpu_capture_fixture_begin(BwGpuCapture *capture)
+{
+    int ok = 0;
+    pthread_mutex_lock(&s_capture_lock);
+    if (!s_capture_fixture && !s_capture_seen_method && !semaphore_target() &&
+        bw_gpu_capture_set_attached(capture, 1)) {
+        s_capture_owner = pthread_self();
+        s_capture_fixture = capture;
+        ok = 1;
+    }
+    pthread_mutex_unlock(&s_capture_lock);
+    return ok;
+}
+
+BwGpuCaptureStatus bw_gpu_capture_fixture_end(void)
+{
+    BwGpuCaptureStatus status = BW_GPU_CAPTURE_ARGUMENT;
+    pthread_mutex_lock(&s_capture_lock);
+    if (s_capture_fixture) {
+        if (!pthread_equal(s_capture_owner, pthread_self())) {
+            bw_gpu_capture_abort(s_capture_fixture, BW_GPU_CAPTURE_THREAD);
+            status = BW_GPU_CAPTURE_THREAD;
+        } else {
+            status = bw_gpu_capture_status(s_capture_fixture);
+            (void)bw_gpu_capture_set_attached(s_capture_fixture, 0);
+            s_capture_fixture = NULL;
+        }
+    }
+    pthread_mutex_unlock(&s_capture_lock);
+    return status;
 }
 #endif
 
@@ -5223,7 +5319,11 @@ int nv2a_pb_exec_idx16(const uint32_t *p, uint32_t n)
         const char *e = getenv("BW_PB_BULK");
         on = !(e && e[0] == '0');
     }
-    if (!on || !n || !s_bw_exec_inited || s_bw_mtrace_on != 0 || bw_audit_on())
+    if (!on || !n || !s_bw_exec_inited || s_bw_mtrace_on != 0 || bw_audit_on()
+#if defined(BW_GPU_CAPTURE_FIXTURE)
+        || capture_fixture_active()
+#endif
+        )
         return 0;
     s_reg[NV097_ARRAY_ELEMENT16 / 4] = p[n - 1];
     s_bw_idx16_bulk += n;
@@ -5316,6 +5416,9 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
 {
     static int inited;
 
+#if defined(BW_GPU_CAPTURE_FIXTURE)
+    capture_fixture_method(subch, method, param);
+#endif
     bw_mtrace(subch, method, param);
     if (bw_audit_on())                    /* Blood Wake: BW_GPU_AUDIT (src/gpu/bw_gpu_audit.c) */
         bw_audit_method(subch, method, param);

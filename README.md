@@ -126,6 +126,10 @@ not require the toolkit's OpenGL backend.
 The [local toolchain note](docs/UPSTREAM_ISSUES.md#local-toolchain-note)
 describes an SDK selection needed on the development machine.
 
+For a bounded, isolated native boot, see the
+[diagnostic runner](docs/BUILDING.md#isolated-native-diagnostic). Its logs and
+any game-derived output must remain private.
+
 ## Windows upstream
 
 The existing Windows build remains available through

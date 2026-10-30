@@ -15,8 +15,10 @@ target_compile_options(bw_fault_test PRIVATE -Wall -Wextra -Werror
     -Wno-deprecated-declarations)
 
 enable_testing()
-add_test(NAME bw_fault_test COMMAND bw_fault_test)
-set_tests_properties(bw_fault_test PROPERTIES TIMEOUT 20)
+add_test(NAME bw_fault_test COMMAND bw_fault_test --non-nested)
+add_test(NAME bw_fault_nested_test COMMAND bw_fault_test --nested-only)
+set_tests_properties(bw_fault_test bw_fault_nested_test PROPERTIES TIMEOUT 20)
+set_tests_properties(bw_fault_nested_test PROPERTIES SKIP_RETURN_CODE 77)
 
 add_executable(bw_boot_test test_boot.c ../../src/bw_macos_boot.c)
 target_include_directories(bw_boot_test PRIVATE ../../src)

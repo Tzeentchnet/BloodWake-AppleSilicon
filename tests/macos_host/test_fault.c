@@ -10,6 +10,7 @@
 #include <string.h>
 #include <sys/mman.h>
 #include <sys/wait.h>
+#include <time.h>
 #include <unistd.h>
 
 #if defined(__APPLE__) && defined(__aarch64__)
@@ -19,6 +20,28 @@ static volatile uint32_t *s_mmio;
 static uint8_t s_registers[0x4000];
 static volatile sig_atomic_t s_decline, s_nested, s_forwarded;
 static _Thread_local int s_tls_count;
+
+#if defined(__has_feature)
+#if __has_feature(thread_sanitizer)
+#define BW_FAULT_TEST_TSAN 1
+#endif
+#endif
+#ifndef BW_FAULT_TEST_TSAN
+#define BW_FAULT_TEST_TSAN 0
+#endif
+
+enum { NESTED_MASK_BLOCKED = 79 };
+
+static int nested_fault_signals_unblocked(void)
+{
+    sigset_t mask;
+    int segv, bus;
+    if (sigprocmask(SIG_SETMASK, NULL, &mask) != 0)
+        return -1;
+    segv = sigismember(&mask, SIGSEGV);
+    bus = sigismember(&mask, SIGBUS);
+    return segv < 0 || bus < 0 ? -1 : !segv && !bus;
+}
 
 static uint64_t read_register(void *dev, uint32_t off, int size)
 {
@@ -47,8 +70,12 @@ int xbox_Ac97PosixFault(void *ucv, uintptr_t fault)
         return 0;
     s_tls_count++;
     errno = EIO;
-    if (s_nested)
+    if (s_nested) {
+        int unblocked = nested_fault_signals_unblocked();
+        if (unblocked != 1)
+            _exit(unblocked == 0 ? NESTED_MASK_BLOCKED : 78);
         *(volatile uint32_t *)(s_guest + 0xfe800100u) = 1;
+    }
     if (s_decline)
         return 0;
     return mmio_emulate_a64((ucontext_t *)ucv,
@@ -64,10 +91,61 @@ static void previous_handler(int sig, siginfo_t *si, void *ucv)
     A64_CTX_PC((ucontext_t *)ucv) += 4;
 }
 
+static int wait_child_bounded(pid_t pid, int *status, long timeout_ms)
+{
+    struct timespec deadline, now, delay = {0, 10000000};
+    int result = 0;
+    pid_t waited;
+
+    if (clock_gettime(CLOCK_MONOTONIC, &deadline) != 0) {
+        perror("clock_gettime");
+        result = -1;
+        goto terminate;
+    }
+    deadline.tv_sec += timeout_ms / 1000;
+    deadline.tv_nsec += (timeout_ms % 1000) * 1000000;
+    if (deadline.tv_nsec >= 1000000000) {
+        deadline.tv_sec++;
+        deadline.tv_nsec -= 1000000000;
+    }
+    for (;;) {
+        waited = waitpid(pid, status, WNOHANG);
+        if (waited == pid)
+            return 1;
+        if (waited < 0 && errno != EINTR) {
+            perror("waitpid");
+            return -1;
+        }
+        if (clock_gettime(CLOCK_MONOTONIC, &now) != 0) {
+            perror("clock_gettime");
+            result = -1;
+            break;
+        }
+        if (now.tv_sec > deadline.tv_sec ||
+            (now.tv_sec == deadline.tv_sec && now.tv_nsec >= deadline.tv_nsec))
+            break;
+        nanosleep(&delay, NULL);
+    }
+
+terminate:
+    if (kill(pid, SIGKILL) != 0 && errno != ESRCH) {
+        perror("kill child");
+        return -1;
+    }
+    do {
+        waited = waitpid(pid, status, 0);
+    } while (waited < 0 && errno == EINTR);
+    if (waited != pid) {
+        perror("reap child");
+        return -1;
+    }
+    return result;
+}
+
 static int child_fails_closed(int nested)
 {
     pid_t pid = fork();
-    int status;
+    int status, waited;
     if (pid == 0) {
         bw_posix_fault_uninstall();
         signal(SIGSEGV, SIG_DFL);
@@ -81,8 +159,18 @@ static int child_fails_closed(int nested)
         *s_mmio = 0x1234;
         _exit(81);
     }
-    if (pid < 0 || waitpid(pid, &status, 0) != pid)
+    if (pid < 0)
         return 0;
+    waited = wait_child_bounded(pid, &status, 6000);
+    if (waited != 1) {
+        fprintf(stderr, "fail-closed child nested=%d %s\n", nested,
+                waited == 0 ? "timed out" : "could not be reaped");
+        return 0;
+    }
+    if (nested && WIFEXITED(status) && WEXITSTATUS(status) == NESTED_MASK_BLOCKED) {
+        fprintf(stderr, "nested fault unavailable: SIGBUS or SIGSEGV is blocked inside the handler\n");
+        return 2;
+    }
     if ((WIFSIGNALED(status) &&
          (WTERMSIG(status) == SIGSEGV || WTERMSIG(status) == SIGBUS)) ||
         (nested && WIFEXITED(status) &&
@@ -91,6 +179,20 @@ static int child_fails_closed(int nested)
         return 1;
     fprintf(stderr, "fail-closed child nested=%d status=%d\n", nested, status);
     return 0;
+}
+
+static int child_timeout_is_reaped(void)
+{
+    pid_t pid = fork();
+    int status, waited;
+    if (pid == 0) {
+        for (;;)
+            pause();
+    }
+    if (pid < 0)
+        return 0;
+    waited = wait_child_bounded(pid, &status, 100);
+    return waited == 0 && WIFSIGNALED(status) && WTERMSIG(status) == SIGKILL;
 }
 
 static void *fault_thread(void *arg)
@@ -105,7 +207,7 @@ static void *fault_thread(void *arg)
     return s_tls_count == 200 ? NULL : (void *)1;
 }
 
-int main(void)
+int main(int argc, char **argv)
 {
     struct sigaction sa;
     uint64_t expected[2] = { 0x0123456789abcdefull, 0xfedcba9876543210ull };
@@ -113,7 +215,14 @@ int main(void)
     uint32_t value = 0;
     pthread_t threads[8];
     int failures = 0;
-    sigset_t mask, after;
+    sigset_t mask, after, fault_mask, previous_mask;
+    int nested_only = argc == 2 && !strcmp(argv[1], "--nested-only");
+    int non_nested_only = argc == 2 && !strcmp(argv[1], "--non-nested");
+
+    if (argc != 1 && !nested_only && !non_nested_only) {
+        fprintf(stderr, "usage: %s [--nested-only|--non-nested]\n", argv[0]);
+        return 1;
+    }
 
     s_guest = mmap(NULL, 0x100000000ull, PROT_NONE,
                    MAP_PRIVATE | MAP_ANON, -1, 0);
@@ -133,6 +242,17 @@ int main(void)
         return 1;
     }
     bw_posix_fault_set_base((uintptr_t)s_guest);
+    if (nested_only) {
+        int result = child_fails_closed(1);
+        bw_posix_fault_uninstall();
+        if (munmap(s_guest, 0x100000000ull) != 0) {
+            perror("munmap");
+            return 1;
+        }
+        if (result == 2)
+            return BW_FAULT_TEST_TSAN ? 77 : 1;
+        return result == 1 ? 0 : 1;
+    }
     *s_mmio = 0xaabbccddu;
     if (*s_mmio != 0xaabbccddu || s_tls_count != 2)
         failures++;
@@ -146,6 +266,17 @@ int main(void)
     if (value != 0xaabbccddu || errno != EDOM ||
         !sigismember(&after, SIGUSR1))
         failures++;
+
+    sigemptyset(&fault_mask);
+    sigaddset(&fault_mask, SIGSEGV);
+    if (pthread_sigmask(SIG_BLOCK, &fault_mask, &previous_mask) != 0) {
+        failures++;
+    } else {
+        if (nested_fault_signals_unblocked() != 0)
+            failures++;
+        if (pthread_sigmask(SIG_SETMASK, &previous_mask, NULL) != 0)
+            failures++;
+    }
 
     __asm__ volatile(
         "ldr q31, [%2]\n\t"
@@ -169,7 +300,10 @@ int main(void)
     if (s_forwarded != 3)
         failures++;
 
-    if (!child_fails_closed(0) || !child_fails_closed(1))
+    if (!child_fails_closed(0) ||
+        (!non_nested_only && child_fails_closed(1) != 1))
+        failures++;
+    if (!child_timeout_is_reaped())
         failures++;
 
     for (uintptr_t i = 0; i < 8; i++)

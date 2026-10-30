@@ -62,27 +62,72 @@ as its working directory. The native install record lists Original only until
 the other edition and renderer features are validated.
 
 To compile an already verified preparation without replacing it, point CMake
-directly at its generated files and use a separate build directory:
+directly at its generated files and use a new private build directory:
 
 ```sh
+umask 077
+mkdir -m 700 build/bloodwake-macos &&
 cmake -S . -B build/bloodwake-macos \
   -DCMAKE_BUILD_TYPE=Release -DCMAKE_OSX_ARCHITECTURES=arm64 \
   -DXBOXRECOMP_DIR="$PWD/build/xboxrecomp" \
   -DBW_GEN_DIR="$PWD/game/prepare/work/gen" \
-  -DPython3_EXECUTABLE="$PWD/build/venv/bin/python"
+  -DPython3_EXECUTABLE="$PWD/build/venv/bin/python" &&
 cmake --build build/bloodwake-macos --target bloodwake --parallel
 ```
 
 This keeps `game/prepare/work/gen` read-only: the ocean translation byproduct
-is written into the CMake build directory. Keep both generated inputs and
-build outputs private. If the default macOS SDK fails a compiler link test,
-select a compatible installed SDK before running either build command. For
+is written into the CMake build directory. Choose a different new directory
+if that one exists, and check ACLs and backups as appropriate. Keep both
+generated inputs and build outputs private. If the default macOS SDK fails a
+compiler link test, select a compatible installed SDK before running either
+build command. For
 example, on the machine described in the
 [local toolchain note](UPSTREAM_ISSUES.md#local-toolchain-note):
 
 ```sh
 export SDKROOT=/Library/Developer/CommandLineTools/SDKs/MacOSX26.5.sdk
 ```
+
+### Isolated native diagnostic
+
+The diagnostic runner performs one boot, not a playability or relaunch test.
+It verifies the prepared disc and generated-code fingerprints, requires the
+pinned toolkit checkout to be clean, prints the executable's SHA-256, and
+compares the prepared tree, toolkit and executable before and after the run.
+The hash identifies the executable; it does not prove which sources were used
+to build it. Tree comparison checks contents, paths, modes and symlink targets,
+not ACLs or extended attributes. Symlinks must resolve within the tree.
+
+On macOS, with a separately built executable, choose a **new** private output
+directory outside the repository, preparation and toolkit:
+
+```sh
+mkdir -p "$HOME/bw-private-diagnostics"
+build/venv/bin/python tools/macos_diagnostic.py \
+  --exe "$PWD/build/bloodwake-macos/bloodwake" \
+  --prepared-tree "$PWD/game/prepare" \
+  --toolkit "$PWD/build/xboxrecomp" \
+  --output-dir "$HOME/bw-private-diagnostics/boot-001" \
+  --seconds 45 --gpu-audit
+```
+
+The runner creates isolated home, configuration, temporary and save paths,
+discards inherited game settings, and refuses USB and audio MMIO. It checks a
+macOS sandbox before starting: writes are allowed only under the output
+directory, network operations and process forks are denied, and TCP/UDP
+denial is probed for both IPv4 and IPv6. This is not a system-wide network
+firewall. The boot has a deadline of 1-300 seconds and an external deadline;
+combined standard output and error are capped at 32 MiB. Other files in the
+private directory are not subject to a total disk quota. A guest-requested
+relaunch is saved privately but not executed. Exit 124 indicates the guest's
+run limit, not a successful playability check.
+
+`--gpu-audit` enables the existing private usage summary; it is not a replay
+capture and a short failing run may end before a summary is written. Add
+`--quincunx-approx` only when intentionally testing the unverified approximation
+described above. Keep the output directory, including logs, saves and any
+guest data, private. A missing sandbox or failed isolation check aborts before
+guest execution.
 
 ## Windows
 

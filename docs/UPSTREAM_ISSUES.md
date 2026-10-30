@@ -211,19 +211,33 @@ device access and guest-memory lifetime while keeping required workers alive.
 The native host consequently retains guest resources until process exit after
 guest entry; USB and APU MMIO must remain disabled.
 
-The manual synthetic probes in `tests/mmio_host/test_irq_shutdown_*` reproduce
-queued, executing, coalesced and concurrent shutdown counterexamples. The OHCI
-probe uses a synthetic callback and producer with the real gate and stop; it
-intercepts concurrent joins instead of performing an undefined double join.
-The APU probe uses synthetic guest memory, dummy audio, and the real APU ISR and
-shutdown; its expected post-shutdown memory fault is contained in a child.
-Neither probe enables a device MMIO trap or uses game data.
+The manual synthetic OHCI and APU callback probes in
+`tests/mmio_host/test_irq_shutdown_*` reproduce queued, executing, coalesced
+and concurrent shutdown counterexamples. The OHCI probe uses a synthetic
+callback and producer with the real gate and stop; it intercepts concurrent
+joins instead of performing an undefined double join. The APU probe uses
+synthetic guest memory, dummy audio, and the real APU ISR and shutdown; its
+expected post-shutdown memory fault is contained in a child. Neither probe
+enables a device MMIO trap or uses game data.
 Queued and coalesced APU callbacks fault after shutdown clears its guest-RAM
 pointer; an executing callback can outlive that shutdown. The concurrent
 cases show an APU shutdown returning before another finishes and two OHCI
 calls attempting the same worker join. The OHCI queued and executing
 callbacks also outlive stop. These observations do not establish game-specific
 behavior.
+
+Three bounded CTest cases add a DPC counterexample using the real carried DPC
+queue and drain, IRQ gate, APU ISR and APU shutdown. The interrupt is posted
+explicitly; its guest ISR and DPC bodies and guest RAM are synthetic. In the
+queued case, the ISR queues one DPC which remains unentered and inserted when
+shutdown returns; it then runs with the APU RAM pointer cleared. In the executing
+case, the DPC begins while that pointer is live and is held inside its callback
+after the queue and inserted bit have cleared. Shutdown returns before the
+callback finishes, and the callback resumes with the pointer cleared. The
+checks include IRQ delivery, guest arguments, queue state and one completed
+drain; a separate oracle self-test rejects incorrectly ordered or missing
+observations. The probe retains its synthetic guest RAM and does not dereference
+freed APU state, enable MMIO or exercise an actual title.
 
 To reproduce with the pinned toolkit and a usable macOS SDK:
 
@@ -233,19 +247,60 @@ export TMPDIR="$PWD/build/irq-probe-scratch"
 cmake -S tests/mmio_host -B build/irq-shutdown-probes \
   -DCMAKE_OSX_SYSROOT=/Library/Developer/CommandLineTools/SDKs/MacOSX26.5.sdk
 cmake --build build/irq-shutdown-probes --target \
-  bw_ohci_irq_shutdown_probe bw_apu_irq_shutdown_probe
+  bw_ohci_irq_shutdown_probe bw_apu_irq_shutdown_probe bw_irq_shutdown_dpc_probe
 (
   ulimit -c 0
+  ctest --test-dir build/irq-shutdown-probes --output-on-failure \
+    --no-tests=error -R '^irq_shutdown_dpc_' &&
   env -i TMPDIR="$TMPDIR" build/irq-shutdown-probes/bw_ohci_irq_shutdown_probe &&
   env -i TMPDIR="$TMPDIR" build/irq-shutdown-probes/bw_apu_irq_shutdown_probe
 )
 ```
 
-Select a locally installed SDK if the example path differs. These are manual
-counterexamples, excluded from the default build and CTest: exit status zero
-means the known unsafe behavior was reproduced, **not** that shutdown is safe.
-If a counterexample stops reproducing, review and replace it with a genuine
-retirement regression; disappearance of one failure is not proof of safety.
+Select a locally installed SDK if the example path differs. The OHCI and APU
+callback probes remain manual and excluded from CTest. The DPC counterexamples
+are in the default build and labeled `counterexample`, `irq` and `dpc`; each
+has a 30-second CTest timeout. Their passing result means the known unsafe
+behavior was reproduced, **not** that shutdown is safe. If a counterexample
+stops reproducing, review and replace it with a genuine retirement regression;
+disappearance of one failure is not proof of safety.
+
+The former manually linked DPC ThreadSanitizer probe hung before `main` on this
+host. A bounded process sample showed SDL2-compat's error dialog running
+modally; a dyld trace showed its SDL3 search resolving `@loader_path` relative
+to the TSan runtime and failing to find SDL3. Adding `/opt/homebrew/lib` to
+`DYLD_LIBRARY_PATH` allowed both original cases to finish. The CMake DPC target
+now adds a discoverable SDL3 library directory to its build rpath, and CTest's
+timeout also bounds failures before the probe's own alarm is installed. If
+SDL2-compat needs SDL3 in a non-discoverable location, configure with an
+appropriate `CMAKE_BUILD_RPATH`. This identified a loader/test-harness issue,
+not a demonstrated production shutdown deadlock.
+
+For example, use a separate TSan build with the same SDK and scratch directory:
+
+```sh
+cmake -S tests/mmio_host -B build/irq-shutdown-tsan \
+  -DCMAKE_OSX_SYSROOT=/Library/Developer/CommandLineTools/SDKs/MacOSX26.5.sdk \
+  -DCMAKE_C_FLAGS="-fsanitize=thread -fno-omit-frame-pointer"
+cmake --build build/irq-shutdown-tsan --target bw_irq_shutdown_dpc_probe
+TSAN_OPTIONS=halt_on_error=1:exitcode=66 \
+  ctest --test-dir build/irq-shutdown-tsan --output-on-failure \
+    --no-tests=error -R '^irq_shutdown_dpc_'
+```
+
+The three DPC checks passed in normal, optimized, TSan and combined
+ASan/UBSan builds, including repeated runs. Sanitizer coverage of these
+controlled synthetic cases is not evidence that the broader device, DPC and
+guest-memory lifetime contract is safe.
+
+A separate `retirement_reference_model` CTest exercises a bounded synthetic
+global admission and quiescence protocol, including IRQs claimed into a
+dispatcher local, DPC requeue/cancel while executing, late continuations,
+concurrent closure and a callback requiring a still-live service worker.
+It is **not wired to the runtime** and does not replace the real-bridge
+counterexamples. Its assumptions, failure handling and unresolved integration
+requirements are detailed in
+[`tests/mmio_host/RETIREMENT_MODEL.md`](../tests/mmio_host/RETIREMENT_MODEL.md).
 
 #### Test-only MMIO dispatch experiment
 

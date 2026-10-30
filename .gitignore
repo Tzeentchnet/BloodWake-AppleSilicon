@@ -35,6 +35,7 @@ bw_relaunch.bin
 bw_launch_next.bin
 play.log
 *.dmp
+*.bwgpu
 
 # Archives (an image inside a zip is still an image)
 *.zip

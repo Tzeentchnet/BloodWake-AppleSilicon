@@ -3351,6 +3351,46 @@ static void failure_test(const char *which)
     }
 }
 
+static void basic_feedback_test(const char *which)
+{
+    uint8_t before[PITCH * HEIGHT];
+    uint32_t end = COLOR_AT + (HEIGHT - 1u) * PITCH + WIDTH * 4u;
+    uint32_t address = !strcmp(which, "basic-feedback-leading") ? COLOR_AT - 4u
+                     : !strcmp(which, "basic-feedback-trailing") ? end - 4u
+                     : !strcmp(which, "basic-feedback-adjacent") ? end
+                     : COLOR_AT;
+
+    if (!strcmp(which, "basic-feedback-adjacent"))
+        for (unsigned i = 0; i < 4; i++)
+            put32(address + i * 4u, 0xFF00FF00u);
+    memcpy(before, s_mem + COLOR_AT, sizeof before);
+    setup_texture(address, 0x01010000u);
+    quad();
+    draw(6);
+    if (!strcmp(which, "basic-feedback-adjacent")) {
+        flip();
+        expect_no_error();
+        CHECK(pixel(4, 4) == 0xFF00FF00u);
+    } else {
+        expect_error("sampling the active colour surface", before);
+    }
+}
+
+static void cpu_write_counterexample_test(void)
+{
+    const uint32_t cpu_color = 0xFFABCDEFu;
+    const uint32_t gpu_color = 0xFF102030u;
+    const uint32_t address = COLOR_AT + 4u * PITCH + 4u * 4u;
+
+    clear(gpu_color);
+    expect_no_error();
+    put32(address, cpu_color);
+    CHECK(pixel(4, 4) == cpu_color);
+    flip();
+    expect_no_error();
+    CHECK(pixel(4, 4) == gpu_color);
+}
+
 int main(int argc, char **argv)
 {
     if (argc != 2) {
@@ -3547,6 +3587,10 @@ int main(int argc, char **argv)
         registration_test();
     else if (!strncmp(argv[1], "mock-", 5))
         mock_order_test(argv[1]);
+    else if (!strncmp(argv[1], "basic-feedback-", 15))
+        basic_feedback_test(argv[1]);
+    else if (!strcmp(argv[1], "cpu-write-counterexample"))
+        cpu_write_counterexample_test();
     else
         failure_test(argv[1]);
     bw_metal_backend_stop();

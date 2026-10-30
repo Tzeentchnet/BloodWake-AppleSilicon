@@ -53,8 +53,11 @@ void bw_metal_backend_set_framebuffer_callback(BwMetalFramebufferCallback callba
  * Quincunx hardware weights, edge rules and rounding have not been verified.
  * Exact hardware sample positions and reconstruction filtering are unverified;
  * the framebuffer consumer chooses the resolve filter.
- * Depth-tested drawing and CPU or texture access to cleared guest depth
- * surfaces remain unsupported; an incomplete clear rectangle is rejected. */
+ * Sampling a guest-address span overlapping the active colour surface is
+ * rejected, including before its first draw. These span checks do not prove
+ * physical alias identity or synchronize guest CPU access. Depth-tested
+ * drawing and CPU or texture access to cleared guest depth surfaces remain
+ * unsupported; an incomplete clear rectangle is rejected. */
 int bw_metal_backend_start(void);
 
 /* Synthetic flat memory for focused tests; it must match the executor's base. */

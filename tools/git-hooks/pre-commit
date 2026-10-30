@@ -36,7 +36,7 @@ while IFS= read -r -d '' f; do
     case "$lower" in
         *.xbe|*.iso|*.xiso|*.img|*.bin|*.gdf|*.pak|*.toc|*.bik|*.xmv|*.wma|*.wav|*.xwb|*.xpr|\
         *.dds|*.tga|*.bmp|*.png|*.jpg|*.jpeg|*.mp4|*.mkv|*.avi|*.webm|*.pdf|*.7z|*.zip|*.rar|\
-        *.gz|*.dmp|*.gpr|*.obj|*.lib|*.exe|*.pdb|*.dll)
+        *.gz|*.dmp|*.gpr|*.bwgpu|*.obj|*.lib|*.exe|*.pdb|*.dll)
             block "$f" "file type that is game content, a capture, a binary or an archive"; continue ;;
     esac
 

@@ -754,15 +754,13 @@ static id<MTLTexture> decode_texture(const Nv2aTexture *tex)
         return metal_fail("invalid stage-0 texture guest-memory span"), nil;
     if (depth_overlaps(tex->offset, span_end(tex->offset, tex->width, tex->height, tex->pitch)))
         return metal_fail("sampling a depth/stencil surface is unsupported"), nil;
-    if (s_dirty) {
-        size_t texture_end = (size_t)tex->offset + (size_t)(tex->height - 1u) * tex->pitch
-                           + (size_t)tex->width * 4u;
-        size_t surface_end = (size_t)s_current.color_va
-                           + (size_t)(s_current.height - 1u) * s_current.pitch
-                           + (size_t)s_current.width * 4u;
-        if (tex->offset < surface_end && s_current.color_va < texture_end)
-            return metal_fail("sampling a pending render target is unsupported"), nil;
-    }
+    if (s_surface &&
+        (uint64_t)tex->offset < span_end(s_current.color_va, s_current.width,
+                                          s_current.height, s_current.pitch) &&
+        (uint64_t)s_current.color_va < span_end(tex->offset, tex->width,
+                                                tex->height, tex->pitch))
+        return metal_fail(s_dirty ? "sampling a pending render target is unsupported"
+                                  : "sampling the active colour surface is unsupported"), nil;
     count = (size_t)tex->width * tex->height;
     pixels = malloc(count * sizeof *pixels);
     if (!pixels)

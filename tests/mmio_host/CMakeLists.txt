@@ -121,6 +121,51 @@ endforeach()
 target_link_libraries(bw_ohci_irq_shutdown_probe PRIVATE Threads::Threads)
 target_link_libraries(bw_apu_irq_shutdown_probe PRIVATE bw_mmio_real_apu)
 
+# These CTest cases also pass only when the known-unsafe behavior is observed.
+# Their names and label deliberately distinguish them from shutdown-safety tests.
+add_executable(bw_irq_shutdown_dpc_probe
+    test_irq_shutdown_dpc_probe.c test_irq_shutdown_dpc_fixture.c
+    test_irq_shutdown_apu_fixture.c
+    "${XBOXRECOMP_DIR}/src/kernel/kernel_hal.c"
+    "${XBOXRECOMP_DIR}/src/platform/host_time.c")
+target_include_directories(bw_irq_shutdown_dpc_probe PRIVATE
+    "${XBOXRECOMP_DIR}/src" "${XBOXRECOMP_DIR}/src/kernel"
+    "${XBOXRECOMP_DIR}/src/usb")
+target_compile_features(bw_irq_shutdown_dpc_probe PRIVATE c_std_11)
+target_compile_options(bw_irq_shutdown_dpc_probe PRIVATE -ffunction-sections -fdata-sections)
+target_link_options(bw_irq_shutdown_dpc_probe PRIVATE -Wl,-dead_strip)
+target_link_libraries(bw_irq_shutdown_dpc_probe PRIVATE bw_mmio_real_apu)
+
+# SDL2-compat loads SDL3 dynamically. Under TSan its @loader_path may refer
+# to the sanitizer instead of SDL2; include a discoverable SDL3 in the test
+# executable's build rpath without making SDL3 a required dependency.
+find_library(BW_IRQ_TEST_SDL3_RUNTIME NAMES SDL3)
+if(BW_IRQ_TEST_SDL3_RUNTIME)
+    get_filename_component(BW_IRQ_TEST_SDL3_DIR "${BW_IRQ_TEST_SDL3_RUNTIME}" DIRECTORY)
+    set_property(TARGET bw_irq_shutdown_dpc_probe APPEND PROPERTY BUILD_RPATH
+        "${BW_IRQ_TEST_SDL3_DIR}")
+endif()
+
+add_test(NAME irq_shutdown_dpc_queued_counterexample
+    COMMAND bw_irq_shutdown_dpc_probe --queued)
+add_test(NAME irq_shutdown_dpc_executing_counterexample
+    COMMAND bw_irq_shutdown_dpc_probe --executing)
+add_test(NAME irq_shutdown_dpc_oracle_self_test
+    COMMAND bw_irq_shutdown_dpc_probe --oracle-self-test)
+set_tests_properties(irq_shutdown_dpc_queued_counterexample
+    irq_shutdown_dpc_executing_counterexample irq_shutdown_dpc_oracle_self_test
+    PROPERTIES TIMEOUT 30 LABELS "counterexample;irq;dpc"
+    ENVIRONMENT "SDL_AUDIODRIVER=dummy;BW_APU_DSP=xemu;BW_APU_DSP_THREAD=1;BW_APU_DSP_FALLBACK=0")
+
+# This synthetic model is deliberately independent of the runtime.
+add_executable(bw_retirement_model_test
+    retirement_model.c test_retirement_model.c)
+target_compile_features(bw_retirement_model_test PRIVATE c_std_11)
+target_link_libraries(bw_retirement_model_test PRIVATE Threads::Threads)
+add_test(NAME retirement_reference_model COMMAND bw_retirement_model_test)
+set_tests_properties(retirement_reference_model PROPERTIES
+    TIMEOUT 30 LABELS "reference-model;irq;dpc")
+
 add_executable(bw_mach_apu_probe test_mach_apu.c
     "${MACH_EXC_DIR}/mach_exc_server.c" ../apu_output/test_support.c)
 target_include_directories(bw_mach_apu_probe PRIVATE "${MACH_EXC_DIR}")

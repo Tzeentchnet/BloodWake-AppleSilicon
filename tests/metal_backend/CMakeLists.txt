@@ -145,10 +145,16 @@ foreach(case semaphore-release semaphore-concurrent visual seed-order perspectiv
              depth-unbound depth-format depth-address depth-invalid-combined depth-invalid-partial depth-pitch depth-color-alias
              depth-pending-color-alias depth-color-after depth-color-after-empty depth-unknown-flags
              depth-overlap depth-reinterpret depth-texture depth-cache-limit
-             surface-switch feedback)
+             surface-switch feedback basic-feedback-exact basic-feedback-leading
+             basic-feedback-trailing basic-feedback-adjacent)
     add_test(NAME "metal_${case}" COMMAND bw_metal_backend_test "${case}")
     set_tests_properties("metal_${case}" PROPERTIES TIMEOUT 20)
 endforeach()
+
+add_test(NAME metal_cpu_write_counterexample
+    COMMAND bw_metal_backend_test cpu-write-counterexample)
+set_tests_properties(metal_cpu_write_counterexample PROPERTIES
+    TIMEOUT 20 LABELS "counterexample;ownership")
 
 foreach(case extended-reject-conv-min-quincunx extended-reject-conv-mag-quincunx
              extended-reject-conv-both-quincunx extended-reject-conv-min-gaussian
