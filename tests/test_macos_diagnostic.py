@@ -4,6 +4,7 @@ import io
 import os
 from pathlib import Path
 import stat
+import struct
 import subprocess
 import sys
 import tempfile
@@ -93,19 +94,32 @@ class MacosDiagnosticTests(unittest.TestCase):
 
     def test_guest_environment_is_allowlisted_and_opt_in(self):
         with mock.patch.dict(os.environ, {"RECOMP_USB": "1", "RECOMP_AC97_READY": "0",
-                                         "BW_SETTINGS": "unsafe"}, clear=True):
+                                         "BW_SETTINGS": "unsafe",
+                                         "BW_MACOS_KEYBOARD_HOOK": "1",
+                                         "BW_SYNTHETIC_INPUT_DIAGNOSTIC": "1"}, clear=True):
             env = diagnostic.diagnostic_env(self.root, self.prepared, 15, False, False, 4, 5)
         self.assertNotIn("RECOMP_USB", env)
         self.assertNotIn("RECOMP_AC97_READY", env)
         self.assertNotIn("BW_METAL_QUINCUNX_APPROX", env)
         self.assertNotIn("BW_GPU_AUDIT", env)
+        self.assertNotIn("BW_MACOS_KEYBOARD_HOOK", env)
+        self.assertNotIn("BW_SYNTHETIC_INPUT_DIAGNOSTIC", env)
         self.assertEqual(env["BW_SETTINGS"], "none")
         self.assertEqual(env["BW_RUN_SECONDS"], "15")
         self.assertEqual(env["BW_NATIVE_LAUNCH_IN_FD"], "4")
-        enabled = diagnostic.diagnostic_env(self.root, self.prepared, 15, True, True, 4, 5)
+        enabled = diagnostic.diagnostic_env(self.root, self.prepared, 15, True, True, 4, 5,
+                                            keyboard_hook=True)
         self.assertEqual(enabled["BW_METAL_QUINCUNX_APPROX"], "1")
         self.assertEqual(enabled["BW_GPU_AUDIT"], "1")
         self.assertEqual(enabled["BW_GPU_AUDIT_FILE"], str(self.root / "gpu-audit.txt"))
+        self.assertEqual(enabled["BW_MACOS_KEYBOARD_HOOK"], "1")
+        self.assertNotIn("BW_SYNTHETIC_INPUT_DIAGNOSTIC", enabled)
+        synthetic = diagnostic.diagnostic_env(self.root, self.prepared, 15, False, False, 4, 5,
+                                               keyboard_hook=True, synthetic_input=True)
+        self.assertEqual(synthetic["BW_SYNTHETIC_INPUT_DIAGNOSTIC"], "1")
+        with self.assertRaisesRegex(ValueError, "requires the experimental keyboard hook"):
+            diagnostic.diagnostic_env(self.root, self.prepared, 15, False, False, 4, 5,
+                                      synthetic_input=True)
 
     def test_sandbox_preflight_fails_closed(self):
         failure = subprocess.CompletedProcess([], 1, "", "sandbox denied setup")
@@ -210,6 +224,114 @@ class MacosDiagnosticTests(unittest.TestCase):
         child.kill.assert_called_once_with()
         child.wait.assert_called_once_with()
 
+    @staticmethod
+    def launch_request(path=b"D:\\default.xbe", data=b""):
+        return (b"BWRL" + struct.pack("<II", 1, len(path)) + path +
+                struct.pack("<I", len(data)) + data)
+
+    def test_relaunch_validation_matches_native_title_and_frame_rules(self):
+        for path in (b"default.xbe", b"D:\\default.xbe", b"d:/DEFAULT.XBE",
+                     b"\\Device\\CdRom0;default.xbe"):
+            for data in (b"", bytes(3072)):
+                diagnostic.validate_relaunch(self.launch_request(path, data))
+
+        valid = self.launch_request()
+        bad_frames = (
+            b"", b"bad!" + valid[4:], valid[:4] + struct.pack("<I", 2) + valid[8:],
+            valid[:-1], valid + b"\0", self.launch_request(b"default\0.xbe"),
+            self.launch_request(b"x" * 261), self.launch_request(data=b"x"),
+        )
+        for frame in bad_frames:
+            with self.subTest(frame_length=len(frame)), self.assertRaises(RuntimeError):
+                diagnostic.validate_relaunch(frame)
+        for path in (b"D:\\other.xbe", b"D:\\..\\default.xbe", b"default.xbe/"):
+            with self.subTest(path=path), self.assertRaisesRegex(RuntimeError, "another title"):
+                diagnostic.validate_relaunch(self.launch_request(path))
+
+    @unittest.skipIf(os.name == "nt", "Windows selectors do not support pipes")
+    def test_relaunch_input_is_delivered_as_validated_private_pipe_data(self):
+        request = self.launch_request(data=bytes(3072))
+        child = mock.Mock()
+        child.wait.return_value = 0
+        child.poll.return_value = 0
+
+        def spawn(_command, **kwargs):
+            input_fd = int(kwargs["env"]["BW_NATIVE_LAUNCH_IN_FD"])
+            self.assertEqual(os.read(input_fd, len(request) + 1), request)
+            self.assertEqual(os.read(input_fd, 1), b"")
+            read_fd, write_fd = os.pipe()
+            os.close(write_fd)
+            child.stdout = os.fdopen(read_fd, "rb")
+            return child
+
+        with mock.patch.object(diagnostic.subprocess, "Popen", side_effect=spawn):
+            status, relaunch, log_size = diagnostic.run_guest_once(
+                Path("/native"), self.root, self.prepared, "profile", 20, False, False,
+                launch=request)
+        self.assertEqual((status, relaunch, log_size), (0, b"", 0))
+
+    def test_follow_relaunches_uses_bounded_separate_boots(self):
+        request = self.launch_request(data=bytes(3072))
+        with mock.patch.object(diagnostic, "run_guest_once",
+                               side_effect=[(0, request, 3), (0, b"", 4)]) as once, \
+             mock.patch.object(diagnostic.time, "monotonic", side_effect=[10, 11, 12]), \
+             contextlib.redirect_stdout(io.StringIO()):
+            result = diagnostic.run_guest_relaunches(
+                Path("/native"), self.root, self.prepared, "profile", 20, False, True, 4, 30)
+        self.assertEqual(result, 0)
+        self.assertEqual((self.root / "relaunch-001.bin").read_bytes(), request)
+        first, second = once.call_args_list
+        self.assertEqual(first.kwargs["launch"], b"")
+        self.assertEqual(second.kwargs["launch"], request)
+        self.assertEqual(first.kwargs["log_name"], "guest-001.log")
+        self.assertEqual(second.kwargs["audit_name"], "gpu-audit-002.txt")
+        self.assertEqual(first.kwargs["timeout"], 29)
+        self.assertEqual(second.kwargs["timeout"], 28)
+        self.assertEqual(second.kwargs["log_limit"], diagnostic.MAX_LOG_BYTES - 3)
+
+    def test_synthetic_input_is_passed_to_each_guest_boot(self):
+        request = self.launch_request()
+        with mock.patch.object(diagnostic, "run_guest_once",
+                               side_effect=[(0, request, 0), (0, b"", 0)]) as once, \
+             contextlib.redirect_stdout(io.StringIO()):
+            result = diagnostic.run_guest_relaunches(
+                Path("/native"), self.root, self.prepared, "profile", 20, False, False,
+                4, 30, keyboard_hook=True, synthetic_input=True)
+        self.assertEqual(result, 0)
+        self.assertEqual(once.call_count, 2)
+        for call in once.call_args_list:
+            self.assertTrue(call.kwargs["keyboard_hook"])
+            self.assertTrue(call.kwargs["synthetic_input"])
+
+    def test_follow_relaunch_rejects_malformed_and_wrong_title_before_next_boot(self):
+        for request in (b"bad", self.launch_request(b"D:\\other.xbe")):
+            with self.subTest(request=request), \
+                 mock.patch.object(diagnostic, "run_guest_once", return_value=(0, request, 0)) as once:
+                with self.assertRaises(RuntimeError):
+                    diagnostic.run_guest_relaunches(
+                        Path("/native"), self.root, self.prepared, "profile", 20, False, False, 4, 30)
+                self.assertEqual(once.call_count, 1)
+            (self.root / "relaunch-001.bin").unlink()
+
+    def test_follow_relaunch_honors_child_error_boot_limit_and_deadline(self):
+        request = self.launch_request()
+        with mock.patch.object(diagnostic, "run_guest_once", return_value=(7, request, 0)) as once:
+            self.assertEqual(diagnostic.run_guest_relaunches(
+                Path("/native"), self.root, self.prepared, "profile", 20, False, False, 4, 30), 7)
+            self.assertEqual(once.call_count, 1)
+        (self.root / "relaunch-001.bin").unlink()
+        with mock.patch.object(diagnostic, "run_guest_once", return_value=(0, request, 0)) as once:
+            with self.assertRaisesRegex(RuntimeError, "relaunch limit"):
+                diagnostic.run_guest_relaunches(
+                    Path("/native"), self.root, self.prepared, "profile", 20, False, False, 1, 30)
+            self.assertEqual(once.call_count, 1)
+        with mock.patch.object(diagnostic, "run_guest_once") as once, \
+             mock.patch.object(diagnostic.time, "monotonic", side_effect=[10, 40]):
+            with self.assertRaisesRegex(RuntimeError, "total diagnostic deadline"):
+                diagnostic.run_guest_relaunches(
+                    Path("/native"), self.root, self.prepared, "profile", 20, False, False, 4, 30)
+            once.assert_not_called()
+
     def main_arguments(self):
         executable = self.root / "binary"
         executable.write_bytes(b"synthetic executable")
@@ -221,6 +343,15 @@ class MacosDiagnosticTests(unittest.TestCase):
             "--exe", str(executable), "--prepared-tree", str(self.prepared),
             "--toolkit", str(self.toolkit), "--output-dir", str(self.root / "output"),
         ]
+
+    def test_synthetic_cli_requires_keyboard_hook(self):
+        arguments = self.main_arguments() + ["--synthetic-input"]
+        errors = io.StringIO()
+        with mock.patch.object(diagnostic.sys, "platform", "darwin"), \
+             contextlib.redirect_stderr(errors), self.assertRaises(SystemExit) as failure:
+            diagnostic.main(arguments)
+        self.assertEqual(failure.exception.code, 2)
+        self.assertIn("--synthetic-input requires --experimental-keyboard-hook", errors.getvalue())
 
     def test_preflight_failure_never_launches_guest_and_rechecks_integrity(self):
         arguments = self.main_arguments()

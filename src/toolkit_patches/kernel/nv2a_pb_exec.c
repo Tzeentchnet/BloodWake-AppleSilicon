@@ -129,11 +129,11 @@ static uint32_t dma_resolve(uint32_t offset)
 {
     extern uint32_t xbox_ContiguousAllocatedBytes(void);
 
-    /* Did this runtime hand the offset out as contiguous memory? Then the
-     * bytes live in the window, and that is not a guess: the arena is a bump
-     * allocator from XBOX_CONTIG_BASE, so everything below its high-water
-     * mark is memory some MmAllocateContiguousMemory call returned. The
-     * title's own writes go through the window, so the executor's must too.
+    /* Prefer the contiguous window below its high-water mark. This is a
+     * compatibility heuristic, not proof that the offset belongs to a live
+     * allocation: alignment, constrained placement and frees can leave holes,
+     * and ordinary RAM can have distinct backing at the same physical number.
+     * Callers must not use this decision as an ownership or lifetime check.
      *
      * Checking this BEFORE the image test is the whole point. The image test
      * only catches an offset that would land on the title's code, and whether

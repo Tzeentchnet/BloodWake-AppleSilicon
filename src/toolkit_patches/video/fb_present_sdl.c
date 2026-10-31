@@ -653,6 +653,39 @@ int xbox_HostWindowMain(int (*guest_main)(void))
         goto startup_failed;
     }
     s_frame_event = s_guest_done_event + 1;
+#ifdef BW_EXPERIMENTAL_SYNTHETIC_INPUT
+    if (env_on("BW_SYNTHETIC_INPUT_DIAGNOSTIC")) {
+        const SDL_Keycode keys[] = {SDLK_RETURN, SDLK_DOWN, SDLK_z};
+        SDL_Event event;
+        xbox_InputSetMainPump(1);
+        xbox_InputSdlInit();
+        for (size_t i = 0; i < sizeof keys / sizeof keys[0]; i++) {
+            memset(&event, 0, sizeof event);
+            event.type = SDL_KEYDOWN;
+            event.key.keysym.sym = keys[i];
+            if (SDL_PushEvent(&event) != 1) {
+                fprintf(stderr, "  [FBWIN] cannot enqueue synthetic input: %s\n", SDL_GetError());
+                goto startup_failed;
+            }
+        }
+        int count = 0, got = 0;
+        unsigned seen = 0;
+        while (count < 256 &&
+               (got = SDL_PeepEvents(&event, 1, SDL_GETEVENT, SDL_KEYDOWN, SDL_KEYDOWN)) == 1) {
+            xbox_InputSdlEvent(&event);
+            for (size_t i = 0; i < sizeof keys / sizeof keys[0]; i++)
+                if (event.key.keysym.sym == keys[i] && !event.key.repeat &&
+                    !(event.key.keysym.mod & KMOD_GUI))
+                    seen |= 1u << i;
+            count++;
+        }
+        if (got < 0 || seen != 7u || count == 256) {
+            fprintf(stderr, "  [FBWIN] cannot process synthetic input events: %s\n", SDL_GetError());
+            goto startup_failed;
+        }
+        fprintf(stderr, "  [FBWIN] synthetic SDL key presses processed\n");
+    }
+#endif
     s_guest_main = guest_main;
     rc = start_guest(&guest);
     if (rc != 0) {

@@ -1,42 +1,54 @@
 # Blood Wake Recomp for Apple Silicon
 
-An in-progress native macOS/Apple Silicon fork of
-[Blood Wake Recomp](https://github.com/minimalice92/bloodwake-recomp), using
-[xboxrecomp](https://github.com/sp00nznet/xboxrecomp). It aims to run your
-own retail copy of Blood Wake using static recompilation and a Metal renderer.
-It is not affiliated with the game or hardware's rights holders.
+An experimental native macOS/Apple Silicon fork of
+[Blood Wake Recomp](https://github.com/minimalice92/bloodwake-recomp), built
+with [xboxrecomp](https://github.com/sp00nznet/xboxrecomp) and a Metal
+renderer. It runs a user-provided retail copy of Blood Wake through static
+recompilation.
 
-## Status
+This project is not affiliated with the game's or hardware's rights holders.
 
-**Not playable on macOS yet.** This fork can prepare and verify translated C
-and build an experimental native Apple Silicon executable. It can open a
-window and enter the guest, but an interactive menu has not been verified.
-Guest USB and audio MMIO remain disabled pending safe dispatch, so controller
-input and game audio do not work yet.
+## Current status
 
-The native host and Metal pushbuffer backend are under development; rendering,
-video, saves and both editions still need game validation. The toolkit's
-OpenGL renderer is not the selected game renderer. See
-[docs/BUILDING.md](docs/BUILDING.md#macos-on-apple-silicon-experimental) for
-native build instructions and limitations, and
-[docs/UPSTREAM_ISSUES.md](docs/UPSTREAM_ISSUES.md) for portability findings.
-The [Apple Silicon handoff](docs/APPLE_SILICON_HANDOFF.md) records the current
-boot blocker and next steps.
+The current arm64 build boots into the game and has been user-confirmed for
+menu navigation and interactive play. A measured 640x480 retail workload
+sustains the original title's 30 FPS cap.
 
-## Prepare your copy
+This is still a development build:
 
-You need to own a retail North American Blood Wake disc and make your own disc
-image or folder of its files, as required by [LEGAL.md](LEGAL.md). You also need
-Python 3.13, Git, and enough free space for the disc and generated files. The
-process uses the upstream retail and generated code fingerprints. The
-repository does not include or download the game itself.
+- The game-specific keyboard bridge and Metal quincunx approximation require
+  explicit build or runtime opt-ins.
+- The quincunx approximation is not verified against NV2A hardware.
+- Guest audio, USB gamepads, physical-controller support, and broad mission,
+  save, FMV, and edition coverage are incomplete.
+- Measured gameplay averages 30 FPS, but p95 frame pacing remains about
+  45-46 ms.
 
-From the repository root, on macOS:
+See [Apple Silicon status](docs/APPLE_SILICON_HANDOFF.md),
+[work completed](docs/WORK_COMPLETED.md), and
+[validation](docs/VALIDATION.md) for details.
+
+## Requirements
+
+- An Apple Silicon Mac
+- Xcode Command Line Tools
+- CMake 3.20 or newer
+- SDL2 2.0.14 or newer
+- OpenSSL 3
+- Python 3.13 and Git
+- Your own North American retail Blood Wake disc image or extracted disc
+
+The repository does not include or download the game.
+
+## Prepare and build
+
+From the repository root:
 
 ```sh
 git config core.hooksPath tools/git-hooks
 python3.13 -m venv build/venv
 build/venv/bin/python -m pip install capstone==5.0.9
+
 git clone https://github.com/sp00nznet/xboxrecomp.git build/xboxrecomp
 git -C build/xboxrecomp checkout --detach f0f8a461496a4f23d9b0aeaa284b8d70ba7ab82b
 
@@ -45,104 +57,57 @@ build/venv/bin/python tools/build_from_disc.py \
   --install-dir game/prepare \
   --toolkit build/xboxrecomp \
   --prepare-only
+
+cmake -S . -B build/bloodwake-macos \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DCMAKE_OSX_ARCHITECTURES=arm64 \
+  -DXBOXRECOMP_DIR="$PWD/build/xboxrecomp" \
+  -DBW_GEN_DIR="$PWD/game/prepare/work/gen" \
+  -DPython3_EXECUTABLE="$PWD/build/venv/bin/python" \
+  -DBW_EXPERIMENTAL_MACOS_KEYBOARD_HOOK=ON
+
+cmake --build build/bloodwake-macos --target bloodwake --parallel
 ```
 
-`--disc` accepts an XISO, a full disc image, or a folder of disc files, not a
-7z archive. Extract the image locally first. `--check-only` checks the disc
-without extracting it or generating code. `--prepare-only` unpacks the disc,
-translates its program, and verifies the generated output; it does **not**
-produce an executable. On macOS, verification compares generated text using
-the Windows line endings of the published fingerprints without changing the
-files. A rerun replaces `game/prepare/work/gen`. Use a separate work directory
-for anything you want to keep.
-
-Keep disc images, unpacked files, generated C, binaries, logs and other
-game-derived material private. The example uses ignored `game/` and `build/`
-directories and enables the upstream commit guard; do not commit or share the
-game or material generated from it. See [LEGAL.md](LEGAL.md) and
-[CONTRIBUTING.md](CONTRIBUTING.md) for the upstream project's conditions.
-
-## Native foundation checks
-
-The standalone Metal backend test sends synthetic NV2A methods through the
-carried pushbuffer executor into an off-screen Metal target. It covers 32-bit
-colour clears, coloured triangles, a basic nearest-filtered and clamp-to-edge
-stage-0 texture, blend factors and equations, colour-write masks, alpha
-comparisons, face culling, and flip readback into synthetic guest memory. Unsupported
-states encountered by this backend are reported as errors; surface and
-texture dimensions are limited to 16384 pixels per axis. The backend is wired
-into the experimental native executable, but in-game rendering has not been
-verified and much of the renderer remains unfinished. The new render states
-include a limited one-stage combiner and BC1 texture path in synthetic tests;
-other combiner and texture states may still fail explicitly.
-
-The separate Metal smoke test renders and reads back a synthetic triangle.
-The audio test checks the SDL dummy device and the carried stereo output
-adapter; it does not exercise the complete APU. The input integration test
-checks SDL keyboard and virtual-controller events through the USB gamepad
-report, including controller connection and disconnection. It does not test
-the game or a physical controller. On macOS, with CMake, SDL2, and the pinned
-toolkit checkout installed, the host MMIO tests also exercise test-only device
-dispatch experiments; they do not enable guest USB or audio:
+If CMake cannot find Homebrew SDL2 or OpenSSL:
 
 ```sh
-cmake -S tests/metal_backend -B build/test-metal-backend
-cmake --build build/test-metal-backend
-ctest --test-dir build/test-metal-backend --output-on-failure
-
-cmake -S tests/metal_smoke -B build/test-metal-smoke
-cmake --build build/test-metal-smoke
-ctest --test-dir build/test-metal-smoke --output-on-failure
-
-cmake -S tests/apu_output -B build/test-apu-output
-cmake --build build/test-apu-output
-ctest --test-dir build/test-apu-output --output-on-failure
-
-cmake -S tests/input_integration -B build/test-input-integration
-cmake --build build/test-input-integration
-ctest --test-dir build/test-input-integration --output-on-failure
-
-cmake -S tests/macos_presenter -B build/test-macos-presenter
-cmake --build build/test-macos-presenter
-ctest --test-dir build/test-macos-presenter --output-on-failure
-
-cmake -S tests/macos_host -B build/test-macos-host
-cmake --build build/test-macos-host
-ctest --test-dir build/test-macos-host --output-on-failure
-
-cmake -S tests/mmio_host -B build/test-mmio-host
-cmake --build build/test-mmio-host
-ctest --test-dir build/test-mmio-host --output-on-failure
-
-build/venv/bin/python -m unittest discover -s tests -p 'test_*.py'
+export CMAKE_PREFIX_PATH="$(brew --prefix sdl2):$(brew --prefix openssl@3)"
 ```
 
-For a toolkit checkout outside `build/xboxrecomp`, pass
-`-DXBOXRECOMP_DIR=/path/to/xboxrecomp` when configuring the Metal backend,
-audio, input, presenter, host, and MMIO tests. The input tests use isolated virtual
-controllers and report a skip when a physical controller is connected. The
-Metal backend test builds only the necessary CPU-side toolkit sources and does
-not require the toolkit's OpenGL backend.
-The [local toolchain note](docs/UPSTREAM_ISSUES.md#local-toolchain-note)
-describes an SDK selection needed on the development machine.
+Run the prepared build:
 
-For a bounded, isolated native boot, see the
-[diagnostic runner](docs/BUILDING.md#isolated-native-diagnostic). Its logs and
-any game-derived output must remain private.
+```sh
+BW_GAME_DIR="$PWD/game/prepare/game/disc" \
+BW_MACOS_KEYBOARD_HOOK=1 \
+BW_METAL_QUINCUNX_APPROX=1 \
+./build/bloodwake-macos/bloodwake
+```
 
-## Windows upstream
+Detailed preparation, alternate install, diagnostic, and Windows instructions
+are in [BUILDING.md](docs/BUILDING.md).
 
-The existing Windows build remains available through
-[`tools/build_from_disc.py`](tools/build_from_disc.py) without `--prepare-only`;
-see [docs/BUILDING.md](docs/BUILDING.md) for its Windows prerequisites and
-instructions. The original project and its documentation remain available
-[upstream](https://github.com/minimalice92/bloodwake-recomp). Two newer
-upstream commits add Windows shader-cache warm-up to the installer; they are
-not yet merged into this fork and do not implement Metal rendering.
+## Documentation
 
-## Credits and licence
+- [BUILDING.md](docs/BUILDING.md) - build, run, and diagnostic instructions
+- [APPLE_SILICON_HANDOFF.md](docs/APPLE_SILICON_HANDOFF.md) - current status
+  and remaining priorities
+- [WORK_COMPLETED.md](docs/WORK_COMPLETED.md) - implementation history
+- [VALIDATION.md](docs/VALIDATION.md) - performance evidence, tests, and
+  integrity checks
+- [SETTINGS.md](docs/SETTINGS.md) - runtime and edition settings
+- [UPSTREAM_ISSUES.md](docs/UPSTREAM_ISSUES.md) - portability findings
+- [GPU_CAPTURE.md](docs/GPU_CAPTURE.md) - synthetic capture fixture
+- [GUEST_MEMORY_INVENTORY.md](docs/GUEST_MEMORY_INVENTORY.md) - memory-access
+  inventory
+
+## Privacy and legal
+
+Keep disc images, unpacked files, generated C, binaries, saves, logs, and
+captures private. Do not commit or share game-derived material. See
+[LEGAL.md](LEGAL.md) and [CONTRIBUTING.md](CONTRIBUTING.md).
 
 Blood Wake is by Stormfront Studios and was published by Microsoft Game
-Studios. This fork builds on Blood Wake Recomp, xboxrecomp and xemu. See
+Studios. This fork builds on Blood Wake Recomp, xboxrecomp, and xemu. See
 [CREDITS.md](CREDITS.md), [NOTICE.md](NOTICE.md), [LICENSE](LICENSE), and
 [LICENSES/](LICENSES/) for attribution and licence details.

@@ -13,6 +13,7 @@
 #include "bw_metal_backend.h"
 #include "bw_backend_sync.h"
 #include "bw_gpu_audit.h"
+#include "d3d/d3d8_swizzle.h"
 
 #define WIDTH 16u
 #define HEIGHT 12u
@@ -143,6 +144,12 @@ extern int bw_metal_test_read_depth(uint32_t va, uint32_t x, uint32_t y,
                                     float *z, uint8_t *stencil);
 extern int bw_metal_test_read_depth_surface(uint32_t va, float *z, uint8_t *stencil,
                                             size_t count);
+extern void bw_metal_test_draw_extended(const Nv2aSurface *surface, const BwXBatch *batch);
+extern size_t bw_metal_test_color_surface_count(void);
+extern uint64_t bw_metal_test_command_submission_count(void);
+extern uint64_t bw_metal_test_draw_encoder_creation_count(void);
+extern uint64_t bw_metal_test_vertex_upload_allocation_count(void);
+extern uint64_t bw_metal_test_texture_upload_count(void);
 
 #define CHECK(condition) do { \
     if (!(condition)) { \
@@ -346,6 +353,13 @@ static void triangle(uint32_t color)
     vertex(2, 2, 10, color, 0, 0);
 }
 
+static void triangle_z(uint32_t color, float z)
+{
+    triangle(color);
+    for (unsigned i = 0; i < 3; i++)
+        put_float(POS_AT + i * 12u + 8u, z);
+}
+
 static void setup_texture(uint32_t address, uint32_t filter)
 {
     method(0x1B00, address);
@@ -436,6 +450,25 @@ static void seed_order_test(void)
     CHECK(pixel(0, 0) == 0xFF124689u);
     CHECK(pixel(4, 3) == 0xFF11CC44u);
     CHECK(pixel(13, 9) == 0xA5A5A5A5u);
+}
+
+static void command_batching_test(void)
+{
+    uint64_t submissions = bw_metal_test_command_submission_count();
+    uint64_t encoders = bw_metal_test_draw_encoder_creation_count();
+    uint64_t uploads = bw_metal_test_vertex_upload_allocation_count();
+    clear(0xFF102030u);
+    triangle(0xFFEE1100u);
+    draw(3);
+    triangle(0xFF11CC44u);
+    draw(3);
+    CHECK(bw_metal_test_command_submission_count() == submissions);
+    CHECK(bw_metal_test_draw_encoder_creation_count() == encoders + 1u);
+    CHECK(bw_metal_test_vertex_upload_allocation_count() == uploads + 1u);
+    flip();
+    expect_no_error();
+    CHECK(bw_metal_test_command_submission_count() == submissions + 1u);
+    CHECK(pixel(4, 3) == 0xFF11CC44u);
 }
 
 static void vertex4(unsigned n, float x, float y, float w, uint32_t color)
@@ -1297,6 +1330,99 @@ static void depth_clear_test(void)
     expect_no_error();
 }
 
+static void depth_draw_test(void)
+{
+    float z;
+    uint8_t stencil;
+    setup_depth(ZETA_AT);
+    depth_clear(3, 0xC000003Cu);
+    clear(0xFF010203u);
+    method(0x030C, 1);
+    method(0x0354, 0x201u);
+    method(0x035C, 1);
+
+    triangle_z(0xFF804020u, 0.5f);
+    draw(3);
+    triangle_z(0xFF20A060u, 0.8f);
+    draw(3);
+    flip();
+    expect_no_error();
+    CHECK(pixel(0, 0) == 0xFF010203u);
+    CHECK(pixel(4, 3) == 0xFF804020u);
+    CHECK(bw_metal_test_read_depth(ZETA_AT, 4, 3, &z, &stencil));
+    CHECK(fabsf(z - 0.5f) < 0.000001f && stencil == 0x3Cu);
+    CHECK(bw_metal_test_read_depth(ZETA_AT, 0, 0, &z, &stencil));
+    CHECK(fabsf(z - (float)0xC00000u / 16777215.0f) < 0.000001f &&
+          stencil == 0x3Cu);
+}
+
+static void polygon_offset_test(int mode)
+{
+    const int biased = mode == 1;
+    float z;
+    uint8_t stencil;
+    setup_depth(ZETA_AT);
+    depth_clear(3, 0xC000003Cu);
+    clear(0xFF010203u);
+    method(0x030C, 1);
+    method(0x0354, 0x201u);
+    method(0x035C, 1);
+    triangle_z(0xFF804020u, 0.5f);
+    draw(3);
+    method(0x0338, mode ? 1u : 0u);
+    method_float(0x0384, mode == 2 ? 0.0f : -0.25f);
+    method_float(0x0388, mode == 2 ? 0.0f : -1.0f);
+    triangle_z(0xFF20A060u, 0.5f);
+    draw(3);
+    flip();
+    expect_no_error();
+    CHECK(pixel(4, 3) == (biased ? 0xFF20A060u : 0xFF804020u));
+    CHECK(bw_metal_test_read_depth(ZETA_AT, 4, 3, &z, &stencil));
+    CHECK((biased ? z < 0.5f : fabsf(z - 0.5f) < 0.000001f) &&
+          stencil == 0x3Cu);
+}
+
+static void stencil_draw_test(void)
+{
+    float z;
+    uint8_t stencil;
+    setup_depth(ZETA_AT);
+    depth_clear(3, 0x8000003Cu);
+    clear(0xFF010203u);
+    method(0x030C, 0);
+    method(0x035C, 0);
+    method(0x032C, 1);
+    method(0x0360, 0x0Fu);
+    method(0x0364, 0x207u);
+    method(0x0368, 0x5Au);
+    method(0x036C, 0xFFu);
+    method(0x0370, 0x1E00u);
+    method(0x0374, 0x1E00u);
+    method(0x0378, 0x1E01u);
+    triangle(0xFF804020u);
+    draw(3);
+
+    method(0x0360, 0);
+    method(0x0364, 0x202u);
+    method(0x0368, 0x0Au);
+    method(0x036C, 0x0Fu);
+    method(0x0378, 0x1E00u);
+    triangle(0xFF20A060u);
+    draw(3);
+    method(0x0368, 0x0Bu);
+    triangle(0xFF2040A0u);
+    draw(3);
+    flip();
+    expect_no_error();
+    CHECK(pixel(0, 0) == 0xFF010203u);
+    CHECK(pixel(4, 3) == 0xFF20A060u);
+    CHECK(bw_metal_test_read_depth(ZETA_AT, 4, 3, &z, &stencil));
+    CHECK(fabsf(z - (float)0x800000u / 16777215.0f) < 0.000001f &&
+          stencil == 0x3Au);
+    CHECK(bw_metal_test_read_depth(ZETA_AT, 0, 0, &z, &stencil));
+    CHECK(stencil == 0x3Cu);
+}
+
 static void depth_unbound_test(void)
 {
     uint8_t before[PITCH * HEIGHT];
@@ -1820,27 +1946,56 @@ static void xrgb_single_draw_test(void)
 #define RC_WORD(a, b, c, d) (((uint32_t)(a) << 24) | ((uint32_t)(b) << 16) | \
                              ((uint32_t)(c) << 8) | (uint32_t)(d))
 
+static void setup_dxt1_texture_stage(unsigned stage, uint32_t address,
+                                     uint32_t color0, uint32_t color1, uint32_t selectors)
+{
+    uint32_t base = 0x1B00u + stage * 0x40u;
+    put32(address, color0 | (color1 << 16));
+    put32(address + 4, selectors);
+    method(base, address);
+    method(base + 4, (2u << 24) | (2u << 20) | (1u << 16) | (0x0Cu << 8) | (2u << 4));
+    method(base + 8, 0x00030303u);
+    method(base + 12, 1u << 30);
+    method(base + 20, (2u << 24) | (6u << 16));
+    method(0x1744 + stage * 4u, UV_AT);
+    method(0x1784 + stage * 4u, 2 | (2 << 4) | (8 << 8));
+}
+
 static void setup_dxt1_texture(uint32_t color0, uint32_t color1, uint32_t selectors)
 {
-    put32(TEX_AT, color0 | (color1 << 16));
-    put32(TEX_AT + 4, selectors);
-    method(0x1B00, TEX_AT);
-    method(0x1B04, (2u << 24) | (2u << 20) | (1u << 16) | (0x0Cu << 8) | (2u << 4));
-    method(0x1B08, 0x00030303u);
-    method(0x1B0C, 1u << 30);
-    method(0x1B14, (2u << 24) | (6u << 16));
-    method(0x1744, UV_AT);
-    method(0x1784, 2 | (2 << 4) | (8 << 8));
+    setup_dxt1_texture_stage(0, TEX_AT, color0, color1, selectors);
+}
+
+static void setup_dxt1_cube_texture_stage(unsigned stage, uint32_t address,
+                                          const uint16_t colors[6])
+{
+    uint32_t base = 0x1B00u + stage * 0x40u;
+    for (unsigned face = 0; face < 6; face++) {
+        put32(address + face * 128u, colors[face]);
+        put32(address + face * 128u + 4u, 0);
+    }
+    method(base, address);
+    method(base + 4, (2u << 24) | (2u << 20) | (1u << 16) |
+                     (0x0Cu << 8) | (2u << 4) | 4u);
+    method(base + 8, 0x00030303u);
+    method(base + 12, 1u << 30);
+    method(base + 20, (2u << 24) | (6u << 16));
 }
 
 static void setup_combiner(const Nv2aCombiner *rc)
 {
-    method(0x0AC0, rc->color_icw[0]);
-    method(0x0260, rc->alpha_icw[0]);
-    method(0x1E40, rc->color_ocw[0]);
-    method(0x0AA0, rc->alpha_ocw[0]);
+    for (unsigned i = 0; i < 8; i++) {
+        method(0x0AC0 + i * 4u, rc->color_icw[i]);
+        method(0x0260 + i * 4u, rc->alpha_icw[i]);
+        method(0x1E40 + i * 4u, rc->color_ocw[i]);
+        method(0x0AA0 + i * 4u, rc->alpha_ocw[i]);
+        method(0x0A60 + i * 4u, rc->factor0[i]);
+        method(0x0A80 + i * 4u, rc->factor1[i]);
+    }
     method(0x0288, rc->final0);
     method(0x028C, rc->final1);
+    method(0x1E20, rc->final_c0);
+    method(0x1E24, rc->final_c1);
     method(0x1E70, rc->stage_program);
     method(0x1E60, rc->control);
 }
@@ -1858,10 +2013,12 @@ static Nv2aCombiner synthetic_combiner(void)
     return rc;
 }
 
-static uint32_t reference_combiner(const Nv2aCombiner *rc, uint32_t vertex, uint32_t texel)
+static uint32_t reference_combiner_with_secondary(const Nv2aCombiner *rc, uint32_t vertex,
+                                                   uint32_t secondary, uint32_t texel)
 {
-    float v0[4], v1[4] = {0}, fog[4] = {0}, t[4][4] = {{0}}, out[4];
+    float v0[4], v1[4], fog[4] = {0}, t[4][4] = {{0}}, out[4];
     nv2a_rc_unpack(vertex, v0);
+    nv2a_rc_unpack(secondary, v1);
     nv2a_rc_unpack(texel, t[0]);
     for (unsigned i = 1; i < 4; i++)
         t[i][3] = 1.0f;
@@ -1870,6 +2027,11 @@ static uint32_t reference_combiner(const Nv2aCombiner *rc, uint32_t vertex, uint
            ((uint32_t)lroundf(out[0] * 255) << 16) |
            ((uint32_t)lroundf(out[1] * 255) << 8) |
             (uint32_t)lroundf(out[2] * 255);
+}
+
+static uint32_t reference_combiner(const Nv2aCombiner *rc, uint32_t vertex, uint32_t texel)
+{
+    return reference_combiner_with_secondary(rc, vertex, 0, texel);
 }
 
 static void extended_basic_test(void)
@@ -1885,6 +2047,38 @@ static void extended_basic_test(void)
     expect_no_error();
     CHECK(color_near(pixel(4, 3), reference_combiner(&rc, source, 0xFFFF0000u), 1));
     CHECK(pixel(0, 0) == 0xFF102030u);
+}
+
+static void extended_texture_cache_test(void)
+{
+    Nv2aCombiner rc = synthetic_combiner();
+    uint64_t uploads = bw_metal_test_texture_upload_count();
+    setup_dxt1_texture(0xF800u, 0, 0);
+    setup_combiner(&rc);
+    triangle(0xFFFFFFFFu);
+
+    clear(0xFF102030u);
+    draw(3);
+    draw(3);
+    CHECK(bw_metal_test_texture_upload_count() == uploads + 1u);
+    flip();
+    expect_no_error();
+    check_pixel_near(0xFFFF0000u, 1, "cached texture first frame", 0);
+
+    clear(0xFF102030u);
+    draw(3);
+    flip();
+    expect_no_error();
+    CHECK(bw_metal_test_texture_upload_count() == uploads + 1u);
+    check_pixel_near(0xFFFF0000u, 1, "cached texture unchanged frame", 0);
+
+    put32(TEX_AT, 0x07E0u);
+    clear(0xFF102030u);
+    draw(3);
+    flip();
+    expect_no_error();
+    CHECK(bw_metal_test_texture_upload_count() == uploads + 2u);
+    check_pixel_near(0xFF00FF00u, 1, "cached texture invalidation", 0);
 }
 
 static void xrgb_single_extended_test(void)
@@ -1952,9 +2146,11 @@ static void xrgb_single_rejection_test(const char *which)
     } else if (!strcmp(which, "xrgb-single-reject-depth")) {
         clear(0xFF102030u);
         triangle(0xFFFFFFFFu);
+        method(0x0214, ZETA_AT);
         method(0x030C, 1);
+        method(0x0354, 0x207u);
         draw(3);
-        expected = "unsupported depth or stencil state";
+        expected = "unsupported depth/stencil surface format";
     } else {
         CHECK(0 && "unknown single-sample XRGB rejection test");
         return;
@@ -2036,6 +2232,1261 @@ static void extended_combiner_test(void)
     CHECK(pixel(4, 3) == 0);
 }
 
+static void extended_multistage_combiner_test(void)
+{
+    const uint32_t source = 0x9F4F91BCu, texel = 0xFFFF00FFu;
+    Nv2aCombiner rc = synthetic_combiner();
+    setup_dxt1_texture(0xF81Fu, 0x07E0u, 0);
+    triangle(source);
+    rc.color_icw[0] = RC_WORD(4, 8, 0x24, 0x28);
+    rc.alpha_icw[0] = RC_WORD(0x14, 0x18, 0x34, 0x38);
+    rc.color_ocw[0] = rc.alpha_ocw[0] = (12u << 4) | 13u;
+    for (unsigned i = 1; i < 8; i++) {
+        if (i & 1u) {
+            rc.color_icw[i] = RC_WORD(12, 0x20, 13, 0x20);
+            rc.alpha_icw[i] = RC_WORD(12, 0x20, 0x1D, 0x20);
+            rc.color_ocw[i] = rc.alpha_ocw[i] = 12u << 8;
+        } else {
+            rc.color_icw[i] = RC_WORD(12, 0x24, 13, 0x28);
+            rc.alpha_icw[i] = RC_WORD(0x1C, 0x34, 0x1D, 0x38);
+            rc.color_ocw[i] = rc.alpha_ocw[i] = (13u << 4) | 12u;
+        }
+    }
+    for (unsigned count = 1; count <= 8; count++) {
+        rc.control = count;
+        setup_combiner(&rc);
+        clear(0xFF102030u);
+        draw(3);
+        flip();
+        expect_no_error();
+        check_pixel_near(reference_combiner(&rc, source, texel), 1,
+                         "multiple combiner stages", count);
+    }
+}
+
+static void check_extended_combiner(const Nv2aCombiner *rc, uint32_t source,
+                                    const char *description, unsigned variant)
+{
+    setup_combiner(rc);
+    triangle(source);
+    clear(0xFF102030u);
+    draw(3);
+    flip();
+    expect_no_error();
+    check_pixel_near(reference_combiner(rc, source, 0xFFFF00FFu), 1,
+                     description, variant);
+}
+
+static void extended_combiner_mappings_test(void)
+{
+    const uint32_t source = 0x7F354A59u;
+    const uint32_t output_maps[] = {0, 0x08, 0x10, 0x18, 0x20, 0x30};
+    Nv2aCombiner rc = synthetic_combiner();
+    setup_dxt1_texture(0xF81Fu, 0x07E0u, 0);
+
+    rc.control = 2;
+    rc.color_ocw[0] = rc.alpha_ocw[0] = 12u << 4;
+    rc.color_ocw[1] = rc.alpha_ocw[1] = 12u << 4;
+    for (unsigned map = 0; map < 8; map++) {
+        rc.color_icw[0] = RC_WORD((map << 5) | 4u, 0x20, 0, 0);
+        rc.alpha_icw[0] = RC_WORD((map << 5) | 0x14u, 0x20, 0, 0);
+        for (unsigned negate = 0; negate < 2; negate++) {
+            rc.color_icw[1] = RC_WORD((negate ? 0xE0u : 0xC0u) | 12u, 0x20, 0, 0);
+            rc.alpha_icw[1] = RC_WORD((negate ? 0xE0u : 0xC0u) | 0x1Cu, 0x20, 0, 0);
+            check_extended_combiner(&rc, source, "general input mapping", map * 2 + negate);
+        }
+    }
+
+    rc = synthetic_combiner();
+    rc.color_icw[0] = RC_WORD(4, 0x20, 0, 0);
+    rc.alpha_icw[0] = RC_WORD(0x14, 0x20, 0, 0);
+    for (unsigned map = 0; map < 8; map++) {
+        rc.final0 = RC_WORD(0, 0, 0, (map << 5) | 12u);
+        rc.final1 = RC_WORD(0, 0, (map << 5) | 0x1Cu, 0x80);
+        check_extended_combiner(&rc, source, "final input mapping", map);
+    }
+
+    rc = synthetic_combiner();
+    rc.control = 2;
+    rc.color_icw[0] = RC_WORD(4, 0x20, 0, 0);
+    rc.alpha_icw[0] = RC_WORD(0x14, 0x20, 0, 0);
+    rc.color_ocw[1] = rc.alpha_ocw[1] = 12u << 4;
+    for (unsigned map = 0; map < sizeof output_maps / sizeof output_maps[0]; map++) {
+        rc.color_ocw[0] = rc.alpha_ocw[0] = (12u << 4) | (output_maps[map] << 12);
+        for (unsigned negate = 0; negate < 2; negate++) {
+            rc.color_icw[1] = RC_WORD((negate ? 0xE0u : 0xC0u) | 12u, 0x20, 0, 0);
+            rc.alpha_icw[1] = RC_WORD((negate ? 0xE0u : 0xC0u) | 0x1Cu, 0x20, 0, 0);
+            check_extended_combiner(&rc, source, "output mapping", map * 2 + negate);
+        }
+    }
+}
+
+static void extended_combiner_operations_test(void)
+{
+    const uint32_t source = 0x7F354A59u;
+    const uint32_t mux_sources[] = {0x00354A59u, 0x7F354A59u,
+                                    0x80354A59u, 0xFF354A59u};
+    Nv2aCombiner rc = synthetic_combiner();
+    setup_dxt1_texture(0xF81Fu, 0x07E0u, 0);
+
+    rc.color_icw[0] = RC_WORD(4, 8, 0x24, 8);
+    rc.alpha_icw[0] = RC_WORD(0x14, 0x20, 0, 0);
+    rc.final0 = RC_WORD(0, 0, 13, 12);
+    for (unsigned flags = 0; flags < 4; flags++) {
+        rc.color_ocw[0] = (12u << 4) | 13u | (flags << 12);
+        check_extended_combiner(&rc, source, "dot product", flags);
+    }
+
+    rc = synthetic_combiner();
+    rc.control = 2;
+    rc.color_icw[0] = RC_WORD(4, 0x20, 0, 0);
+    rc.alpha_icw[0] = RC_WORD(0x14, 0x20, 0, 0);
+    rc.color_icw[1] = RC_WORD(4, 0x20, 0x24, 0x20);
+    rc.alpha_icw[1] = RC_WORD(0x14, 0x20, 0x34, 0x20);
+    rc.color_ocw[1] = rc.alpha_ocw[1] = (12u << 8) | (4u << 12);
+    for (unsigned select = 0; select < 2; select++) {
+        rc.control = 2u | (select << 8);
+        for (unsigned value = 0; value < sizeof mux_sources / sizeof mux_sources[0]; value++)
+            check_extended_combiner(&rc, mux_sources[value], "mux", select * 4 + value);
+    }
+
+    rc = synthetic_combiner();
+    rc.color_icw[0] = RC_WORD(4, 0x20, 0x24, 0x20);
+    rc.color_ocw[0] = (12u << 4) | 13u | (0xC0u << 12);
+    rc.alpha_ocw[0] = 0;
+    for (unsigned dest = 12; dest <= 13; dest++) {
+        rc.final1 = RC_WORD(0, 0, 0x10u | dest, 0x80);
+        check_extended_combiner(&rc, source, "blue to alpha", dest);
+    }
+    rc.alpha_ocw[0] = 12u << 4;
+    rc.final1 = RC_WORD(0, 0, 0x1C, 0x80);
+    check_extended_combiner(&rc, source, "alpha overrides blue to alpha", 0);
+}
+
+static void extended_combiner_constants_test(void)
+{
+    const uint32_t source = 0x7F354A59u;
+    Nv2aCombiner rc = synthetic_combiner();
+    setup_dxt1_texture(0xF81Fu, 0x07E0u, 0);
+
+    rc.control = 2;
+    rc.factor0[0] = 0xC0804020u;
+    rc.factor1[0] = 0x8040A060u;
+    rc.factor0[1] = 0x4070C0D0u;
+    rc.factor1[1] = 0xE0D05090u;
+    rc.color_icw[1] = RC_WORD(1, 2, 0, 0);
+    rc.alpha_icw[1] = RC_WORD(0x11, 0x12, 0, 0);
+    rc.color_ocw[1] = rc.alpha_ocw[1] = 12u << 4;
+    for (unsigned flags = 0; flags < 4; flags++) {
+        rc.control = 2u | ((flags & 1u) << 12) | ((flags & 2u) << 15);
+        check_extended_combiner(&rc, source, "per-stage constants", flags);
+    }
+
+    rc = synthetic_combiner();
+    rc.color_icw[0] = RC_WORD(4, 0x20, 0, 0);
+    rc.alpha_icw[0] = RC_WORD(0x14, 0x20, 0, 0);
+    rc.final_c0 = 0x80904020u;
+    rc.final_c1 = 0x6040A070u;
+    rc.final0 = RC_WORD(0x11, 1, 2, 12);
+    rc.final1 = RC_WORD(0, 0, 0x12, 0x80);
+    check_extended_combiner(&rc, source, "final constants", 0);
+
+    for (unsigned flags = 0; flags < 8; flags++) {
+        rc.final0 = RC_WORD(0, 0, 0, 14);
+        rc.final1 = RC_WORD(0, 0, 0x1C, flags << 5);
+        check_extended_combiner(&rc, source, "final sum", flags);
+    }
+    rc.final0 = RC_WORD(0, 0, 0, 15);
+    rc.final1 = RC_WORD(1, 2, 0x1C, 0x80);
+    check_extended_combiner(&rc, source, "final product", 0);
+    rc.final1 = RC_WORD(14, 1, 0x1C, 0x80);
+    check_extended_combiner(&rc, source, "sum feeding final product", 0);
+
+    rc.final0 = rc.final1 = 0;
+    check_extended_combiner(&rc, source, "no final combiner", 0);
+}
+
+static void extended_combiner_secondary_test(void)
+{
+    const uint32_t source = 0x7F354A59u, secondary = 0xA04060C0u;
+    const Nv2aSurface surface = {COLOR_AT, WIDTH, HEIGHT, PITCH, 4, 1, 1};
+    const Nv2aRenderState state = {.color_mask = 0x01010101u, .depth_max = 1.0f};
+    BwXVertex vertices[3] = {0};
+    Nv2aCombiner rc = synthetic_combiner();
+    BwXBatch batch = {
+        .vertices = vertices, .count = 3, .state = &state, .rc = &rc,
+        .tex = {{.offset = TEX_AT, .width = 4, .height = 4, .color = 0x0C,
+                 .addr_u = 3, .addr_v = 3, .levels = 1,
+                 .filter = (2u << 24) | (6u << 16)}},
+        .tex_valid = {1}, .tex_normalized = {1},
+    };
+    const float xy[3][2] = {{2, 2}, {14, 2}, {2, 10}};
+    setup_dxt1_texture(0xF81Fu, 0x07E0u, 0);
+    for (unsigned i = 0; i < 3; i++) {
+        vertices[i].x = xy[i][0];
+        vertices[i].y = xy[i][1];
+        vertices[i].z = 0.5f;
+        vertices[i].rhw = vertices[i].tc[0][3] = 1.0f;
+        nv2a_rc_unpack(source, vertices[i].d0);
+        nv2a_rc_unpack(secondary, vertices[i].d1);
+    }
+
+    rc.color_icw[0] = RC_WORD(5, 0x20, 0, 0);
+    rc.alpha_icw[0] = RC_WORD(0x15, 0x20, 0, 0);
+    for (unsigned flags = 0; flags < 8; flags++) {
+        rc.final0 = RC_WORD(0, 0, 0, 14);
+        rc.final1 = RC_WORD(0, 0, 0x1C, flags << 5);
+        clear(0xFF102030u);
+        bw_metal_test_draw_extended(&surface, &batch);
+        flip();
+        expect_no_error();
+        check_pixel_near(reference_combiner_with_secondary(&rc, source, secondary, 0xFFFF00FFu),
+                         1, "secondary and final sum", flags);
+    }
+}
+
+static void extended_fog_test(void)
+{
+    const Nv2aSurface surface = {COLOR_AT, WIDTH, HEIGHT, PITCH, 4, 1, 1};
+    const Nv2aRenderState state = {.color_mask = 0x01010101u, .depth_max = 1.0f};
+    BwXVertex vertices[3] = {0};
+    Nv2aCombiner rc = synthetic_combiner();
+    BwXBatch batch = {
+        .vertices = vertices, .count = 3, .state = &state, .rc = &rc,
+        .fogc = {0xE8 / 255.0f, 0x80 / 255.0f, 0x49 / 255.0f, 0.0f},
+    };
+    const float xy[3][2] = {{2, 2}, {14, 2}, {2, 10}};
+    rc.stage_program = 0;
+    rc.final0 = RC_WORD(0, 0, 0, 3);
+    rc.final1 = RC_WORD(0, 0, 0x13, 0x80);
+    for (unsigned i = 0; i < 3; i++) {
+        vertices[i].x = xy[i][0];
+        vertices[i].y = xy[i][1];
+        vertices[i].z = 0.5f;
+        vertices[i].rhw = 1.0f;
+        vertices[i].fog = 0.75f;
+        vertices[i].pad[0] = 0.25f;
+    }
+    method(0x02A4, 1);
+    method(0x029C, 0x2601);
+    method(0x02A8, 0xFF4980E8u);
+    method_float(0x09C0, 1.0f);
+    method_float(0x09C4, 1.0f);
+    clear(0xFF102030u);
+    bw_metal_test_draw_extended(&surface, &batch);
+    flip();
+    expect_no_error();
+    check_pixel_near(0x40E88049u, 1, "extended fog", 0);
+}
+
+static void extended_passthrough_stage_test(void)
+{
+    const Nv2aSurface surface = {COLOR_AT, WIDTH, HEIGHT, PITCH, 4, 1, 1};
+    const Nv2aRenderState state = {.color_mask = 0x01010101u, .depth_max = 1.0f};
+    BwXVertex vertices[3] = {0};
+    Nv2aCombiner rc = synthetic_combiner();
+    BwXBatch batch = {.vertices = vertices, .count = 3, .state = &state, .rc = &rc};
+    const float xy[3][2] = {{2, 2}, {14, 2}, {2, 10}};
+    setup_dxt1_texture_stage(0, TEX_AT, 0xF800u, 0, 0);
+    setup_dxt1_texture_stage(1, TEX_AT + 8u, 0x07E0u, 0, 0);
+    for (unsigned stage = 0; stage < 2; stage++) {
+        batch.tex[stage] = (Nv2aTexture){
+            .offset = TEX_AT + stage * 8u, .width = 4, .height = 4, .color = 0x0Cu,
+            .addr_u = 3, .addr_v = 3, .levels = 1,
+            .filter = (2u << 24) | (6u << 16),
+        };
+        batch.tex_valid[stage] = batch.tex_normalized[stage] = 1;
+    }
+    rc.stage_program = 0x00021021u;
+    rc.final0 = RC_WORD(0, 0, 0, 10);
+    rc.final1 = RC_WORD(0, 0, 0x1A, 0x80);
+    for (unsigned i = 0; i < 3; i++) {
+        vertices[i].x = xy[i][0];
+        vertices[i].y = xy[i][1];
+        vertices[i].z = 0.5f;
+        vertices[i].rhw = 1.0f;
+        vertices[i].tc[0][3] = vertices[i].tc[1][3] = 1.0f;
+        vertices[i].tc[2][0] = 1.5f;
+        vertices[i].tc[2][1] = 0.5f;
+        vertices[i].tc[2][2] = -0.5f;
+        vertices[i].tc[2][3] = 0.25f;
+    }
+    clear(0xFF102030u);
+    bw_metal_test_draw_extended(&surface, &batch);
+    flip();
+    expect_no_error();
+    check_pixel_near(0x40FF8000u, 1, "pass-through texture stage", 0);
+}
+
+static void extended_texture_stages_test(void)
+{
+    const uint32_t colors[4] = {0xFFFF00FFu, 0xFF00FF00u, 0xFFFF0000u, 0xFF0000FFu};
+    const uint32_t bc1[4] = {0xF81Fu, 0x07E0u, 0xF800u, 0x001Fu};
+    const Nv2aSurface surface = {COLOR_AT, WIDTH, HEIGHT, PITCH, 4, 1, 1};
+    const Nv2aRenderState state = {.color_mask = 0x01010101u, .depth_max = 1.0f};
+    BwXVertex vertices[3] = {0};
+    Nv2aCombiner rc = synthetic_combiner();
+    BwXBatch batch = {.vertices = vertices, .count = 3, .state = &state, .rc = &rc};
+    const float xy[3][2] = {{2, 2}, {14, 2}, {2, 10}};
+    for (unsigned stage = 0; stage < 4; stage++) {
+        uint32_t address = TEX_AT + stage * 8u;
+        setup_dxt1_texture_stage(stage, address, bc1[stage], 0, 0);
+        batch.tex[stage] = (Nv2aTexture){
+            .offset = address, .width = 4, .height = 4, .color = 0x0C,
+            .addr_u = 3, .addr_v = 3, .levels = 1, .filter = (2u << 24) | (6u << 16),
+        };
+        batch.tex_valid[stage] = batch.tex_normalized[stage] = 1;
+    }
+    for (unsigned i = 0; i < 3; i++) {
+        vertices[i].x = xy[i][0];
+        vertices[i].y = xy[i][1];
+        vertices[i].z = 0.5f;
+        vertices[i].rhw = 1.0f;
+        nv2a_rc_unpack(0x7F354A59u, vertices[i].d0);
+        for (unsigned stage = 0; stage < 4; stage++)
+            vertices[i].tc[stage][3] = 1.0f;
+    }
+
+    for (unsigned mask = 0; mask < 16; mask++) {
+        rc.stage_program = 0;
+        for (unsigned stage = 0; stage < 4; stage++) {
+            batch.tex_valid[stage] = !!(mask & (1u << stage));
+            for (unsigned i = 0; i < 3; i++)
+                vertices[i].tc[stage][3] = batch.tex_valid[stage] ? 1.0f : 0.0f;
+            if (batch.tex_valid[stage])
+                rc.stage_program |= 1u << (stage * 5u);
+        }
+        for (unsigned stage = 0; stage < 4; stage++) {
+            uint32_t expected = (mask & (1u << stage)) ? colors[stage] : 0xFF000000u;
+            rc.final0 = RC_WORD(0, 0, 0, 8u + stage);
+            rc.final1 = RC_WORD(0, 0, 0x18u + stage, 0x80);
+            clear(0xFF102030u);
+            bw_metal_test_draw_extended(&surface, &batch);
+            flip();
+            expect_no_error();
+            check_pixel_near(expected, 1, "texture stages", mask * 4u + stage);
+        }
+    }
+
+    rc.stage_program = 1u | (1u << 5) | (1u << 10) | (1u << 15);
+    for (unsigned stage = 1; stage < 4; stage++)
+        setup_dxt1_texture_stage(stage, TEX_AT + stage * 8u, 0xF800u, 0x07E0u, 0x44444444u);
+    for (unsigned stage = 1; stage < 4; stage++) {
+        rc.final0 = RC_WORD(0, 0, 0, 8u + stage);
+        rc.final1 = RC_WORD(0, 0, 0x18u + stage, 0x80);
+        for (unsigned sample = 0; sample < 2; sample++) {
+            for (unsigned i = 0; i < 3; i++) {
+                for (unsigned coord = 1; coord < 4; coord++) {
+                    vertices[i].tc[coord][0] = 0.125f;
+                    vertices[i].tc[coord][1] = 0.125f;
+                    vertices[i].tc[coord][3] = 1.0f;
+                }
+                if (sample) {
+                    vertices[i].tc[stage][0] = 0.75f;
+                    vertices[i].tc[stage][1] = 0.25f;
+                    vertices[i].tc[stage][3] = 2.0f;
+                }
+            }
+            clear(0xFF102030u);
+            bw_metal_test_draw_extended(&surface, &batch);
+            flip();
+            expect_no_error();
+            check_pixel_near(sample ? 0xFF00FF00u : 0xFFFF0000u, 1,
+                             "stage projective coordinates", stage * 2u + sample);
+        }
+    }
+
+    setup_dxt1_texture_stage(1, TEX_AT + 8u, 0xF800u, 0x07E0u, 0x44444444u);
+    rc.stage_program = 1u << 5;
+    rc.final0 = RC_WORD(0, 0, 0, 9);
+    rc.final1 = RC_WORD(0, 0, 0x19, 0x80);
+    setup_combiner(&rc);
+    triangle(0xFFFFFFFFu);
+    method(0x1748, UV_AT + 0x100u);
+    method(0x1788, 2 | (4 << 4) | (16 << 8));
+    for (unsigned sample = 0; sample < 2; sample++) {
+        for (unsigned i = 0; i < 3; i++) {
+            put_float(UV_AT + 0x100u + i * 16u, sample ? 0.75f : 0.125f);
+            put_float(UV_AT + 0x104u + i * 16u, sample ? 0.25f : 0.125f);
+            put_float(UV_AT + 0x108u + i * 16u, 0.0f);
+            put_float(UV_AT + 0x10Cu + i * 16u, sample ? 2.0f : 1.0f);
+        }
+        clear(0xFF102030u);
+        draw(3);
+        flip();
+        expect_no_error();
+        check_pixel_near(sample ? 0xFF00FF00u : 0xFFFF0000u, 1,
+                         "executor projective texture stage", sample);
+    }
+    rc.stage_program = 0;
+    rc.final0 = RC_WORD(0, 0, 0, 8);
+    rc.final1 = RC_WORD(0, 0, 0x18, 0x80);
+    setup_combiner(&rc);
+    clear(0xFF102030u);
+    draw(3);
+    flip();
+    expect_no_error();
+    check_pixel_near(0xFF000000u, 1, "executor inactive texture stages", 0);
+}
+
+static void setup_dxt_alpha_texture_stage(unsigned stage, uint32_t address, uint32_t format)
+{
+    for (unsigned block = 0; block < 4; block++) {
+        uint8_t *data = s_mem + address + block * 16u;
+        if (format == 0x0Eu) {
+            put32(address + block * 16u, 0x76543210u);
+            put32(address + block * 16u + 4u, 0xFEDCBA98u);
+        } else {
+            uint64_t selectors = 0;
+            data[0] = block & 1u ? 30u : 230u;
+            data[1] = block & 1u ? 220u : 40u;
+            for (unsigned i = 0; i < 16; i++)
+                selectors |= (uint64_t)(i & 7u) << (3u * i);
+            for (unsigned i = 0; i < 6; i++)
+                data[2 + i] = (uint8_t)(selectors >> (8u * i));
+        }
+        uint32_t color0 = block & 1u ? 0xF800u : 0x07E0u;
+        uint32_t color1 = block & 1u ? 0x001Fu : 0xF800u;
+        put32(address + block * 16u + 8u, color0 | (color1 << 16));
+        put32(address + block * 16u + 12u, 0xE4E4E4E4u);
+    }
+    uint32_t base = 0x1B00u + stage * 0x40u;
+    method(base, address);
+    method(base + 4, (3u << 24) | (3u << 20) | (1u << 16) |
+                      (format << 8) | (2u << 4));
+    method(base + 8, 0x00030303u);
+    method(base + 12, 1u << 30);
+    method(base + 20, (2u << 24) | (6u << 16));
+}
+
+static void setup_swizzled_texture_stage(unsigned stage, uint32_t address, uint32_t format,
+                                         uint32_t base_width, uint32_t base_height,
+                                         uint32_t levels, int solid_levels)
+{
+    const uint32_t rgb565[4] = {0xF800u, 0x07E0u, 0x001Fu, 0xFFFFu};
+    const uint32_t argb[4] = {0x20FF0000u, 0x8000FF00u, 0xC00000FFu, 0xFFFFFFFFu};
+    uint32_t width = base_width, height = base_height, cursor = address;
+    uint32_t bpp = format == 0x05u ? 2u : 4u, log_width = 0, log_height = 0;
+    for (uint32_t n = base_width; n > 1u; n >>= 1) log_width++;
+    for (uint32_t n = base_height; n > 1u; n >>= 1) log_height++;
+    for (uint32_t level = 0; level < levels; level++) {
+        for (uint32_t y = 0; y < height; y++) {
+            for (uint32_t x = 0; x < width; x++) {
+                uint32_t offset = cursor + swizzle_offset(x, y, width, height) * bpp;
+                if (bpp == 2u) {
+                    uint16_t value = solid_levels ? (uint16_t)rgb565[level]
+                        : (uint16_t)((((x * 3u + y * 5u) & 31u) << 11) |
+                                     (((x * 7u + y * 9u) & 63u) << 5) |
+                                     ((x * 11u + y * 2u) & 31u));
+                    memcpy(s_mem + offset, &value, sizeof value);
+                } else {
+                    uint32_t value = solid_levels ? argb[level]
+                        : (((x * 19u + y * 13u + 17u) & 255u) << 24) |
+                          (((x * 29u + y * 3u + 11u) & 255u) << 16) |
+                          (((x * 7u + y * 31u + 23u) & 255u) << 8) |
+                           ((x * 37u + y * 5u + 41u) & 255u);
+                    put32(offset, value);
+                }
+            }
+        }
+        cursor += width * height * bpp;
+        width = width > 1u ? width / 2u : 1u;
+        height = height > 1u ? height / 2u : 1u;
+    }
+    uint32_t base = 0x1B00u + stage * 0x40u;
+    method(base, address);
+    method(base + 4u, (log_height << 24) | (log_width << 20) | (levels << 16) |
+                      (format << 8) | (2u << 4));
+    method(base + 8u, 0x00030303u);
+    method(base + 12u, (1u << 30) | ((levels - 1u) << 6));
+    method(base + 20u, (2u << 24) | (6u << 16));
+}
+
+static uint32_t average_argb(uint32_t a, uint32_t b)
+{
+    uint32_t result = 0;
+    for (unsigned shift = 0; shift < 32; shift += 8)
+        result |= ((((a >> shift) & 255u) + ((b >> shift) & 255u) + 1u) / 2u) << shift;
+    return result;
+}
+
+static void extended_dot_reflection_test(void)
+{
+    static const uint16_t diffuse_faces[6] = {
+        0xF800u, 0x07E0u, 0x001Fu, 0xFFFFu, 0xFFE0u, 0x07FFu
+    };
+    static const uint16_t specular_faces[6] = {
+        0xF81Fu, 0x07FFu, 0xFFE0u, 0x001Fu, 0xF800u, 0x07E0u
+    };
+    Nv2aCombiner rc = synthetic_combiner();
+    rc.stage_program = 1u | (0x11u << 5) | (0x0Bu << 10) | (0x0Cu << 15);
+    rc.final0 = RC_WORD(0, 0, 0, 10);
+    rc.final1 = RC_WORD(0, 0, 0x1A, 0x80);
+
+    setup_dxt1_texture_stage(0, TEX_AT, 0xF800u, 0, 0);
+    setup_dxt1_texture_stage(1, TEX_AT + 0x100u, 0xFFFFu, 0, 0);
+    setup_dxt1_cube_texture_stage(2, TEX_AT + 0x1000u, diffuse_faces);
+    setup_dxt1_cube_texture_stage(3, TEX_AT + 0x2000u, specular_faces);
+    setup_combiner(&rc);
+    method(0x1E74, 0);
+    method(0x1E78, 0);
+    triangle(0xFFFFFFFFu);
+
+    const float coordinates[3][4] = {
+        {0.0f, 1.0f, 0.0f, 0.0f},
+        {1.0f, 0.0f, 0.0f, 1.0f},
+        {0.0f, 0.0f, 0.0f, 0.0f},
+    };
+    for (unsigned stage = 1; stage < 4; stage++) {
+        uint32_t address = UV_AT + stage * 0x100u;
+        method(0x1744 + stage * 4u, address);
+        method(0x1784 + stage * 4u, 2 | (4 << 4) | (16 << 8));
+        for (unsigned vertex_index = 0; vertex_index < 3; vertex_index++)
+            for (unsigned component = 0; component < 4; component++)
+                put_float(address + vertex_index * 16u + component * 4u,
+                          coordinates[stage - 1u][component]);
+    }
+
+    clear(0xFF102030u);
+    draw(3);
+    flip();
+    expect_no_error();
+    check_pixel_near(0xFF0000FFu, 1, "diffuse cube +Y", 0);
+
+    method(0x1E78, 1u << 16);
+    clear(0xFF102030u);
+    draw(3);
+    flip();
+    expect_no_error();
+    check_pixel_near(0xFF00FF00u, 1, "dot prior-stage input", 0);
+
+    method(0x1E78, 0);
+    method(0x1E74, 0x111u);
+    clear(0xFF102030u);
+    draw(3);
+    flip();
+    expect_no_error();
+    check_pixel_near(0xFF00FF00u, 1, "dot RGB mapping", 0);
+
+    method(0x1E74, 0);
+    method(0x0288, RC_WORD(0, 0, 0, 11));
+    method(0x028C, RC_WORD(0, 0, 0x1B, 0x80));
+    clear(0xFF102030u);
+    draw(3);
+    flip();
+    expect_no_error();
+    check_pixel_near(0xFFFFFF00u, 1, "specular reflected cube +Y", 0);
+
+    method(0x1E74, 0x111u);
+    method(0x1E78, 0x00210000u);
+    method(0x0288, RC_WORD(0, 0, 0, 10));
+    method(0x028C, RC_WORD(0, 0, 0x1A, 0x80));
+    clear(0xFF102030u);
+    draw(3);
+    flip();
+    expect_no_error();
+    check_pixel_near(0xFF00FF00u, 1, "retail diffuse dot state", 0);
+
+    method(0x0288, RC_WORD(0, 0, 0, 11));
+    method(0x028C, RC_WORD(0, 0, 0x1B, 0x80));
+    clear(0xFF102030u);
+    draw(3);
+    flip();
+    expect_no_error();
+    check_pixel_near(0xFFFF00FFu, 1, "retail specular dot state", 0);
+}
+
+static void extended_swizzled_test(void)
+{
+    const uint32_t formats[3] = {0x05u, 0x06u, 0x07u};
+    const uint32_t widths[3] = {8u, 4u, 8u}, heights[3] = {4u, 8u, 8u};
+    const float xy[3][2] = {{2, 2}, {14, 2}, {2, 10}};
+    const Nv2aSurface surface = {COLOR_AT, WIDTH, HEIGHT, PITCH, 4, 1, 1};
+    const Nv2aRenderState state = {.color_mask = 0x01010101u, .depth_max = 1.0f};
+    BwXVertex vertices[3] = {0};
+    Nv2aCombiner rc = synthetic_combiner();
+    BwXBatch batch = {.vertices = vertices, .count = 3, .state = &state, .rc = &rc};
+    uint32_t expected[3][64];
+    rc.stage_program = 1u | (1u << 5) | (1u << 10) | (1u << 15);
+    for (unsigned stage = 0; stage < 3; stage++) {
+        uint32_t address = TEX_AT + stage * 256u;
+        setup_swizzled_texture_stage(stage, address, formats[stage],
+                                     widths[stage], heights[stage], 1, 0);
+        batch.tex[stage] = (Nv2aTexture){
+            .offset = address, .width = widths[stage], .height = heights[stage],
+            .color = formats[stage], .addr_u = 3, .addr_v = 3, .levels = 1,
+            .filter = (2u << 24) | (6u << 16),
+        };
+        batch.tex_valid[stage] = batch.tex_normalized[stage] = 1;
+        CHECK(nv2a_backend_decode_texture(&batch.tex[stage], expected[stage]));
+    }
+    setup_dxt1_texture_stage(3, TEX_AT + 768u, 0xF81Fu, 0, 0);
+    batch.tex[3] = (Nv2aTexture){
+        .offset = TEX_AT + 768u, .width = 4, .height = 4, .color = 0x0C,
+        .addr_u = 3, .addr_v = 3, .levels = 1, .filter = (2u << 24) | (6u << 16),
+    };
+    batch.tex_valid[3] = batch.tex_normalized[3] = 1;
+    for (unsigned i = 0; i < 3; i++) {
+        vertices[i].x = xy[i][0];
+        vertices[i].y = xy[i][1];
+        vertices[i].z = 0.5f;
+        vertices[i].rhw = 1.0f;
+        for (unsigned stage = 0; stage < 4; stage++)
+            vertices[i].tc[stage][3] = 1.0f;
+    }
+    triangle(0xFFFFFFFFu);
+    for (unsigned stage = 0; stage < 3; stage++) {
+        rc.final0 = RC_WORD(0, 0, 0, 8u + stage);
+        rc.final1 = RC_WORD(0, 0, 0x18u + stage, 0x80);
+        setup_combiner(&rc);
+        uint32_t uv = UV_AT + 0x100u + stage * 0x40u;
+        method(0x1744u + stage * 4u, uv);
+        method(0x1784u + stage * 4u, 2 | (2 << 4) | (8 << 8));
+        for (unsigned sample = 0; sample < widths[stage] * heights[stage]; sample++) {
+            uint32_t x = sample % widths[stage];
+            uint32_t y = sample / widths[stage];
+            float u = (x + 0.5f) / widths[stage];
+            float v = (y + 0.5f) / heights[stage];
+            for (unsigned i = 0; i < 3; i++) {
+                vertices[i].tc[stage][0] = u;
+                vertices[i].tc[stage][1] = v;
+                put_float(uv + i * 8u, u);
+                put_float(uv + i * 8u + 4u, v);
+            }
+            clear(0xFF102030u);
+            bw_metal_test_draw_extended(&surface, &batch);
+            flip();
+            expect_no_error();
+            check_pixel_near(expected[stage][y * widths[stage] + x], 1,
+                             "swizzled texture decode", stage * 64u + sample);
+            if (sample < 2) {
+                clear(0xFF102030u);
+                draw(3);
+                flip();
+                expect_no_error();
+                check_pixel_near(expected[stage][y * widths[stage] + x], 1,
+                                 "executor swizzled texture", stage * 64u + sample);
+            }
+        }
+        for (unsigned i = 0; i < 3; i++) {
+            vertices[i].tc[stage][0] = 1.0f / widths[stage];
+            vertices[i].tc[stage][1] = 0.5f / heights[stage];
+        }
+        clear(0xFF102030u);
+        bw_metal_test_draw_extended(&surface, &batch);
+        flip();
+        expect_no_error();
+        check_pixel_near(average_argb(expected[stage][0], expected[stage][1]), 2,
+                         "swizzled bilinear filtering", stage);
+    }
+}
+
+static void extended_swizzled_mips_test(void)
+{
+    const uint32_t formats[3] = {0x05u, 0x06u, 0x07u};
+    const uint32_t widths[3] = {8u, 4u, 8u}, heights[3] = {4u, 8u, 8u};
+    const float xy[3][2] = {{2, 2}, {14, 2}, {2, 10}};
+    const float scales[5] = {1.0f, 2.0f, 4.0f, 8.0f, 2.828427125f};
+    const Nv2aSurface surface = {COLOR_AT, WIDTH, HEIGHT, PITCH, 4, 1, 1};
+    const Nv2aRenderState state = {.color_mask = 0x01010101u, .depth_max = 1.0f};
+    BwXVertex vertices[3] = {0};
+    Nv2aCombiner rc = synthetic_combiner();
+    BwXBatch batch = {.vertices = vertices, .count = 3, .state = &state, .rc = &rc};
+    uint32_t expected[3][4];
+    rc.stage_program = 1u | (1u << 5) | (1u << 10);
+    for (unsigned stage = 0; stage < 3; stage++) {
+        uint32_t address = TEX_AT + stage * 512u;
+        uint32_t w = widths[stage], h = heights[stage];
+        uint32_t bpp = formats[stage] == 0x05u ? 2u : 4u;
+        setup_swizzled_texture_stage(stage, address, formats[stage], w, h, 4, 1);
+        batch.tex[stage] = (Nv2aTexture){
+            .offset = address, .width = w, .height = h, .color = formats[stage],
+            .addr_u = 3, .addr_v = 3, .levels = 4, .filter = (2u << 24) | (6u << 16),
+        };
+        batch.tex_valid[stage] = batch.tex_normalized[stage] = 1;
+        for (unsigned level = 0; level < 4; level++) {
+            uint32_t pixels[64];
+            Nv2aTexture probe = batch.tex[stage];
+            probe.offset = address;
+            probe.width = w;
+            probe.height = h;
+            probe.levels = 1;
+            CHECK(nv2a_backend_decode_texture(&probe, pixels));
+            expected[stage][level] = pixels[0];
+            address += w * h * bpp;
+            w = w > 1u ? w / 2u : 1u;
+            h = h > 1u ? h / 2u : 1u;
+        }
+    }
+    triangle(0xFFFFFFFFu);
+    for (unsigned i = 0; i < 3; i++) {
+        vertices[i].x = xy[i][0];
+        vertices[i].y = xy[i][1];
+        vertices[i].z = 0.5f;
+        vertices[i].rhw = 1.0f;
+        for (unsigned stage = 0; stage < 3; stage++)
+            vertices[i].tc[stage][3] = 1.0f;
+    }
+    for (unsigned sample = 0; sample < 5; sample++) {
+        for (unsigned stage = 0; stage < 3; stage++) {
+            uint32_t uv = UV_AT + 0x100u + stage * 0x40u;
+            method(0x1744u + stage * 4u, uv);
+            method(0x1784u + stage * 4u, 2 | (2 << 4) | (8 << 8));
+            for (unsigned i = 0; i < 3; i++) {
+                float u = (xy[i][0] - 2.0f) * scales[sample] / widths[stage];
+                float v = (xy[i][1] - 2.0f) * scales[sample] / heights[stage];
+                vertices[i].tc[stage][0] = u;
+                vertices[i].tc[stage][1] = v;
+                put_float(uv + i * 8u, u);
+                put_float(uv + i * 8u + 4u, v);
+            }
+        }
+        for (unsigned stage = 0; stage < 3; stage++) {
+            uint32_t value = sample == 4u
+                           ? average_argb(expected[stage][1], expected[stage][2])
+                           : expected[stage][sample];
+            rc.final0 = RC_WORD(0, 0, 0, 8u + stage);
+            rc.final1 = RC_WORD(0, 0, 0x18u + stage, 0x80);
+            clear(0xFF102030u);
+            bw_metal_test_draw_extended(&surface, &batch);
+            flip();
+            expect_no_error();
+            check_pixel_near(value, 2, "swizzled mip selection", sample * 3u + stage);
+            setup_combiner(&rc);
+            clear(0xFF102030u);
+            draw(3);
+            flip();
+            expect_no_error();
+            check_pixel_near(value, 2, "executor swizzled mips", sample * 3u + stage);
+        }
+    }
+
+    setup_swizzled_texture_stage(2, TEX_AT + 1024u, 0x07u, 1, 1, 1, 0);
+    batch.tex[2].width = batch.tex[2].height = batch.tex[2].levels = 1;
+    rc.stage_program = 1u << 10;
+    rc.final0 = RC_WORD(0, 0, 0, 10);
+    rc.final1 = RC_WORD(0, 0, 0x1A, 0x80);
+    uint32_t one_pixel;
+    CHECK(nv2a_backend_decode_texture(&batch.tex[2], &one_pixel));
+    clear(0xFF102030u);
+    bw_metal_test_draw_extended(&surface, &batch);
+    flip();
+    expect_no_error();
+    check_pixel_near(one_pixel, 1, "one-pixel swizzled texture", 0);
+    setup_combiner(&rc);
+    clear(0xFF102030u);
+    draw(3);
+    flip();
+    expect_no_error();
+    check_pixel_near(one_pixel, 1, "executor one-pixel swizzled texture", 0);
+
+    setup_swizzled_texture_stage(0, TEX_AT + 1538u, 0x05u, 1, 1, 1, 0);
+    batch.tex[0].offset = TEX_AT + 1538u;
+    batch.tex[0].width = batch.tex[0].height = batch.tex[0].levels = 1;
+    rc.stage_program |= 1u;
+    rc.final0 = RC_WORD(0, 0, 0, 8);
+    rc.final1 = RC_WORD(0, 0, 0x18, 0x80);
+    CHECK(nv2a_backend_decode_texture(&batch.tex[0], &one_pixel));
+    clear(0xFF102030u);
+    bw_metal_test_draw_extended(&surface, &batch);
+    flip();
+    expect_no_error();
+    check_pixel_near(one_pixel, 1, "two-byte aligned RGB565", 0);
+}
+
+static unsigned reference_address(int coordinate, unsigned size, unsigned mode)
+{
+    int n = (int)size;
+    if (mode == 1u)
+        return (unsigned)((coordinate % n + n) % n);
+    if (mode == 2u) {
+        int value = (coordinate % (2 * n) + 2 * n) % (2 * n);
+        return (unsigned)(value < n ? value : 2 * n - 1 - value);
+    }
+    return coordinate < 0 ? 0u : (coordinate >= n ? size - 1u : (unsigned)coordinate);
+}
+
+static void extended_texture_address_test(void)
+{
+    const int coords[][2] = {{-9, 6}, {-1, -1}, {0, 0}, {3, 3}, {4, 4}, {5, -4}, {8, 9}};
+    const unsigned modes[] = {1u, 2u, 3u, 5u};
+    const float xy[3][2] = {{2, 2}, {14, 2}, {2, 10}};
+    const Nv2aSurface surface = {COLOR_AT, WIDTH, HEIGHT, PITCH, 4, 1, 1};
+    const Nv2aRenderState state = {.color_mask = 0x01010101u, .depth_max = 1.0f};
+    BwXVertex vertices[3] = {0};
+    Nv2aCombiner rc = synthetic_combiner();
+    BwXBatch batch = {.vertices = vertices, .count = 3, .state = &state, .rc = &rc};
+    uint32_t expected[4][16];
+    rc.stage_program = 1u | (1u << 5) | (1u << 10) | (1u << 15);
+    triangle(0xFFFFFFFFu);
+    for (unsigned stage = 0; stage < 4; stage++) {
+        uint32_t address = TEX_AT + stage * 256u;
+        if (stage == 3u) {
+            setup_dxt1_texture_stage(stage, address, 0xF800u, 0x001Fu, 0xE4E4E4E4u);
+        } else {
+            setup_swizzled_texture_stage(stage, address, 0x06u, 4, 4, 1, 0);
+            for (unsigned i = 0; i < 16; i++) {
+                uint32_t value;
+                memcpy(&value, s_mem + address + i * 4u, sizeof value);
+                put32(address + i * 4u, value ^ (stage * 0x11220408u));
+            }
+        }
+        batch.tex[stage] = (Nv2aTexture){
+            .offset = address, .width = 4, .height = 4, .color = stage == 3u ? 0x0Cu : 0x06u,
+            .addr_u = 3, .addr_v = 3, .levels = 1, .filter = (2u << 24) | (6u << 16),
+        };
+        batch.tex_valid[stage] = batch.tex_normalized[stage] = 1;
+        CHECK(nv2a_backend_decode_texture(&batch.tex[stage], expected[stage]));
+        method(0x1744u + stage * 4u, UV_AT + 0x100u + stage * 0x40u);
+        method(0x1784u + stage * 4u, 2 | (2 << 4) | (8 << 8));
+    }
+    for (unsigned i = 0; i < 3; i++) {
+        vertices[i].x = xy[i][0];
+        vertices[i].y = xy[i][1];
+        vertices[i].z = 0.5f;
+        vertices[i].rhw = 1.0f;
+        for (unsigned stage = 0; stage < 4; stage++)
+            vertices[i].tc[stage][3] = 1.0f;
+    }
+    for (unsigned pass = 0; pass < 4; pass++) {
+        for (unsigned stage = 0; stage < 4; stage++) {
+            unsigned pair = pass * 4u + stage;
+            unsigned u = modes[pair % 4u], v = modes[pair / 4u];
+            batch.tex[stage].addr_u = u;
+            batch.tex[stage].addr_v = v;
+            method(0x1B08u + stage * 0x40u, (3u << 16) | (v << 8) | u);
+        }
+        for (unsigned sample = 0; sample < sizeof coords / sizeof coords[0] + 1u; sample++) {
+            int x = sample == 7u ? -1 : coords[sample][0];
+            int y = sample == 7u ? 1 : coords[sample][1];
+            float u = sample == 7u ? 0.0f : (x + 0.5f) / 4.0f;
+            float v = (y + 0.5f) / 4.0f;
+            for (unsigned stage = 0; stage < 4; stage++) {
+                uint32_t uv = UV_AT + 0x100u + stage * 0x40u;
+                for (unsigned i = 0; i < 3; i++) {
+                    vertices[i].tc[stage][0] = u;
+                    vertices[i].tc[stage][1] = v;
+                    put_float(uv + i * 8u, u);
+                    put_float(uv + i * 8u + 4u, v);
+                }
+            }
+            for (unsigned stage = 0; stage < 4; stage++) {
+                unsigned col = reference_address(x, 4u, batch.tex[stage].addr_u);
+                unsigned row = reference_address(y, 4u, batch.tex[stage].addr_v);
+                uint32_t value = expected[stage][row * 4u + col];
+                if (sample == 7u) {
+                    unsigned next = reference_address(0, 4u, batch.tex[stage].addr_u);
+                    value = average_argb(value, expected[stage][row * 4u + next]);
+                }
+                rc.final0 = RC_WORD(0, 0, 0, 8u + stage);
+                rc.final1 = RC_WORD(0, 0, 0x18u + stage, 0x80);
+                clear(0xFF102030u);
+                bw_metal_test_draw_extended(&surface, &batch);
+                flip();
+                expect_no_error();
+                check_pixel_near(value, 2, "texture address mode", pass * 32u + sample * 4u + stage);
+                setup_combiner(&rc);
+                clear(0xFF102030u);
+                draw(3);
+                flip();
+                expect_no_error();
+                check_pixel_near(value, 2, "executor texture address mode",
+                                 pass * 32u + sample * 4u + stage);
+            }
+        }
+    }
+    setup_swizzled_texture_stage(3, TEX_AT + 768u, 0x06u, 4, 4, 3, 1);
+    batch.tex[3].color = 0x06u;
+    batch.tex[3].levels = 3;
+    batch.tex[3].addr_u = 1;
+    batch.tex[3].addr_v = 2;
+    method(0x1BC8, 0x00030201u);
+    rc.stage_program = 1u << 15;
+    rc.final0 = RC_WORD(0, 0, 0, 11);
+    rc.final1 = RC_WORD(0, 0, 0x1B, 0x80);
+    for (unsigned i = 0; i < 3; i++) {
+        float u = (xy[i][0] - 2.0f) / 2.0f;
+        float v = (xy[i][1] - 2.0f) / 2.0f;
+        vertices[i].tc[3][0] = u;
+        vertices[i].tc[3][1] = v;
+        put_float(UV_AT + 0x1C0u + i * 8u, u);
+        put_float(UV_AT + 0x1C0u + i * 8u + 4u, v);
+    }
+    clear(0xFF102030u);
+    bw_metal_test_draw_extended(&surface, &batch);
+    flip();
+    expect_no_error();
+    check_pixel_near(0x8000FF00u, 2, "mipped wrap and mirror", 0);
+    setup_combiner(&rc);
+    clear(0xFF102030u);
+    draw(3);
+    flip();
+    expect_no_error();
+    check_pixel_near(0x8000FF00u, 2, "executor mipped wrap and mirror", 0);
+}
+
+static void setup_dxt_mip_texture_stage(unsigned stage, uint32_t address,
+                                        uint32_t format, uint32_t min_filter,
+                                        uint32_t base_width, uint32_t base_height)
+{
+    const uint32_t colors[4] = {0xF800u, 0x07E0u, 0x001Fu, 0xFFFFu};
+    uint32_t cursor = address, width = base_width, height = base_height;
+    uint32_t log_width = 0, log_height = 0;
+    uint32_t block_bytes = format == 0x0Cu ? 8u : 16u;
+    for (uint32_t n = base_width; n > 1u; n >>= 1) log_width++;
+    for (uint32_t n = base_height; n > 1u; n >>= 1) log_height++;
+    for (unsigned level = 0; level < 4; level++) {
+        unsigned blocks = ((width + 3u) / 4u) * ((height + 3u) / 4u);
+        for (unsigned block = 0; block < blocks; block++) {
+            uint32_t color_at = cursor;
+            if (format == 0x0Eu) {
+                put32(cursor, 0xFFFFFFFFu);
+                put32(cursor + 4u, 0xFFFFFFFFu);
+                color_at += 8u;
+            } else if (format == 0x0Fu) {
+                put32(cursor, 0x0000FFFFu);
+                put32(cursor + 4u, 0);
+                color_at += 8u;
+            }
+            put32(color_at, colors[level]);
+            put32(color_at + 4u, 0);
+            cursor += block_bytes;
+        }
+        width = width > 1u ? width / 2u : 1u;
+        height = height > 1u ? height / 2u : 1u;
+    }
+    uint32_t base = 0x1B00u + stage * 0x40u;
+    method(base, address);
+    method(base + 4u, (log_height << 24) | (log_width << 20) | (4u << 16) |
+                      (format << 8) | (2u << 4));
+    method(base + 8u, 0x00030303u);
+    method(base + 12u, (1u << 30) | (3u << 6));
+    method(base + 20u, (2u << 24) | (min_filter << 16));
+}
+
+static void extended_dxt_mips_test(void)
+{
+    const uint32_t formats[4] = {0x0Cu, 0x0Eu, 0x0Fu, 0x0Cu};
+    const uint32_t widths[4] = {8u, 8u, 4u, 8u};
+    const uint32_t heights[4] = {8u, 4u, 8u, 8u};
+    const uint32_t colors[5] = {
+        0xFFFF0000u, 0xFF00FF00u, 0xFF0000FFu, 0xFFFFFFFFu, 0xFF008080u
+    };
+    const float scales[5] = {1.0f, 2.0f, 4.0f, 8.0f, 2.828427125f};
+    const float xy[3][2] = {{2, 2}, {14, 2}, {2, 10}};
+    const Nv2aSurface surface = {COLOR_AT, WIDTH, HEIGHT, PITCH, 4, 1, 1};
+    const Nv2aRenderState state = {.color_mask = 0x01010101u, .depth_max = 1.0f};
+    BwXVertex vertices[3] = {0};
+    Nv2aCombiner rc = synthetic_combiner();
+    BwXBatch batch = {.vertices = vertices, .count = 3, .state = &state, .rc = &rc};
+
+    rc.stage_program = 1u | (1u << 5) | (1u << 10) | (1u << 15);
+    for (unsigned stage = 0; stage < 4; stage++) {
+        uint32_t address = TEX_AT + stage * 256u;
+        uint32_t min_filter = stage & 1u ? 6u : 2u;
+        setup_dxt_mip_texture_stage(stage, address, formats[stage], min_filter,
+                                    widths[stage], heights[stage]);
+        batch.tex[stage] = (Nv2aTexture){
+            .offset = address, .width = widths[stage], .height = heights[stage],
+            .color = formats[stage],
+            .addr_u = 3, .addr_v = 3, .levels = 4,
+            .filter = (2u << 24) | (min_filter << 16),
+        };
+        batch.tex_valid[stage] = batch.tex_normalized[stage] = 1;
+    }
+    triangle(0xFFFFFFFFu);
+    for (unsigned i = 0; i < 3; i++) {
+        vertices[i].x = xy[i][0];
+        vertices[i].y = xy[i][1];
+        vertices[i].z = 0.5f;
+        vertices[i].rhw = 1.0f;
+        for (unsigned stage = 0; stage < 4; stage++)
+            vertices[i].tc[stage][3] = 2.0f;
+    }
+    for (unsigned pass = 0; pass < 3; pass++) {
+        uint32_t levels = pass == 2 ? 3u : 4u;
+        for (unsigned stage = 0; stage < 4; stage++) {
+            uint32_t min_filter = (stage + pass) & 1u ? 6u : 2u;
+            uint32_t base = 0x1B00u + stage * 0x40u;
+            uint32_t log_width = widths[stage] == 8u ? 3u : 2u;
+            uint32_t log_height = heights[stage] == 8u ? 3u : 2u;
+            method(base + 4u, (log_height << 24) | (log_width << 20) | (levels << 16) |
+                              (formats[stage] << 8) | (2u << 4));
+            method(base + 20u, (2u << 24) | (min_filter << 16));
+            batch.tex[stage].levels = levels;
+            batch.tex[stage].filter = (2u << 24) | (min_filter << 16);
+        }
+        for (unsigned sample = 0; sample < 5; sample++) {
+            for (unsigned stage = 0; stage < 4; stage++) {
+                uint32_t uv = UV_AT + 0x100u + stage * 0x40u;
+                method(0x1744u + stage * 4u, uv);
+                method(0x1784u + stage * 4u, 2 | (4 << 4) | (16 << 8));
+                for (unsigned i = 0; i < 3; i++) {
+                    float u = (xy[i][0] - 2.0f) * scales[sample] * 2.0f / widths[stage];
+                    float v = (xy[i][1] - 2.0f) * scales[sample] * 2.0f / heights[stage];
+                    vertices[i].tc[stage][0] = u;
+                    vertices[i].tc[stage][1] = v;
+                    put_float(uv + i * 16u, u);
+                    put_float(uv + i * 16u + 4u, v);
+                    put_float(uv + i * 16u + 8u, 0.0f);
+                    put_float(uv + i * 16u + 12u, 2.0f);
+                }
+            }
+            for (unsigned stage = 0; stage < 4; stage++) {
+                unsigned index = ((stage + pass) & 1u) ? sample : 0u;
+                if (levels == 3u && index == 3u)
+                    index = 2u;
+                uint32_t expected = colors[index];
+                rc.final0 = RC_WORD(0, 0, 0, 8u + stage);
+                rc.final1 = RC_WORD(0, 0, 0x18u + stage, 0x80);
+                clear(0xFF102030u);
+                bw_metal_test_draw_extended(&surface, &batch);
+                flip();
+                expect_no_error();
+                check_pixel_near(expected, 2, "direct BC mip selection",
+                                 pass * 20u + sample * 4u + stage);
+
+                setup_combiner(&rc);
+                clear(0xFF102030u);
+                draw(3);
+                flip();
+                expect_no_error();
+                check_pixel_near(expected, 2, "executor BC mip selection",
+                                 pass * 20u + sample * 4u + stage);
+            }
+        }
+    }
+}
+
+static void extended_dxt_nearest_mip_test(void)
+{
+    const Nv2aSurface surface = {COLOR_AT, WIDTH, HEIGHT, PITCH, 4, 1, 1};
+    const Nv2aRenderState state = {.color_mask = 0x01010101u, .depth_max = 1.0f};
+    const float xy[3][2] = {{2, 2}, {14, 2}, {2, 10}};
+    BwXVertex vertices[3] = {0};
+    Nv2aCombiner rc = synthetic_combiner();
+    BwXBatch batch = {.vertices = vertices, .count = 3, .state = &state, .rc = &rc};
+
+    setup_dxt_mip_texture_stage(0, TEX_AT, 0x0Fu, 4u, 8u, 8u);
+    batch.tex[0] = (Nv2aTexture){
+        .offset = TEX_AT, .width = 8, .height = 8, .color = 0x0Fu,
+        .addr_u = 3, .addr_v = 3, .levels = 4,
+        .filter = (2u << 24) | (4u << 16),
+    };
+    batch.tex_valid[0] = batch.tex_normalized[0] = 1;
+    rc.final0 = RC_WORD(0, 0, 0, 8);
+    rc.final1 = RC_WORD(0, 0, 0x18, 0x80);
+    triangle(0xFFFFFFFFu);
+    method(0x1744, UV_AT + 0x100u);
+    method(0x1784, 2 | (4 << 4) | (16 << 8));
+    for (unsigned i = 0; i < 3; i++) {
+        float u = (xy[i][0] - 2.0f);
+        float v = (xy[i][1] - 2.0f);
+        vertices[i].x = xy[i][0];
+        vertices[i].y = xy[i][1];
+        vertices[i].z = 0.5f;
+        vertices[i].rhw = 1.0f;
+        vertices[i].tc[0][0] = u;
+        vertices[i].tc[0][1] = v;
+        vertices[i].tc[0][3] = 2.0f;
+        put_float(UV_AT + 0x100u + i * 16u, u);
+        put_float(UV_AT + 0x104u + i * 16u, v);
+        put_float(UV_AT + 0x108u + i * 16u, 0.0f);
+        put_float(UV_AT + 0x10Cu + i * 16u, 2.0f);
+    }
+
+    clear(0xFF102030u);
+    bw_metal_test_draw_extended(&surface, &batch);
+    flip();
+    expect_no_error();
+    check_pixel_near(0xFF0000FFu, 2, "direct nearest BC mip", 0);
+
+    setup_combiner(&rc);
+    clear(0xFF102030u);
+    draw(3);
+    flip();
+    expect_no_error();
+    check_pixel_near(0xFF0000FFu, 2, "executor nearest BC mip", 0);
+}
+
+static void extended_dxt_mip_limit_test(void)
+{
+    const Nv2aSurface surface = {COLOR_AT, WIDTH, HEIGHT, PITCH, 4, 1, 1};
+    const Nv2aRenderState state = {.color_mask = 0x01010101u, .depth_max = 1.0f};
+    const float xy[3][2] = {{2, 2}, {14, 2}, {2, 10}};
+    BwXVertex vertices[3] = {0};
+    Nv2aCombiner rc = synthetic_combiner();
+    BwXBatch batch = {.vertices = vertices, .count = 3, .state = &state, .rc = &rc};
+    uint32_t width = 2048, height = 4, cursor = TEX_AT;
+    for (unsigned level = 0; level < 12; level++) {
+        uint32_t color = level == 11u ? 0xFFFFu : level == 10u ? 0x001Fu : 0xF800u;
+        uint32_t blocks = ((width + 3u) / 4u) * ((height + 3u) / 4u);
+        for (uint32_t block = 0; block < blocks; block++) {
+            put32(cursor, 0x0000FFFFu);
+            put32(cursor + 4u, 0);
+            put32(cursor + 8u, color);
+            put32(cursor + 12u, 0);
+            cursor += 16u;
+        }
+        width = width > 1u ? width / 2u : 1u;
+        height = height > 1u ? height / 2u : 1u;
+    }
+    method(0x1B00, TEX_AT);
+    method(0x1B04, (2u << 24) | (11u << 20) | (12u << 16) | (0x0Fu << 8) | (2u << 4));
+    method(0x1B08, 0x00030303u);
+    method(0x1B0C, (1u << 30) | (11u << 6));
+    method(0x1B14, (2u << 24) | (6u << 16));
+    batch.tex[0] = (Nv2aTexture){
+        .offset = TEX_AT, .width = 2048, .height = 4, .color = 0x0Fu,
+        .addr_u = 3, .addr_v = 3, .levels = 12, .filter = (2u << 24) | (6u << 16),
+    };
+    batch.tex_valid[0] = batch.tex_normalized[0] = 1;
+    rc.final0 = RC_WORD(0, 0, 0, 8);
+    rc.final1 = RC_WORD(0, 0, 0x18, 0x80);
+    for (unsigned sample = 0; sample < 2; sample++) {
+        float scale = sample ? 2048.0f : 1024.0f;
+        for (unsigned i = 0; i < 3; i++) {
+            vertices[i].x = xy[i][0];
+            vertices[i].y = xy[i][1];
+            vertices[i].z = 0.5f;
+            vertices[i].rhw = 1.0f;
+            vertices[i].tc[0][0] = (xy[i][0] - 2.0f) * scale / 2048.0f;
+            vertices[i].tc[0][1] = (xy[i][1] - 2.0f) * scale / 4.0f;
+            vertices[i].tc[0][3] = 1.0f;
+        }
+        clear(0xFF102030u);
+        bw_metal_test_draw_extended(&surface, &batch);
+        flip();
+        expect_no_error();
+        check_pixel_near(sample ? 0xFFFFFFFFu : 0xFF0000FFu, 2,
+                         "maximum BC mip chain", sample);
+    }
+}
+
+static void extended_dxt_alpha_test(void)
+{
+    const Nv2aSurface surface = {COLOR_AT, WIDTH, HEIGHT, PITCH, 4, 1, 1};
+    const Nv2aRenderState state = {.color_mask = 0x01010101u, .depth_max = 1.0f};
+    BwXVertex vertices[3] = {0};
+    Nv2aCombiner rc = synthetic_combiner();
+    BwXBatch batch = {.vertices = vertices, .count = 3, .state = &state, .rc = &rc};
+    const float xy[3][2] = {{2, 2}, {14, 2}, {2, 10}};
+    const unsigned ys[4] = {0, 3, 4, 7};
+    for (unsigned i = 0; i < 3; i++) {
+        vertices[i].x = xy[i][0];
+        vertices[i].y = xy[i][1];
+        vertices[i].z = 0.5f;
+        vertices[i].rhw = 1.0f;
+        for (unsigned stage = 0; stage < 4; stage++)
+            vertices[i].tc[stage][3] = 1.0f;
+    }
+    for (uint32_t format = 0x0Eu; format <= 0x0Fu; format++) {
+        for (unsigned stage = 0; stage < 4; stage++) {
+            uint32_t address = TEX_AT + stage * 64u;
+            setup_dxt_alpha_texture_stage(stage, address, format);
+            memset(batch.tex_valid, 0, sizeof batch.tex_valid);
+            batch.tex[stage] = (Nv2aTexture){
+                .offset = address, .width = 8, .height = 8, .color = format,
+                .addr_u = 3, .addr_v = 3, .levels = 1, .filter = (2u << 24) | (6u << 16),
+            };
+            batch.tex_valid[stage] = batch.tex_normalized[stage] = 1;
+            rc.stage_program = 1u << (stage * 5u);
+            rc.final0 = RC_WORD(0, 0, 0, 8u + stage);
+            rc.final1 = RC_WORD(0, 0, 0x18u + stage, 0x80);
+            for (unsigned row = 0; row < 4; row++) {
+                for (unsigned x = 0; x < 8; x++) {
+                    uint32_t expected = 0;
+                    CHECK(d3d8_dxt_decode_texel(s_mem + address, format, x, ys[row], 8, &expected));
+                    for (unsigned i = 0; i < 3; i++) {
+                        vertices[i].tc[stage][0] = (x + 0.5f) / 8.0f;
+                        vertices[i].tc[stage][1] = (ys[row] + 0.5f) / 8.0f;
+                    }
+                    clear(0xFF102030u);
+                    bw_metal_test_draw_extended(&surface, &batch);
+                    flip();
+                    expect_no_error();
+                    check_pixel_near(expected, format == 0x0Fu ? 2 : 1, "DXT alpha texture",
+                                     (format << 24) | (stage << 16) | (ys[row] << 8) | x);
+                }
+            }
+            if (stage == 2) {
+                uint32_t expected = 0;
+                CHECK(d3d8_dxt_decode_texel(s_mem + address, format, 5, 7, 8, &expected));
+                setup_combiner(&rc);
+                triangle(0xFFFFFFFFu);
+                method(0x1744u + stage * 4u, UV_AT + 0x100u);
+                method(0x1784u + stage * 4u, 2 | (2 << 4) | (8 << 8));
+                for (unsigned i = 0; i < 3; i++) {
+                    put_float(UV_AT + 0x100u + i * 8u, 5.5f / 8.0f);
+                    put_float(UV_AT + 0x104u + i * 8u, 7.5f / 8.0f);
+                }
+                clear(0xFF102030u);
+                draw(3);
+                flip();
+                expect_no_error();
+                check_pixel_near(expected, format == 0x0Fu ? 2 : 1,
+                                 "executor DXT alpha texture", format);
+            }
+        }
+    }
+    const uint32_t formats[4] = {0x0Cu, 0x0Eu, 0x0Fu, 0x0Eu};
+    const unsigned xs[4] = {0, 7, 5, 1}, sample_y[4] = {0, 3, 7, 0};
+    uint32_t expected[4] = {0};
+    setup_dxt1_texture_stage(0, TEX_AT, 0xF800u, 0x001Fu, 0);
+    batch.tex[0] = (Nv2aTexture){
+        .offset = TEX_AT, .width = 4, .height = 4, .color = 0x0C,
+        .addr_u = 3, .addr_v = 3, .levels = 1, .filter = (2u << 24) | (6u << 16),
+    };
+    for (unsigned stage = 1; stage < 4; stage++) {
+        uint32_t address = TEX_AT + stage * 64u;
+        setup_dxt_alpha_texture_stage(stage, address, formats[stage]);
+        batch.tex[stage] = (Nv2aTexture){
+            .offset = address, .width = 8, .height = 8, .color = formats[stage],
+            .addr_u = 3, .addr_v = 3, .levels = 1, .filter = (2u << 24) | (6u << 16),
+        };
+    }
+    rc.stage_program = 1u | (1u << 5) | (1u << 10) | (1u << 15);
+    for (unsigned stage = 0; stage < 4; stage++) {
+        unsigned width = stage ? 8u : 4u;
+        batch.tex_valid[stage] = batch.tex_normalized[stage] = 1;
+        CHECK(d3d8_dxt_decode_texel(s_mem + batch.tex[stage].offset, formats[stage],
+                                    xs[stage], sample_y[stage], width, &expected[stage]));
+        for (unsigned i = 0; i < 3; i++) {
+            vertices[i].tc[stage][0] = (xs[stage] + 0.5f) / width;
+            vertices[i].tc[stage][1] = (sample_y[stage] + 0.5f) / width;
+        }
+    }
+    for (unsigned stage = 0; stage < 4; stage++) {
+        rc.final0 = RC_WORD(0, 0, 0, 8u + stage);
+        rc.final1 = RC_WORD(0, 0, 0x18u + stage, 0x80);
+        clear(0xFF102030u);
+        bw_metal_test_draw_extended(&surface, &batch);
+        flip();
+        expect_no_error();
+        check_pixel_near(expected[stage], formats[stage] == 0x0Fu ? 2 : 1,
+                         "mixed BC texture stages", stage);
+
+        setup_combiner(&rc);
+        triangle(0xFFFFFFFFu);
+        for (unsigned coord = 0; coord < 4; coord++) {
+            unsigned width = coord ? 8u : 4u;
+            uint32_t uv = UV_AT + 0x100u + coord * 0x40u;
+            method(0x1744u + coord * 4u, uv);
+            method(0x1784u + coord * 4u, 2 | (2 << 4) | (8 << 8));
+            for (unsigned i = 0; i < 3; i++) {
+                put_float(uv + i * 8u, (xs[coord] + 0.5f) / width);
+                put_float(uv + i * 8u + 4u, (sample_y[coord] + 0.5f) / width);
+            }
+        }
+        clear(0xFF102030u);
+        draw(3);
+        flip();
+        expect_no_error();
+        check_pixel_near(expected[stage], formats[stage] == 0x0Fu ? 2 : 1,
+                         "executor mixed BC texture stages", stage);
+    }
+}
+
 static void set_triangle_uv(float u, float v)
 {
     for (unsigned i = 0; i < 3; i++) {
@@ -2055,6 +3506,59 @@ static void setup_xrgb_convolution_texture(uint32_t address, uint32_t filter)
     method(0x1B1C, (AA_WIDTH << 16) | HEIGHT);
     method(0x1744, UV_AT);
     method(0x1784, 2 | (2 << 4) | (8 << 8));
+}
+
+static void setup_linear_texture(uint32_t address, uint32_t color, uint32_t width,
+                                 uint32_t height, uint32_t pitch, uint32_t filter)
+{
+    method(0x1B00, address);
+    method(0x1B04, (1u << 16) | (color << 8) | (2u << 4) | 0xAu);
+    method(0x1B08, 0x00010303u);
+    method(0x1B0C, 0x4003FFC0u);
+    method(0x1B10, pitch << 16);
+    method(0x1B14, filter);
+    method(0x1B1C, (width << 16) | height);
+    method(0x1744, UV_AT);
+    method(0x1784, 2 | (2 << 4) | (8 << 8));
+}
+
+static void extended_linear_texture_test(void)
+{
+    const uint32_t width = 4u, height = 4u, pitch = 24u;
+    const uint32_t colors[4][4] = {
+        {0x10204080u, 0x20408020u, 0x30602040u, 0x40804020u},
+        {0x506080A0u, 0x6080A060u, 0x70A06080u, 0x80C08040u},
+        {0x90402060u, 0xA0604080u, 0xB08060A0u, 0xC0A08060u},
+        {0xD02060A0u, 0xE04080C0u, 0xF060A080u, 0x8080C0A0u},
+    };
+    Nv2aCombiner rc = synthetic_combiner();
+    memset(s_mem + TEX_AT, 0xA5, pitch * height);
+    for (unsigned y = 0; y < height; y++)
+        for (unsigned x = 0; x < width; x++)
+            put32(TEX_AT + y * pitch + x * 4u, colors[y][x]);
+    setup_combiner(&rc);
+    triangle(0xFFFFFFFFu);
+
+    setup_linear_texture(TEX_AT, 0x1Eu, width, height, pitch, 0x01032000u);
+    set_triangle_uv(1.5f, 2.5f);
+    clear(0xFF010203u);
+    draw(3);
+    flip();
+    expect_no_error();
+    CHECK(pixel(4, 3) == (colors[2][1] | 0xFF000000u));
+
+    setup_linear_texture(TEX_AT, 0x12u, width, height, pitch, 0x02022000u);
+    set_triangle_uv(1.0f, 1.0f);
+    clear(0xFF010203u);
+    draw(3);
+    flip();
+    expect_no_error();
+    uint32_t top = average_argb(colors[0][0], colors[0][1]);
+    uint32_t bottom = average_argb(colors[1][0], colors[1][1]);
+    check_pixel_near(average_argb(top, bottom), 2, "pitch-linear bilinear texture", 0);
+    for (unsigned y = 0; y < height; y++)
+        for (unsigned x = width * 4u; x < pitch; x++)
+            CHECK(s_mem[TEX_AT + y * pitch + x] == 0xA5u);
 }
 
 static void extended_bc1_inactive_kernel_test(int immediate)
@@ -2216,6 +3720,49 @@ static void extended_projective_test(void)
     CHECK(color_near(pixel(4, 3), 0xFFAC1E35u, 2));
 }
 
+static void extended_projective_divisor_test(unsigned kind)
+{
+    Nv2aCombiner rc = synthetic_combiner();
+    float q = kind == 1u ? -1.0f : kind == 2u ? FLT_MIN / 2.0f : 0.0f;
+    float u = kind == 1u ? -0.375f : kind == 2u ? q * 0.125f : 0.125f;
+    float v = kind == 1u ? -0.125f : kind == 2u ? q * 0.125f : 0.125f;
+    setup_dxt1_texture(0xF800u, 0x001Fu, (1u << 2) | (2u << 4) | (3u << 6));
+    setup_combiner(&rc);
+    triangle(0xFFFFFFFFu);
+    method(0x1784, 2 | (4 << 4) | (16 << 8));
+    for (unsigned i = 0; i < 3; i++) {
+        put_float(UV_AT + i * 16u, u);
+        put_float(UV_AT + i * 16u + 4u, v);
+        put_float(UV_AT + i * 16u + 8u, 0.0f);
+        put_float(UV_AT + i * 16u + 12u, q);
+    }
+    clear(0xFF102030u);
+    draw(3);
+    flip();
+    expect_no_error();
+    CHECK(color_near(pixel(4, 3), kind == 1u ? 0xFF0000FFu : 0xFFFF0000u, 2));
+}
+
+static void extended_nonfinite_texture_coordinate_test(void)
+{
+    Nv2aCombiner rc = synthetic_combiner();
+    setup_dxt1_texture(0xF800u, 0x001Fu, (1u << 2) | (2u << 4) | (3u << 6));
+    setup_combiner(&rc);
+    triangle(0xFFFFFFFFu);
+    method(0x1784, 2 | (4 << 4) | (16 << 8));
+    for (unsigned i = 0; i < 3; i++) {
+        put_float(UV_AT + i * 16u, 0.375f);
+        put_float(UV_AT + i * 16u + 4u, NAN);
+        put_float(UV_AT + i * 16u + 8u, 0.0f);
+        put_float(UV_AT + i * 16u + 12u, 1.0f);
+    }
+    clear(0xFF102030u);
+    draw(3);
+    flip();
+    expect_no_error();
+    check_pixel_near(0xFFFF0000u, 2, "non-finite texture coordinate", 0);
+}
+
 static void extended_blend_test(void)
 {
     Nv2aCombiner rc = synthetic_combiner();
@@ -2301,43 +3848,139 @@ static void extended_rejection_test(const char *which)
     clear(0xFF102030u);
 
     if (!strcmp(which, "extended-reject-stage-count"))
+        method(0x1E60, 9);
+    else if (!strcmp(which, "extended-reject-late-stage")) {
         method(0x1E60, 2);
+        method(0x0AC4, RC_WORD(6, 8, 0, 0));
+    }
     else if (!strcmp(which, "extended-reject-control"))
         method(0x1E60, 0x201);
     else if (!strcmp(which, "extended-reject-rgb-mapping"))
-        method(0x0AC0, rc.color_icw[0] | (2u << 29));
+        method(0x1E40, (12u << 4) | (0x28u << 12));
     else if (!strcmp(which, "extended-reject-alpha-mapping"))
-        method(0x0260, rc.alpha_icw[0] | (2u << 29));
+        method(0x0AA0, (12u << 4) | (0x38u << 12));
     else if (!strcmp(which, "extended-reject-input"))
-        method(0x0AC0, RC_WORD(1, 8, 0, 0));
+        method(0x0AC0, RC_WORD(6, 8, 0, 0));
     else if (!strcmp(which, "extended-reject-destination"))
         method(0x1E40, 4u << 4);
     else if (!strcmp(which, "extended-reject-duplicate"))
         method(0x1E40, (12u << 4) | 12u);
-    else if (!strcmp(which, "extended-reject-dot"))
-        method(0x1E40, (12u << 4) | (1u << 13));
-    else if (!strcmp(which, "extended-reject-mux"))
-        method(0x0AA0, (12u << 4) | (1u << 14));
-    else if (!strcmp(which, "extended-reject-scale"))
-        method(0x1E40, (12u << 4) | (1u << 16));
+    else if (!strcmp(which, "extended-reject-rgb-flags"))
+        method(0x1E40, (12u << 4) | (1u << 20));
+    else if (!strcmp(which, "extended-reject-alpha-flags"))
+        method(0x0AA0, (12u << 4) | (1u << 18));
     else if (!strcmp(which, "extended-reject-final-special"))
-        method(0x0288, RC_WORD(0, 0, 0, 14));
+        method(0x0288, RC_WORD(0, 0, 0, 6));
+    else if (!strcmp(which, "extended-reject-final-self-reference"))
+        method(0x028C, RC_WORD(15, 0, 0x1C, 0x80));
     else if (!strcmp(which, "extended-reject-final-flags"))
         method(0x028C, rc.final1 | 1u);
     else if (!strcmp(which, "extended-reject-program"))
         method(0x1E70, 2);
+    else if (!strcmp(which, "extended-reject-later-program"))
+        method(0x1E70, 1u | (2u << 10));
     else {
         expected = "extended texture";
-        if (!strcmp(which, "extended-reject-format"))
-            method(0x1B04, (format & ~(0xFFu << 8)) | (0x0Eu << 8));
+        if (!strncmp(which, "extended-reject-stage1-", 23)) {
+            setup_dxt1_texture_stage(1, TEX_AT + 8u, 0x07E0u, 0, 0);
+            method(0x1E70, 1u | (1u << 5));
+            if (!strcmp(which, "extended-reject-stage1-format"))
+                method(0x1B44, (format & ~(0xFFu << 8)) | (0x0Du << 8));
+            else if (!strcmp(which, "extended-reject-stage1-alias")) {
+                expected = "active colour surface";
+                method(0x1B40, COLOR_AT);
+            } else if (!strcmp(which, "extended-reject-stage1-projective")) {
+                expected = "projective divisor";
+                method(0x1748, UV_AT + 0x100u);
+                method(0x1788, 2 | (4 << 4) | (16 << 8));
+                for (unsigned i = 0; i < 3; i++) {
+                    put_float(UV_AT + 0x100u + i * 16u, 0.25f);
+                    put_float(UV_AT + 0x104u + i * 16u, 0.25f);
+                    put_float(UV_AT + 0x108u + i * 16u, 0.0f);
+                    put_float(UV_AT + 0x10Cu + i * 16u, INFINITY);
+                }
+            } else {
+                CHECK(0 && "unknown stage-1 rejection test");
+                return;
+            }
+        } else if (!strcmp(which, "extended-reject-format"))
+            method(0x1B04, (format & ~(0xFFu << 8)) | (0x0Du << 8));
+        else if (!strcmp(which, "extended-reject-dxt3-span") ||
+                 !strcmp(which, "extended-reject-dxt5-span")) {
+            uint32_t color = strstr(which, "dxt3") ? 0x0Eu : 0x0Fu;
+            setup_dxt_alpha_texture_stage(0, TEX_AT, color);
+            method(0x1B00, MEM_BYTES - 32u);
+        }
+        else if (!strcmp(which, "extended-reject-dxt5-stage3-alias")) {
+            setup_dxt_alpha_texture_stage(3, TEX_AT, 0x0Fu);
+            method(0x1E70, 1u << 15);
+            method(0x1BC0, COLOR_AT - 32u);
+            expected = "active colour surface";
+        }
+        else if (!strcmp(which, "extended-reject-cube-span") ||
+                 !strcmp(which, "extended-reject-cube-layout")) {
+            static const uint16_t faces[6] = {
+                0xF800u, 0x07E0u, 0x001Fu, 0xFFFFu, 0xFFE0u, 0x07FFu
+            };
+            setup_dxt1_cube_texture_stage(2, TEX_AT + 0x1000u, faces);
+            method(0x1E70, 1u | (0x11u << 5) | (0x0Bu << 10));
+            if (strstr(which, "span")) {
+                method(0x1B80, MEM_BYTES - 128u);
+                expected = "texture guest-memory span";
+            } else
+                method(0x1B84, (2u << 24) | (3u << 20) | (1u << 16) |
+                               (0x0Cu << 8) | (2u << 4) | 4u);
+        }
         else if (!strcmp(which, "extended-reject-mips"))
-            method(0x1B04, (format & ~(0xFu << 16)) | (2u << 16));
+            method(0x1B04, (format & ~(0xFu << 16)) | (4u << 16));
+        else if (!strcmp(which, "extended-reject-mip-limit"))
+            method(0x1B04, (2u << 24) | (12u << 20) | (13u << 16) |
+                             (0x0Cu << 8) | (2u << 4));
+        else if (!strcmp(which, "extended-reject-swizzled-span") ||
+                 !strcmp(which, "extended-reject-swizzled-alias")) {
+            unsigned stage = strstr(which, "alias") ? 3u : 0u;
+            setup_swizzled_texture_stage(stage, TEX_AT, 0x06u, 8, 8, 4, 1);
+            method(0x1E70, 1u << (stage * 5u));
+            if (stage == 3u) {
+                method(0x1BC0, COLOR_AT - 336u);
+                expected = "active colour surface";
+            } else
+                method(0x1B00, MEM_BYTES - 336u);
+        }
+        else if (!strcmp(which, "extended-reject-swizzled-alignment")) {
+            setup_swizzled_texture_stage(0, TEX_AT, 0x05u, 8, 8, 1, 0);
+            method(0x1B00, TEX_AT + 1u);
+        }
+        else if (!strcmp(which, "extended-reject-mip-span") ||
+                 !strcmp(which, "extended-reject-mip-stage3-alias")) {
+            setup_dxt_mip_texture_stage(3, TEX_AT, 0x0Fu, 6u, 8u, 8u);
+            method(0x1E70, 1u << 15);
+            if (strstr(which, "alias")) {
+                method(0x1BC0, COLOR_AT - 96u);
+                expected = "active colour surface";
+            } else
+                method(0x1BC0, MEM_BYTES - 96u);
+        }
+        else if (!strcmp(which, "extended-reject-mip-lod-bias") ||
+                 !strcmp(which, "extended-reject-mip-lod-min") ||
+                 !strcmp(which, "extended-reject-mip-lod-max")) {
+            setup_dxt_mip_texture_stage(0, TEX_AT, 0x0Cu, 6u, 8u, 8u);
+            expected = "extended texture mip LOD state";
+            if (strstr(which, "bias"))
+                method(0x1B14, (2u << 24) | (6u << 16) | 1u);
+            else if (strstr(which, "-min"))
+                method(0x1B0C, (1u << 30) | (1u << 18) | (3u << 6));
+            else
+                method(0x1B0C, (1u << 30) | (2u << 6));
+        }
         else if (!strcmp(which, "extended-reject-dimensions"))
             method(0x1B04, (format & ~(0xFu << 20)) | (1u << 20));
-        else if (!strcmp(which, "extended-reject-wrap"))
-            method(0x1B08, 0x00030301u);
+        else if (!strcmp(which, "extended-reject-address"))
+            method(0x1B08, 0x00030300u);
+        else if (!strcmp(which, "extended-reject-border"))
+            method(0x1B08, 0x00030403u);
         else if (!strcmp(which, "extended-reject-filter"))
-            method(0x1B14, (1u << 24) | (6u << 16));
+            method(0x1B14, (3u << 24) | (6u << 16));
         else if (!strncmp(which, "extended-reject-conv-", 21)) {
             uint32_t kernel = strstr(which, "quincunx") ? 1u
                             : strstr(which, "gaussian") ? 2u : 7u;
@@ -2360,23 +4003,29 @@ static void extended_rejection_test(const char *which)
             method(0x1B00, MEM_BYTES);
         else if (!strcmp(which, "extended-reject-alignment"))
             method(0x1B00, TEX_AT + 4u);
+        else if (!strcmp(which, "extended-reject-linear-pitch") ||
+                 !strcmp(which, "extended-reject-linear-span") ||
+                 !strcmp(which, "extended-reject-linear-alignment")) {
+            setup_linear_texture(TEX_AT, 0x1Eu, 4u, 4u, 24u, 0x01032000u);
+            if (strstr(which, "pitch")) {
+                method(0x1B10, 12u << 16);
+                expected = "extended texture dimensions";
+            } else {
+                method(0x1B00, strstr(which, "span") ? MEM_BYTES - 16u : TEX_AT + 1u);
+                expected = "texture guest-memory span";
+            }
+        }
         else if (!strcmp(which, "extended-reject-active-alias")) {
             expected = "active colour surface";
             method(0x1B00, COLOR_AT);
-        } else if (!strcmp(which, "extended-reject-pending-alias")) {
-            expected = "pending render target";
-            method(0x1B00, COLOR_AT);
-            method(0x0210, ZETA3_AT);
         } else if (!strcmp(which, "extended-reject-depth-alias")) {
             expected = "depth/stencil surface";
             setup_depth(ZETA_AT);
             depth_clear(3, 0xFFFFFF00u);
             method(0x1B00, ZETA_AT);
         } else if (!strncmp(which, "extended-reject-projective-", 27)) {
-            float q = !strcmp(which, "extended-reject-projective-zero") ? 0.0f :
-                      !strcmp(which, "extended-reject-projective-negative") ? -1.0f :
-                      !strcmp(which, "extended-reject-projective-subnormal") ? FLT_MIN / 2.0f :
-                      !strcmp(which, "extended-reject-projective-overflow") ? FLT_MIN : INFINITY;
+            float q = !strcmp(which, "extended-reject-projective-overflow")
+                    ? FLT_MIN : INFINITY;
             expected = "projective divisor";
             method(0x1784, 2 | (4 << 4) | (16 << 8));
             for (unsigned i = 0; i < 3; i++) {
@@ -2786,11 +4435,6 @@ static void quincunx_approx_rejection_test(const char *which)
     } else if (!strcmp(which, "quincunx-approx-reject-active-alias")) {
         expected = "active colour surface";
         method(0x1B00, destination);
-    } else if (!strcmp(which, "quincunx-approx-reject-pending-alias")) {
-        expected = "pending render target";
-        setup_xrgb_aa_surface();
-        clear(0xFF214365u);
-        setup_xrgb_single_surface(destination);
     } else if (!strcmp(which, "quincunx-approx-reject-depth-alias")) {
         expected = "depth/stencil surface";
         setup_depth(ZETA_AT);
@@ -3285,9 +4929,11 @@ static void failure_test(const char *which)
         expect_error("incomplete clear", before);
     } else {
         clear(0xFF102030u);
-        if (!strcmp(which, "unsupported-state"))
+        if (!strcmp(which, "unsupported-state")) {
+            setup_depth(ZETA_AT);
             method(0x030C, 1);
-        else if (!strcmp(which, "invalid-blend-src") || !strcmp(which, "invalid-blend-dst") ||
+            method(0x0354, 0xFFFFu);
+        } else if (!strcmp(which, "invalid-blend-src") || !strcmp(which, "invalid-blend-dst") ||
                  !strcmp(which, "invalid-blend-equation")) {
             blend_state(!strcmp(which, "invalid-blend-src") ? 0xFFFFu : 1,
                         !strcmp(which, "invalid-blend-dst") ? 0x308u : 0,
@@ -3301,14 +4947,21 @@ static void failure_test(const char *which)
             method(0x03A0, !strcmp(which, "invalid-cull-winding") ? 0xFFFFu : 0x900u);
         } else if (!strcmp(which, "unsupported-fog"))
             method(0x02A4, 1);
+        else if (!strcmp(which, "invalid-polygon-offset-factor")) {
+            method(0x0338, 1);
+            method_float(0x0384, NAN);
+            method_float(0x0388, -1.0f);
+        } else if (!strcmp(which, "invalid-polygon-offset-units")) {
+            method(0x0338, 1);
+            method_float(0x0384, -0.25f);
+            method_float(0x0388, INFINITY);
+        }
         else if (!strcmp(which, "unsupported-stage"))
             method(0x1B40, TEX_AT);
         else if (!strcmp(which, "unsupported-combiner"))
-            method(0x1E60, 1);
+            method(0x1E60, 9);
         else if (!strcmp(which, "screen-combiner"))
             method(0x1E60, 0);
-        else if (!strcmp(which, "surface-switch"))
-            method(0x0210, COLOR_AT + PITCH * HEIGHT);
         else if (!strcmp(which, "unsupported-texture") || !strcmp(which, "cube-texture") ||
                  !strcmp(which, "texture-extent") ||
                  !strcmp(which, "invalid-texture") ||
@@ -3329,7 +4982,7 @@ static void failure_test(const char *which)
               !strcmp(which, "texture-extent") ||
               !strcmp(which, "invalid-texture") || !strcmp(which, "unaligned-texture") ||
               !strcmp(which, "feedback")) ? 6 : 3);
-        const char *expected = !strcmp(which, "unsupported-state") ? "unsupported depth"
+        const char *expected = !strcmp(which, "unsupported-state") ? "unsupported depth comparison"
                              : !strcmp(which, "invalid-blend-src") ? "unsupported blend factor"
                              : !strcmp(which, "invalid-blend-dst") ? "unsupported destination blend factor"
                              : !strcmp(which, "invalid-blend-equation") ? "unsupported blend equation"
@@ -3337,10 +4990,11 @@ static void failure_test(const char *which)
                              : (!strcmp(which, "invalid-cull-face") ||
                                 !strcmp(which, "invalid-cull-winding")) ? "unsupported cull"
                              : !strcmp(which, "unsupported-fog") ? "unsupported fog"
+                             : (!strcmp(which, "invalid-polygon-offset-factor") ||
+                                !strcmp(which, "invalid-polygon-offset-units")) ? "invalid polygon offset"
                              : !strcmp(which, "unsupported-stage") ? "texture stages"
                              : !strcmp(which, "unsupported-combiner") ? "register-combiner"
                              : !strcmp(which, "screen-combiner") ? "combiner state"
-                             : !strcmp(which, "surface-switch") ? "changing colour surfaces"
                              : (!strcmp(which, "unsupported-texture") ||
                                 !strcmp(which, "cube-texture")) ? "unsupported stage-0"
                              : !strcmp(which, "texture-extent") ? "texture dimensions exceed"
@@ -3349,6 +5003,91 @@ static void failure_test(const char *which)
                              : "pending render target";
         expect_error(expected, before);
     }
+}
+
+static void surface_switch_test(void)
+{
+    const uint32_t next_at = COLOR_AT + 0x2000u;
+    const uint32_t first = 0xFF214365u;
+    const uint32_t second = 0xFF102030u;
+    const uint32_t cpu_seed = 0xFFABCDEFu;
+    const uint32_t draw_color = 0xFF804020u;
+
+    memset(s_mem + next_at, 0x6B, AA_PITCH * HEIGHT);
+    clear(first);
+    setup_color_mode(SURFACE_XRGB_AA, next_at);
+    clear(second);
+    expect_no_error();
+    CHECK(pixel(0, 0) == first);
+    CHECK(surface_pixel(next_at, AA_PITCH, 0, 0) == 0x6B6B6B6Bu);
+    CHECK(bw_metal_test_color_surface_count() == 2u);
+
+    put32(COLOR_AT, cpu_seed);
+    setup_surface(1);
+    triangle(draw_color);
+    draw(3);
+    expect_no_error();
+    CHECK(surface_pixel(next_at, AA_PITCH, 0, 0) == (second & 0x00FFFFFFu));
+    CHECK(bw_metal_test_color_surface_count() == 2u);
+
+    flip();
+    expect_no_error();
+    CHECK(pixel(0, 0) == cpu_seed);
+    CHECK(pixel(4, 3) == draw_color);
+}
+
+static void extended_render_target_texture_test(void)
+{
+    Nv2aCombiner rc = synthetic_combiner();
+    const uint32_t destination = ZETA3_AT;
+
+    memset(s_mem + destination, 0x6B, PITCH * HEIGHT);
+    setup_dxt1_texture(0xF800u, 0x001Fu, 0);
+    setup_combiner(&rc);
+    triangle(0xFFFFFFFFu);
+    clear(0xFF102030u);
+    method(0x1B00, COLOR_AT);
+    method(0x0210, destination);
+    draw(3);
+    flip();
+    expect_no_error();
+    CHECK(pixel(0, 0) == 0xFF102030u);
+    CHECK(surface_pixel(destination, PITCH, 0, 0) == 0x6B6B6B6Bu);
+    CHECK(surface_pixel(destination, PITCH, 4, 3) != 0x6B6B6B6Bu);
+}
+
+static void quincunx_approx_render_target_resolve_test(void)
+{
+    const uint32_t destination = COLOR_AT + 0x2000u;
+    Nv2aCombiner rc = synthetic_combiner();
+
+    memset(s_mem + destination, 0x6B, PITCH * HEIGHT);
+    setup_xrgb_aa_surface();
+    clear(0xFF214365u);
+    setup_xrgb_single_surface(destination);
+    for (unsigned y = 0; y < HEIGHT; y++)
+        for (unsigned x = 0; x < WIDTH; x++)
+            put32(ZETA_AT + y * PITCH + x * 4u, 0xFFFFFF00u);
+    method(0x0208, 0x0124u);
+    method(0x020C, (PITCH << 16) | PITCH);
+    method(0x0214, ZETA_AT);
+    method(0x030C, 1);
+    method(0x0354, 0x201u);
+    method(0x035C, 1);
+    setup_xrgb_convolution_texture(COLOR_AT, (4u << 24) | (7u << 16) | (1u << 13));
+    setup_combiner(&rc);
+    triangle(0xFFFFFFFFu);
+    set_triangle_uv(6.5f, 3.5f);
+    draw(3);
+    flip();
+    expect_no_error();
+    CHECK(aa_pixel(0, 0) == 0x00214365u);
+    CHECK(surface_pixel(destination, PITCH, 0, 0) == 0x6B6B6B6Bu);
+    CHECK(surface_pixel(destination, PITCH, 4, 3) == 0x00214365u);
+    float z;
+    uint8_t stencil;
+    CHECK(bw_metal_test_read_depth(ZETA_AT, 4, 3, &z, &stencil));
+    CHECK(fabsf(z - 0.5f) < 0.000001f && stencil == 0);
 }
 
 static void basic_feedback_test(const char *which)
@@ -3437,6 +5176,8 @@ int main(int argc, char **argv)
         visual_test();
     else if (!strcmp(argv[1], "seed-order"))
         seed_order_test();
+    else if (!strcmp(argv[1], "command-batching"))
+        command_batching_test();
     else if (!strcmp(argv[1], "perspective"))
         perspective_test();
     else if (!strcmp(argv[1], "blend"))
@@ -3453,6 +5194,16 @@ int main(int argc, char **argv)
         full_rect_test();
     else if (!strcmp(argv[1], "depth-clear"))
         depth_clear_test();
+    else if (!strcmp(argv[1], "depth-draw"))
+        depth_draw_test();
+    else if (!strcmp(argv[1], "polygon-offset"))
+        polygon_offset_test(1);
+    else if (!strcmp(argv[1], "polygon-offset-disabled"))
+        polygon_offset_test(0);
+    else if (!strcmp(argv[1], "polygon-offset-zero"))
+        polygon_offset_test(2);
+    else if (!strcmp(argv[1], "stencil-draw"))
+        stencil_draw_test();
     else if (!strcmp(argv[1], "partial-color"))
         partial_color_test();
     else if (!strcmp(argv[1], "partial-color-masks"))
@@ -3521,8 +5272,44 @@ int main(int argc, char **argv)
         xrgb_single_rejection_test(argv[1]);
     else if (!strcmp(argv[1], "extended-basic"))
         extended_basic_test();
+    else if (!strcmp(argv[1], "extended-texture-cache"))
+        extended_texture_cache_test();
     else if (!strcmp(argv[1], "extended-combiner"))
         extended_combiner_test();
+    else if (!strcmp(argv[1], "extended-multistage"))
+        extended_multistage_combiner_test();
+    else if (!strcmp(argv[1], "extended-combiner-mappings"))
+        extended_combiner_mappings_test();
+    else if (!strcmp(argv[1], "extended-combiner-operations"))
+        extended_combiner_operations_test();
+    else if (!strcmp(argv[1], "extended-combiner-constants"))
+        extended_combiner_constants_test();
+    else if (!strcmp(argv[1], "extended-combiner-secondary"))
+        extended_combiner_secondary_test();
+    else if (!strcmp(argv[1], "extended-fog"))
+        extended_fog_test();
+    else if (!strcmp(argv[1], "extended-passthrough-stage"))
+        extended_passthrough_stage_test();
+    else if (!strcmp(argv[1], "extended-texture-stages"))
+        extended_texture_stages_test();
+    else if (!strcmp(argv[1], "extended-dot-reflection"))
+        extended_dot_reflection_test();
+    else if (!strcmp(argv[1], "extended-dxt-alpha"))
+        extended_dxt_alpha_test();
+    else if (!strcmp(argv[1], "extended-swizzled"))
+        extended_swizzled_test();
+    else if (!strcmp(argv[1], "extended-swizzled-mips"))
+        extended_swizzled_mips_test();
+    else if (!strcmp(argv[1], "extended-linear"))
+        extended_linear_texture_test();
+    else if (!strcmp(argv[1], "extended-texture-address"))
+        extended_texture_address_test();
+    else if (!strcmp(argv[1], "extended-dxt-mips"))
+        extended_dxt_mips_test();
+    else if (!strcmp(argv[1], "extended-dxt-nearest-mip"))
+        extended_dxt_nearest_mip_test();
+    else if (!strcmp(argv[1], "extended-dxt-mip-limit"))
+        extended_dxt_mip_limit_test();
     else if (!strcmp(argv[1], "extended-bc1"))
         extended_bc1_test();
     else if (!strncmp(argv[1], "extended-bc1-inactive-kernel-",
@@ -3530,10 +5317,20 @@ int main(int argc, char **argv)
         extended_bc1_inactive_kernel_test(strstr(argv[1], "-immediate") != NULL);
     else if (!strcmp(argv[1], "extended-projective"))
         extended_projective_test();
+    else if (!strcmp(argv[1], "extended-projective-zero"))
+        extended_projective_divisor_test(0);
+    else if (!strcmp(argv[1], "extended-projective-negative"))
+        extended_projective_divisor_test(1);
+    else if (!strcmp(argv[1], "extended-projective-subnormal"))
+        extended_projective_divisor_test(2);
+    else if (!strcmp(argv[1], "extended-nonfinite-texture-coordinate"))
+        extended_nonfinite_texture_coordinate_test();
     else if (!strcmp(argv[1], "extended-blend"))
         extended_blend_test();
     else if (!strcmp(argv[1], "extended-alpha-pipeline"))
         extended_alpha_pipeline_test();
+    else if (!strcmp(argv[1], "extended-render-target-texture"))
+        extended_render_target_texture_test();
     else if (!strncmp(argv[1], "extended-reject-", 16))
         extended_rejection_test(argv[1]);
     else if (!strcmp(argv[1], "framebuffer-info-normal"))
@@ -3572,6 +5369,8 @@ int main(int argc, char **argv)
         quincunx_approx_lifecycle_test();
     else if (!strcmp(argv[1], "quincunx-approx-reference-sweep"))
         quincunx_approx_reference_sweep_test();
+    else if (!strcmp(argv[1], "quincunx-approx-render-target-resolve"))
+        quincunx_approx_render_target_resolve_test();
     else if (!strncmp(argv[1], "framebuffer-info-xrgb-from-", 27)) {
         unsigned from = strstr(argv[1], "-from-aa-") ? SURFACE_XRGB_AA
                       : strstr(argv[1], "-from-argb-") ? SURFACE_ARGB_SINGLE
@@ -3591,6 +5390,8 @@ int main(int argc, char **argv)
         basic_feedback_test(argv[1]);
     else if (!strcmp(argv[1], "cpu-write-counterexample"))
         cpu_write_counterexample_test();
+    else if (!strcmp(argv[1], "surface-switch"))
+        surface_switch_test();
     else
         failure_test(argv[1]);
     bw_metal_backend_stop();

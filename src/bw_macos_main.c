@@ -2,6 +2,9 @@
 #include "bw_edition.h"
 #include "bw_framelog.h"
 #include "bw_macos_boot.h"
+#ifdef BW_EXPERIMENTAL_MACOS_KEYBOARD_HOOK
+#include "bw_macos_input_bridge.h"
+#endif
 #include "bw_posix_fault.h"
 #include "bw_profile.h"
 #include "bw_settings.h"
@@ -91,6 +94,43 @@ static int configure_native(void)
 {
     const char *gpu = getenv("BW_GPU");
     const char *watch = getenv("RECOMP_WATCH");
+    const char *keyboard_hook = getenv("BW_MACOS_KEYBOARD_HOOK");
+    const char *synthetic_input = getenv("BW_SYNTHETIC_INPUT_DIAGNOSTIC");
+
+    if (keyboard_hook && strcmp(keyboard_hook, "0") && strcmp(keyboard_hook, "1")) {
+        fprintf(stderr, "[BW] BW_MACOS_KEYBOARD_HOOK must be 0 or 1\n");
+        return -1;
+    }
+    if (synthetic_input && strcmp(synthetic_input, "0") && strcmp(synthetic_input, "1")) {
+        fprintf(stderr, "[BW] BW_SYNTHETIC_INPUT_DIAGNOSTIC must be 0 or 1\n");
+        return -1;
+    }
+#ifdef BW_EXPERIMENTAL_SYNTHETIC_INPUT
+    if (synthetic_input && !strcmp(synthetic_input, "1")) {
+        if (!keyboard_hook || strcmp(keyboard_hook, "1")) {
+            fprintf(stderr, "[BW] synthetic input diagnostic requires the experimental keyboard hook\n");
+            return -1;
+        }
+        bw_macos_input_bridge_trace_synthetic(1);
+        fprintf(stderr, "[BW] synthetic SDL input diagnostic enabled; no physical keys are generated\n");
+    }
+#else
+    if (synthetic_input && !strcmp(synthetic_input, "1")) {
+        fprintf(stderr, "[BW] synthetic input diagnostic was not included in this build\n");
+        return -1;
+    }
+#endif
+#ifdef BW_EXPERIMENTAL_MACOS_KEYBOARD_HOOK
+    bw_macos_input_bridge_configure(keyboard_hook && !strcmp(keyboard_hook, "1"));
+    if (keyboard_hook && !strcmp(keyboard_hook, "1"))
+        fprintf(stderr, "[BW] experimental game-specific keyboard hook enabled; "
+                        "ABI and guest behavior are not fully verified\n");
+#else
+    if (keyboard_hook && !strcmp(keyboard_hook, "1")) {
+        fprintf(stderr, "[BW] experimental keyboard hook was not included in this build\n");
+        return -1;
+    }
+#endif
 
     if (gpu && strcasecmp(gpu, "metal")) {
         fprintf(stderr, "[BW] BW_GPU must be 'metal' on the native macOS host\n");
@@ -119,6 +159,26 @@ static int configure_native(void)
         fprintf(stderr, "[BW] cannot configure native defaults\n");
         return -1;
     }
+#ifdef BW_EXPERIMENTAL_MACOS_KEYBOARD_HOOK
+    if (keyboard_hook && !strcmp(keyboard_hook, "1")) {
+        const char *keyboard = getenv("RECOMP_KEYBOARD");
+        if (!keyboard || !*keyboard || *keyboard == '0') {
+            fprintf(stderr, "[BW] experimental keyboard hook requires RECOMP_KEYBOARD enabled\n");
+            return -1;
+        }
+    }
+#endif
+#ifdef BW_EXPERIMENTAL_SYNTHETIC_INPUT
+    if (synthetic_input && !strcmp(synthetic_input, "1")) {
+        const char *window = getenv("RECOMP_FB_WINDOW");
+        const char *headless = getenv("RECOMP_HEADLESS");
+        if (!window || !*window || *window == '0' ||
+            (headless && *headless && *headless != '0')) {
+            fprintf(stderr, "[BW] synthetic input diagnostic requires a visible SDL window\n");
+            return -1;
+        }
+    }
+#endif
     fprintf(stderr, "[BW] audio and guest USB are disabled: safe trapped-MMIO "
                     "dispatch is not available\n");
     return 0;

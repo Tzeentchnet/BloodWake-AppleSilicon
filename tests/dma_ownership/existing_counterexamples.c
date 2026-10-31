@@ -4,6 +4,9 @@
 
 #include <pthread.h>
 #include <sched.h>
+#include <signal.h>
+#include <sys/mman.h>
+#include <unistd.h>
 
 static pthread_mutex_t heap_mutex = PTHREAD_MUTEX_INITIALIZER;
 static pthread_mutex_t gate_mutex = PTHREAD_MUTEX_INITIALIZER;
@@ -13,6 +16,10 @@ static uint32_t guest_va;
 static uint8_t *bytes;
 static uint8_t observed_first, observed_second, observed_byte;
 static ULONG_PTR translated;
+static int fault_notice[2], fault_resume[2];
+static uintptr_t protected_start, protected_end;
+static uint32_t worker_allocation;
+static uint8_t *worker_write;
 
 VOID AcquireSRWLockExclusive(PSRWLOCK lock)
 {
@@ -178,6 +185,129 @@ static int alias_counterexample(void)
     return ok;
 }
 
+static void protection_fault(int sig, siginfo_t *info, void *context)
+{
+    char token = 1;
+    uintptr_t address = info ? (uintptr_t)info->si_addr : 0;
+    (void)context;
+    if (!info || (sig != SIGSEGV && sig != SIGBUS) ||
+        address < protected_start || address >= protected_end ||
+        write(fault_notice[1], &token, 1) != 1 ||
+        read(fault_resume[0], &token, 1) != 1)
+        _exit(1);
+}
+
+static int install_protection_fault(void)
+{
+    struct sigaction action = {0};
+    action.sa_sigaction = protection_fault;
+    action.sa_flags = SA_SIGINFO;
+    if (sigemptyset(&action.sa_mask) || pipe(fault_notice) || pipe(fault_resume))
+        return 0;
+    return sigaction(SIGSEGV, &action, NULL) == 0 &&
+           sigaction(SIGBUS, &action, NULL) == 0;
+}
+
+static int await_protection_fault(void)
+{
+    char token;
+    return read(fault_notice[0], &token, 1) == 1;
+}
+
+static int resume_protection_fault(void)
+{
+    char token = 1;
+    return write(fault_resume[1], &token, 1) == 1;
+}
+
+static void *allocate_block(void *unused)
+{
+    (void)unused;
+    worker_allocation = xbox_ContiguousAllocEx(CONTIG_PAGE, CONTIG_PAGE,
+                                                CONTIG_PAGE, 2 * CONTIG_PAGE - 1);
+    return NULL;
+}
+
+static int publication_counterexample(void)
+{
+    long page = sysconf(_SC_PAGESIZE);
+    size_t mapping_size, protected_offset;
+    pthread_t worker;
+    uint8_t *mapping;
+    uint32_t expected = XBOX_CONTIG_BASE + CONTIG_PAGE;
+    int observed;
+    if (page <= 0 || page > XBOX_CONTIG_SIZE / 2 || (page & (page - 1)) ||
+        !install_protection_fault()) return 0;
+    mapping_size = (size_t)page * 2u + CONTIG_PAGE;
+    mapping = mmap(NULL, mapping_size, PROT_READ | PROT_WRITE,
+                   MAP_PRIVATE | MAP_ANON, -1, 0);
+    if (mapping == MAP_FAILED) return 0;
+    memset(mapping, 0xA5, mapping_size);
+    g_memory_offset = (ptrdiff_t)(uintptr_t)mapping - XBOX_CONTIG_BASE;
+    protected_offset = CONTIG_PAGE & ~((size_t)page - 1u);
+    protected_start = (uintptr_t)mapping + protected_offset;
+    protected_end = protected_start + (size_t)page;
+    if (mprotect((void *)protected_start, (size_t)page, PROT_READ) ||
+        pthread_create(&worker, NULL, allocate_block, NULL) || !await_protection_fault())
+        return 0;
+    observed = xbox_ContiguousBlockSize(expected) == CONTIG_PAGE &&
+               bw_shared_u8_load(&xbox_ContiguousPageMap()[1]) == 1 &&
+               xbox_ContiguousAllocatedBytes() >= 2 * CONTIG_PAGE &&
+               mapping[CONTIG_PAGE] == 0xA5;
+    if (mprotect((void *)protected_start, (size_t)page, PROT_READ | PROT_WRITE) ||
+        !resume_protection_fault() || pthread_join(worker, NULL))
+        return 0;
+    observed = observed && worker_allocation == expected && mapping[CONTIG_PAGE] == 0;
+    if (munmap(mapping, mapping_size)) return 0;
+    return observed;
+}
+
+static void *write_block(void *unused)
+{
+    (void)unused;
+    *worker_write = 0x6B;
+    return NULL;
+}
+
+static int host_page_counterexample(void)
+{
+    long page = sysconf(_SC_PAGESIZE);
+    size_t mapping_size;
+    pthread_t worker;
+    uint8_t *mapping;
+    uint32_t first, second;
+    int observed;
+    if (page <= 0 || page > XBOX_CONTIG_SIZE / 2 || (page & (page - 1))) return 0;
+    if ((size_t)page < 2u * CONTIG_PAGE) return 77;
+    if (!install_protection_fault()) return 0;
+    mapping_size = (size_t)page * 3u;
+    mapping = mmap(NULL, mapping_size, PROT_READ | PROT_WRITE,
+                   MAP_PRIVATE | MAP_ANON, -1, 0);
+    if (mapping == MAP_FAILED) return 0;
+    g_memory_offset = (ptrdiff_t)(uintptr_t)mapping - XBOX_CONTIG_BASE;
+    first = xbox_ContiguousAllocEx(CONTIG_PAGE, CONTIG_PAGE, (uint32_t)page,
+                                   (uint32_t)page + 2u * CONTIG_PAGE - 1u);
+    second = xbox_ContiguousAllocEx(CONTIG_PAGE, CONTIG_PAGE, (uint32_t)page,
+                                    (uint32_t)page + 2u * CONTIG_PAGE - 1u);
+    if (first != XBOX_CONTIG_BASE + (uint32_t)page || second != first + CONTIG_PAGE)
+        return 0;
+    protected_start = (uintptr_t)mapping + (size_t)page;
+    protected_end = protected_start + (size_t)page;
+    worker_write = mapping + (size_t)page + CONTIG_PAGE;
+    if (mprotect((void *)protected_start, (size_t)page, PROT_READ) ||
+        pthread_create(&worker, NULL, write_block, NULL) || !await_protection_fault())
+        return 0;
+    observed = *worker_write == 0 &&
+               xbox_ContiguousBlockSize(first) == CONTIG_PAGE &&
+               xbox_ContiguousBlockSize(second) == CONTIG_PAGE;
+    if (mprotect((void *)protected_start, (size_t)page, PROT_READ | PROT_WRITE) ||
+        !resume_protection_fault() || pthread_join(worker, NULL))
+        return 0;
+    observed = observed && *worker_write == 0x6B;
+    if (munmap(mapping, mapping_size)) return 0;
+    return observed;
+}
+
 int main(int argc, char **argv)
 {
     int ok;
@@ -185,6 +315,11 @@ int main(int argc, char **argv)
     if (!strcmp(argv[1], "heap")) ok = heap_counterexample();
     else if (!strcmp(argv[1], "contiguous")) ok = contiguous_counterexample();
     else if (!strcmp(argv[1], "alias")) ok = alias_counterexample();
+    else if (!strcmp(argv[1], "publication")) ok = publication_counterexample();
+    else if (!strcmp(argv[1], "host-page")) {
+        ok = host_page_counterexample();
+        if (ok == 77) return 77;
+    }
     else return 2;
     if (!ok) fprintf(stderr, "expected counterexample was not reproduced\n");
     return !ok;

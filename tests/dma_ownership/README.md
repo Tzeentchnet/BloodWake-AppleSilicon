@@ -24,6 +24,15 @@ the production path is safe:
   number. A subsequent translation changes the last-translation byte even
   while both names remain live. A physical number and that byte do not
   uniquely identify a retained mapping.
+* In an mmap-backed fixture using the real contiguous allocator, a protected
+  initialization write is paused after the allocator publishes its page map,
+  allocation size and high-water mark. Another thread can observe those
+  published values while the allocation still contains its previous bytes.
+  Initialization resumes only after that observation.
+* If a host page covers at least two 4 KiB guest pages, two separate real
+  contiguous allocations can share it. Protecting the host page for one
+  allocation also faults a write to the other. The test skips on hosts whose
+  protection granularity is too small to reproduce this case.
 
 These tests do not invoke the device implementations. OHCI's separate
 validation and later resolution, APU raw and cached pointers, and the NV2A
@@ -110,6 +119,7 @@ implementation must:
 2. Coordinate acquisition with **all** allocation, naming, claim, release,
    decommit, protection and teardown paths. Account for shared heap pages,
    exact-address claims, page zero, image/stack, extended VM and every alias.
+   Account for host protection pages shared by independent guest allocations.
    Publish initialized data and metadata together, and define a lock order;
    never wait for a lease while holding a lock its release needs.
 3. Pin or copy every complete DMA range before use, including descriptors,
@@ -126,6 +136,39 @@ implementation must:
    writes race-free or make a multi-byte payload an atomic snapshot. Every
    CPU/device access involved must obey the same supported synchronization
    protocol, including accesses emitted by recompiled guest code.
+
+## Protected Metal alias experiments
+
+The Metal shared-backing test also remaps one synthetic allocation to a second
+host address. It protects the original CPU mapping, verifies a CPU access
+faults, and submits a Metal clear through the unprotected alias. The completed
+result is visible after restoring CPU access. A three-mapping variant protects
+both synthetic guest aliases, then verifies GPU and CPU writes through the
+restored aliases. A counterexample leaves one alias unprotected and observes a
+queued GPU write overwrite a CPU write through it. These establish only local
+OS/Metal behavior for the tested mappings and hardware; they do not identify
+or protect every real guest alias.
+
+`tests/mmio_host/test_mach_metal_ownership.m` is a separate child-process
+experiment. Two CPU threads fault on one protected mapping while a Metal
+command waits on an event; an exception server waits for GPU completion,
+restores access to both synthetic aliases, and lets the CPU instructions
+retry. A separate interleaving faults while the aliases are being protected
+sequentially and holds GPU execution until both protections are installed.
+An atomic handoff also works when a faulting thread holds an unrelated test mutex. Two deliberately
+unsafe variants reproduce deadlocks: the exception server tries to take a
+mutex held by the faulting thread, or the submitting thread faults before its
+GPU command has been submitted. Submitter faults during arming or before
+submission are also tested with explicit identity rejection, and a synthetic
+arming failure is surfaced by terminating the child. Passing the counterexamples means the deadlocks
+were reproduced, not that they are fixed in the runtime.
+
+These fixtures are not a production fault handler. They do not prove exception
+forwarding and teardown, every guest alias, multiple overlapping resources,
+allocator and mapping lifetime, arbitrary locks inside Metal or system
+libraries, or safe command publication and failure handling. The sanitizer
+runs cannot observe GPU races or physical aliases mapped at different host
+addresses. The dirty-surface guard and the USB/APU MMIO restrictions remain.
 
 Until those requirements are met, keep guest USB and APU MMIO disabled; do
 not infer that the existing default heap mapping is safe for asynchronous DMA.
@@ -148,5 +191,6 @@ For separate ThreadSanitizer or ASan/UBSan builds, use respectively
 -DCMAKE_EXE_LINKER_FLAGS='-fsanitize=address,undefined'` and a different
 build directory. On this macOS ASan runtime, leak detection is unsupported;
 run its tests with `ASAN_OPTIONS=detect_leaks=0` rather than claiming leak
-coverage. The focused 13-test suite passed normally, under TSan, and under
-ASan/UBSan with leak detection disabled on the SDK 26.5 build.
+coverage. The 15-test suite passed normally on the SDK 26.5 build. The two
+new protection counterexamples also passed under TSan and ASan/UBSan with
+leak detection disabled; a passing counterexample reproduces the hazard.

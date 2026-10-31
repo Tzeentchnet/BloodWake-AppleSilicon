@@ -6,12 +6,13 @@ Everything happens on your own PC. Your disc's files, the C code generated from 
 
 ## macOS on Apple Silicon (experimental)
 
-The native build is a work in progress, not a claim that the game or either
-edition is playable. It uses Apple Clang and the project's Metal backend
-rather than the toolkit's OpenGL renderer. Install Xcode Command Line Tools,
-CMake 3.20 or newer, SDL2 2.0.14 or newer, OpenSSL, and the Python
-requirements described in the [README](../README.md). CMake must be able to
-find the SDL2 and OpenSSL packages; with Homebrew, for example:
+The native build is a work in progress. The current input-enabled Original
+edition build is user-confirmed for menu navigation and in-game play at the
+title's 30 FPS cap. It uses Apple Clang and the project's Metal backend rather
+than the toolkit's OpenGL renderer. Install Xcode Command Line Tools, CMake
+3.20 or newer, SDL2 2.0.14 or newer, OpenSSL, and the Python requirements
+described in the [README](../README.md). CMake must be able to find the SDL2
+and OpenSSL packages; with Homebrew, for example:
 
 ```sh
 export CMAKE_PREFIX_PATH="$(brew --prefix sdl2):$(brew --prefix openssl@3)"
@@ -41,8 +42,8 @@ approximation for quincunx-filtered pitch-linear XRGB textures. This is not
 verified NV2A filtering. The renderer logs a warning at startup and on first
 use; values other than `1`, including an unset or empty value, leave strict
 rejection enabled. Other unsupported texture states still fail explicitly.
-Synthetic tests cover the approximation, but it has not been validated in
-the game.
+Synthetic tests cover the approximation, and the measured retail gameplay run
+exercised it. It has not been validated against NV2A hardware.
 
 For a complete build from your disc, use a **new** install directory:
 
@@ -71,7 +72,8 @@ cmake -S . -B build/bloodwake-macos \
   -DCMAKE_BUILD_TYPE=Release -DCMAKE_OSX_ARCHITECTURES=arm64 \
   -DXBOXRECOMP_DIR="$PWD/build/xboxrecomp" \
   -DBW_GEN_DIR="$PWD/game/prepare/work/gen" \
-  -DPython3_EXECUTABLE="$PWD/build/venv/bin/python" &&
+  -DPython3_EXECUTABLE="$PWD/build/venv/bin/python" \
+  -DBW_EXPERIMENTAL_MACOS_KEYBOARD_HOOK=ON &&
 cmake --build build/bloodwake-macos --target bloodwake --parallel
 ```
 
@@ -88,9 +90,47 @@ example, on the machine described in the
 export SDKROOT=/Library/Developer/CommandLineTools/SDKs/MacOSX26.5.sdk
 ```
 
+For an input-enabled build, `-DBW_EXPERIMENTAL_MACOS_KEYBOARD_HOOK=ON`
+enables compilation of a fingerprint-checked, game-specific keyboard bridge.
+Its derived generated source stays in the build directory.
+The hook is still disabled at runtime unless `BW_MACOS_KEYBOARD_HOOK=1` is
+explicitly set; enabling it also requires `RECOMP_KEYBOARD` to be enabled.
+Other values for `BW_MACOS_KEYBOARD_HOOK` except `0` are rejected, and a
+normal build rejects `1` rather than silently ignoring it. The bridge
+supports one keyboard on port 0, advertises no feedback motors and reports
+feedback as unsupported. It bypasses
+guest device initialization and does not enable guest USB MMIO. The current
+input-enabled build has now been user-confirmed for menu navigation and
+in-game play; detailed reconnect, focus-loss and lifecycle behavior remain
+unverified.
+
+An isolated retail run has verified guest initialization, enumeration,
+controller open, device-change and sustained state-poll calls with this hook
+active while the scripted 3D scene ran at its 30 FPS cap. A separate synthetic
+run verified that a guest state poll received Start, Down and A. Physical
+interaction was subsequently confirmed by the user with the current build.
+The build and runtime opt-ins remain required while the broader input contract
+is still experimental. Run an input-enabled build with:
+
+```sh
+BW_GAME_DIR="$PWD/game/prepare/game/disc" \
+BW_MACOS_KEYBOARD_HOOK=1 \
+BW_METAL_QUINCUNX_APPROX=1 \
+build/bloodwake-macos/bloodwake
+```
+
+For a synthetic-input diagnostic only, additionally build with
+`-DBW_EXPERIMENTAL_SYNTHETIC_INPUT=ON`. This requires the experimental keyboard
+hook build option and is off by default. A separate runtime opt-in,
+`BW_SYNTHETIC_INPUT_DIAGNOSTIC=1`, requires the hook and a visible SDL window.
+It queues and holds synthetic Return, Down and Z key presses inside this
+process before starting the guest; it does not generate physical or OS-level
+keystrokes. The hook logs when a guest state query sees Start, Down and A.
+This tests neither physical keyboard input nor menu navigation.
+
 ### Isolated native diagnostic
 
-The diagnostic runner performs one boot, not a playability or relaunch test.
+By default, the diagnostic runner performs one boot, not a playability test.
 It verifies the prepared disc and generated-code fingerprints, requires the
 pinned toolkit checkout to be clean, prints the executable's SHA-256, and
 compares the prepared tree, toolkit and executable before and after the run.
@@ -118,14 +158,27 @@ directory, network operations and process forks are denied, and TCP/UDP
 denial is probed for both IPv4 and IPv6. This is not a system-wide network
 firewall. The boot has a deadline of 1-300 seconds and an external deadline;
 combined standard output and error are capped at 32 MiB. Other files in the
-private directory are not subject to a total disk quota. A guest-requested
-relaunch is saved privately but not executed. Exit 124 indicates the guest's
-run limit, not a successful playability check.
+private directory are not subject to a total disk quota. By default, a
+guest-requested relaunch is saved privately but not executed. Exit 124
+indicates the guest's run limit, not a successful playability check.
+
+To follow same-title relaunch requests, add `--follow-relaunches`. Each boot
+uses a separate sandboxed child and numbered private logs, audits and relaunch
+records; only validated BWRL requests for `default.xbe` are followed.
+`--max-boots` bounds the number of boots (default 4, maximum 16), and
+`--total-seconds` bounds total guest execution (default 300, maximum 3600).
+The 32 MiB output limit applies across all boot logs. This mode has been
+exercised through the retail title's validated same-title relaunch.
 
 `--gpu-audit` enables the existing private usage summary; it is not a replay
 capture and a short failing run may end before a summary is written. Add
 `--quincunx-approx` only when intentionally testing the unverified approximation
-described above. Keep the output directory, including logs, saves and any
+described above. `--experimental-keyboard-hook` opts into the experimental
+hook in a build containing it; inherited hook settings are otherwise discarded.
+With a synthetic-input diagnostic build, add `--synthetic-input` along with
+`--experimental-keyboard-hook` to opt into the held synthetic key presses.
+Inherited synthetic-input settings are also discarded.
+Keep the output directory, including logs, saves and any
 guest data, private. A missing sandbox or failed isolation check aborts before
 guest execution.
 
@@ -204,3 +257,4 @@ Pull the new version of this repository and run the same command again. A rebuil
 - The generated C lives in the work folder and must never be committed or shared. The commit guard blocks it, along with game files, images and executables: enable it in your clone with `git config core.hooksPath tools/git-hooks`.
 - `src/toolkit_patches/` holds patched copies of a few toolkit runtime files, compiled in place of the toolkit's own. Each has a `.diff` showing the exact change, and CMake checks the SHA-256 of the toolkit file it was made from, so a toolkit change stops the build until the patch has been checked again.
 - The CMake option `BW_GEN_DIR` points the build at generated C outside the source tree; `build_from_disc.py` sets it for you.
+- Regression commands and the latest recorded results are in [VALIDATION.md](VALIDATION.md).

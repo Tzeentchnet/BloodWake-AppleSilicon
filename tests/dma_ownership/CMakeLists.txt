@@ -36,9 +36,13 @@ enable_testing()
 add_test(NAME existing_heap_reuse_default COMMAND dma_existing_counterexamples heap)
 add_test(NAME existing_contiguous_reuse COMMAND dma_existing_counterexamples contiguous)
 add_test(NAME existing_alias_ambiguity COMMAND dma_existing_counterexamples alias)
+add_test(NAME existing_allocation_publication COMMAND dma_existing_counterexamples publication)
+add_test(NAME existing_host_page_overlap COMMAND dma_existing_counterexamples host-page)
+set_tests_properties(existing_host_page_overlap PROPERTIES SKIP_RETURN_CODE 77)
 add_test(NAME reference_pin_contract COMMAND dma_reference_model)
 set_tests_properties(existing_heap_reuse_default existing_contiguous_reuse
-    existing_alias_ambiguity reference_pin_contract PROPERTIES TIMEOUT 30)
+    existing_alias_ambiguity existing_allocation_publication existing_host_page_overlap
+    reference_pin_contract PROPERTIES TIMEOUT 30)
 
 foreach(case IN ITEMS aliases subpage batch limits shutdown handoff churn release claim)
     add_test(NAME physical_authority_${case} COMMAND dma_physical_authority ${case})

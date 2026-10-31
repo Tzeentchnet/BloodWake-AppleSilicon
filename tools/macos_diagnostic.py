@@ -8,6 +8,7 @@ import os
 from pathlib import Path
 import selectors
 import stat
+import struct
 import subprocess
 import sys
 import tempfile
@@ -18,6 +19,7 @@ ROOT = Path(__file__).resolve().parents[1]
 TOOLKIT_COMMIT = "f0f8a461496a4f23d9b0aeaa284b8d70ba7ab82b"
 MAX_LOG_BYTES = 32 * 1024 * 1024
 MAX_RELAUNCH_BYTES = 16 + 260 + 3072
+MAX_RELAUNCH_BOOTS = 16
 SANDBOX = "/usr/bin/sandbox-exec"
 
 
@@ -198,7 +200,10 @@ def verify_sandbox(profile, output, protected):
           "IPv4/IPv6 TCP/UDP, fork and posix_spawn denied")
 
 
-def diagnostic_env(output, game_dir, seconds, quincunx, audit, input_fd, output_fd):
+def diagnostic_env(output, game_dir, seconds, quincunx, audit, input_fd, output_fd,
+                   audit_name="gpu-audit.txt", keyboard_hook=False, synthetic_input=False):
+    if synthetic_input and not keyboard_hook:
+        raise ValueError("synthetic input requires the experimental keyboard hook")
     env = {
         "PATH": "/usr/bin:/bin:/usr/sbin:/sbin",
         "HOME": str(output / "home"),
@@ -216,14 +221,20 @@ def diagnostic_env(output, game_dir, seconds, quincunx, audit, input_fd, output_
     }
     if quincunx:
         env["BW_METAL_QUINCUNX_APPROX"] = "1"
+    if keyboard_hook:
+        env["BW_MACOS_KEYBOARD_HOOK"] = "1"
+    if synthetic_input:
+        env["BW_SYNTHETIC_INPUT_DIAGNOSTIC"] = "1"
     if audit:
         env["BW_GPU_AUDIT"] = "1"
         env["BW_GPU_AUDIT_EVERY"] = "5"
-        env["BW_GPU_AUDIT_FILE"] = str(output / "gpu-audit.txt")
+        env["BW_GPU_AUDIT_FILE"] = str(output / audit_name)
     return env
 
 
-def capture_guest_output(child, output_read, log, timeout):
+def capture_guest_output(child, output_read, log, timeout, log_limit=None):
+    if log_limit is None:
+        log_limit = MAX_LOG_BYTES
     deadline = time.monotonic() + timeout
     log_size = 0
     relaunch = bytearray()
@@ -240,7 +251,7 @@ def capture_guest_output(child, output_read, log, timeout):
                     if not data:
                         selector.unregister(key.fileobj)
                     elif key.data == "log":
-                        allowed = min(len(data), MAX_LOG_BYTES - log_size)
+                        allowed = min(len(data), log_limit - log_size)
                         log.write(data[:allowed])
                         log_size += allowed
                         if allowed != len(data):
@@ -266,16 +277,50 @@ def capture_guest_output(child, output_read, log, timeout):
             child.stdout.close()
 
 
-def run_guest(executable, output, game_dir, profile, seconds, quincunx, audit):
+def validate_relaunch(data):
+    if len(data) < 16 or data[:4] != b"BWRL":
+        raise RuntimeError("guest returned an invalid relaunch request")
+    version, path_length = struct.unpack_from("<II", data, 4)
+    if version != 1 or path_length > 260 or len(data) < 16 + path_length:
+        raise RuntimeError("guest returned an invalid relaunch request")
+    path = data[12:12 + path_length]
+    data_length = struct.unpack_from("<I", data, 12 + path_length)[0]
+    if b"\0" in path or data_length not in (0, 3072) or len(data) != 16 + path_length + data_length:
+        raise RuntimeError("guest returned an invalid relaunch request")
+    path = path.lower()
+    if path.startswith((b"d:\\", b"d:/")):
+        path = path[3:]
+    elif path.startswith(b"\\device\\cdrom0;"):
+        path = path[15:]
+    if path != b"default.xbe":
+        raise RuntimeError("guest relaunch request targets another title")
+
+
+def run_guest_once(executable, output, game_dir, profile, seconds, quincunx, audit,
+                   launch=b"", log_name="guest.log", audit_name="gpu-audit.txt",
+                   timeout=None, log_limit=None, keyboard_hook=False, synthetic_input=False):
     input_read = input_write = output_read = output_write = -1
     child = None
     try:
         input_read, input_write = os.pipe()
         output_read, output_write = os.pipe()
+        if launch:
+            validate_relaunch(launch)
+            os.set_blocking(input_write, False)
+            remaining = memoryview(launch)
+            while remaining:
+                try:
+                    written = os.write(input_write, remaining)
+                except BlockingIOError as error:
+                    raise RuntimeError("relaunch request does not fit in the input pipe") from error
+                if written <= 0:
+                    raise RuntimeError("cannot write the relaunch request")
+                remaining = remaining[written:]
         os.close(input_write)
         input_write = -1
-        env = diagnostic_env(output, game_dir, seconds, quincunx, audit, input_read, output_write)
-        with open(output / "guest.log", "xb") as log:
+        env = diagnostic_env(output, game_dir, seconds, quincunx, audit, input_read, output_write,
+                             audit_name, keyboard_hook, synthetic_input)
+        with open(output / log_name, "xb") as log:
             child = subprocess.Popen(
                 [SANDBOX, "-p", profile, str(executable), "--bw-native-child"],
                 cwd=output, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
@@ -285,11 +330,11 @@ def run_guest(executable, output, game_dir, profile, seconds, quincunx, audit):
             input_read = -1
             os.close(output_write)
             output_write = -1
-            result, relaunch = capture_guest_output(child, output_read, log, seconds + 15)
-        if relaunch:
-            (output / "relaunch.bin").write_bytes(relaunch)
-            print("Guest requested a relaunch; request saved privately, not executed")
-        return result
+            result, relaunch = capture_guest_output(child, output_read, log,
+                                                    seconds + 15 if timeout is None else timeout,
+                                                    log_limit)
+            log_size = log.tell()
+        return result, relaunch, log_size
     finally:
         try:
             if child is not None and child.poll() is None:
@@ -303,6 +348,47 @@ def run_guest(executable, output, game_dir, profile, seconds, quincunx, audit):
                     os.close(fd)
 
 
+def run_guest(executable, output, game_dir, profile, seconds, quincunx, audit,
+              keyboard_hook=False, synthetic_input=False):
+    result, relaunch, _ = run_guest_once(executable, output, game_dir, profile,
+                                         seconds, quincunx, audit, keyboard_hook=keyboard_hook,
+                                         synthetic_input=synthetic_input)
+    if relaunch:
+        (output / "relaunch.bin").write_bytes(relaunch)
+        print("Guest requested a relaunch; request saved privately, not executed")
+    return result
+
+
+def run_guest_relaunches(executable, output, game_dir, profile, seconds, quincunx,
+                         audit, max_boots, total_seconds, keyboard_hook=False,
+                         synthetic_input=False):
+    deadline = time.monotonic() + total_seconds
+    log_remaining = MAX_LOG_BYTES
+    launch = b""
+    for boot in range(1, max_boots + 1):
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise RuntimeError("guest exceeded the total diagnostic deadline")
+        result, relaunch, log_size = run_guest_once(
+            executable, output, game_dir, profile, seconds, quincunx, audit,
+            launch=launch, log_name=f"guest-{boot:03d}.log",
+            audit_name=f"gpu-audit-{boot:03d}.txt",
+            timeout=min(seconds + 15, remaining), log_limit=log_remaining,
+            keyboard_hook=keyboard_hook, synthetic_input=synthetic_input)
+        log_remaining -= log_size
+        if relaunch:
+            with open(output / f"relaunch-{boot:03d}.bin", "xb") as record:
+                record.write(relaunch)
+        if result != 0 or not relaunch:
+            return result
+        validate_relaunch(relaunch)
+        if boot == max_boots:
+            raise RuntimeError("guest relaunch limit reached")
+        launch = relaunch
+        print(f"Following validated guest relaunch for boot {boot + 1}")
+    raise RuntimeError("guest relaunch limit reached")
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--exe", required=True, help="separately built native executable")
@@ -312,11 +398,29 @@ def main(argv=None):
     parser.add_argument("--seconds", type=int, default=45, help="single-boot deadline (1-300 seconds)")
     parser.add_argument("--quincunx-approx", action="store_true", help="opt into the unverified approximation")
     parser.add_argument("--gpu-audit", action="store_true", help="write the private GPU usage summary")
+    parser.add_argument("--experimental-keyboard-hook", action="store_true",
+                        help="opt into the unverified game-specific keyboard hook")
+    parser.add_argument("--synthetic-input", action="store_true",
+                        help="send synthetic SDL keys to a diagnostic build; no physical keys")
+    parser.add_argument("--follow-relaunches", action="store_true",
+                        help="follow validated guest relaunches in separately sandboxed boots")
+    parser.add_argument("--max-boots", type=int,
+                        help="maximum boot count with --follow-relaunches (default 4, maximum 16)")
+    parser.add_argument("--total-seconds", type=int,
+                        help="total guest deadline with --follow-relaunches (default 300, maximum 3600)")
     args = parser.parse_args(argv)
     if sys.platform != "darwin":
         parser.error("this diagnostic requires macOS")
     if not 1 <= args.seconds <= 300:
         parser.error("--seconds must be between 1 and 300")
+    if args.synthetic_input and not args.experimental_keyboard_hook:
+        parser.error("--synthetic-input requires --experimental-keyboard-hook")
+    if not args.follow_relaunches and (args.max_boots is not None or args.total_seconds is not None):
+        parser.error("--max-boots and --total-seconds require --follow-relaunches")
+    if args.max_boots is not None and not 1 <= args.max_boots <= MAX_RELAUNCH_BOOTS:
+        parser.error("--max-boots must be between 1 and 16")
+    if args.total_seconds is not None and not 1 <= args.total_seconds <= 3600:
+        parser.error("--total-seconds must be between 1 and 3600")
 
     output = None
     try:
@@ -342,8 +446,19 @@ def main(argv=None):
         result = None
         try:
             verify_sandbox(profile, output, game_dir / "default.xbe")
-            result = run_guest(executable, output, game_dir, profile, args.seconds,
-                               args.quincunx_approx, args.gpu_audit)
+            if args.follow_relaunches:
+                result = run_guest_relaunches(
+                    executable, output, game_dir, profile, args.seconds,
+                    args.quincunx_approx, args.gpu_audit,
+                    args.max_boots if args.max_boots is not None else 4,
+                    args.total_seconds if args.total_seconds is not None else 300,
+                    keyboard_hook=args.experimental_keyboard_hook,
+                    synthetic_input=args.synthetic_input)
+            else:
+                result = run_guest(executable, output, game_dir, profile, args.seconds,
+                                   args.quincunx_approx, args.gpu_audit,
+                                   keyboard_hook=args.experimental_keyboard_hook,
+                                   synthetic_input=args.synthetic_input)
         finally:
             changed = snapshot_tree(prepared) != baseline
             if toolkit_revision(toolkit) != revision or digest_file(executable) != executable_hash:

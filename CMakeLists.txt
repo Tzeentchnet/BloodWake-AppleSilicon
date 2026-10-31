@@ -43,6 +43,18 @@ add_compile_definitions(
 set(BW_GEN_DIR "${CMAKE_CURRENT_SOURCE_DIR}/src/recomp/gen" CACHE PATH
     "Folder holding the generated C (recomp_*.c, recomp_funcs.h, recomp_types.h)")
 
+option(BW_EXPERIMENTAL_MACOS_KEYBOARD_HOOK
+    "Build the default-off, game-specific macOS keyboard hook" OFF)
+option(BW_EXPERIMENTAL_SYNTHETIC_INPUT
+    "Build the default-off synthetic SDL input diagnostic" OFF)
+if(BW_EXPERIMENTAL_MACOS_KEYBOARD_HOOK AND NOT APPLE)
+    message(FATAL_ERROR "The experimental keyboard hook is available only on macOS.")
+endif()
+if(BW_EXPERIMENTAL_SYNTHETIC_INPUT AND
+   (NOT APPLE OR NOT BW_EXPERIMENTAL_MACOS_KEYBOARD_HOOK))
+    message(FATAL_ERROR "Synthetic input requires the experimental macOS keyboard hook.")
+endif()
+
 # Build-time translators (tools/bw_ocean_xlate.py) run with the Python CMake
 # finds, or the one given as -DPython3_EXECUTABLE=... (no `py` launcher needed).
 find_package(Python3 3.10 REQUIRED COMPONENTS Interpreter)
@@ -102,6 +114,28 @@ file(GLOB RECOMP_GEN_SOURCES CONFIGURE_DEPENDS "${BW_GEN_DIR}/*.c")
 if(NOT RECOMP_GEN_SOURCES)
     message(FATAL_ERROR "No generated C in ${BW_GEN_DIR}. Run tools/run_pipeline.py first "
                         "(or tools/build_from_disc.py), or pass -DBW_GEN_DIR=<its --gen-dir>.")
+endif()
+
+if(BW_EXPERIMENTAL_MACOS_KEYBOARD_HOOK)
+    set(BW_INPUT_GENERATED_SOURCE "${CMAKE_CURRENT_BINARY_DIR}/bw_input/recomp_0032.c")
+    set(BW_INPUT_PREPARED_SOURCE "${BW_GEN_DIR}/recomp_0032.c")
+    if(NOT BW_INPUT_PREPARED_SOURCE IN_LIST RECOMP_GEN_SOURCES)
+        message(FATAL_ERROR "The experimental input hook requires recomp_0032.c.")
+    endif()
+    add_custom_command(
+        OUTPUT "${BW_INPUT_GENERATED_SOURCE}"
+        COMMAND "${CMAKE_COMMAND}" -E make_directory "${CMAKE_CURRENT_BINARY_DIR}/bw_input"
+        COMMAND "${Python3_EXECUTABLE}"
+            "${CMAKE_CURRENT_SOURCE_DIR}/tools/prepare_macos_input_hooks.py"
+            --source "${BW_INPUT_PREPARED_SOURCE}"
+            --fingerprint "${CMAKE_CURRENT_SOURCE_DIR}/fingerprints/generated.json"
+            --output "${BW_INPUT_GENERATED_SOURCE}"
+        DEPENDS "${BW_INPUT_PREPARED_SOURCE}"
+            "${CMAKE_CURRENT_SOURCE_DIR}/tools/prepare_macos_input_hooks.py"
+            "${CMAKE_CURRENT_SOURCE_DIR}/fingerprints/generated.json"
+        VERBATIM)
+    list(REMOVE_ITEM RECOMP_GEN_SOURCES "${BW_INPUT_PREPARED_SOURCE}")
+    list(APPEND RECOMP_GEN_SOURCES "${BW_INPUT_GENERATED_SOURCE}")
 endif()
 
 # Core game sources
@@ -169,6 +203,10 @@ set(GAME_SOURCES
 )
 endif()
 
+if(BW_EXPERIMENTAL_MACOS_KEYBOARD_HOOK)
+    list(APPEND GAME_SOURCES src/bw_macos_input_bridge.c)
+endif()
+
 # The recomp pipeline also generates a dispatch header and function declarations.
 # These are included by the generated .c files:
 #   src/recomp/gen/recomp_funcs.h    - extern declarations for all recompiled functions
@@ -177,6 +215,13 @@ endif()
 
 if(APPLE)
     add_executable(${PROJECT_NAME} ${GAME_SOURCES} ${RECOMP_GEN_SOURCES})
+    if(BW_EXPERIMENTAL_MACOS_KEYBOARD_HOOK)
+        target_compile_definitions(${PROJECT_NAME} PRIVATE BW_EXPERIMENTAL_MACOS_KEYBOARD_HOOK=1)
+    endif()
+    if(BW_EXPERIMENTAL_SYNTHETIC_INPUT)
+        target_compile_definitions(${PROJECT_NAME} PRIVATE BW_EXPERIMENTAL_SYNTHETIC_INPUT=1)
+        target_compile_definitions(xbox_video PRIVATE BW_EXPERIMENTAL_SYNTHETIC_INPUT=1)
+    endif()
     set_source_files_properties(src/gpu/bw_metal_backend.m PROPERTIES
         COMPILE_OPTIONS "-fobjc-arc")
     set_source_files_properties(src/bw_ocean_native.c PROPERTIES

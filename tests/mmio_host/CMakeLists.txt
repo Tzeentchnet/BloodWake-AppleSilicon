@@ -4,6 +4,7 @@ project(bw_mmio_host C)
 if(NOT APPLE OR NOT CMAKE_SYSTEM_PROCESSOR MATCHES "^(arm64|aarch64)$")
     message(FATAL_ERROR "These tests require macOS on Apple Silicon")
 endif()
+enable_language(OBJC)
 
 set(XBOXRECOMP_DIR "${CMAKE_CURRENT_LIST_DIR}/../../build/xboxrecomp" CACHE PATH
     "Path to the pinned xboxrecomp checkout")
@@ -173,6 +174,19 @@ target_link_libraries(bw_mach_apu_probe PRIVATE bw_mmio_real_apu)
 add_test(NAME mach_exception_apu_probe COMMAND bw_mach_apu_probe)
 set_tests_properties(mach_exception_apu_probe PROPERTIES TIMEOUT 30 SKIP_RETURN_CODE 77
     ENVIRONMENT "SDL_AUDIODRIVER=dummy;BW_APU_DSP=xemu;BW_APU_DSP_FALLBACK=0")
+
+find_library(BW_METAL_FRAMEWORK Metal REQUIRED)
+find_library(BW_FOUNDATION_FRAMEWORK Foundation REQUIRED)
+add_executable(bw_mach_metal_ownership_probe test_mach_metal_ownership.m
+    "${MACH_EXC_DIR}/mach_exc_server.c")
+target_include_directories(bw_mach_metal_ownership_probe PRIVATE "${MACH_EXC_DIR}")
+target_compile_options(bw_mach_metal_ownership_probe PRIVATE
+    "$<$<COMPILE_LANGUAGE:OBJC>:-fobjc-arc>")
+target_link_libraries(bw_mach_metal_ownership_probe PRIVATE
+    "${BW_METAL_FRAMEWORK}" "${BW_FOUNDATION_FRAMEWORK}" Threads::Threads)
+add_test(NAME mach_metal_ownership_probe COMMAND bw_mach_metal_ownership_probe)
+set_tests_properties(mach_metal_ownership_probe PROPERTIES TIMEOUT 40 SKIP_RETURN_CODE 77
+    LABELS "experiment;counterexample")
 
 # Rename just the synthetic support getter so the fixture can inject one
 # same-thread reentry during a real device callback.

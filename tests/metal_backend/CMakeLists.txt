@@ -69,7 +69,30 @@ add_metal_backend_test_executable(bw_metal_backend_legacy_math_test)
 target_compile_definitions(bw_metal_backend_legacy_math_test PRIVATE BW_METAL_TEST_FORCE_LEGACY_MATH=1)
 
 enable_testing()
-foreach(case semaphore-release semaphore-concurrent visual seed-order perspective blend color-mask alpha-test pipeline-cache cull full-rect depth-clear
+add_executable(bw_metal_shared_backing_test shared_backing_test.m)
+target_compile_options(bw_metal_shared_backing_test PRIVATE -fobjc-arc)
+target_link_libraries(bw_metal_shared_backing_test PRIVATE "${FOUNDATION_FRAMEWORK}" "${METAL_FRAMEWORK}")
+add_test(NAME metal_shared-backing-experiment COMMAND bw_metal_shared_backing_test)
+set_tests_properties(metal_shared-backing-experiment PROPERTIES LABELS "experiment")
+add_test(NAME metal_shared-backing-reuse-counterexample
+    COMMAND bw_metal_shared_backing_test reuse-counterexample)
+set_tests_properties(metal_shared-backing-reuse-counterexample PROPERTIES
+    LABELS "experiment;counterexample" TIMEOUT 20)
+add_test(NAME metal_shared-backing-protected-alias
+    COMMAND bw_metal_shared_backing_test protected-alias)
+set_tests_properties(metal_shared-backing-protected-alias PROPERTIES
+    LABELS "experiment" TIMEOUT 20)
+add_test(NAME metal_shared-backing-protected-all-aliases
+    COMMAND bw_metal_shared_backing_test protected-all-aliases)
+set_tests_properties(metal_shared-backing-protected-all-aliases PROPERTIES
+    LABELS "experiment" TIMEOUT 20)
+add_test(NAME metal_shared-backing-unprotected-alias-counterexample
+    COMMAND bw_metal_shared_backing_test unprotected-alias-counterexample)
+set_tests_properties(metal_shared-backing-unprotected-alias-counterexample PROPERTIES
+    LABELS "experiment;counterexample" TIMEOUT 20)
+
+foreach(case semaphore-release semaphore-concurrent visual seed-order command-batching perspective blend color-mask alpha-test pipeline-cache cull full-rect depth-clear
+             depth-draw stencil-draw polygon-offset polygon-offset-disabled polygon-offset-zero
              partial-color partial-color-masks partial-color-default-rect partial-clip partial-empty
              partial-depth partial-depth-seed partial-depth-empty partial-depth-unbound
              partial-depth-flip-only partial-depth-unbound-flip-only partial-depth-rebind
@@ -84,27 +107,50 @@ foreach(case semaphore-release semaphore-concurrent visual seed-order perspectiv
              xrgb-single-reject-fixed-one xrgb-single-reject-2d-aa
              xrgb-single-reject-pitch xrgb-single-reject-origin xrgb-single-reject-unmapped
              xrgb-single-reject-incomplete-rect xrgb-single-reject-depth
-             extended-basic
-             extended-combiner extended-bc1
+             extended-basic extended-texture-cache
+             extended-combiner extended-multistage extended-combiner-mappings
+             extended-combiner-operations extended-combiner-constants
+             extended-combiner-secondary extended-fog extended-passthrough-stage
+             extended-texture-stages extended-dot-reflection extended-bc1 extended-dxt-alpha
+             extended-dxt-mips extended-dxt-nearest-mip extended-dxt-mip-limit
+             extended-swizzled extended-swizzled-mips
+             extended-linear
+             extended-texture-address
              extended-bc1-inactive-kernel-normal extended-bc1-inactive-kernel-immediate
-             extended-projective extended-blend
+             extended-projective extended-projective-zero extended-projective-negative
+             extended-projective-subnormal
+             extended-nonfinite-texture-coordinate
+             extended-blend
              extended-alpha-pipeline
-             extended-reject-stage-count extended-reject-control extended-reject-rgb-mapping
-             extended-reject-alpha-mapping extended-reject-input extended-reject-destination
-             extended-reject-duplicate extended-reject-dot extended-reject-mux
-             extended-reject-scale extended-reject-final-special extended-reject-final-flags
-             extended-reject-program extended-reject-format extended-reject-mips
-             extended-reject-dimensions extended-reject-wrap extended-reject-filter
+             extended-reject-stage-count extended-reject-late-stage extended-reject-control
+             extended-reject-input extended-reject-destination extended-reject-duplicate
+             extended-reject-rgb-flags extended-reject-alpha-flags
+             extended-reject-rgb-mapping extended-reject-alpha-mapping
+             extended-reject-final-special extended-reject-final-self-reference
+             extended-reject-final-flags
+             extended-reject-program extended-reject-later-program
+             extended-reject-stage1-format extended-reject-stage1-alias
+             extended-reject-stage1-projective extended-reject-format
+             extended-reject-dxt3-span extended-reject-dxt5-span
+             extended-reject-dxt5-stage3-alias extended-reject-mips extended-reject-mip-limit
+             extended-reject-cube-span extended-reject-cube-layout
+             extended-reject-swizzled-span extended-reject-swizzled-alias
+             extended-reject-swizzled-alignment
+             extended-reject-mip-span extended-reject-mip-stage3-alias
+             extended-reject-mip-lod-bias extended-reject-mip-lod-min extended-reject-mip-lod-max
+             extended-reject-dimensions extended-reject-address extended-reject-border extended-reject-filter
              extended-reject-conv-min-quincunx extended-reject-conv-mag-quincunx
              extended-reject-conv-both-quincunx extended-reject-conv-min-gaussian
              extended-reject-conv-mag-gaussian extended-reject-conv-min-reserved
              extended-reject-conv-mag-reserved
              extended-reject-signed extended-reject-disabled extended-reject-alphakill
              extended-reject-colorkey extended-reject-anisotropy extended-reject-span
-             extended-reject-alignment extended-reject-active-alias extended-reject-pending-alias
-             extended-reject-depth-alias extended-reject-projective-zero
-             extended-reject-projective-negative extended-reject-projective-infinite
-             extended-reject-projective-subnormal extended-reject-projective-overflow
+             extended-reject-alignment
+             extended-reject-linear-pitch extended-reject-linear-span
+             extended-reject-linear-alignment
+             extended-reject-active-alias extended-render-target-texture
+             extended-reject-depth-alias extended-reject-projective-infinite
+             extended-reject-projective-overflow
              framebuffer-info-normal framebuffer-info-immediate framebuffer-info-passthrough
              framebuffer-info-depth-only framebuffer-info-stale framebuffer-info-reject framebuffer-info-lifecycle
              framebuffer-info-xrgb-from-aa-to-single-normal framebuffer-info-xrgb-from-aa-to-single-immediate
@@ -127,7 +173,7 @@ foreach(case semaphore-release semaphore-concurrent visual seed-order perspectiv
              quincunx-approx-reject-width quincunx-approx-reject-height
              quincunx-approx-reject-pitch quincunx-approx-reject-unaligned
              quincunx-approx-reject-span quincunx-approx-reject-active-alias
-             quincunx-approx-reject-pending-alias quincunx-approx-reject-depth-alias
+             quincunx-approx-render-target-resolve quincunx-approx-reject-depth-alias
              quincunx-approx-lifecycle quincunx-approx-reference-sweep
              mock-checked-normal mock-checked-immediate mock-checked-failure-normal mock-checked-failure-immediate
              mock-checked-remap-normal mock-checked-remap-immediate
@@ -137,7 +183,8 @@ foreach(case semaphore-release semaphore-concurrent visual seed-order perspectiv
              mock-legacy-rebind-aa-normal mock-legacy-rebind-aa-immediate
              unsupported-state invalid-blend-src invalid-blend-dst invalid-blend-equation invalid-alpha-func
              invalid-cull-face invalid-cull-winding
-             unsupported-fog unsupported-texture cube-texture texture-extent
+             unsupported-fog invalid-polygon-offset-factor invalid-polygon-offset-units
+             unsupported-texture cube-texture texture-extent
              invalid-surface unsupported-surface unsupported-origin
              argb-with-aa xrgb-other-aa aa-other-format xrgb-reserved-layout
              invalid-address surface-extent invalid-texture unaligned-texture unsupported-combiner
@@ -179,7 +226,7 @@ foreach(case framebuffer-info-xrgb-convolution-approx-normal
              quincunx-approx-reject-width quincunx-approx-reject-height
              quincunx-approx-reject-pitch quincunx-approx-reject-unaligned
              quincunx-approx-reject-span quincunx-approx-reject-active-alias
-             quincunx-approx-reject-pending-alias quincunx-approx-reject-depth-alias
+             quincunx-approx-render-target-resolve quincunx-approx-reject-depth-alias
              quincunx-approx-lifecycle quincunx-approx-reference-sweep)
     set_tests_properties("metal_${case}" PROPERTIES ENVIRONMENT "BW_METAL_QUINCUNX_APPROX=1")
 endforeach()
@@ -218,7 +265,8 @@ set_tests_properties(metal_quincunx-approx-reference-sweep PROPERTIES TIMEOUT 12
 foreach(case framebuffer-info-xrgb-convolution-approx-normal
              framebuffer-info-xrgb-convolution-approx-immediate
              quincunx-approx-reference-sweep quincunx-approx-lifecycle
-             quincunx-approx-reject-pending-alias extended-bc1-inactive-kernel-normal)
+             quincunx-approx-render-target-resolve extended-bc1-inactive-kernel-normal
+             extended-texture-stages)
     add_test(NAME "metal_legacy-math-${case}" COMMAND bw_metal_backend_legacy_math_test "${case}")
     set_tests_properties("metal_legacy-math-${case}" PROPERTIES
         ENVIRONMENT "BW_METAL_QUINCUNX_APPROX=1" TIMEOUT 120)

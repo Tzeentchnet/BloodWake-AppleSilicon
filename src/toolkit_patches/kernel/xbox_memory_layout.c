@@ -4528,13 +4528,13 @@ uint32_t xbox_ContiguousBlockSize(uint32_t va)
     return result;
 }
 
-/* High-water mark of the window: everything below it was, at some point,
- * memory a MmAllocateContiguousMemory call returned.
+/* High-water mark of the contiguous window. Ranges below it can include
+ * unallocated holes, freed blocks, or bytes still being initialized.
  *
  * Lets a caller holding a physical address decide whether it names contiguous
- * memory this runtime allocated. The pushbuffer executor needs exactly that:
- * a surface offset is physical, and only the window makes it addressable.
- * Never decreases, so a freed-and-reused texture stays addressable. */
+ * memory this runtime might have allocated; this is only a compatibility
+ * heuristic, not evidence of live allocation identity or ownership. Never
+ * decreases, so a freed-and-reused texture stays addressable. */
 uint32_t xbox_ContiguousAllocatedBytes(void)
 {
     return contig_high_load();

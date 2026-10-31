@@ -84,3 +84,33 @@ target_compile_options(bw_native_startup_test PRIVATE -Wall -Wextra -Werror
     -Wno-comment)
 add_test(NAME bw_native_startup_test COMMAND bw_native_startup_test)
 set_tests_properties(bw_native_startup_test PROPERTIES TIMEOUT 30)
+
+add_library(bw_native_synthetic_under_test OBJECT ../../src/bw_macos_main.c)
+target_compile_definitions(bw_native_synthetic_under_test PRIVATE main=bw_native_main
+    BW_EXPERIMENTAL_MACOS_KEYBOARD_HOOK=1 BW_EXPERIMENTAL_SYNTHETIC_INPUT=1)
+target_include_directories(bw_native_synthetic_under_test PRIVATE
+    ../../src "${XBOXRECOMP_DIR}/include" "${XBOXRECOMP_DIR}/src"
+    "${XBOXRECOMP_DIR}/src/kernel" "${XBOXRECOMP_DIR}/src/d3d"
+    "${XBOXRECOMP_DIR}/src/audio" "${XBOXRECOMP_DIR}/src/input"
+    "${XBOXRECOMP_DIR}/src/apu" "${XBOXRECOMP_DIR}/src/nv2a"
+    "${XBOXRECOMP_DIR}/src/video")
+target_compile_options(bw_native_synthetic_under_test PRIVATE -Wall -Wextra -Werror
+    -Wno-comment)
+
+add_executable(bw_native_synthetic_startup_test test_native_main.c ../../src/bw_macos_boot.c
+    ../../src/toolkit_patches/kernel/nv2a_pb_scan.c
+    $<TARGET_OBJECTS:bw_native_synthetic_under_test>)
+target_compile_definitions(bw_native_synthetic_startup_test PRIVATE BW_EXPERIMENTAL_SYNTHETIC_INPUT=1)
+target_include_directories(bw_native_synthetic_startup_test PRIVATE
+    ../../src "${XBOXRECOMP_DIR}/include" "${XBOXRECOMP_DIR}/src"
+    "${XBOXRECOMP_DIR}/src/kernel" "${XBOXRECOMP_DIR}/src/d3d"
+    "${XBOXRECOMP_DIR}/src/audio" "${XBOXRECOMP_DIR}/src/input"
+    "${XBOXRECOMP_DIR}/src/apu" "${XBOXRECOMP_DIR}/src/nv2a"
+    "${XBOXRECOMP_DIR}/src/video")
+target_link_libraries(bw_native_synthetic_startup_test PRIVATE Threads::Threads)
+target_compile_options(bw_native_synthetic_startup_test PRIVATE -Wall -Wextra -Werror
+    -Wno-comment)
+add_test(NAME bw_native_synthetic_startup_test COMMAND bw_native_synthetic_startup_test)
+set_tests_properties(bw_native_synthetic_startup_test PROPERTIES TIMEOUT 30)
+set_tests_properties(bw_native_startup_test bw_native_synthetic_startup_test
+    PROPERTIES RESOURCE_LOCK bw_native_fixture)

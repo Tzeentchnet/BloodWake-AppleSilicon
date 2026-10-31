@@ -33,6 +33,11 @@ static void check(int ok)
         _exit(70);
 }
 
+#ifdef BW_EXPERIMENTAL_SYNTHETIC_INPUT
+void bw_macos_input_bridge_configure(int enabled) { (void)enabled; }
+void bw_macos_input_bridge_trace_synthetic(int enabled) { check(enabled); }
+#endif
+
 void bw_settings_apply(void) {}
 void bw_settings_print_schema(FILE *f) { fputs("{}\n", f); }
 int bw_edition_init(char *err, size_t n) { (void)err; (void)n; step = 1; return 0; }
@@ -277,6 +282,9 @@ int main(int argc, char **argv)
     unsetenv("RECOMP_VBLANK");
     unsetenv("BW_LAUNCH_DATA_FILE");
     unsetenv("BW_RUN_SECONDS");
+    unsetenv("BW_MACOS_KEYBOARD_HOOK");
+    unsetenv("BW_SYNTHETIC_INPUT_DIAGNOSTIC");
+    unsetenv("RECOMP_HEADLESS");
     check_scanner_requires_execution_switch();
     setenv("BW_SETTINGS", "none", 1);
     setenv("BW_GAME_DIR", "bw-host-fixture", 1);
@@ -337,6 +345,36 @@ int main(int argc, char **argv)
     setenv("BW_GPU", "d3d11", 1);
     if (invoke(argc, argv, "normal") == 0)
         return 8;
+    unsetenv("BW_GPU");
+    setenv("BW_SYNTHETIC_INPUT_DIAGNOSTIC", "invalid", 1);
+    if (invoke(argc, argv, "normal") == 0)
+        return 14;
+    setenv("BW_SYNTHETIC_INPUT_DIAGNOSTIC", "1", 1);
+    if (invoke(argc, argv, "normal") == 0)
+        return 15;
+#ifdef BW_EXPERIMENTAL_SYNTHETIC_INPUT
+    setenv("BW_MACOS_KEYBOARD_HOOK", "1", 1);
+    setenv("RECOMP_HEADLESS", "1", 1);
+    if (invoke(argc, argv, "normal") == 0)
+        return 16;
+    unsetenv("RECOMP_HEADLESS");
+    setenv("RECOMP_FB_WINDOW", "0", 1);
+    if (invoke(argc, argv, "normal") == 0)
+        return 17;
+    unsetenv("RECOMP_FB_WINDOW");
+    setenv("RECOMP_KEYBOARD", "0", 1);
+    if (invoke(argc, argv, "normal") == 0)
+        return 18;
+    unsetenv("RECOMP_KEYBOARD");
+    if (invoke(argc, argv, "normal") != 0)
+        return 19;
+#else
+    setenv("BW_MACOS_KEYBOARD_HOOK", "1", 1);
+    if (invoke(argc, argv, "normal") == 0)
+        return 20;
+#endif
+    unsetenv("BW_MACOS_KEYBOARD_HOOK");
+    unsetenv("BW_SYNTHETIC_INPUT_DIAGNOSTIC");
     unlink("bw-host-fixture/default.xbe");
     rmdir("bw-host-fixture");
     puts("native startup and process lifetime: synthetic checks passed");
