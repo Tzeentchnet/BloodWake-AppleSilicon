@@ -30,11 +30,25 @@ When unset, the native host defaults `RECOMP_PB_EXEC=1` and
 presence-based: even an empty value or `0` enables the executor or vblank.
 `RECOMP_PB_WALK=dma` remains an explicit opt-in.
 
-For supported Metal colour surfaces, the SDL presenter uses the surface's
-frozen pixel format, geometry and sampling dimensions. Supersampled frames
-use a rounded RGB box-average fallback before the gamma ramp; the
-title-selected NV2A reconstruction filter has not yet been implemented.
-Unsupported surface formats or sampling modes fail explicitly.
+For supported Metal colour surfaces, the default macOS path presents directly
+through the SDL-owned `CAMetalLayer`. Letterboxing, final scaling, guest-AA
+resolve, and the title gamma ramp remain on the GPU. Colour and depth targets
+use private Metal storage and may be larger than the Xbox surface; a
+guest-sized staging texture performs box-filtered readback before the
+executor's required snapshot. This removes the second guest-memory read, CPU
+gamma pass, and SDL streaming-texture upload, but it does not yet remove the
+synchronous guest-memory writeback required by the executor contract.
+
+Original remains at the Xbox render size unless explicitly overridden.
+Remastered follows `VFX_NATIVE_RES`, `BW_VFX_SCALE`, `BW_VFX_SSAA`, and
+`BW_VFX_GUESTAA`. For Apple Silicon diagnostics,
+`BW_METAL_RENDER_SCALE=auto` matches the drawable's largest 4:3 picture and
+tracks completed window resizes; a numeric value from `0.5` through `10`
+forces that scale in either edition. `BW_METAL_DIRECT_PRESENT=0` selects the
+older CPU/SDL presentation fallback; unset or `1` uses direct Metal
+presentation. Invalid values fail at startup rather than silently selecting a
+different mode. Unsupported surface formats or sampling modes also fail
+explicitly.
 
 For diagnostics with a freshly rebuilt native executable,
 `BW_METAL_QUINCUNX_APPROX=1` opts into a narrowly scoped legacy Gaussian

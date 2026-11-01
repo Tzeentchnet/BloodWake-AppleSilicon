@@ -94,6 +94,17 @@ Applies to: Remastered. Default: **Native (match the screen)**.
 | 720p | `fix:+VFX_NATIVE_RES;env:BW_VFX_SCALE=1.5` |
 | 480p (as the console) | `fix:-VFX_NATIVE_RES` |
 
+On Apple Silicon, the Metal backend implements these choices with private
+colour and depth render targets while keeping the Xbox-sized guest surface for
+snapshots. Native follows the drawable's largest 4:3 picture; live size
+changes take effect after a completed frame. `BW_VFX_SSAA=1..4` multiplies the
+native scale, and `BW_VFX_GUESTAA=1` retains the game's own AA dimensions on
+top of it.
+
+`BW_METAL_RENDER_SCALE=auto` or `BW_METAL_RENDER_SCALE=0.5..10` is an advanced
+macOS diagnostic override that also works in Original. Without that override,
+Original remains at 1x. This override is not a launcher choice.
+
 ### Frame rate cap
 
 The most frames a second the game draws. The console ran missions at 30. Higher rates draw extra frames between the game's own steps, so it looks smoother while playing at the same speed. Match my display follows your screen's refresh rate, which on a very fast monitor means hundreds of frames a second: 120 or 144 is plenty and keeps the PC cooler and quieter.

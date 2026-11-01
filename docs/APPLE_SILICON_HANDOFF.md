@@ -24,6 +24,12 @@ The first measured window included a 2.71-second loading stall and averaged
 23.62 FPS. The older `[GPU] ... fps` line uses C `clock()` CPU time and is not
 accepted as wall-clock evidence.
 
+Since that measured 640x480 run, the Metal path has gained direct
+`CAMetalLayer` presentation and private, independently scaled colour and depth
+targets. Synthetic tests and a native Release build pass, but those changes
+have not yet had a comparable hands-on retail run. Do not treat the older
+frame-time numbers as scaled-rendering measurements.
+
 ## Required opt-ins
 
 The currently verified path requires:
@@ -51,6 +57,8 @@ Guest USB and APU MMIO remain disabled. Do not set `RECOMP_USB` or
 ## Remaining limitations
 
 - Formal visual comparison with trustworthy reference frames is outstanding.
+- Direct presentation and scaled rendering still need a real-window retail
+  check covering visual correctness, resize behavior, frame time, and memory.
 - Quincunx filtering is approximate and not hardware-verified.
 - Frame pacing reaches the 30 FPS average target but retains 45-46 ms p95
   intervals in the measured scene.
@@ -72,6 +80,8 @@ Guest USB and APU MMIO remain disabled. Do not set `RECOMP_USB` or
 - Collect a representative 60-second active-gameplay sample and continue
   reporting average FPS, median, p95, maximum stalls, resolution, and enabled
   approximations.
+- Repeat that sample with direct presentation at 1x and automatic native scale
+  so the CPU-copy savings, GPU cost, and memory growth are measured separately.
 - Investigate the remaining frame-pacing jitter without weakening correctness
   or silently skipping unsupported work.
 

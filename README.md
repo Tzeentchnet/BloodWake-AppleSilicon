@@ -16,6 +16,10 @@ sustains the original title's 30 FPS cap.
 
 This is still a development build:
 
+- The Metal path now presents directly through `CAMetalLayer` and can render
+  into private, output-scaled colour and depth targets. Synthetic coverage is
+  complete, but scaled retail gameplay performance and visuals still need
+  hands-on validation.
 - The game-specific keyboard bridge and Metal quincunx approximation require
   explicit build or runtime opt-ins.
 - The quincunx approximation is not verified against NV2A hardware.

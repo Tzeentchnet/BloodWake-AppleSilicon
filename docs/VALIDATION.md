@@ -40,9 +40,18 @@ wall-clock performance evidence.
 
 ## Current regression coverage
 
-- The Metal backend suite passes 298/298 tests, including texture-stage masks,
+- The Metal backend suite passes 306/306 tests, including texture-stage masks,
   combiner operations, cube reflection, mip selection, command-buffer and
   render-encoder batching, texture caching, and upload-arena reuse.
+- Eight dedicated scaling cases cover forced 2x private targets, guest-AA
+  collapse, exact guest seeding, weighted box-filter readback, scaled colour
+  and depth scissors, invalid scale rejection, SSAA minimum handling, and a
+  live 1x-to-2x resize with depth/stencil preservation.
+- The macOS presenter suite passes 59/59 tests, including direct Metal
+  attachment, resize propagation, and confirmation that direct mode skips CPU
+  gamma and SDL texture upload.
+- The standalone Metal smoke test passes, and the Release native `bloodwake`
+  target builds successfully with the direct presenter and scaled-target path.
 - Focused Metal cases have also passed with ASan/UBSan and Metal validation.
 - The diagnostic runner passed 45 Python tests, including bounded execution,
   isolation, relaunch validation, and output handling.
@@ -58,6 +67,11 @@ wall-clock performance evidence.
 - The synthetic GPU capture suite passed 11 tests normally and under
   ASan/UBSan, with four focused TSan cases.
 - Windows and x86 execution were not validated on the Apple Silicon host.
+
+The direct-present and scaled-target results above are synthetic/build
+validation. A real-window retail gameplay run at native internal resolution
+is still outstanding, so no scaled-performance or memory claim is recorded
+yet.
 
 ## Integrity and privacy
 

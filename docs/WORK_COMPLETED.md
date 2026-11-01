@@ -10,6 +10,9 @@ test coverage are in [VALIDATION.md](VALIDATION.md).
 - Integrated the native macOS host, main-thread SDL event handling, guest event
   bridge, Metal lifecycle, framebuffer descriptor handoff, gamma application,
   and a visible 640x480 presentation path.
+- Added direct `CAMetalLayer` presentation with main-thread attachment and
+  resize propagation. Letterboxing, guest-AA resolve, scaling, and gamma now
+  run on the GPU; `BW_METAL_DIRECT_PRESENT=0` retains the CPU/SDL fallback.
 - Added a bounded isolated diagnostic runner with private writable paths,
   read-only prepared inputs, network and process-spawn denial, output limits,
   deadlines, executable and source fingerprints, and validated same-title
@@ -22,6 +25,13 @@ test coverage are in [VALIDATION.md](VALIDATION.md).
 - Implemented colour and depth/stencil surfaces, clears, drawing, blending,
   colour masks, alpha testing, culling, polygon offset, gamma, presentation,
   and ordered surface writeback.
+- Added independently scaled private colour and depth/stencil targets. Guest
+  surfaces seed through shared staging, guest-sized readback uses a weighted
+  box filter, guest AA collapses at native scale unless explicitly retained,
+  and partial-clear rectangles map conservatively into physical pixels.
+- Added automatic drawable-based scaling with post-frame cache epochs.
+  Depth/stencil contents are preserved through live scale changes before
+  targets are recreated.
 - Ported the DirectX register-combiner model for one to eight stages plus the
   final combiner, including constants, input/output mappings, dot products,
   mux, blue-to-alpha, scratch destinations, fog, and inactive stages.
@@ -54,6 +64,9 @@ test coverage are in [VALIDATION.md](VALIDATION.md).
   render-target writeback invalidates overlaps.
 - Added monotonic rolling frame-time reporting under `BW_GPU_AUDIT=1`,
   including average FPS, median, p95, and maximum frame interval.
+- Removed the direct-present path's CPU gamma pass, second guest-memory read,
+  and SDL streaming-texture upload. The executor's synchronous guest-sized
+  writeback remains for snapshots and framebuffer dumps.
 
 ## Input
 
@@ -98,6 +111,9 @@ test coverage are in [VALIDATION.md](VALIDATION.md).
 
 - Exact NV2A quincunx weights, sample positions, edge behavior, and rounding
   remain unknown.
+- Direct presentation and internal scaling have synthetic regression coverage,
+  but scaled retail visuals, frame time, and memory use have not yet received
+  a hands-on gameplay run.
 - CPU/GPU ownership is coordinated only at the renderer's explicit surface
   boundaries; general guest aliases and concurrent CPU access are not solved.
 - Guest USB, physical gamepads, APU audio, FMV, saves, other editions, and
