@@ -39,7 +39,7 @@ foreach(case
         renderer-fail logical-size-fail event-fail thread-fail
         frame-32 frame-16 frame-contig lost-completion blocked-copy late-worker
         close texture-fail update-fail render-fail invalid-format invalid-address
-        late-present-error metal-headless metal-1x metal-xzero-1x metal-contig metal-2x1
+        late-present-error metal-headless metal-direct metal-1x metal-xzero-1x metal-contig metal-2x1
         metal-1x2 metal-2x2 metal-batched metal-resize metal-replace
         metal-descriptor-copy metal-late-worker metal-guard-padding metal-guarded metal-outside
         metal-span-wrap metal-missing metal-missing-zero metal-mismatch-va

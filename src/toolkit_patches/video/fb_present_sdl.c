@@ -55,6 +55,7 @@
 #if defined(__APPLE__)
 #include <mach/mach.h>
 #include <mach/mach_vm.h>
+#include <SDL_metal.h>
 #include "bw_framebuffer_metal.h"
 #endif
 
@@ -227,6 +228,7 @@ static void present_copy(uint32_t fb_va, uint32_t pitch)
 
 #if defined(__APPLE__)
 static _Atomic int s_metal_expected;
+static _Atomic int s_metal_direct;
 static _Thread_local BwMetalFramebuffer s_metal_frame;
 static _Thread_local int s_metal_pending;
 static uint8_t *s_metal_samples;
@@ -423,7 +425,7 @@ void xbox_FramebufferWindowPresent(uint32_t fb_va, uint32_t pitch)
             s_metal_pending = 0;
             if (!pending || frame.guest_va != fb_va || frame.pitch != pitch)
                 present_fail(PRESENT_ERROR_DESCRIPTOR);
-            else
+            else if (!atomic_load_explicit(&s_metal_direct, memory_order_acquire))
                 present_copy_metal(&frame);
         } else
 #endif
@@ -578,6 +580,9 @@ int xbox_HostWindowMain(int (*guest_main)(void))
     SDL_Window *win = NULL;
     SDL_Renderer *ren = NULL;
     SDL_Texture *tex = NULL;
+#if defined(__APPLE__)
+    SDL_MetalView metal_view = NULL;
+#endif
     pthread_t guest;
     uint32_t tex_bpp = 0, tex_width = 0, tex_height = 0;
     uint64_t shown_seq = 0, t_title = 0, flips_title = 0;
@@ -634,17 +639,51 @@ int xbox_HostWindowMain(int (*guest_main)(void))
             goto startup_failed;
         }
     }
-    ren = SDL_CreateRenderer(win, -1, vsync ? SDL_RENDERER_PRESENTVSYNC : 0);
-    if (!ren || SDL_RenderSetLogicalSize(ren, (int)FB_W, (int)FB_H) != 0) {
-        fprintf(stderr, "  [FBWIN] cannot create the SDL renderer: %s\n", SDL_GetError());
-        goto startup_failed;
+#if defined(__APPLE__)
+    if (atomic_load_explicit(&s_metal_expected, memory_order_acquire)) {
+        const char *direct = getenv("BW_METAL_DIRECT_PRESENT");
+        int direct_on = !direct || !strcmp(direct, "1");
+        if (direct && strcmp(direct, "0") && strcmp(direct, "1")) {
+            fprintf(stderr, "  [FBWIN] BW_METAL_DIRECT_PRESENT must be 0 or 1\n");
+            goto startup_failed;
+        }
+        if (direct_on) {
+            int drawable_width, drawable_height;
+            metal_view = SDL_Metal_CreateView(win);
+            if (!metal_view) {
+                fprintf(stderr, "  [FBWIN] cannot create the SDL Metal view: %s\n",
+                        SDL_GetError());
+                goto startup_failed;
+            }
+            void *layer = SDL_Metal_GetLayer(metal_view);
+            SDL_Metal_GetDrawableSize(win, &drawable_width, &drawable_height);
+            if (!layer || drawable_width <= 0 || drawable_height <= 0 ||
+                !bw_metal_backend_attach_presenter(layer, (uint32_t)drawable_width,
+                                                   (uint32_t)drawable_height, vsync)) {
+                fprintf(stderr, "  [FBWIN] cannot attach the direct Metal presenter\n");
+                goto startup_failed;
+            }
+            atomic_store_explicit(&s_metal_direct, 1, memory_order_release);
+            dirty = 0;
+            fprintf(stderr, "  [FBWIN] framebuffer window open (%ux%u logical,"
+                    " direct Metal, vsync %s); guest runs on a pthread\n",
+                    FB_W, FB_H, vsync ? "on" : "off");
+        }
     }
-    {
-        SDL_RendererInfo ri;
-        if (SDL_GetRendererInfo(ren, &ri) == 0)
-            fprintf(stderr, "  [FBWIN] framebuffer window open (%ux%u, SDL %s renderer,"
-                    " vsync %s); guest runs on a pthread\n",
-                    FB_W, FB_H, ri.name, vsync ? "on" : "off");
+#endif
+    if (!atomic_load_explicit(&s_metal_direct, memory_order_acquire)) {
+        ren = SDL_CreateRenderer(win, -1, vsync ? SDL_RENDERER_PRESENTVSYNC : 0);
+        if (!ren || SDL_RenderSetLogicalSize(ren, (int)FB_W, (int)FB_H) != 0) {
+            fprintf(stderr, "  [FBWIN] cannot create the SDL renderer: %s\n", SDL_GetError());
+            goto startup_failed;
+        }
+        {
+            SDL_RendererInfo ri;
+            if (SDL_GetRendererInfo(ren, &ri) == 0)
+                fprintf(stderr, "  [FBWIN] framebuffer window open (%ux%u, SDL %s renderer,"
+                        " vsync %s); guest runs on a pthread\n",
+                        FB_W, FB_H, ri.name, vsync ? "on" : "off");
+        }
     }
 
     s_guest_done_event = SDL_RegisterEvents(2);
@@ -724,8 +763,23 @@ int xbox_HostWindowMain(int (*guest_main)(void))
                     atomic_store_explicit(&s_wake_pending, 0, memory_order_release);
                 else if (ev.type == SDL_WINDOWEVENT
                          && (ev.window.event == SDL_WINDOWEVENT_EXPOSED
-                             || ev.window.event == SDL_WINDOWEVENT_SIZE_CHANGED))
+                             || ev.window.event == SDL_WINDOWEVENT_SIZE_CHANGED)) {
+#if defined(__APPLE__)
+                    if (atomic_load_explicit(&s_metal_direct, memory_order_acquire) &&
+                        ev.window.event == SDL_WINDOWEVENT_SIZE_CHANGED) {
+                        int drawable_width, drawable_height;
+                        SDL_Metal_GetDrawableSize(win, &drawable_width, &drawable_height);
+                        if (drawable_width > 0 && drawable_height > 0 &&
+                            !bw_metal_backend_resize_presenter((uint32_t)drawable_width,
+                                                              (uint32_t)drawable_height)) {
+                            fprintf(stderr, "  [FBWIN] cannot resize the direct Metal presenter\n");
+                            fflush(stderr);
+                            _exit(1);
+                        }
+                    }
+#endif
                     dirty = 1;
+                }
             } while (SDL_PollEvent(&ev));
         }
 
@@ -766,7 +820,7 @@ int xbox_HostWindowMain(int (*guest_main)(void))
                 runtime_failure("cannot update the framebuffer texture");
             dirty = 1;
         }
-        if (dirty) {
+        if (dirty && !atomic_load_explicit(&s_metal_direct, memory_order_acquire)) {
             dirty = 0;
             if (SDL_SetRenderDrawColor(ren, 0, 0, 0, 255) != 0 ||
                 SDL_RenderClear(ren) != 0 ||
@@ -815,6 +869,10 @@ int xbox_HostWindowMain(int (*guest_main)(void))
     return s_guest_rc;
 
 startup_failed:
+#if defined(__APPLE__)
+    if (metal_view)
+        SDL_Metal_DestroyView(metal_view);
+#endif
     if (ren)
         SDL_DestroyRenderer(ren);
     if (win)

@@ -303,7 +303,6 @@ static int guest_main(void)
     bw_posix_fault_set_base((uintptr_t)g_xbox_mem_offset);
     bw_edition_apply_image_fixes(xbe_data, xbe_size);
     free(xbe_data);
-    bw_sdl_framebuffer_expect_metal();
     bw_metal_backend_set_framebuffer_callback(bw_sdl_framebuffer_prepare_metal);
     if (!bw_metal_backend_start()) {
         fprintf(stderr, "[BW] Metal initialization failed: %s\n",
@@ -448,6 +447,7 @@ int main(int argc, char **argv)
     }
     if (configure_native() != 0 || start_run_limit() != 0)
         return 1;
+    bw_sdl_framebuffer_expect_metal();
     rc = xbox_HostWindowMain(guest_main);
     if (s_boot.guest_entered)
         finish_diagnostics("guest return");

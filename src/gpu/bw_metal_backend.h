@@ -25,6 +25,18 @@ typedef struct {
 typedef int (*BwMetalFramebufferCallback)(const BwMetalFramebuffer *framebuffer);
 void bw_metal_backend_set_framebuffer_callback(BwMetalFramebufferCallback callback);
 
+/* Attach the CAMetalLayer owned by the main-thread SDL presenter before
+ * starting the backend. Direct presentation keeps the completed frame on the
+ * GPU; guest-memory synchronization still happens for executor snapshots and
+ * framebuffer dumps. The layer pointer is opaque here so C callers do not
+ * depend on Objective-C headers. Returns nonzero on success. */
+int bw_metal_backend_attach_presenter(void *metal_layer, uint32_t drawable_width,
+                                      uint32_t drawable_height, int vsync);
+/* Main-thread only. Zero dimensions (a minimized window) are accepted without
+ * changing the last drawable size. Returns zero for an invalid call. */
+int bw_metal_backend_resize_presenter(uint32_t drawable_width,
+                                      uint32_t drawable_height);
+
 /* Start after the toolkit has mapped guest memory and before the guest submits
  * GPU work. The host must set RECOMP_PB_EXEC before the toolkit starts its
  * poll thread; it is presence-based, so even "0" enables execution. Executor

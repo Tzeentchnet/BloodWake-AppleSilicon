@@ -1,4 +1,5 @@
 #include <SDL.h>
+#include <SDL_metal.h>
 
 #include <errno.h>
 #include <pthread.h>
@@ -38,6 +39,7 @@ typedef struct {
     atomic_int memory_dead, late_memory_access, atexit_called;
     atomic_int texture_creations, texture_width, texture_height;
     atomic_int expected_width, expected_height;
+    atomic_int metal_attach, metal_resize;
     atomic_uint uploaded_pixel, uploaded_last, gamma_input_first;
     atomic_uint uploaded_pixels[6];
 } Shared;
@@ -48,6 +50,7 @@ static pthread_t s_main, s_worker, s_producer, s_releaser;
 static int s_worker_created, s_producer_created, s_releaser_created;
 static _Alignas(16384) uint8_t s_memory[MEMORY_SIZE];
 static int s_window, s_renderer, s_texture;
+static int s_metal_view;
 static atomic_int s_sdl_active;
 static Uint32 s_done_event, s_frame_event;
 
@@ -70,6 +73,25 @@ static void check(int ok, const char *message)
 static void check_main(void)
 {
     check(pthread_equal(pthread_self(), s_main), "SDL/input call left the main thread");
+}
+
+int bw_metal_backend_attach_presenter(void *layer, uint32_t width,
+                                      uint32_t height, int vsync)
+{
+    check(layer != NULL, "direct presenter receives a Metal layer");
+    check(width == WIDTH * 2u && height == HEIGHT * 2u,
+          "direct presenter receives drawable pixels");
+    check(vsync == 1, "direct presenter receives vsync setting");
+    atomic_fetch_add(&s->metal_attach, 1);
+    return 1;
+}
+
+int bw_metal_backend_resize_presenter(uint32_t width, uint32_t height)
+{
+    check(width == WIDTH * 2u && height == HEIGHT * 2u,
+          "direct presenter resize receives drawable pixels");
+    atomic_fetch_add(&s->metal_resize, 1);
+    return 1;
 }
 
 static void sleep_ms(unsigned ms)
@@ -212,6 +234,34 @@ SDL_Window * SDLCALL SDL_CreateWindow(const char *title, int x, int y, int w, in
     (void)title; (void)x; (void)y; (void)w; (void)h; (void)flags;
     check_main();
     return is_case("window-fail") ? NULL : (SDL_Window *)&s_window;
+}
+
+SDL_MetalView SDLCALL SDL_Metal_CreateView(SDL_Window *window)
+{
+    check_main();
+    check(window == (SDL_Window *)&s_window, "Metal view uses the created window");
+    return (SDL_MetalView)&s_metal_view;
+}
+
+void SDLCALL SDL_Metal_DestroyView(SDL_MetalView view)
+{
+    check_main();
+    check(view == (SDL_MetalView)&s_metal_view, "destroy the created Metal view");
+}
+
+void * SDLCALL SDL_Metal_GetLayer(SDL_MetalView view)
+{
+    check_main();
+    check(view == (SDL_MetalView)&s_metal_view, "get the created Metal layer");
+    return &s_metal_view;
+}
+
+void SDLCALL SDL_Metal_GetDrawableSize(SDL_Window *window, int *w, int *h)
+{
+    check_main();
+    check(window == (SDL_Window *)&s_window, "query the created Metal window");
+    if (w) *w = (int)WIDTH * 2;
+    if (h) *h = (int)HEIGHT * 2;
 }
 
 Uint32 SDLCALL SDL_GetWindowFlags(SDL_Window *window)
@@ -663,6 +713,18 @@ static int metal_guest(void)
     xbox_FramebufferWindowPresent(is_case("metal-mismatch-va") ? frame.guest_va + 4
                                  : is_case("metal-missing-zero") ? 0 : frame.guest_va,
                                  is_case("metal-mismatch-pitch") ? frame.pitch + 4 : frame.pitch);
+    if (is_case("metal-direct")) {
+        SDL_Event event;
+        check(atomic_load(&s->metal_attach) == 1, "direct presenter attached once");
+        check(!atomic_load(&s->updates) && !atomic_load(&s->gamma_calls),
+              "direct presentation skips the CPU upload and gamma path");
+        memset(&event, 0, sizeof event);
+        event.type = SDL_WINDOWEVENT;
+        event.window.event = SDL_WINDOWEVENT_SIZE_CHANGED;
+        check(SDL_PushEvent(&event) == 1, "queue direct-presenter resize");
+        check(wait_at_least(&s->metal_resize, 1), "resize reaches direct presenter");
+        return 37;
+    }
     if (is_case("metal-guarded") || is_case("metal-outside") ||
         is_case("metal-span-wrap") || is_case("metal-missing") ||
         is_case("metal-missing-zero") || is_case("metal-mismatch-va") ||
@@ -819,6 +881,8 @@ int main(int argc, char **argv)
         setenv("RECOMP_HEADLESS", "1", 1);
     if (is_case("headless-window-off"))
         setenv("RECOMP_FB_WINDOW", "0", 1);
+    if (is_case("metal-direct"))
+        bw_sdl_framebuffer_expect_metal();
 
     if (runtime_case()) {
         pid_t child = fork();

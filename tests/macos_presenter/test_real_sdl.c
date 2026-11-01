@@ -20,6 +20,19 @@
 int xbox_HostWindowMain(int (*guest_main)(void));
 void xbox_FramebufferWindowPresent(uint32_t va, uint32_t pitch);
 
+int bw_metal_backend_attach_presenter(void *layer, uint32_t width,
+                                      uint32_t height, int vsync)
+{
+    (void)layer; (void)width; (void)height; (void)vsync;
+    return 1;
+}
+
+int bw_metal_backend_resize_presenter(uint32_t width, uint32_t height)
+{
+    (void)width; (void)height;
+    return 1;
+}
+
 static _Alignas(16) uint8_t s_memory[2u * 1024u * 1024u];
 static atomic_int s_guest_calls;
 static int s_headless;

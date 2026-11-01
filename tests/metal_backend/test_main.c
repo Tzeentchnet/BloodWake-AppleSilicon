@@ -14,6 +14,7 @@
 #include "bw_backend_sync.h"
 #include "bw_gpu_audit.h"
 #include "d3d/d3d8_swizzle.h"
+#include "../../src/bw_edition.h"
 
 #define WIDTH 16u
 #define HEIGHT 12u
@@ -41,6 +42,7 @@ static uint32_t s_fence_va;
 static int s_fence_register_enabled;
 static volatile uint32_t s_fence_register;
 static int s_failed;
+static bw_edition_t s_edition = BW_ED_ORIGINAL;
 
 ptrdiff_t xbox_GetMemoryOffset(void) { return (ptrdiff_t)s_guest_base; }
 void *xbox_GetMemoryBase(void) { return s_runtime_base; }
@@ -131,6 +133,9 @@ volatile uint32_t *xbox_Nv2aRegPtr(uint32_t offset)
 int bw_ab_off(const char *fix) { (void)fix; return 0; }
 void bw_ab_frame(uint32_t frame) { s_ab_frame = frame; }
 int bw_audit_on(void) { return 0; }
+int bw_gamma_lut(uint8_t lut[768]) { (void)lut; return 0; }
+unsigned char g_bw_fix_on[BW_FIX_COUNT];
+bw_edition_t bw_edition(void) { return s_edition; }
 void bw_audit_method(uint32_t subch, uint32_t method, uint32_t param)
 { (void)subch; (void)method; (void)param; }
 void bw_audit_draw(const BwAuditDraw *draw) { (void)draw; }
@@ -150,6 +155,12 @@ extern uint64_t bw_metal_test_command_submission_count(void);
 extern uint64_t bw_metal_test_draw_encoder_creation_count(void);
 extern uint64_t bw_metal_test_vertex_upload_allocation_count(void);
 extern uint64_t bw_metal_test_texture_upload_count(void);
+extern int bw_metal_test_current_surface(uint32_t *width, uint32_t *height,
+                                         int *private_storage);
+extern int bw_metal_test_current_depth(uint32_t va, uint32_t *width, uint32_t *height,
+                                       int *private_storage);
+extern void bw_metal_test_set_present_size(uint32_t width, uint32_t height);
+extern int bw_metal_test_write_surface_pixel(uint32_t x, uint32_t y, uint32_t argb);
 
 #define CHECK(condition) do { \
     if (!(condition)) { \
@@ -5130,6 +5141,107 @@ static void cpu_write_counterexample_test(void)
     CHECK(pixel(4, 4) == gpu_color);
 }
 
+static void render_scale_test(void)
+{
+    uint32_t width = 0, height = 0;
+    int private_storage = 0;
+    clear(0xFF214365u);
+    CHECK(bw_metal_test_current_surface(&width, &height, &private_storage));
+    CHECK(width == WIDTH * 2u && height == HEIGHT * 2u);
+    CHECK(private_storage);
+    flip();
+    expect_no_error();
+    CHECK(pixel(0, 0) == 0xFF214365u);
+    CHECK(pixel(WIDTH - 1u, HEIGHT - 1u) == 0xFF214365u);
+}
+
+static void render_scale_aa_test(void)
+{
+    uint32_t width = 0, height = 0;
+    int private_storage = 0;
+    setup_xrgb_aa_surface();
+    clear(0xFF123456u);
+    CHECK(bw_metal_test_current_surface(&width, &height, &private_storage));
+    CHECK(width == WIDTH * 2u && height == HEIGHT * 2u);
+    CHECK(private_storage);
+    flip();
+    expect_no_error();
+    CHECK(aa_pixel(0, 0) == 0x00123456u);
+    CHECK(aa_pixel(AA_WIDTH - 1u, HEIGHT - 1u) == 0x00123456u);
+}
+
+static void render_scale_box_test(void)
+{
+    clear(0xFF000000u);
+    CHECK(bw_metal_test_write_surface_pixel(0, 0, 0xFFFFFFFFu));
+    flip();
+    expect_no_error();
+    uint32_t filtered = pixel(0, 0);
+    CHECK(((filtered >> 24) & 0xFFu) == 0xFFu);
+    CHECK(abs((int)((filtered >> 16) & 0xFFu) - 0x40) <= 1);
+    CHECK(abs((int)((filtered >> 8) & 0xFFu) - 0x40) <= 1);
+    CHECK(abs((int)(filtered & 0xFFu) - 0x40) <= 1);
+    CHECK(pixel(1, 0) == 0xFF000000u);
+}
+
+static void render_scale_depth_test(void)
+{
+    uint32_t width = 0, height = 0;
+    int private_storage = 0;
+    float z = 0.0f;
+    uint8_t stencil = 0;
+    setup_depth(ZETA_AT);
+    depth_clear(3, 0x2000003Cu);
+    CHECK(bw_metal_test_current_depth(ZETA_AT, &width, &height, &private_storage));
+    CHECK(width == WIDTH * 2u && height == HEIGHT * 2u);
+    CHECK(private_storage);
+    set_clear_rect(2, 3, 4, 5);
+    depth_clear(1, 0x60000000u);
+    CHECK(bw_metal_test_read_depth(ZETA_AT, 3, 6, &z, &stencil));
+    CHECK(fabsf(z - (float)0x200000u / 16777215.0f) < 0.000001f);
+    CHECK(stencil == 0x3Cu);
+    CHECK(bw_metal_test_read_depth(ZETA_AT, 4, 6, &z, &stencil));
+    CHECK(fabsf(z - (float)0x600000u / 16777215.0f) < 0.000001f);
+    CHECK(stencil == 0x3Cu);
+    CHECK(bw_metal_test_read_depth(ZETA_AT, 9, 11, &z, &stencil));
+    CHECK(fabsf(z - (float)0x600000u / 16777215.0f) < 0.000001f);
+    CHECK(bw_metal_test_read_depth(ZETA_AT, 10, 11, &z, &stencil));
+    CHECK(fabsf(z - (float)0x200000u / 16777215.0f) < 0.000001f);
+}
+
+static void render_scale_auto_test(void)
+{
+    uint32_t width = 0, height = 0;
+    int private_storage = 0;
+    float z = 0.0f;
+    uint8_t stencil = 0;
+    setup_depth(ZETA_AT);
+    depth_clear(3, 0x60000042u);
+    bw_metal_test_set_present_size(1280, 960);
+    clear(0xFF102030u);
+    CHECK(bw_metal_test_current_surface(&width, &height, &private_storage));
+    CHECK(width == WIDTH && height == HEIGHT);
+    flip();
+    expect_no_error();
+    CHECK(surface_pixel(ZETA_AT, PITCH, 0, 0) == 0x60000042u);
+    set_clear_rect(0, 0, 0, 0);
+    depth_clear(2, 0x11111137u);
+    CHECK(bw_metal_test_read_depth(ZETA_AT, 0, 0, &z, &stencil));
+    CHECK(fabsf(z - (float)0x600000u / 16777215.0f) < 0.000001f);
+    CHECK(stencil == 0x37u);
+    CHECK(bw_metal_test_read_depth(ZETA_AT, 4, 4, &z, &stencil));
+    CHECK(fabsf(z - (float)0x600000u / 16777215.0f) < 0.000001f);
+    CHECK(stencil == 0x42u);
+    set_clear_rect(0, 0, WIDTH - 1u, HEIGHT - 1u);
+    clear(0xFF405060u);
+    CHECK(bw_metal_test_current_surface(&width, &height, &private_storage));
+    CHECK(width == WIDTH * 2u && height == HEIGHT * 2u);
+    CHECK(private_storage);
+    flip();
+    expect_no_error();
+    CHECK(pixel(0, 0) == 0xFF405060u);
+}
+
 int main(int argc, char **argv)
 {
     if (argc != 2) {
@@ -5139,6 +5251,23 @@ int main(int argc, char **argv)
     unsetenv("RECOMP_NO_COMBINERS");
     unsetenv("RECOMP_FB_DUMP");
     unsetenv("RECOMP_FB_DUMP_FLIPS");
+    unsetenv("BW_METAL_RENDER_SCALE");
+    unsetenv("BW_VFX_NATIVE_RES");
+    unsetenv("BW_VFX_SSAA");
+    unsetenv("RECOMP_WINDOW_SCALE");
+    if (!strcmp(argv[1], "render-scale-auto")) {
+        setenv("BW_METAL_RENDER_SCALE", "auto", 1);
+        setenv("RECOMP_WINDOW_SCALE", "1", 1);
+    } else if (!strcmp(argv[1], "render-scale-invalid")) {
+        setenv("BW_METAL_RENDER_SCALE", "0.25", 1);
+    } else if (!strcmp(argv[1], "render-scale-ssaa-min")) {
+        s_edition = BW_ED_REMASTERED;
+        setenv("BW_VFX_NATIVE_RES", "1", 1);
+        setenv("BW_VFX_SSAA", "0.5", 1);
+        setenv("RECOMP_WINDOW_SCALE", "2", 1);
+    } else if (!strncmp(argv[1], "render-scale", sizeof("render-scale") - 1u)) {
+        setenv("BW_METAL_RENDER_SCALE", "2", 1);
+    }
     setenv("BW_IMMEDIATE_PRESENT", "1", 1);
     memset(s_mem, 0, sizeof s_mem);
     memset(s_mem + COLOR_AT, 0xA5, PITCH * HEIGHT);
@@ -5159,6 +5288,13 @@ int main(int argc, char **argv)
         CHECK(bw_metal_backend_error() && strstr(bw_metal_backend_error(), "guest memory"));
         bw_metal_backend_stop();
     }
+    if (!strcmp(argv[1], "render-scale-invalid")) {
+        CHECK(!bw_metal_backend_start_for_test(s_mem, sizeof s_mem));
+        CHECK(bw_metal_backend_error() &&
+              strstr(bw_metal_backend_error(), "BW_METAL_RENDER_SCALE"));
+        bw_metal_backend_stop();
+        return s_failed ? 1 : 0;
+    }
     if (!strncmp(argv[1], "framebuffer-info-", 17) ||
         !strncmp(argv[1], "extended-reject-", 16) ||
         !strncmp(argv[1], "extended-bc1-inactive-kernel-",
@@ -5174,6 +5310,20 @@ int main(int argc, char **argv)
     setup_surface(strcmp(argv[1], "screen-combiner") != 0);
     if (!strcmp(argv[1], "visual"))
         visual_test();
+    else if (!strcmp(argv[1], "render-scale"))
+        render_scale_test();
+    else if (!strcmp(argv[1], "render-scale-aa"))
+        render_scale_aa_test();
+    else if (!strcmp(argv[1], "render-scale-partial"))
+        partial_color_test();
+    else if (!strcmp(argv[1], "render-scale-box"))
+        render_scale_box_test();
+    else if (!strcmp(argv[1], "render-scale-depth"))
+        render_scale_depth_test();
+    else if (!strcmp(argv[1], "render-scale-auto"))
+        render_scale_auto_test();
+    else if (!strcmp(argv[1], "render-scale-ssaa-min"))
+        render_scale_test();
     else if (!strcmp(argv[1], "seed-order"))
         seed_order_test();
     else if (!strcmp(argv[1], "command-batching"))

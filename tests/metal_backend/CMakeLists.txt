@@ -42,6 +42,7 @@ check_toolkit_source("src/d3d/d3d8_swizzle.h"
 
 find_library(FOUNDATION_FRAMEWORK Foundation REQUIRED)
 find_library(METAL_FRAMEWORK Metal REQUIRED)
+find_library(QUARTZCORE_FRAMEWORK QuartzCore REQUIRED)
 find_package(Threads REQUIRED)
 
 set(METAL_BACKEND_TEST_SOURCES
@@ -60,7 +61,8 @@ function(add_metal_backend_test_executable target)
     target_compile_definitions(${target} PRIVATE BW_METAL_TESTING=1)
     target_compile_options(${target} PRIVATE $<$<COMPILE_LANGUAGE:OBJC>:-fobjc-arc>)
     target_link_libraries(${target} PRIVATE
-        "${FOUNDATION_FRAMEWORK}" "${METAL_FRAMEWORK}" Threads::Threads m)
+        "${FOUNDATION_FRAMEWORK}" "${METAL_FRAMEWORK}" "${QUARTZCORE_FRAMEWORK}"
+        Threads::Threads m)
     set_target_properties(${target} PROPERTIES C_STANDARD 11 C_STANDARD_REQUIRED ON)
 endfunction()
 
@@ -91,7 +93,10 @@ add_test(NAME metal_shared-backing-unprotected-alias-counterexample
 set_tests_properties(metal_shared-backing-unprotected-alias-counterexample PROPERTIES
     LABELS "experiment;counterexample" TIMEOUT 20)
 
-foreach(case semaphore-release semaphore-concurrent visual seed-order command-batching perspective blend color-mask alpha-test pipeline-cache cull full-rect depth-clear
+foreach(case semaphore-release semaphore-concurrent visual
+             render-scale render-scale-aa render-scale-partial render-scale-box
+             render-scale-depth render-scale-auto render-scale-invalid render-scale-ssaa-min
+             seed-order command-batching perspective blend color-mask alpha-test pipeline-cache cull full-rect depth-clear
              depth-draw stencil-draw polygon-offset polygon-offset-disabled polygon-offset-zero
              partial-color partial-color-masks partial-color-default-rect partial-clip partial-empty
              partial-depth partial-depth-seed partial-depth-empty partial-depth-unbound

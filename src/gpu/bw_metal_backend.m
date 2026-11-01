@@ -1,7 +1,9 @@
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
+#import <QuartzCore/CAMetalLayer.h>
 
 #include <float.h>
+#include <errno.h>
 #include <math.h>
 #include <stdatomic.h>
 #include <stdarg.h>
@@ -12,6 +14,8 @@
 
 #include "bw_metal_backend.h"
 #include "bw_backend_sync.h"
+#include "bw_gamma.h"
+#include "../bw_edition.h"
 #include "d3d/d3d8_swizzle.h"
 #include "../toolkit_patches/bw_runtime_lifecycle.h"
 
@@ -44,6 +48,18 @@ typedef struct {
 } MetalUniforms;
 
 typedef struct {
+    uint32_t width, height, aa_sx, aa_sy;
+} MetalResolveUniforms;
+
+typedef struct {
+    uint32_t source_width, source_height, destination_width, destination_height;
+} MetalScaleUniforms;
+
+typedef struct {
+    uint32_t gamma_enabled, padding[3];
+} MetalPresentUniforms;
+
+typedef struct {
     MetalUniforms draw;
     float fog_color[4];
     uint32_t combiner[8][4];
@@ -72,13 +88,14 @@ typedef struct {
 
 typedef struct {
     uint32_t color_va, width, height, pitch;
-    uint32_t format, bytes_per_pixel, aa_sx, aa_sy;
+    uint32_t physical_width, physical_height;
+    uint32_t format, bytes_per_pixel, aa_sx, aa_sy, scale_epoch;
 } MetalColorSurfaceKey;
 
 @interface BWMetalDepthSurface : NSObject {
 @public
     id<MTLTexture> texture;
-    uint32_t va, width, height, pitch;
+    uint32_t va, width, height, guest_width, guest_height, pitch, scale_epoch;
     uint64_t end;
     unsigned initialized;
 }
@@ -109,10 +126,21 @@ static int s_registered;
 static int s_dirty;
 static int s_quincunx_approx;
 static int s_quincunx_reported;
+static float s_render_scale = 1.0f;
+static float s_render_fixed_scale = 1.0f;
+static float s_render_ssaa = 1.0f;
+static unsigned s_render_scale_epoch = 1;
+static int s_render_scale_auto;
+static int s_render_guest_aa;
 static uint32_t s_frame;
 static uint32_t s_current_format;
 static Nv2aSurface s_current;
 static BwMetalFramebufferCallback s_framebuffer_callback;
+static CAMetalLayer *s_present_layer;
+static atomic_uint s_present_width;
+static atomic_uint s_present_height;
+static id<MTLTexture> s_present_surface;
+static BwMetalFramebuffer s_present_framebuffer;
 static id<MTLDevice> s_device;
 static id<MTLCommandQueue> s_queue;
 static id<MTLCommandBuffer> s_pending_command;
@@ -133,6 +161,25 @@ static id<MTLFunction> s_extended_fragment_function;
 static id<MTLFunction> s_clear_vertex_function;
 static id<MTLFunction> s_clear_color_function;
 static id<MTLFunction> s_clear_depth_function;
+static id<MTLFunction> s_present_vertex_function;
+static id<MTLFunction> s_present_resolve_function;
+static id<MTLFunction> s_present_fragment_function;
+static id<MTLFunction> s_scale_function;
+static id<MTLFunction> s_box_function;
+static id<MTLRenderPipelineState> s_present_resolve_pipeline;
+static id<MTLRenderPipelineState> s_present_pipeline;
+static id<MTLRenderPipelineState> s_scale_pipeline;
+static id<MTLRenderPipelineState> s_box_pipeline;
+static id<MTLSamplerState> s_present_sampler;
+static id<MTLTexture> s_surface_upload;
+static id<MTLTexture> s_surface_readback;
+static id<MTLTexture> s_present_resolve;
+static id<MTLTexture> s_present_gamma;
+static id<MTLCommandBuffer> s_last_present_command;
+static uint8_t s_present_gamma_bytes[1024];
+static int s_present_gamma_valid;
+static uint64_t s_presented_frames;
+static uint64_t s_dropped_drawables;
 static NSMutableDictionary<NSData *, id<MTLRenderPipelineState>> *s_pipelines;
 static NSMutableDictionary<NSNumber *, id<MTLRenderPipelineState>> *s_clear_pipelines;
 static NSMutableDictionary<NSData *, id<MTLTexture>> *s_color_surfaces;
@@ -152,6 +199,8 @@ static uint64_t s_last_flip_ns;
 static int s_frame_timing_enabled;
 
 static int flush_commands(void);
+static id<MTLCommandBuffer> pending_command(void);
+static int preserve_depth_surfaces(void);
 
 static void end_draw_encoder(void)
 {
@@ -417,6 +466,63 @@ static const char s_shader[] =
     "  if (u.texture.x) o.rgb = floor(o.rgb * 255.0 + 0.5) / 255.0;\n"
     "  return o;\n"
     "}\n"
+    "struct PresentVarying { float4 position [[position]]; float2 uv; };\n"
+    "struct ResolveUniforms { uint width, height, aa_sx, aa_sy; };\n"
+    "struct ScaleUniforms { uint source_width, source_height, destination_width, destination_height; };\n"
+    "struct PresentUniforms { uint gamma_enabled; uint3 padding; };\n"
+    "vertex PresentVarying present_vertex(uint i [[vertex_id]]) {\n"
+    "  const float2 p[3] = {float2(-1, -1), float2(3, -1), float2(-1, 3)};\n"
+    "  PresentVarying o; o.position = float4(p[i], 0, 1);\n"
+    "  o.uv = float2(p[i].x * 0.5 + 0.5, 0.5 - p[i].y * 0.5); return o;\n"
+    "}\n"
+    "fragment float4 present_resolve(PresentVarying in [[stage_in]],\n"
+    "    texture2d<float, access::read> source [[texture(0)]],\n"
+    "    constant ResolveUniforms &u [[buffer(0)]]) {\n"
+    "  uint2 logical = uint2(u.width, u.height);\n"
+    "  uint2 p = min(uint2(in.uv * float2(logical)), logical - 1u);\n"
+    "  float4 color = 0.0; uint count = u.aa_sx * u.aa_sy;\n"
+    "  for (uint y = 0; y < u.aa_sy; y++)\n"
+    "    for (uint x = 0; x < u.aa_sx; x++)\n"
+    "      color += source.read(p * uint2(u.aa_sx, u.aa_sy) + uint2(x, y));\n"
+    "  return color / float(count);\n"
+    "}\n"
+    "fragment float4 scale_fragment(PresentVarying in [[stage_in]],\n"
+    "    texture2d<float> source [[texture(0)]], sampler source_sampler [[sampler(0)]]) {\n"
+    "  return source.sample(source_sampler, in.uv);\n"
+    "}\n"
+    "fragment float4 box_fragment(PresentVarying in [[stage_in]],\n"
+    "    texture2d<float, access::read> source [[texture(0)]],\n"
+    "    constant ScaleUniforms &u [[buffer(0)]]) {\n"
+    "  uint2 destination = uint2(u.destination_width, u.destination_height);\n"
+    "  uint2 p = min(uint2(in.position.xy), destination - 1u);\n"
+    "  float2 ratio = float2(u.source_width, u.source_height) / float2(destination);\n"
+    "  float2 lo = float2(p) * ratio, hi = float2(p + 1u) * ratio;\n"
+    "  uint2 begin = uint2(floor(lo));\n"
+    "  uint2 end = min(uint2(ceil(hi)), uint2(u.source_width, u.source_height));\n"
+    "  float4 color = 0.0; float weight = 0.0;\n"
+    "  for (uint y = begin.y; y < end.y; y++) {\n"
+    "    float wy = max(0.0, min(hi.y, float(y + 1u)) - max(lo.y, float(y)));\n"
+    "    for (uint x = begin.x; x < end.x; x++) {\n"
+    "      float wx = max(0.0, min(hi.x, float(x + 1u)) - max(lo.x, float(x)));\n"
+    "      float w = wx * wy; color += source.read(uint2(x, y)) * w; weight += w;\n"
+    "    }\n"
+    "  }\n"
+    "  return color / weight;\n"
+    "}\n"
+    "fragment float4 present_fragment(PresentVarying in [[stage_in]],\n"
+    "    texture2d<float> source [[texture(0)]],\n"
+    "    texture2d<float, access::read> gamma_lut [[texture(1)]],\n"
+    "    sampler source_sampler [[sampler(0)]],\n"
+    "    constant PresentUniforms &u [[buffer(0)]]) {\n"
+    "  float4 color = source.sample(source_sampler, in.uv);\n"
+    "  if (u.gamma_enabled) {\n"
+    "    uint3 i = uint3(clamp(floor(color.rgb * 255.0 + 0.5), 0.0, 255.0));\n"
+    "    color.r = gamma_lut.read(uint2(i.r, 0)).r;\n"
+    "    color.g = gamma_lut.read(uint2(i.g, 0)).g;\n"
+    "    color.b = gamma_lut.read(uint2(i.b, 0)).b;\n"
+    "  }\n"
+    "  return float4(color.rgb, 1.0);\n"
+    "}\n"
     "vertex float4 clear_vertex(uint i [[vertex_id]], constant float &z [[buffer(0)]]) {\n"
     "  const float2 p[3] = {float2(-1, -1), float2(3, -1), float2(-1, 3)};\n"
     "  return float4(p[i], z, 1);\n"
@@ -426,7 +532,10 @@ static const char s_shader[] =
 
 static int metal_fail(const char *format, ...)
 {
-    if (!atomic_load_explicit(&s_error_ready, memory_order_acquire)) {
+    int expected = 0;
+    if (atomic_compare_exchange_strong_explicit(&s_error_ready, &expected, -1,
+                                                memory_order_acq_rel,
+                                                memory_order_acquire)) {
         va_list args;
         va_start(args, format);
         vsnprintf(s_error, sizeof s_error, format, args);
@@ -444,12 +553,199 @@ static const char *metal_error_text(NSError *error)
 
 const char *bw_metal_backend_error(void)
 {
-    return atomic_load_explicit(&s_error_ready, memory_order_acquire) ? s_error : NULL;
+    return atomic_load_explicit(&s_error_ready, memory_order_acquire) == 1 ? s_error : NULL;
+}
+
+static int presenter_fail(const char *message)
+{
+    fprintf(stderr, "[GPU-METAL] direct presenter unavailable: %s\n", message);
+    return 0;
+}
+
+int bw_metal_backend_attach_presenter(void *metal_layer, uint32_t drawable_width,
+                                      uint32_t drawable_height, int vsync)
+{
+    @autoreleasepool {
+        if (![NSThread isMainThread])
+            return presenter_fail("attachment did not run on the process main thread");
+        if (!metal_layer || !drawable_width || !drawable_height)
+            return presenter_fail("invalid CAMetalLayer or drawable size");
+        if (s_registered || s_queue)
+            return presenter_fail("backend already started");
+        CAMetalLayer *layer = (__bridge CAMetalLayer *)metal_layer;
+        id<MTLDevice> device = MTLCreateSystemDefaultDevice();
+        if (!device)
+            return presenter_fail("no Metal device");
+        layer.device = device;
+        layer.pixelFormat = MTLPixelFormatBGRA8Unorm;
+        layer.framebufferOnly = YES;
+        layer.presentsWithTransaction = NO;
+        layer.maximumDrawableCount = 3;
+        layer.displaySyncEnabled = vsync != 0;
+        layer.allowsNextDrawableTimeout = YES;
+        layer.drawableSize = CGSizeMake(drawable_width, drawable_height);
+        s_device = device;
+        s_present_layer = layer;
+        atomic_store_explicit(&s_present_width, drawable_width, memory_order_release);
+        atomic_store_explicit(&s_present_height, drawable_height, memory_order_release);
+        fprintf(stderr, "[GPU-METAL] direct CAMetalLayer presenter attached (%ux%u, vsync %s)\n",
+                drawable_width, drawable_height, vsync ? "on" : "off");
+        return 1;
+    }
+}
+
+int bw_metal_backend_resize_presenter(uint32_t drawable_width,
+                                      uint32_t drawable_height)
+{
+    @autoreleasepool {
+        if (![NSThread isMainThread])
+            return presenter_fail("resize did not run on the process main thread");
+        if (!s_present_layer)
+            return presenter_fail("resize occurred before attachment");
+        if (!drawable_width || !drawable_height)
+            return 1;
+        s_present_layer.drawableSize = CGSizeMake(drawable_width, drawable_height);
+        atomic_store_explicit(&s_present_width, drawable_width, memory_order_release);
+        atomic_store_explicit(&s_present_height, drawable_height, memory_order_release);
+        return 1;
+    }
 }
 
 static uint8_t *guest_pointer(uint32_t address)
 {
     return (uint8_t *)(s_guest + (uintptr_t)address);
+}
+
+static int parse_scale(const char *value, float *scale)
+{
+    char *end;
+    float parsed;
+    if (!value || !*value)
+        return 0;
+    errno = 0;
+    parsed = strtof(value, &end);
+    if (errno || *end || !isfinite(parsed) || parsed < 0.5f || parsed > 10.0f)
+        return 0;
+    *scale = parsed;
+    return 1;
+}
+
+static float automatic_render_scale(void)
+{
+    uint32_t width = atomic_load_explicit(&s_present_width, memory_order_acquire);
+    uint32_t height = atomic_load_explicit(&s_present_height, memory_order_acquire);
+    if (!width || !height) {
+        const char *window_scale = getenv("RECOMP_WINDOW_SCALE");
+        unsigned scale = window_scale ? (unsigned)atoi(window_scale) : 2u;
+        if (scale < 1u || scale > 8u)
+            scale = 2u;
+        width = 640u * scale;
+        height = 480u * scale;
+    }
+    float picture_height = fminf((float)height, (float)width * 0.75f);
+    float scale = picture_height / 480.0f * s_render_ssaa;
+    if (scale < 0.5f) scale = 0.5f;
+    if (scale > 10.0f) scale = 10.0f;
+    return scale;
+}
+
+static int refresh_render_scale(int discard_surfaces)
+{
+    float next = s_render_scale_auto ? automatic_render_scale() : s_render_fixed_scale;
+    if (fabsf(next - s_render_scale) <= 0.001f)
+        return 1;
+    if (discard_surfaces && (s_surface || s_dirty))
+        return metal_fail("render scale changed while a colour surface was active");
+    if (discard_surfaces && !preserve_depth_surfaces())
+        return 0;
+    s_render_scale = next;
+    s_render_scale_epoch++;
+    if (discard_surfaces) {
+        [s_color_surfaces removeAllObjects];
+        [s_depth_surfaces removeAllObjects];
+        s_surface_upload = nil;
+        s_surface_readback = nil;
+        s_present_resolve = nil;
+    }
+    fprintf(stderr, "[GPU-METAL] internal render scale %.3f "
+                    "(640x480 target %.0fx%.0f, epoch %u)\n",
+            s_render_scale, 640.0f * s_render_scale, 480.0f * s_render_scale,
+            s_render_scale_epoch);
+    return 1;
+}
+
+static int configure_render_scale(void)
+{
+    const char *override = getenv("BW_METAL_RENDER_SCALE");
+    const char *vfx = getenv("BW_VFX");
+    float fixed;
+    int native = 0;
+
+    s_render_scale = 1.0f;
+    s_render_fixed_scale = 1.0f;
+    s_render_ssaa = 1.0f;
+    s_render_scale_epoch = 1;
+    s_render_scale_auto = 0;
+    s_render_guest_aa = 0;
+    if (override) {
+        if (!strcmp(override, "auto"))
+            s_render_scale_auto = 1;
+        else if (parse_scale(override, &fixed))
+            s_render_fixed_scale = fixed;
+        else
+            return metal_fail("BW_METAL_RENDER_SCALE must be auto or a number from 0.5 to 10");
+    } else if (bw_edition_at_least(BW_ED_REMASTERED) && !(vfx && vfx[0] == '0')) {
+        const char *native_env = getenv("BW_VFX_NATIVE_RES");
+        native = bw_fix_enabled(BW_FIX_VFX_NATIVE_RES);
+        if (native_env && *native_env)
+            native = native_env[0] != '0' &&
+                     !(native_env[0] == 'o' && native_env[1] == 'f') &&
+                     !(native_env[0] == 'O' && native_env[1] == 'F');
+        const char *fixed_env = getenv("BW_VFX_SCALE");
+        if (fixed_env && parse_scale(fixed_env, &fixed)) {
+            s_render_fixed_scale = fixed;
+            native = 1;
+        } else if (native) {
+            const char *ssaa = getenv("BW_VFX_SSAA");
+            if (ssaa && parse_scale(ssaa, &fixed) && fixed >= 1.0f)
+                s_render_ssaa = fixed > 4.0f ? 4.0f : fixed;
+            s_render_scale_auto = 1;
+        }
+        const char *guest_aa = getenv("BW_VFX_GUESTAA");
+        s_render_guest_aa = guest_aa && !strcmp(guest_aa, "1");
+    }
+    if (!refresh_render_scale(0))
+        return 0;
+    if (override)
+        fprintf(stderr, "[GPU-METAL] BW_METAL_RENDER_SCALE override enabled%s\n",
+                s_render_scale_auto ? " (auto)" : "");
+    return 1;
+}
+
+static int surface_physical_size(const Nv2aSurface *surface,
+                                 uint32_t *width, uint32_t *height)
+{
+    if (fabsf(s_render_scale - 1.0f) <= 0.001f) {
+        *width = surface->width;
+        *height = surface->height;
+        return 1;
+    }
+    float sx = s_render_scale;
+    float sy = s_render_scale;
+    if (!s_render_guest_aa) {
+        sx /= surface->aa_sx;
+        sy /= surface->aa_sy;
+    }
+    double scaled_width = floor((double)surface->width * sx + 0.5);
+    double scaled_height = floor((double)surface->height * sy + 0.5);
+    if (scaled_width < 1.0) scaled_width = 1.0;
+    if (scaled_height < 1.0) scaled_height = 1.0;
+    if (scaled_width > METAL_MAX_DIMENSION || scaled_height > METAL_MAX_DIMENSION)
+        return metal_fail("scaled colour surface dimensions exceed %u",
+                          METAL_MAX_DIMENSION);
+    *width = (uint32_t)scaled_width;
+    *height = (uint32_t)scaled_height;
+    return 1;
 }
 
 static uint64_t hash_bytes(const uint8_t *bytes, size_t size)
@@ -643,11 +939,105 @@ static int same_surface(const Nv2aSurface *a, const Nv2aSurface *b)
            a->aa_sx == b->aa_sx && a->aa_sy == b->aa_sy;
 }
 
+static int ensure_surface_upload(uint32_t width, uint32_t height)
+{
+    if (s_surface_upload && s_surface_upload.width == width &&
+        s_surface_upload.height == height)
+        return 1;
+    MTLTextureDescriptor *desc =
+        [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
+                                                           width:width height:height mipmapped:NO];
+    if (!desc)
+        return metal_fail("could not create colour surface upload descriptor");
+    desc.storageMode = MTLStorageModeShared;
+    desc.usage = MTLTextureUsageShaderRead;
+    s_surface_upload = [s_device newTextureWithDescriptor:desc];
+    if (!s_surface_upload)
+        return metal_fail("could not create colour surface upload texture");
+    return 1;
+}
+
+static int ensure_surface_readback(uint32_t width, uint32_t height)
+{
+    if (s_surface_readback && s_surface_readback.width == width &&
+        s_surface_readback.height == height)
+        return 1;
+    MTLTextureDescriptor *desc =
+        [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
+                                                           width:width height:height mipmapped:NO];
+    if (!desc)
+        return metal_fail("could not create colour surface readback descriptor");
+    desc.storageMode = MTLStorageModeShared;
+    desc.usage = MTLTextureUsageRenderTarget;
+    s_surface_readback = [s_device newTextureWithDescriptor:desc];
+    if (!s_surface_readback)
+        return metal_fail("could not create colour surface readback texture");
+    return 1;
+}
+
+static int encode_surface_copy(id<MTLTexture> source, id<MTLTexture> destination,
+                               int box_filter)
+{
+    end_draw_encoder();
+    id<MTLCommandBuffer> command = pending_command();
+    if (!command)
+        return 0;
+    if (source.width == destination.width && source.height == destination.height) {
+        id<MTLBlitCommandEncoder> blit = [command blitCommandEncoder];
+        if (!blit)
+            return metal_fail("could not create colour surface copy command");
+        [blit copyFromTexture:source sourceSlice:0 sourceLevel:0
+                sourceOrigin:MTLOriginMake(0, 0, 0)
+                  sourceSize:MTLSizeMake(source.width, source.height, 1)
+                   toTexture:destination destinationSlice:0 destinationLevel:0
+          destinationOrigin:MTLOriginMake(0, 0, 0)];
+        [blit endEncoding];
+        return 1;
+    }
+    MTLRenderPassDescriptor *pass = [MTLRenderPassDescriptor renderPassDescriptor];
+    if (!pass)
+        return metal_fail("could not create colour surface scaling pass");
+    pass.colorAttachments[0].texture = destination;
+    pass.colorAttachments[0].loadAction = MTLLoadActionDontCare;
+    pass.colorAttachments[0].storeAction = MTLStoreActionStore;
+    id<MTLRenderCommandEncoder> encoder = [command renderCommandEncoderWithDescriptor:pass];
+    if (!encoder)
+        return metal_fail("could not create colour surface scaling command");
+    MetalScaleUniforms uniforms = {
+        (uint32_t)source.width, (uint32_t)source.height,
+        (uint32_t)destination.width, (uint32_t)destination.height,
+    };
+    [encoder setRenderPipelineState:box_filter ? s_box_pipeline : s_scale_pipeline];
+    [encoder setFragmentTexture:source atIndex:0];
+    if (box_filter)
+        [encoder setFragmentBytes:&uniforms length:sizeof uniforms atIndex:0];
+    else
+        [encoder setFragmentSamplerState:s_sampler atIndex:0];
+    [encoder drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+    [encoder endEncoding];
+    return 1;
+}
+
+static int seed_color_surface(id<MTLTexture> destination, const Nv2aSurface *surface)
+{
+    if (!ensure_surface_upload(surface->width, surface->height))
+        return 0;
+    [s_surface_upload replaceRegion:MTLRegionMake2D(0, 0, surface->width, surface->height)
+                        mipmapLevel:0 withBytes:guest_pointer(surface->color_va)
+                        bytesPerRow:surface->pitch];
+    return encode_surface_copy(s_surface_upload, destination, 0);
+}
+
 static int writeback(void)
 {
     size_t row, bytes;
     uint8_t *pixels;
 
+    if (s_surface && s_dirty) {
+        if (!ensure_surface_readback(s_current.width, s_current.height) ||
+            !encode_surface_copy(s_surface, s_surface_readback, 1))
+            return 0;
+    }
     if (!flush_commands())
         return 0;
     if (!s_surface || !s_dirty)
@@ -659,9 +1049,9 @@ static int writeback(void)
     pixels = malloc(bytes);
     if (!pixels)
         return metal_fail("could not allocate colour surface readback");
-    [s_surface getBytes:pixels bytesPerRow:row
-             fromRegion:MTLRegionMake2D(0, 0, s_current.width, s_current.height)
-            mipmapLevel:0];
+    [s_surface_readback getBytes:pixels bytesPerRow:row
+                      fromRegion:MTLRegionMake2D(0, 0, s_current.width, s_current.height)
+                     mipmapLevel:0];
     for (uint32_t y = 0; y < s_current.height; y++)
         memcpy(guest_pointer(s_current.color_va) + (size_t)y * s_current.pitch,
                pixels + (size_t)y * row, row);
@@ -675,15 +1065,21 @@ static int writeback(void)
 
 static id<MTLTexture> cached_surface(const Nv2aSurface *s, uint32_t format)
 {
+    uint32_t physical_width, physical_height;
+    if (!surface_physical_size(s, &physical_width, &physical_height))
+        return nil;
     MetalColorSurfaceKey value = {
         .color_va = s->color_va,
         .width = s->width,
         .height = s->height,
         .pitch = s->pitch,
+        .physical_width = physical_width,
+        .physical_height = physical_height,
         .format = format,
         .bytes_per_pixel = s->bytes_per_pixel,
         .aa_sx = s->aa_sx,
         .aa_sy = s->aa_sy,
+        .scale_epoch = s_render_scale_epoch,
     };
     NSData *key = [NSData dataWithBytes:&value length:sizeof value];
     id<MTLTexture> texture = s_color_surfaces[key];
@@ -697,14 +1093,15 @@ static id<MTLTexture> cached_surface(const Nv2aSurface *s, uint32_t format)
         return metal_fail("colour surface cache is full"), nil;
     MTLTextureDescriptor *desc;
     desc = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
-                                                             width:s->width
-                                                            height:s->height
+                                                             width:physical_width
+                                                            height:physical_height
                                                          mipmapped:NO];
-    desc.storageMode = MTLStorageModeShared;
+    desc.storageMode = MTLStorageModePrivate;
     desc.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
     texture = [s_device newTextureWithDescriptor:desc];
     if (!texture)
-        return metal_fail("could not create colour surface %ux%u", s->width, s->height), nil;
+        return metal_fail("could not create colour surface %ux%u (guest %ux%u)",
+                          physical_width, physical_height, s->width, s->height), nil;
     s_color_surfaces[key] = texture;
     return texture;
 }
@@ -725,8 +1122,8 @@ static int prepare_surface(const Nv2aSurface *s)
     surface = cached_surface(s, format);
     if (!surface)
         return 0;
-    [surface replaceRegion:MTLRegionMake2D(0, 0, s->width, s->height)
-               mipmapLevel:0 withBytes:guest_pointer(s->color_va) bytesPerRow:s->pitch];
+    if (!seed_color_surface(surface, s))
+        return 0;
     s_surface = surface;
     s_current = *s;
     s_current_format = format;
@@ -748,7 +1145,7 @@ static int validate_unmodified_surface(const Nv2aSurface *s)
 static BWMetalDepthSurface *prepare_depth_surface(const Nv2aSurface *s,
                                                    const Nv2aRenderState *rs)
 {
-    uint32_t format, pitch;
+    uint32_t format, pitch, physical_width, physical_height;
     uint64_t end;
     BWMetalDepthSurface *depth;
     MTLTextureDescriptor *desc;
@@ -756,6 +1153,8 @@ static BWMetalDepthSurface *prepare_depth_surface(const Nv2aSurface *s,
     if (!rs || !rs->zeta_va)
         return metal_fail("depth/stencil clear requires a bound depth surface"), nil;
     if (!surface_valid(s))
+        return nil;
+    if (!surface_physical_size(s, &physical_width, &physical_height))
         return nil;
     format = bw_backend_reg(0x0208u);
     if (((format >> 4) & 0xFu) != 2u || ((format >> 8) & 0xFu) != 1u)
@@ -775,7 +1174,9 @@ static BWMetalDepthSurface *prepare_depth_surface(const Nv2aSurface *s,
 
     depth = s_depth_surfaces[@(rs->zeta_va)];
     if (depth) {
-        if (depth->width != s->width || depth->height != s->height || depth->pitch != pitch)
+        if (depth->guest_width != s->width || depth->guest_height != s->height ||
+            depth->width != physical_width || depth->height != physical_height ||
+            depth->pitch != pitch || depth->scale_epoch != s_render_scale_epoch)
             return metal_fail("reinterpreting a depth/stencil surface is unsupported"), nil;
         return depth;
     }
@@ -788,8 +1189,8 @@ static BWMetalDepthSurface *prepare_depth_surface(const Nv2aSurface *s,
     if (s_depth_surfaces.count >= METAL_MAX_DEPTH_SURFACES)
         return metal_fail("depth/stencil surface cache is full"), nil;
     desc = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatDepth32Float_Stencil8
-                                                             width:s->width
-                                                            height:s->height
+                                                             width:physical_width
+                                                            height:physical_height
                                                          mipmapped:NO];
     if (!desc)
         return metal_fail("could not create depth/stencil surface descriptor"), nil;
@@ -802,9 +1203,12 @@ static BWMetalDepthSurface *prepare_depth_surface(const Nv2aSurface *s,
     if (!depth->texture)
         return metal_fail("could not create depth/stencil surface"), nil;
     depth->va = rs->zeta_va;
-    depth->width = s->width;
-    depth->height = s->height;
+    depth->width = physical_width;
+    depth->height = physical_height;
+    depth->guest_width = s->width;
+    depth->guest_height = s->height;
     depth->pitch = pitch;
+    depth->scale_epoch = s_render_scale_epoch;
     depth->end = end;
     s_depth_surfaces[@(depth->va)] = depth;
     return depth;
@@ -896,6 +1300,77 @@ static int depth_transfer_layout(BWMetalDepthSurface *depth, MetalDepthTransfer 
     return 1;
 }
 
+static int preserve_depth_surfaces(void)
+{
+    if (!s_depth_surfaces.count)
+        return 1;
+    if (!flush_commands())
+        return 0;
+    for (NSNumber *key in s_depth_surfaces) {
+        BWMetalDepthSurface *depth = s_depth_surfaces[key];
+        MetalDepthTransfer layout;
+        if (!depth->initialized)
+            continue;
+        if (!depth_transfer_layout(depth, &layout))
+            return 0;
+        id<MTLBuffer> buffer =
+            [s_device newBufferWithLength:layout.total options:MTLResourceStorageModeShared];
+        id<MTLCommandBuffer> command = [s_queue commandBuffer];
+        id<MTLBlitCommandEncoder> blit = [command blitCommandEncoder];
+        if (!buffer || !buffer.contents || !command || !blit)
+            return metal_fail("could not create depth/stencil preservation resources");
+        MTLSize size = MTLSizeMake(depth->width, depth->height, 1);
+        if (depth->initialized & 1u)
+            [blit copyFromTexture:depth->texture sourceSlice:0 sourceLevel:0
+                    sourceOrigin:MTLOriginMake(0, 0, 0) sourceSize:size
+                        toBuffer:buffer destinationOffset:0
+           destinationBytesPerRow:layout.depth_row
+        destinationBytesPerImage:layout.depth_row * depth->height
+                         options:MTLBlitOptionDepthFromDepthStencil];
+        if (depth->initialized & 2u)
+            [blit copyFromTexture:depth->texture sourceSlice:0 sourceLevel:0
+                    sourceOrigin:MTLOriginMake(0, 0, 0) sourceSize:size
+                        toBuffer:buffer destinationOffset:layout.stencil_offset
+           destinationBytesPerRow:layout.stencil_row
+        destinationBytesPerImage:layout.stencil_row * depth->height
+                         options:MTLBlitOptionStencilFromDepthStencil];
+        [blit endEncoding];
+        if (!finish_command(command))
+            return 0;
+        for (uint32_t y = 0; y < depth->guest_height; y++) {
+            uint32_t source_y = (uint32_t)(((uint64_t)y * 2u + 1u) * depth->height /
+                                           ((uint64_t)depth->guest_height * 2u));
+            if (source_y >= depth->height)
+                source_y = depth->height - 1u;
+            const float *z = (const float *)((const uint8_t *)buffer.contents +
+                                             (size_t)source_y * layout.depth_row);
+            const uint8_t *stencil = (const uint8_t *)buffer.contents +
+                                     layout.stencil_offset +
+                                     (size_t)source_y * layout.stencil_row;
+            uint8_t *guest = guest_pointer(depth->va) + (size_t)y * depth->pitch;
+            for (uint32_t x = 0; x < depth->guest_width; x++) {
+                uint32_t source_x =
+                    (uint32_t)(((uint64_t)x * 2u + 1u) * depth->width /
+                               ((uint64_t)depth->guest_width * 2u));
+                uint32_t packed;
+                if (source_x >= depth->width)
+                    source_x = depth->width - 1u;
+                memcpy(&packed, guest + (size_t)x * 4u, sizeof packed);
+                if (depth->initialized & 1u) {
+                    float value = fminf(1.0f, fmaxf(0.0f, z[source_x]));
+                    uint32_t z24 = (uint32_t)lroundf(value * 16777215.0f);
+                    packed = (packed & 0xFFu) | (z24 << 8);
+                }
+                if (depth->initialized & 2u)
+                    packed = (packed & 0xFFFFFF00u) | stencil[source_x];
+                memcpy(guest + (size_t)x * 4u, &packed, sizeof packed);
+            }
+        }
+        invalidate_texture_cache(depth->va, depth->end);
+    }
+    return 1;
+}
+
 static int seed_depth_surface(BWMetalDepthSurface *depth)
 {
     unsigned missing = 3u & ~depth->initialized;
@@ -912,13 +1387,17 @@ static int seed_depth_surface(BWMetalDepthSurface *depth)
     if (!buffer || !buffer.contents)
         return metal_fail("could not allocate depth/stencil upload buffer");
     for (uint32_t y = 0; y < depth->height; y++) {
-        const uint8_t *guest = guest_pointer(depth->va) + (size_t)y * depth->pitch;
+        uint32_t guest_y = (uint32_t)((uint64_t)y * depth->guest_height / depth->height);
+        const uint8_t *guest =
+            guest_pointer(depth->va) + (size_t)guest_y * depth->pitch;
         float *z = (float *)((uint8_t *)buffer.contents + (size_t)y * layout.depth_row);
         uint8_t *stencil = (uint8_t *)buffer.contents + layout.stencil_offset
                          + (size_t)y * layout.stencil_row;
         for (uint32_t x = 0; x < depth->width; x++) {
+            uint32_t guest_x =
+                (uint32_t)((uint64_t)x * depth->guest_width / depth->width);
             uint32_t packed;
-            memcpy(&packed, guest + (size_t)x * 4u, sizeof packed);
+            memcpy(&packed, guest + (size_t)guest_x * 4u, sizeof packed);
             if (missing & 1u)
                 z[x] = (float)(packed >> 8) / 16777215.0f;
             if (missing & 2u)
@@ -1809,6 +2288,16 @@ static void metal_clear(const Nv2aSurface *s, const Nv2aRenderState *rs,
             if (!depth)
                 return;
         }
+        if (!fast_clear) {
+            uint32_t target_width = color_flags ? (uint32_t)s_surface.width : depth->width;
+            uint32_t target_height = color_flags ? (uint32_t)s_surface.height : depth->height;
+            rect[0] = (uint32_t)((uint64_t)rect[0] * target_width / s->width);
+            rect[1] = (uint32_t)((uint64_t)rect[1] * target_height / s->height);
+            rect[2] = (uint32_t)(((uint64_t)rect[2] * target_width + s->width - 1u) /
+                                 s->width);
+            rect[3] = (uint32_t)(((uint64_t)rect[3] * target_height + s->height - 1u) /
+                                 s->height);
+        }
         id<MTLRenderPipelineState> pipeline = nil;
         id<MTLDepthStencilState> depth_state = nil;
         if (!fast_clear) {
@@ -2351,6 +2840,69 @@ uint64_t bw_metal_test_texture_upload_count(void)
 {
     return s_texture_uploads;
 }
+
+int bw_metal_test_current_surface(uint32_t *width, uint32_t *height,
+                                  int *private_storage)
+{
+    if (!s_surface)
+        return 0;
+    if (width) *width = (uint32_t)s_surface.width;
+    if (height) *height = (uint32_t)s_surface.height;
+    if (private_storage)
+        *private_storage = s_surface.storageMode == MTLStorageModePrivate;
+    return 1;
+}
+
+int bw_metal_test_current_depth(uint32_t va, uint32_t *width, uint32_t *height,
+                                int *private_storage)
+{
+    BWMetalDepthSurface *depth = s_depth_surfaces[@(va)];
+    if (!depth)
+        return 0;
+    if (width) *width = depth->width;
+    if (height) *height = depth->height;
+    if (private_storage)
+        *private_storage = depth->texture.storageMode == MTLStorageModePrivate;
+    return 1;
+}
+
+void bw_metal_test_set_present_size(uint32_t width, uint32_t height)
+{
+    atomic_store_explicit(&s_present_width, width, memory_order_release);
+    atomic_store_explicit(&s_present_height, height, memory_order_release);
+}
+
+int bw_metal_test_write_surface_pixel(uint32_t x, uint32_t y, uint32_t argb)
+{
+    @autoreleasepool {
+        if (!s_surface || x >= s_surface.width || y >= s_surface.height)
+            return 0;
+        if (!flush_commands())
+            return 0;
+        MTLTextureDescriptor *desc =
+            [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:s_surface.pixelFormat
+                                                               width:1 height:1 mipmapped:NO];
+        if (!desc)
+            return metal_fail("could not create test pixel staging descriptor");
+        desc.storageMode = MTLStorageModeShared;
+        id<MTLTexture> staging = [s_device newTextureWithDescriptor:desc];
+        id<MTLCommandBuffer> command = [s_queue commandBuffer];
+        id<MTLBlitCommandEncoder> blit = [command blitCommandEncoder];
+        if (!staging || !command || !blit)
+            return metal_fail("could not create test pixel staging resources");
+        [staging replaceRegion:MTLRegionMake2D(0, 0, 1, 1)
+                   mipmapLevel:0 withBytes:&argb bytesPerRow:sizeof argb];
+        [blit copyFromTexture:staging sourceSlice:0 sourceLevel:0
+                 sourceOrigin:MTLOriginMake(0, 0, 0) sourceSize:MTLSizeMake(1, 1, 1)
+                    toTexture:s_surface destinationSlice:0 destinationLevel:0
+           destinationOrigin:MTLOriginMake(x, y, 0)];
+        [blit endEncoding];
+        if (!finish_command(command))
+            return 0;
+        s_dirty = 1;
+        return 1;
+    }
+}
 #endif
 
 void bw_metal_backend_set_framebuffer_callback(BwMetalFramebufferCallback callback)
@@ -2358,10 +2910,155 @@ void bw_metal_backend_set_framebuffer_callback(BwMetalFramebufferCallback callba
     s_framebuffer_callback = callback;
 }
 
+static id<MTLTexture> present_resolve_target(uint32_t width, uint32_t height)
+{
+    if (s_present_resolve && s_present_resolve.width == width &&
+        s_present_resolve.height == height)
+        return s_present_resolve;
+    MTLTextureDescriptor *desc =
+        [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
+                                                           width:width height:height mipmapped:NO];
+    if (!desc)
+        return metal_fail("could not create presentation resolve descriptor"), nil;
+    desc.storageMode = MTLStorageModePrivate;
+    desc.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
+    s_present_resolve = [s_device newTextureWithDescriptor:desc];
+    if (!s_present_resolve)
+        return metal_fail("could not create presentation resolve %ux%u", width, height), nil;
+    return s_present_resolve;
+}
+
+static int update_present_gamma(int *enabled)
+{
+    uint8_t ramp[768], pixels[1024];
+    *enabled = bw_gamma_lut(ramp);
+    for (unsigned i = 0; i < 256; i++) {
+        pixels[i * 4u + 0u] = *enabled ? ramp[i] : (uint8_t)i;
+        pixels[i * 4u + 1u] = *enabled ? ramp[256u + i] : (uint8_t)i;
+        pixels[i * 4u + 2u] = *enabled ? ramp[512u + i] : (uint8_t)i;
+        pixels[i * 4u + 3u] = 0xff;
+    }
+    if (!s_present_gamma) {
+        MTLTextureDescriptor *desc =
+            [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm
+                                                               width:256 height:1 mipmapped:NO];
+        if (!desc)
+            return metal_fail("could not create presentation gamma descriptor");
+        desc.storageMode = MTLStorageModeShared;
+        desc.usage = MTLTextureUsageShaderRead;
+        s_present_gamma = [s_device newTextureWithDescriptor:desc];
+        if (!s_present_gamma)
+            return metal_fail("could not create presentation gamma texture");
+        s_present_gamma_valid = 0;
+    }
+    if (!s_present_gamma_valid ||
+        memcmp(s_present_gamma_bytes, pixels, sizeof pixels) != 0) {
+        [s_present_gamma replaceRegion:MTLRegionMake2D(0, 0, 256, 1)
+                           mipmapLevel:0 withBytes:pixels bytesPerRow:sizeof pixels];
+        memcpy(s_present_gamma_bytes, pixels, sizeof pixels);
+        s_present_gamma_valid = 1;
+    }
+    return 1;
+}
+
+static int direct_present(void)
+{
+    if (!s_present_layer || !s_present_surface)
+        return 1;
+    id<CAMetalDrawable> drawable = [s_present_layer nextDrawable];
+    if (!drawable) {
+        s_dropped_drawables++;
+        if (s_dropped_drawables <= 3u)
+            fprintf(stderr, "[GPU-METAL] drawable unavailable; dropped presentation frame %llu\n",
+                    (unsigned long long)s_dropped_drawables);
+        return 1;
+    }
+    id<MTLCommandBuffer> command = [s_queue commandBuffer];
+    if (!command)
+        return metal_fail("could not create presentation command buffer");
+    id<MTLTexture> source = s_present_surface;
+    uint32_t logical_width = s_present_framebuffer.width / s_present_framebuffer.aa_sx;
+    uint32_t logical_height = s_present_framebuffer.height / s_present_framebuffer.aa_sy;
+    uint32_t picture_width =
+        (uint32_t)fmax(1.0, floor((double)logical_width * s_render_scale + 0.5));
+    uint32_t picture_height =
+        (uint32_t)fmax(1.0, floor((double)logical_height * s_render_scale + 0.5));
+    if (source.width != picture_width || source.height != picture_height) {
+        source = present_resolve_target(picture_width, picture_height);
+        if (!source)
+            return 0;
+        MTLRenderPassDescriptor *pass = [MTLRenderPassDescriptor renderPassDescriptor];
+        if (!pass)
+            return metal_fail("could not create presentation resolve pass");
+        pass.colorAttachments[0].texture = source;
+        pass.colorAttachments[0].loadAction = MTLLoadActionDontCare;
+        pass.colorAttachments[0].storeAction = MTLStoreActionStore;
+        id<MTLRenderCommandEncoder> encoder =
+            [command renderCommandEncoderWithDescriptor:pass];
+        if (!encoder)
+            return metal_fail("could not create presentation resolve command");
+        MetalScaleUniforms uniforms = {
+            (uint32_t)s_present_surface.width, (uint32_t)s_present_surface.height,
+            picture_width, picture_height,
+        };
+        [encoder setRenderPipelineState:s_box_pipeline];
+        [encoder setFragmentTexture:s_present_surface atIndex:0];
+        [encoder setFragmentBytes:&uniforms length:sizeof uniforms atIndex:0];
+        [encoder drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+        [encoder endEncoding];
+    }
+    int gamma_enabled;
+    if (!update_present_gamma(&gamma_enabled))
+        return 0;
+    MTLRenderPassDescriptor *pass = [MTLRenderPassDescriptor renderPassDescriptor];
+    if (!pass)
+        return metal_fail("could not create presentation pass");
+    pass.colorAttachments[0].texture = drawable.texture;
+    pass.colorAttachments[0].loadAction = MTLLoadActionClear;
+    pass.colorAttachments[0].storeAction = MTLStoreActionStore;
+    pass.colorAttachments[0].clearColor = MTLClearColorMake(0, 0, 0, 1);
+    id<MTLRenderCommandEncoder> encoder = [command renderCommandEncoderWithDescriptor:pass];
+    if (!encoder)
+        return metal_fail("could not create presentation render command");
+    double drawable_width = drawable.texture.width;
+    double drawable_height = drawable.texture.height;
+    double width, height;
+    if (drawable_width * logical_height <= drawable_height * logical_width) {
+        width = drawable_width;
+        height = drawable_width * logical_height / logical_width;
+    } else {
+        height = drawable_height;
+        width = drawable_height * logical_width / logical_height;
+    }
+    MTLViewport viewport = {
+        floor((drawable_width - width) * 0.5),
+        floor((drawable_height - height) * 0.5),
+        width, height, 0.0, 1.0,
+    };
+    MetalPresentUniforms uniforms = {(uint32_t)gamma_enabled, {0, 0, 0}};
+    [encoder setViewport:viewport];
+    [encoder setRenderPipelineState:s_present_pipeline];
+    [encoder setFragmentTexture:source atIndex:0];
+    [encoder setFragmentTexture:s_present_gamma atIndex:1];
+    [encoder setFragmentSamplerState:s_present_sampler atIndex:0];
+    [encoder setFragmentBytes:&uniforms length:sizeof uniforms atIndex:0];
+    [encoder drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+    [encoder endEncoding];
+    [command presentDrawable:drawable];
+    [command addCompletedHandler:^(id<MTLCommandBuffer> completed) {
+        if (completed.status != MTLCommandBufferStatusCompleted)
+            metal_fail("presentation GPU command failed: %s",
+                       metal_error_text(completed.error));
+    }];
+    [command commit];
+    s_command_submissions++;
+    s_last_present_command = command;
+    s_presented_frames++;
+    return 1;
+}
+
 static int report_framebuffer(const Nv2aSurface *surface, uint32_t format)
 {
-    if (!s_framebuffer_callback)
-        return 1;
     if (format != METAL_COLOR_ARGB8 && format != METAL_COLOR_XRGB_ZERO)
         return metal_fail("unsupported framebuffer descriptor format");
     BwMetalFramebuffer info = {
@@ -2374,8 +3071,18 @@ static int report_framebuffer(const Nv2aSurface *surface, uint32_t format)
         .aa_sx = surface->aa_sx,
         .aa_sy = surface->aa_sy,
     };
-    if (!s_framebuffer_callback(&info))
+    if (s_framebuffer_callback && !s_framebuffer_callback(&info))
         return metal_fail("presenter rejected framebuffer descriptor");
+    if (s_present_layer) {
+        id<MTLTexture> texture = cached_surface(surface, format);
+        if (!texture)
+            return 0;
+        if (texture != s_surface &&
+            (!seed_color_surface(texture, surface) || !flush_commands()))
+            return 0;
+        s_present_surface = texture;
+        s_present_framebuffer = info;
+    }
     return 1;
 }
 
@@ -2423,7 +3130,12 @@ static void metal_flip(void)
         }
         if (now)
             s_last_flip_ns = now;
+        if (!direct_present())
+            return;
+        s_present_surface = nil;
         s_surface = nil;
+        if (!refresh_render_scale(1))
+            return;
         bw_ab_frame(++s_frame);
     }
 }
@@ -2442,9 +3154,12 @@ static void disable_legacy_fast_math(MTLCompileOptions *options)
 static int initialize_metal(void)
 {
     NSError *error = nil;
-    s_device = MTLCreateSystemDefaultDevice();
+    if (!s_device)
+        s_device = MTLCreateSystemDefaultDevice();
     if (!s_device)
         return metal_fail("no Metal device");
+    if (s_present_layer && s_present_layer.device != s_device)
+        return metal_fail("direct presenter and backend use different Metal devices");
     s_queue = [s_device newCommandQueue];
     if (!s_queue)
         return metal_fail("could not create Metal command queue");
@@ -2476,10 +3191,49 @@ static int initialize_metal(void)
     s_clear_vertex_function = [library newFunctionWithName:@"clear_vertex"];
     s_clear_color_function = [library newFunctionWithName:@"clear_color"];
     s_clear_depth_function = [library newFunctionWithName:@"clear_depth"];
+    s_present_vertex_function = [library newFunctionWithName:@"present_vertex"];
+    s_present_resolve_function = [library newFunctionWithName:@"present_resolve"];
+    s_present_fragment_function = [library newFunctionWithName:@"present_fragment"];
+    s_scale_function = [library newFunctionWithName:@"scale_fragment"];
+    s_box_function = [library newFunctionWithName:@"box_fragment"];
     if (!s_vertex_function || !s_color_function || !s_texture_function ||
         !s_extended_vertex_function || !s_extended_fragment_function ||
-        !s_clear_vertex_function || !s_clear_color_function || !s_clear_depth_function)
+        !s_clear_vertex_function || !s_clear_color_function || !s_clear_depth_function ||
+        !s_present_vertex_function || !s_present_resolve_function ||
+        !s_present_fragment_function || !s_scale_function || !s_box_function)
         return metal_fail("Metal shader entry point missing");
+    MTLRenderPipelineDescriptor *present_pipeline = [MTLRenderPipelineDescriptor new];
+    if (!present_pipeline)
+        return metal_fail("could not create presentation pipeline descriptor");
+    present_pipeline.vertexFunction = s_present_vertex_function;
+    present_pipeline.fragmentFunction = s_present_resolve_function;
+    present_pipeline.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm;
+    s_present_resolve_pipeline =
+        [s_device newRenderPipelineStateWithDescriptor:present_pipeline error:&error];
+    if (!s_present_resolve_pipeline)
+        return metal_fail("presentation resolve pipeline creation failed: %s",
+                          metal_error_text(error));
+    present_pipeline.fragmentFunction = s_scale_function;
+    error = nil;
+    s_scale_pipeline =
+        [s_device newRenderPipelineStateWithDescriptor:present_pipeline error:&error];
+    if (!s_scale_pipeline)
+        return metal_fail("surface scaling pipeline creation failed: %s",
+                          metal_error_text(error));
+    present_pipeline.fragmentFunction = s_box_function;
+    error = nil;
+    s_box_pipeline =
+        [s_device newRenderPipelineStateWithDescriptor:present_pipeline error:&error];
+    if (!s_box_pipeline)
+        return metal_fail("surface box-filter pipeline creation failed: %s",
+                          metal_error_text(error));
+    present_pipeline.fragmentFunction = s_present_fragment_function;
+    error = nil;
+    s_present_pipeline =
+        [s_device newRenderPipelineStateWithDescriptor:present_pipeline error:&error];
+    if (!s_present_pipeline)
+        return metal_fail("presentation pipeline creation failed: %s",
+                          metal_error_text(error));
     s_pipelines = [NSMutableDictionary new];
     if (!s_pipelines)
         return metal_fail("could not create draw pipeline cache");
@@ -2492,6 +3246,11 @@ static int initialize_metal(void)
     s_sampler = [s_device newSamplerStateWithDescriptor:sampler];
     if (!s_sampler)
         return metal_fail("sampler creation failed");
+    sampler.minFilter = MTLSamplerMinMagFilterLinear;
+    sampler.magFilter = MTLSamplerMinMagFilterLinear;
+    s_present_sampler = [s_device newSamplerStateWithDescriptor:sampler];
+    if (!s_present_sampler)
+        return metal_fail("presentation sampler creation failed");
     const MTLSamplerAddressMode modes[3] = {
         MTLSamplerAddressModeRepeat, MTLSamplerAddressModeMirrorRepeat,
         MTLSamplerAddressModeClampToEdge,
@@ -2551,12 +3310,26 @@ static int start_with_regions(void *guest_memory, size_t low_size,
     s_vertex_upload_offset = 0;
     s_vertex_upload_allocations = 0;
     s_texture_uploads = 0;
+    s_present_surface = nil;
+    memset(&s_present_framebuffer, 0, sizeof s_present_framebuffer);
+    s_surface_upload = nil;
+    s_surface_readback = nil;
+    s_present_resolve = nil;
+    s_present_gamma = nil;
+    s_last_present_command = nil;
+    s_present_gamma_valid = 0;
+    s_presented_frames = 0;
+    s_dropped_drawables = 0;
     s_frame_time_count = 0;
     s_last_flip_ns = 0;
     const char *audit = getenv("BW_GPU_AUDIT");
     s_frame_timing_enabled = audit && !strcmp(audit, "1");
     const char *approx = getenv("BW_METAL_QUINCUNX_APPROX");
     s_quincunx_approx = approx && !strcmp(approx, "1");
+    if (!configure_render_scale()) {
+        bw_metal_backend_stop();
+        return 0;
+    }
     if (!initialize_metal()) {
         bw_metal_backend_stop();
         return 0;
@@ -2606,6 +3379,12 @@ void bw_metal_backend_stop(void)
 {
     if (s_pending_command)
         (void)flush_commands();
+    if (s_last_present_command) {
+        [s_last_present_command waitUntilCompleted];
+        if (s_last_present_command.status != MTLCommandBufferStatusCompleted)
+            metal_fail("presentation GPU command failed during shutdown: %s",
+                       metal_error_text(s_last_present_command.error));
+    }
     if (s_frame_timing_enabled)
         report_frame_times("all", s_frame_times, s_frame_time_count);
     size_t trailing = s_frame_time_count < 300u ? s_frame_time_count : 300u;
@@ -2623,6 +3402,19 @@ void bw_metal_backend_stop(void)
     s_current_format = 0;
     s_framebuffer_callback = NULL;
     s_surface = nil;
+    s_present_surface = nil;
+    memset(&s_present_framebuffer, 0, sizeof s_present_framebuffer);
+    s_present_resolve = nil;
+    s_present_gamma = nil;
+    s_last_present_command = nil;
+    s_present_gamma_valid = 0;
+    s_present_sampler = nil;
+    s_surface_upload = nil;
+    s_surface_readback = nil;
+    s_present_resolve_pipeline = nil;
+    s_present_pipeline = nil;
+    s_scale_pipeline = nil;
+    s_box_pipeline = nil;
     s_pending_command = nil;
     s_draw_encoder = nil;
     s_draw_color = nil;
@@ -2655,8 +3447,16 @@ void bw_metal_backend_stop(void)
     s_clear_vertex_function = nil;
     s_clear_color_function = nil;
     s_clear_depth_function = nil;
+    s_present_vertex_function = nil;
+    s_present_resolve_function = nil;
+    s_present_fragment_function = nil;
+    s_scale_function = nil;
+    s_box_function = nil;
     s_queue = nil;
     s_device = nil;
+    s_present_layer = nil;
+    atomic_store_explicit(&s_present_width, 0, memory_order_release);
+    atomic_store_explicit(&s_present_height, 0, memory_order_release);
     s_guest = 0;
     memset(s_guest_regions, 0, sizeof s_guest_regions);
     memset(&s_current, 0, sizeof s_current);

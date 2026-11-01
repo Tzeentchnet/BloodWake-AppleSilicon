@@ -269,6 +269,7 @@ target_include_directories(${PROJECT_NAME} PRIVATE
 if(APPLE)
     find_library(BW_FOUNDATION_FRAMEWORK Foundation REQUIRED)
     find_library(BW_METAL_FRAMEWORK Metal REQUIRED)
+    find_library(BW_QUARTZCORE_FRAMEWORK QuartzCore REQUIRED)
     find_library(BW_COREGRAPHICS_FRAMEWORK CoreGraphics REQUIRED)
     target_include_directories(${PROJECT_NAME} BEFORE PRIVATE "${BW_OCEAN_GENERATED_DIR}")
     target_include_directories(${PROJECT_NAME} PRIVATE
@@ -276,7 +277,8 @@ if(APPLE)
         "${XBOXRECOMP_DIR}/src"
         "${XBOXRECOMP_DIR}/src/kernel")
     target_link_libraries(${PROJECT_NAME} PRIVATE
-        "${BW_FOUNDATION_FRAMEWORK}" "${BW_METAL_FRAMEWORK}" "${BW_COREGRAPHICS_FRAMEWORK}")
+        "${BW_FOUNDATION_FRAMEWORK}" "${BW_METAL_FRAMEWORK}"
+        "${BW_QUARTZCORE_FRAMEWORK}" "${BW_COREGRAPHICS_FRAMEWORK}")
 else()
     target_link_libraries(${PROJECT_NAME} PRIVATE
         d3d11
