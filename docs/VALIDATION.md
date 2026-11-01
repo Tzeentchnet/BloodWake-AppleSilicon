@@ -35,6 +35,13 @@ wall-clock performance evidence.
   Down, and A.
 - The user subsequently confirmed menu navigation, entering the game, and
   interactive play with the current input-enabled build.
+- On 2026-11-01, a direct-Metal real-window run selected a 4x internal target
+  (2560x1920). The user reported no visual issues during gameplay; no sticky
+  Metal or command-buffer error was logged, and the process exited with status
+  zero after the window was closed.
+- That 4x run had no sound because guest APU MMIO is intentionally disabled on
+  the current macOS host. It does not indicate a presentation/scaling audio
+  regression.
 - Physical gamepads, feedback, reconnect behavior, focus-loss recovery, and
   the complete input lifecycle remain unverified.
 
@@ -68,10 +75,10 @@ wall-clock performance evidence.
   ASan/UBSan, with four focused TSan cases.
 - Windows and x86 execution were not validated on the Apple Silicon host.
 
-The direct-present and scaled-target results above are synthetic/build
-validation. A real-window retail gameplay run at native internal resolution
-is still outstanding, so no scaled-performance or memory claim is recorded
-yet.
+The direct-present and scaled-target paths now also have hands-on 4x visual
+confirmation. Formal reference comparison and controlled frame-time and
+memory measurements remain outstanding, so no scaled-performance claim is
+recorded yet.
 
 ## Integrity and privacy
 

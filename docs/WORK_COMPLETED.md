@@ -111,9 +111,9 @@ test coverage are in [VALIDATION.md](VALIDATION.md).
 
 - Exact NV2A quincunx weights, sample positions, edge behavior, and rounding
   remain unknown.
-- Direct presentation and internal scaling have synthetic regression coverage,
-  but scaled retail visuals, frame time, and memory use have not yet received
-  a hands-on gameplay run.
+- Direct presentation and 4x internal scaling have synthetic coverage and
+  hands-on retail visual confirmation. Formal reference comparison, frame
+  time, and memory measurements remain outstanding.
 - CPU/GPU ownership is coordinated only at the renderer's explicit surface
   boundaries; general guest aliases and concurrent CPU access are not solved.
 - Guest USB, physical gamepads, APU audio, FMV, saves, other editions, and

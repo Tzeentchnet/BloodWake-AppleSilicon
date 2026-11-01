@@ -1,6 +1,6 @@
 # Apple Silicon handoff
 
-Status updated 2026-10-31 after hands-on gameplay confirmation.
+Status updated 2026-11-01 after hands-on 4x Metal gameplay confirmation.
 
 ## Current status
 
@@ -26,9 +26,16 @@ accepted as wall-clock evidence.
 
 Since that measured 640x480 run, the Metal path has gained direct
 `CAMetalLayer` presentation and private, independently scaled colour and depth
-targets. Synthetic tests and a native Release build pass, but those changes
-have not yet had a comparable hands-on retail run. Do not treat the older
-frame-time numbers as scaled-rendering measurements.
+targets. A real-window run with automatic scaling selected a 4x internal
+target (2560x1920); the user reported no visual issues during gameplay, and
+the process completed without a sticky Metal or command-buffer error. This is
+hands-on confirmation rather than a formal reference comparison. Frame time
+and memory were not measured, so the older 640x480 numbers are not
+scaled-rendering measurements.
+
+The run had no sound, as expected: the macOS host currently disables guest
+APU MMIO because lock-safe trapped-MMIO dispatch is not implemented. Audio
+was not lost in the Metal presentation or scaling path.
 
 ## Required opt-ins
 
@@ -57,8 +64,9 @@ Guest USB and APU MMIO remain disabled. Do not set `RECOMP_USB` or
 ## Remaining limitations
 
 - Formal visual comparison with trustworthy reference frames is outstanding.
-- Direct presentation and scaled rendering still need a real-window retail
-  check covering visual correctness, resize behavior, frame time, and memory.
+- Direct presentation and 4x scaled rendering have hands-on visual
+  confirmation; resize behavior, frame time, and memory still need a
+  controlled retail check.
 - Quincunx filtering is approximate and not hardware-verified.
 - Frame pacing reaches the 30 FPS average target but retains 45-46 ms p95
   intervals in the measured scene.
