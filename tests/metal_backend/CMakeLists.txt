@@ -114,7 +114,7 @@ foreach(case semaphore-release semaphore-concurrent visual
              xrgb-single-reject-pitch xrgb-single-reject-origin xrgb-single-reject-unmapped
              xrgb-single-reject-incomplete-rect xrgb-single-reject-depth
              extended-basic extended-texture-cache
-             ocean-marker-batches ocean-marker-retail
+             ocean-marker-batches ocean-fingerprint ocean-marker-retail
              extended-combiner extended-multistage extended-combiner-mappings
              extended-combiner-operations extended-combiner-constants
              extended-combiner-secondary extended-fog extended-passthrough-stage

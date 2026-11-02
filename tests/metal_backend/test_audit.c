@@ -40,7 +40,7 @@ static void *write_gamma(void *unused)
 int main(void)
 {
     pthread_t thread, initializers[4];
-    char text[8192];
+    char text[16384];
     size_t n;
     FILE *f;
     remove(s_path);
@@ -56,6 +56,11 @@ int main(void)
         pthread_join(initializers[i], NULL);
     if (atomic_load(&s_init_failed) || !bw_audit_on())
         return 1;
+    for (unsigned i = 0; i < BW_AUDIT_OCEAN_FINGERPRINT_SLOTS; i++)
+        bw_audit_ocean_fingerprint(UINT64_C(0xA000000000000000) + i, i == 1);
+    bw_audit_ocean_fingerprint(UINT64_C(0xA000000000000000), 0);
+    bw_audit_ocean_fingerprint(UINT64_C(0xB000000000000000), 0);
+    bw_audit_ocean_fingerprint(UINT64_C(0xB000000000000001), 0);
     bw_audit_method(0, 0x0208, 8);
     bw_audit_clear(0xF0, 16, 12, NULL);
     bw_audit_flip(0x10000, 8);
@@ -72,7 +77,11 @@ int main(void)
     n = fread(text, 1, sizeof text - 1, f);
     fclose(f);
     text[n] = '\0';
-    if (!strstr(text, "GPU audit") || !strstr(text, "0208")) {
+    if (!strstr(text, "GPU audit") || !strstr(text, "0208") ||
+        !strstr(text, "Marked ocean batch fingerprints") ||
+        !strstr(text, "batches 35, hashes 32/32, table-overflow batches 2, "
+                      "within-scope mismatches 1") ||
+        !strstr(text, "A000000000000000          2 batches")) {
         fprintf(stderr, "audit report is missing expected data\n");
         return 1;
     }

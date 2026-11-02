@@ -22,9 +22,18 @@ typedef struct {
     uint32_t color_offset;      /* the colour surface this draw renders into */
 } BwAuditDraw;
 
+enum {
+    BW_AUDIT_OCEAN_FINGERPRINT_VERSION = 1,
+    BW_AUDIT_OCEAN_FINGERPRINT_SLOTS = 32
+};
+
 int  bw_audit_on(void);
 void bw_audit_method(uint32_t subch, uint32_t method, uint32_t param);
 void bw_audit_draw(const BwAuditDraw *d);
+/* Stable metadata fingerprints for explicitly marked ocean batches. The
+ * marker is the classifier; a hash is diagnostic evidence only.
+ * scope_mismatch says this hash differs from the first one in its BEGIN/END. */
+void bw_audit_ocean_fingerprint(uint64_t fingerprint, int scope_mismatch);
 /* CLEAR_SURFACE: flags, the surface clip (w, h) and the clear rectangle
  * (x0, y0, x1, y1 exclusive; NULL if the title never set one). */
 void bw_audit_clear(uint32_t flags, uint32_t surf_w, uint32_t surf_h, const uint32_t *rect);

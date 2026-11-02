@@ -228,7 +228,7 @@ def verify_sandbox(profile, output, protected):
 
 def diagnostic_env(output, game_dir, seconds, quincunx, audit, input_fd, output_fd,
                    audit_name="gpu-audit.txt", keyboard_hook=False, synthetic_input=False,
-                   edition="original"):
+                   edition="original", disable_audio=False):
     if synthetic_input and not keyboard_hook:
         raise ValueError("synthetic input requires the experimental keyboard hook")
     if edition not in EDITIONS:
@@ -254,6 +254,8 @@ def diagnostic_env(output, game_dir, seconds, quincunx, audit, input_fd, output_
         env["BW_MACOS_KEYBOARD_HOOK"] = "1"
     if synthetic_input:
         env["BW_SYNTHETIC_INPUT_DIAGNOSTIC"] = "1"
+    if disable_audio:
+        env["BW_MACOS_AUDIO"] = "0"
     if audit:
         env["BW_GPU_AUDIT"] = "1"
         env["BW_GPU_AUDIT_EVERY"] = "5"
@@ -328,7 +330,7 @@ def validate_relaunch(data):
 def run_guest_once(executable, output, game_dir, profile, seconds, quincunx, audit,
                    launch=b"", log_name="guest.log", audit_name="gpu-audit.txt",
                    timeout=None, log_limit=None, keyboard_hook=False, synthetic_input=False,
-                   edition="original"):
+                   edition="original", disable_audio=False):
     input_read = input_write = output_read = output_write = -1
     child = None
     try:
@@ -349,7 +351,7 @@ def run_guest_once(executable, output, game_dir, profile, seconds, quincunx, aud
         os.close(input_write)
         input_write = -1
         env = diagnostic_env(output, game_dir, seconds, quincunx, audit, input_read, output_write,
-                             audit_name, keyboard_hook, synthetic_input, edition)
+                             audit_name, keyboard_hook, synthetic_input, edition, disable_audio)
         with open(output / log_name, "xb") as log:
             child = subprocess.Popen(
                 [SANDBOX, "-p", profile, str(executable), "--bw-native-child"],
@@ -379,10 +381,12 @@ def run_guest_once(executable, output, game_dir, profile, seconds, quincunx, aud
 
 
 def run_guest(executable, output, game_dir, profile, seconds, quincunx, audit,
-              keyboard_hook=False, synthetic_input=False, edition="original"):
+              keyboard_hook=False, synthetic_input=False, edition="original",
+              disable_audio=False):
     result, relaunch, _ = run_guest_once(executable, output, game_dir, profile,
                                          seconds, quincunx, audit, keyboard_hook=keyboard_hook,
-                                         synthetic_input=synthetic_input, edition=edition)
+                                         synthetic_input=synthetic_input, edition=edition,
+                                         disable_audio=disable_audio)
     if relaunch:
         (output / "relaunch.bin").write_bytes(relaunch)
         print("Guest requested a relaunch; request saved privately, not executed")
@@ -391,7 +395,7 @@ def run_guest(executable, output, game_dir, profile, seconds, quincunx, audit,
 
 def run_guest_relaunches(executable, output, game_dir, profile, seconds, quincunx,
                          audit, max_boots, total_seconds, keyboard_hook=False,
-                         synthetic_input=False, edition="original"):
+                         synthetic_input=False, edition="original", disable_audio=False):
     deadline = time.monotonic() + total_seconds
     log_remaining = MAX_LOG_BYTES
     launch = b""
@@ -405,7 +409,8 @@ def run_guest_relaunches(executable, output, game_dir, profile, seconds, quincun
             launch=launch, log_name=f"guest-{boot:03d}.log",
             audit_name=f"gpu-audit-{boot:03d}.txt",
             timeout=min(seconds + 15, remaining), log_limit=log_remaining,
-            keyboard_hook=keyboard_hook, synthetic_input=synthetic_input, edition=edition)
+            keyboard_hook=keyboard_hook, synthetic_input=synthetic_input, edition=edition,
+            disable_audio=disable_audio)
         completed_boots = boot
         log_remaining -= log_size
         if relaunch:
@@ -489,6 +494,8 @@ def main(argv=None):
                         help="guest edition (default: original)")
     parser.add_argument("--quincunx-approx", action="store_true", help="opt into the unverified approximation")
     parser.add_argument("--gpu-audit", action="store_true", help="write the private GPU usage summary")
+    parser.add_argument("--disable-audio", action="store_true",
+                        help="disable native audio for an isolated non-audio diagnostic")
     parser.add_argument("--experimental-keyboard-hook", action="store_true",
                         help="opt into the unverified game-specific keyboard hook")
     parser.add_argument("--synthetic-input", action="store_true",
@@ -535,6 +542,7 @@ def main(argv=None):
         executable_hash = digest_file(executable)
         print("Executable SHA-256:", executable_hash)
         print("Diagnostic edition:", args.edition.capitalize())
+        print("Diagnostic audio:", "disabled" if args.disable_audio else "enabled")
         result = None
         completed_boots = 0
         boot_limit_reached = False
@@ -548,7 +556,8 @@ def main(argv=None):
                     max_boots,
                     args.total_seconds if args.total_seconds is not None else 300,
                     keyboard_hook=args.experimental_keyboard_hook,
-                    synthetic_input=args.synthetic_input, edition=args.edition)
+                    synthetic_input=args.synthetic_input, edition=args.edition,
+                    disable_audio=args.disable_audio)
                 result = relaunch_result.guest_status
                 completed_boots = relaunch_result.completed_boots
                 boot_limit_reached = relaunch_result.boot_limit_reached
@@ -556,7 +565,8 @@ def main(argv=None):
                 result = run_guest(executable, output, game_dir, profile, args.seconds,
                                    args.quincunx_approx, args.gpu_audit,
                                    keyboard_hook=args.experimental_keyboard_hook,
-                                   synthetic_input=args.synthetic_input, edition=args.edition)
+                                   synthetic_input=args.synthetic_input, edition=args.edition,
+                                   disable_audio=args.disable_audio)
                 completed_boots = 1
         finally:
             changed = snapshot_tree(prepared) != baseline

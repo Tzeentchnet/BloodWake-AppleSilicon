@@ -43,6 +43,10 @@ static int s_fence_register_enabled;
 static volatile uint32_t s_fence_register;
 static int s_failed;
 static bw_edition_t s_edition = BW_ED_ORIGINAL;
+static int s_audit_enabled;
+static uint64_t s_ocean_audit_hashes[64];
+static int s_ocean_audit_mismatches[64];
+static unsigned s_ocean_audit_count;
 
 ptrdiff_t xbox_GetMemoryOffset(void) { return (ptrdiff_t)s_guest_base; }
 void *xbox_GetMemoryBase(void) { return s_runtime_base; }
@@ -132,13 +136,23 @@ volatile uint32_t *xbox_Nv2aRegPtr(uint32_t offset)
 }
 int bw_ab_off(const char *fix) { (void)fix; return 0; }
 void bw_ab_frame(uint32_t frame) { s_ab_frame = frame; }
-int bw_audit_on(void) { return 0; }
+int bw_audit_on(void) { return s_audit_enabled; }
 int bw_gamma_lut(uint8_t lut[768]) { (void)lut; return 0; }
 unsigned char g_bw_fix_on[BW_FIX_COUNT];
 bw_edition_t bw_edition(void) { return s_edition; }
 void bw_audit_method(uint32_t subch, uint32_t method, uint32_t param)
 { (void)subch; (void)method; (void)param; }
 void bw_audit_draw(const BwAuditDraw *draw) { (void)draw; }
+void bw_audit_ocean_fingerprint(uint64_t fingerprint, int scope_mismatch)
+{
+    if (s_ocean_audit_count >= sizeof s_ocean_audit_hashes / sizeof s_ocean_audit_hashes[0]) {
+        s_failed = 1;
+        return;
+    }
+    s_ocean_audit_hashes[s_ocean_audit_count] = fingerprint;
+    s_ocean_audit_mismatches[s_ocean_audit_count] = scope_mismatch;
+    s_ocean_audit_count++;
+}
 void bw_audit_clear(uint32_t flags, uint32_t width, uint32_t height, const uint32_t *rect)
 { (void)flags; (void)width; (void)height; (void)rect; }
 void bw_audit_flip(uint32_t offset, uint32_t format) { (void)offset; (void)format; }
@@ -165,6 +179,13 @@ extern unsigned bw_metal_test_sampler_anisotropy(int min_linear, unsigned mip_mo
 extern void bw_metal_test_apply_pending_render_settings(void);
 extern void bw_ocean_marker_test_counts(unsigned long *received, unsigned long *scopes,
                                         unsigned long *rejected);
+extern uint64_t bw_ocean_fingerprint_test_hash(const BwXBatch *batch,
+                                               const uint32_t (*program)[4],
+                                               uint32_t ninstr);
+extern void bw_ocean_fingerprint_test_scope_reset(void);
+extern void bw_ocean_fingerprint_test_collect(const BwXBatch *batch,
+                                              const uint32_t (*program)[4],
+                                              uint32_t ninstr);
 
 #define CHECK(condition) do { \
     if (!(condition)) { \
@@ -2103,6 +2124,144 @@ static void check_ocean_marker_counts(unsigned long received, unsigned long scop
     CHECK(actual_rejected == rejected);
 }
 
+static void reset_ocean_audit_capture(void)
+{
+    memset(s_ocean_audit_hashes, 0, sizeof s_ocean_audit_hashes);
+    memset(s_ocean_audit_mismatches, 0, sizeof s_ocean_audit_mismatches);
+    s_ocean_audit_count = 0;
+}
+
+static void ocean_fingerprint_test(void)
+{
+    static const BwXBackend probe = {.draw = ocean_marker_probe_draw};
+    Nv2aRenderState rs_a = {0}, rs_b;
+    Nv2aCombiner rc_a = synthetic_combiner(), rc_b;
+    BwXVertex vertex_a = {0}, vertex_b = {0};
+    BwXBatch a = {0}, b;
+    uint32_t program_a[2][4] = {
+        {0x10203040u, 0x50607080u, 0x90A0B0C0u, 0xD0E0F000u},
+        {0x01020304u, 0x05060708u, 0x090A0B0Cu, 0x00000001u}
+    };
+    uint32_t program_b[2][4];
+    uint64_t baseline;
+
+    rs_a.blend_src = 0x0302u;
+    rs_a.blend_dst = 0x0303u;
+    rs_a.color_mask = 0x01010101u;
+    rs_a.zeta_va = 0x10000u;
+    rs_a.depth_min = 0.125f;
+    rs_a.depth_max = 0.875f;
+    rs_b = rs_a;
+    rs_b.zeta_va = 0x20000u;
+    rc_b = rc_a;
+    a.vertices = &vertex_a;
+    a.count = 3;
+    a.state = &rs_a;
+    a.rc = &rc_a;
+    a.tex_valid[0] = 1;
+    a.tex_normalized[0] = 1;
+    a.tex[0].offset = 0x30000u;
+    a.tex[0].width = 64;
+    a.tex[0].height = 32;
+    a.tex[0].pitch = 256;
+    a.tex[0].color = 0x0Cu;
+    a.tex[0].addr_u = 1;
+    a.tex[0].addr_v = 3;
+    a.tex[0].levels = 4;
+    a.tex[0].filter = 0x04060000u;
+    a.tex_border[0] = 0xFF102030u;
+    a.fogc[0] = 0.25f;
+    a.fogc[1] = 0.5f;
+    a.fogc[2] = 0.75f;
+    a.clip_plane_mode = 3;
+    a.dot_rgbmapping = 0x1234u;
+    a.other_stage_input = 0x5678u;
+    b = a;
+    b.vertices = &vertex_b;
+    b.count = 99;
+    b.state = &rs_b;
+    b.rc = &rc_b;
+    b.tex[0].offset = 0x3F000u;
+    memcpy(program_b, program_a, sizeof program_b);
+
+    baseline = bw_ocean_fingerprint_test_hash(
+        &a, (const uint32_t (*)[4])program_a, 2);
+    CHECK(baseline == bw_ocean_fingerprint_test_hash(
+        &a, (const uint32_t (*)[4])program_a, 2));
+    CHECK(baseline == bw_ocean_fingerprint_test_hash(
+        &b, (const uint32_t (*)[4])program_b, 2));
+    rs_b.blend_enable = 1;
+    CHECK(baseline != bw_ocean_fingerprint_test_hash(
+        &b, (const uint32_t (*)[4])program_b, 2));
+    rs_b = rs_a;
+    rc_b.final0 ^= 1u;
+    CHECK(baseline != bw_ocean_fingerprint_test_hash(
+        &b, (const uint32_t (*)[4])program_b, 2));
+    rc_b = rc_a;
+    b.tex[0].filter ^= 0x10000u;
+    CHECK(baseline != bw_ocean_fingerprint_test_hash(
+        &b, (const uint32_t (*)[4])program_b, 2));
+    b.tex[0].filter = a.tex[0].filter;
+    program_b[0][0] ^= 1u;
+    CHECK(baseline != bw_ocean_fingerprint_test_hash(
+        &b, (const uint32_t (*)[4])program_b, 2));
+    memcpy(program_b, program_a, sizeof program_b);
+
+    reset_ocean_audit_capture();
+    bw_ocean_fingerprint_test_scope_reset();
+    a.draw_marker = BW_X_DRAW_MARKER_OCEAN;
+    bw_ocean_fingerprint_test_collect(&a, (const uint32_t (*)[4])program_a, 2);
+    CHECK(s_ocean_audit_count == 0);
+    s_audit_enabled = 1;
+    a.draw_marker = BW_X_DRAW_MARKER_NONE;
+    bw_ocean_fingerprint_test_collect(&a, (const uint32_t (*)[4])program_a, 2);
+    CHECK(s_ocean_audit_count == 0);
+    a.draw_marker = BW_X_DRAW_MARKER_OCEAN;
+    bw_ocean_fingerprint_test_collect(&a, (const uint32_t (*)[4])program_a, 2);
+    bw_ocean_fingerprint_test_collect(&a, (const uint32_t (*)[4])program_a, 2);
+    CHECK(s_ocean_audit_count == 2);
+    CHECK(s_ocean_audit_hashes[0] == s_ocean_audit_hashes[1]);
+    CHECK(!s_ocean_audit_mismatches[0] && !s_ocean_audit_mismatches[1]);
+    rs_a.blend_enable = 1;
+    bw_ocean_fingerprint_test_collect(&a, (const uint32_t (*)[4])program_a, 2);
+    CHECK(s_ocean_audit_count == 3 && s_ocean_audit_mismatches[2]);
+    bw_ocean_fingerprint_test_scope_reset();
+    bw_ocean_fingerprint_test_collect(&a, (const uint32_t (*)[4])program_a, 2);
+    CHECK(s_ocean_audit_count == 4 && !s_ocean_audit_mismatches[3]);
+    a.draw_marker = BW_X_DRAW_MARKER_NONE;
+    bw_ocean_fingerprint_test_collect(&a, (const uint32_t (*)[4])program_a, 2);
+    CHECK(s_ocean_audit_count == 4);
+
+    reset_ocean_audit_capture();
+    setup_combiner(&rc_a);
+    triangle(0xFFFFFFFFu);
+    bw_backend_ext_register(&probe);
+    draw(3);
+    CHECK(s_ocean_audit_count == 0);
+    method(0x0100, BW_DRAW_MARKER_OCEAN_DRAW);
+    draw(3);
+    method(0x0100, BW_DRAW_MARKER_OCEAN_DRAW);
+    draw(3);
+    CHECK(s_ocean_audit_count == 2);
+    CHECK(s_ocean_audit_hashes[0] == s_ocean_audit_hashes[1]);
+    method(0x0304, 1);
+    method(0x0100, BW_DRAW_MARKER_OCEAN_DRAW);
+    draw(3);
+    CHECK(s_ocean_audit_count == 3);
+    CHECK(s_ocean_audit_hashes[2] != s_ocean_audit_hashes[1]);
+    draw(3);
+    CHECK(s_ocean_audit_count == 3);
+    method(0x0100, BW_DRAW_MARKER_OCEAN_DRAW);
+    flip();
+    draw(3);
+    CHECK(s_ocean_audit_count == 3);
+    CHECK(!s_ocean_audit_mismatches[0] && !s_ocean_audit_mismatches[1]
+          && !s_ocean_audit_mismatches[2]);
+    check_ocean_marker_counts(4, 3, 1);
+    bw_backend_ext_register(NULL);
+    s_audit_enabled = 0;
+}
+
 static void ocean_marker_batches_test(void)
 {
     static const BwXBackend probe = {.draw = ocean_marker_probe_draw};
@@ -2188,11 +2347,14 @@ static void ocean_marker_retail_test(void)
     setup_dxt1_texture(0xF800u, 0x001Fu, 0);
     setup_combiner(&rc);
     triangle(source);
+    reset_ocean_audit_capture();
+    s_audit_enabled = 1;
     clear(0xFF102030u);
     draw(3);
     flip();
     expect_no_error();
     unmarked = pixel(4, 3);
+    CHECK(s_ocean_audit_count == 0);
 
     clear(0xFF102030u);
     for (unsigned i = 0; i < OCEAN_MARKER_REPEAT_COUNT; i++)
@@ -2201,6 +2363,7 @@ static void ocean_marker_retail_test(void)
     flip();
     expect_no_error();
     marked = pixel(4, 3);
+    CHECK(s_ocean_audit_count == 1);
 
     clear(0xFF102030u);
     draw(3);
@@ -2209,6 +2372,8 @@ static void ocean_marker_retail_test(void)
     after_marked = pixel(4, 3);
     CHECK(marked == unmarked);
     CHECK(after_marked == unmarked);
+    CHECK(s_ocean_audit_count == 1);
+    s_audit_enabled = 0;
 }
 
 static void extended_texture_cache_test(void)
@@ -5597,6 +5762,8 @@ int main(int argc, char **argv)
         extended_basic_test();
     else if (!strcmp(argv[1], "ocean-marker-batches"))
         ocean_marker_batches_test();
+    else if (!strcmp(argv[1], "ocean-fingerprint"))
+        ocean_fingerprint_test();
     else if (!strcmp(argv[1], "ocean-marker-retail"))
         ocean_marker_retail_test();
     else if (!strcmp(argv[1], "extended-texture-cache"))

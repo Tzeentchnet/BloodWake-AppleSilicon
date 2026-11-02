@@ -33,9 +33,12 @@ This is still a development build:
 - A versioned in-stream marker now identifies validated ocean submissions and
   is copied into executor batches without changing retail rendering. A
   four-boot Remastered diagnostic observed 41,348 markers, 512 scoped ocean
-  batches, and zero rejected markers. A fail-closed MSAA evidence tool records
-  memory, timing, correctness, and visual-review gates; this Apple M5 reports
-  2x/4x/8x capability, but Metal MSAA remains unsupported.
+  batches, and zero rejected markers. Marked batches now have a bounded,
+  metadata-only private audit fingerprint; representative hands-on pass
+  coverage remains outstanding. A fail-closed MSAA evidence tool records
+  memory, timing, correctness, and visual-review gates. This Apple M5 reports
+  2x/4x/8x capability and passes the standalone color/depth/resolve smoke
+  path, but Metal MSAA remains unsupported.
 - Optional gameplay mouse input supports sensitivity, inversion, response,
   steering/aim stick selection, and hold/toggle relative capture. Native
   point-and-click menu hitboxes are still a planned reverse-engineering task.
@@ -48,11 +51,11 @@ This is still a development build:
   confirmed.
 - USB gamepads, physical-controller support, and broad mission, save, FMV,
   and edition coverage are incomplete.
-- Current regression results include 313/313 Metal backend tests, 61/61
+- Current regression results include 314/314 Metal backend tests, 61/61
   presenter tests, 35/35 MMIO host tests, 8/8 normal and ASan/UBSan macOS host
   tests, 11/11 input integration tests, 4/4 APU output tests, and 100/100
   concurrent APU restore stress runs. The complete Python suite passes
-  102/102.
+  103/103.
 - A post-roadmap 30-second isolated retail boot reached its configured limit
   with direct Metal at 2560x1920, native audio/DSP activity, 1,490 audited
   flips, 4,503 draws, 1,252,771 vertices, unchanged input trees/executable,

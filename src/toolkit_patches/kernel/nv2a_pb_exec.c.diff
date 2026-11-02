@@ -523,7 +523,7 @@
  static void backend_from_xf(const Nv2aVshOutput *v, Nv2aVertex *o)
  {
      float su = 1.0f, sv = 1.0f;
-@@ -2024,6 +2357,62 @@ static void backend_from_xf(const Nv2aVshOutput *v, Nv2aVertex *o)
+@@ -2024,6 +2357,64 @@ static void backend_from_xf(const Nv2aVshOutput *v, Nv2aVertex *o)
      o->v = v->tex[0][1] * sv;
  }
 
@@ -544,6 +544,8 @@
 +        return t->pitch ? 1 : t->levels;
 +    return tex_size_from_format(t->color) ? t->levels : 1;
 +}
++
++static void bw_ocean_fingerprint_note_current(const BwXBatch *xb);
 +
 +/* The extended entry's batch state: all four stages, the combiners, the fog
 + * colour and the clip-plane mode. Vertices are the caller's. */
@@ -586,7 +588,7 @@
  /* `textured`: the batch carried texture coordinates, so the bound texture is
   * part of it. */
  static void backend_flush(int textured)
-@@ -2037,6 +2426,22 @@ static void backend_flush(int textured)
+@@ -2037,6 +2428,23 @@ static void backend_flush(int textured)
          return;
      current_surface(&surf);
      current_render_state(&rs);
@@ -599,6 +601,7 @@
 +            fill_xbatch(&xb, &rs);
 +            xb.vertices = s_xverts;
 +            xb.count = s_bcount;
++            bw_ocean_fingerprint_note_current(&xb);
 +            s_xbackend->draw(&surf, &xb);
 +            s_gpu.tris_drawn += s_bcount / 3;
 +            s_bcount = 0;
@@ -609,7 +612,7 @@
      batch.vertices = s_bverts;
      batch.count = s_bcount;
      batch.texture = NULL;
-@@ -2049,14 +2454,14 @@ static void backend_flush(int textured)
+@@ -2049,14 +2457,14 @@ static void backend_flush(int textured)
          tex.color  = s_gpu.texs[0].color;
          tex.addr_u = s_gpu.texs[0].addr_u;
          tex.addr_v = s_gpu.texs[0].addr_v;
@@ -626,7 +629,7 @@
  }
 
  /* One triangle by vertex index: gather position and, if the batch has one,
-@@ -2124,10 +2529,39 @@ static void raster_indexed(uint32_t i0, uint32_t i1, uint32_t i2, uint32_t argb)
+@@ -2124,10 +2532,39 @@ static void raster_indexed(uint32_t i0, uint32_t i1, uint32_t i2, uint32_t argb)
   * the title does reads it back, so a float buffer per zeta offset is enough. */
  #define NV_ZBUF_W 1280   /* 640x480 at 2x2 anti-aliasing */
  #define NV_ZBUF_H 1024
@@ -667,7 +670,7 @@
  static float zclear_value(void)
  {
      /* Zeta format in SURFACE_FORMAT bits 4-7: 1 is Z16, 2 is Z24S8. */
-@@ -2136,34 +2570,47 @@ static float zclear_value(void)
+@@ -2136,34 +2573,47 @@ static float zclear_value(void)
                     : (float)(s_gpu.zstencil_clear >> 8);
  }
 
@@ -727,7 +730,7 @@
  }
 
  static int depth_pass(float z, float stored)
-@@ -2240,6 +2687,35 @@ static void rc_texel(const Texture *t, uint32_t face, float u, float v,
+@@ -2240,6 +2690,35 @@ static void rc_texel(const Texture *t, uint32_t face, float u, float v,
                       float out[4])
  {
      uint32_t texel, mag = (t->filter >> 24) & 0xF, min = (t->filter >> 16) & 0xFF;
@@ -763,7 +766,7 @@
      if (tex_size_from_format(t->color)) {
          u *= (float)t->width;
          v *= (float)t->height;
-@@ -2274,6 +2750,103 @@ static void rc_texel(const Texture *t, uint32_t face, float u, float v,
+@@ -2274,6 +2753,103 @@ static void rc_texel(const Texture *t, uint32_t face, float u, float v,
          out[0] = out[1] = out[2] = out[3] = 1.0f;
  }
 
@@ -867,7 +870,7 @@
  /* What texture stage `st` contributes, by its SHADER_STAGE_PROGRAM mode
   * (xemu psh.c). Returns 0 when a clip-plane stage kills the pixel. */
  static int rc_stage_fetch(int st, const float c[4], float out[4])
-@@ -2289,27 +2862,13 @@ static int rc_stage_fetch(int st, const float c[4], float out[4])
+@@ -2289,27 +2865,13 @@ static int rc_stage_fetch(int st, const float c[4], float out[4])
      case 1: case 2:                               /* PROJECT2D / 3D */
          rc_texel(t, 0, c[0] / q, c[1] / q, out);
          return 1;
@@ -897,7 +900,7 @@
      case 4:                                       /* PASSTHRU */
          for (j = 0; j < 4; j++)
              out[j] = c[j] < 0.0f ? 0.0f : (c[j] > 1.0f ? 1.0f : c[j]);
-@@ -2356,6 +2915,46 @@ static float fog_factor(float d)
+@@ -2356,6 +2918,46 @@ static float fog_factor(float d)
      return f < 0.0f ? 0.0f : (f > 1.0f ? 1.0f : f);
  }
 
@@ -944,7 +947,7 @@
  static int alpha_test_pass(float a)
  {
      int v = (int)(a * 255.0f + 0.5f), r = (int)(s_gpu.alpha_ref & 0xFF);
-@@ -2379,6 +2978,8 @@ typedef struct {
+@@ -2379,6 +2981,8 @@ typedef struct {
      const Nv2aVshOutput *va, *vb, *vc;
      const float *a, *b, *c;
      float iw[3], uv[3][2], stc[3][4][4], vfog[3], fogc[4], inv_area;
@@ -953,7 +956,7 @@
      float *zb;
      int minx, maxx, miny, maxy, use_rc, textured;
  } XfTri;
-@@ -2405,7 +3006,7 @@ static void xf_rows(const XfTri *T, int y0, int step, XfCount *cnt)
+@@ -2405,7 +3009,7 @@ static void xf_rows(const XfTri *T, int y0, int step, XfCount *cnt)
                  continue;
              /* w1 is opposite a, w2 opposite b, w0 opposite c. */
              l0 = w1 * T->inv_area; l1 = w2 * T->inv_area; l2 = w0 * T->inv_area;
@@ -962,7 +965,7 @@
              {
                  float *zp = T->zb ? &T->zb[(size_t)y * NV_ZBUF_W + x] : NULL;
                  int shade = (s_gpu.color_mask & 0x01010101u) || s_gpu.alpha_test;
-@@ -2418,26 +3019,39 @@ static void xf_rows(const XfTri *T, int y0, int step, XfCount *cnt)
+@@ -2418,26 +3022,39 @@ static void xf_rows(const XfTri *T, int y0, int step, XfCount *cnt)
                  }
                  argb = 0;
                  if (shade) {
@@ -1011,7 +1014,7 @@
                          }
                          if (!keep)
                              continue;
-@@ -2645,6 +3259,38 @@ static void xf_queue_push(const XfTri *T)
+@@ -2645,6 +3262,38 @@ static void xf_queue_push(const XfTri *T)
      s_xfq_px += (long)(T->maxx - T->minx) * (T->maxy - T->miny);
  }
 
@@ -1050,7 +1053,7 @@
  static void raster_xf_triangle(const Nv2aVshOutput *va, const Nv2aVshOutput *vb,
                                 const Nv2aVshOutput *vc)
  {
-@@ -2663,6 +3309,7 @@ static void raster_xf_triangle(const Nv2aVshOutput *va, const Nv2aVshOutput *vb,
+@@ -2663,6 +3312,7 @@ static void raster_xf_triangle(const Nv2aVshOutput *va, const Nv2aVshOutput *vb,
      T.bpp = surface_bpp();
      T.textured = s_gpu.texs[0].valid && !s_xf_no_tex;
      T.use_rc = s_gpu.rc_seen && !no_rc;
@@ -1058,7 +1061,7 @@
      T.va = va; T.vb = vb; T.vc = vc;
 
      v[0] = va; v[1] = vb; v[2] = vc;
-@@ -2685,6 +3332,15 @@ static void raster_xf_triangle(const Nv2aVshOutput *va, const Nv2aVshOutput *vb,
+@@ -2685,6 +3335,15 @@ static void raster_xf_triangle(const Nv2aVshOutput *va, const Nv2aVshOutput *vb,
              backend_from_xf(va, &o[0]);
              backend_from_xf(vb, &o[1]);
              backend_from_xf(vc, &o[2]);
@@ -1074,7 +1077,7 @@
              s_bcount += 3;
          }
          return;
-@@ -2715,7 +3371,7 @@ static void raster_xf_triangle(const Nv2aVshOutput *va, const Nv2aVshOutput *vb,
+@@ -2715,7 +3374,7 @@ static void raster_xf_triangle(const Nv2aVshOutput *va, const Nv2aVshOutput *vb,
              for (st = 0; st < 4; st++)
                  for (j = 0; j < 4; j++)
                      T.stc[k][st][j] = v[k]->tex[st][j] * T.iw[k];
@@ -1083,7 +1086,7 @@
          }
          /* FOG_COLOR is R in bits 0-7, the reverse of a D3DCOLOR. */
          nv2a_rc_unpack(s_gpu.fog_color, T.fogc);
-@@ -2739,6 +3395,7 @@ static void raster_xf_triangle(const Nv2aVshOutput *va, const Nv2aVshOutput *vb,
+@@ -2739,6 +3398,7 @@ static void raster_xf_triangle(const Nv2aVshOutput *va, const Nv2aVshOutput *vb,
      }
      s_gpu.xf_drawn++;
      T.inv_area = 1.0f / area;
@@ -1091,7 +1094,7 @@
 
      xf_queue_push(&T);
      (void)cnt;
-@@ -2911,6 +3568,15 @@ static int transform_vertex(uint32_t index, Nv2aVshOutput *out)
+@@ -2911,6 +3571,15 @@ static int transform_vertex(uint32_t index, Nv2aVshOutput *out)
       * keeps 1/w finite. -0 stays behind the eye and is clipped, as on xemu. */
      if (out->pos[3] == 0.0f && !signbit(out->pos[3]))
          out->pos[3] = 1.0f;
@@ -1107,7 +1110,7 @@
      /* The program's viewport is in logical pixels; the surface may be larger
       * (anti-aliasing). */
      out->pos[0] *= s_gpu.aa_sx;
-@@ -2927,32 +3593,781 @@ static void xf_set_viewport(void)
+@@ -2927,31 +3596,969 @@ static void xf_set_viewport(void)
      s_xf_o[2] = of[2];
  }
 
@@ -1156,7 +1159,6 @@
 -         * fixed-function batches, raw and transformed -- the one view that
 -         * tells a wrong matrix layout from wrong vertex data. */
 -        if (ftrace < 0)
--            ftrace = getenv("RECOMP_FFP_TRACE") != NULL;
 +static void note_xf_formats(void)
 +{
 +    uint32_t i;
@@ -1194,6 +1196,194 @@
 + * G program on the GPU, C program on the CPU, F fixed function, S screen
 + * space, U untransformed (dropped), ? nothing drawn. */
 +static char      s_bw_audit_path = '?';
++
++static uint64_t s_bw_ocean_scope_fingerprint;
++static int s_bw_ocean_scope_fingerprint_valid;
++
++static uint64_t bw_ocean_fingerprint_word(uint64_t hash, uint32_t value)
++{
++    unsigned i;
++    for (i = 0; i < 4; i++) {
++        hash ^= (uint8_t)(value >> (i * 8));
++        hash *= UINT64_C(1099511628211);
++    }
++    return hash;
++}
++
++static uint32_t bw_ocean_fingerprint_float(float value)
++{
++    uint32_t bits;
++    memcpy(&bits, &value, sizeof bits);
++    return bits;
++}
++
++static uint64_t bw_ocean_batch_fingerprint(const BwXBatch *xb,
++                                            const uint32_t (*program)[4],
++                                            uint32_t ninstr)
++{
++    const Nv2aRenderState *rs = xb->state;
++    const Nv2aCombiner *rc = xb->rc;
++    uint64_t hash = UINT64_C(14695981039346656037);
++    uint32_t i, st;
++#define BW_OCEAN_FP_WORD(value) \
++    hash = bw_ocean_fingerprint_word(hash, (uint32_t)(value))
++
++    BW_OCEAN_FP_WORD(0x42574F46u);
++    BW_OCEAN_FP_WORD(BW_AUDIT_OCEAN_FINGERPRINT_VERSION);
++    BW_OCEAN_FP_WORD(rs != NULL);
++    if (rs) {
++        BW_OCEAN_FP_WORD(rs->blend_enable);
++        BW_OCEAN_FP_WORD(rs->blend_src);
++        BW_OCEAN_FP_WORD(rs->blend_dst);
++        BW_OCEAN_FP_WORD(rs->blend_eq);
++        BW_OCEAN_FP_WORD(rs->blend_color);
++        BW_OCEAN_FP_WORD(rs->alpha_test_enable);
++        BW_OCEAN_FP_WORD(rs->alpha_func);
++        BW_OCEAN_FP_WORD(rs->alpha_ref);
++        BW_OCEAN_FP_WORD(rs->depth_test_enable);
++        BW_OCEAN_FP_WORD(rs->depth_func);
++        BW_OCEAN_FP_WORD(rs->depth_write);
++        BW_OCEAN_FP_WORD(rs->color_mask);
++        BW_OCEAN_FP_WORD(rs->cull_enable);
++        BW_OCEAN_FP_WORD(rs->cull_face);
++        BW_OCEAN_FP_WORD(rs->front_face);
++        BW_OCEAN_FP_WORD(rs->zeta_va != 0);
++        BW_OCEAN_FP_WORD(bw_ocean_fingerprint_float(rs->depth_min));
++        BW_OCEAN_FP_WORD(bw_ocean_fingerprint_float(rs->depth_max));
++        BW_OCEAN_FP_WORD(rs->stencil_enable);
++        BW_OCEAN_FP_WORD(rs->stencil_func);
++        BW_OCEAN_FP_WORD(rs->stencil_ref);
++        BW_OCEAN_FP_WORD(rs->stencil_func_mask);
++        BW_OCEAN_FP_WORD(rs->stencil_write_mask);
++        BW_OCEAN_FP_WORD(rs->stencil_fail);
++        BW_OCEAN_FP_WORD(rs->stencil_zfail);
++        BW_OCEAN_FP_WORD(rs->stencil_zpass);
++    }
++    BW_OCEAN_FP_WORD(rc != NULL);
++    if (rc) {
++        uint32_t stages = rc->control & 0xFFu;
++        BW_OCEAN_FP_WORD(rc->control);
++        BW_OCEAN_FP_WORD(rc->stage_program);
++        BW_OCEAN_FP_WORD(stages);
++        if (stages > 8)
++            stages = 8;
++        for (i = 0; i < stages; i++) {
++            BW_OCEAN_FP_WORD(rc->color_icw[i]);
++            BW_OCEAN_FP_WORD(rc->alpha_icw[i]);
++            BW_OCEAN_FP_WORD(rc->color_ocw[i]);
++            BW_OCEAN_FP_WORD(rc->alpha_ocw[i]);
++            BW_OCEAN_FP_WORD(rc->factor0[i]);
++            BW_OCEAN_FP_WORD(rc->factor1[i]);
++        }
++        BW_OCEAN_FP_WORD(rc->final0);
++        BW_OCEAN_FP_WORD(rc->final1);
++        BW_OCEAN_FP_WORD(rc->final_c0);
++        BW_OCEAN_FP_WORD(rc->final_c1);
++    }
++    for (st = 0; st < 4; st++) {
++        const Nv2aTexture *tex = &xb->tex[st];
++        BW_OCEAN_FP_WORD(xb->tex_valid[st] != 0);
++        if (!xb->tex_valid[st])
++            continue;
++        /* Guest offsets, host pointers, texels and vertices are deliberately
++         * absent; only the copied sampler and layout metadata is stable. */
++        BW_OCEAN_FP_WORD(xb->tex_normalized[st] != 0);
++        BW_OCEAN_FP_WORD(xb->tex_cube[st] != 0);
++        BW_OCEAN_FP_WORD(tex->width);
++        BW_OCEAN_FP_WORD(tex->height);
++        BW_OCEAN_FP_WORD(tex->pitch);
++        BW_OCEAN_FP_WORD(tex->color);
++        BW_OCEAN_FP_WORD(tex->addr_u);
++        BW_OCEAN_FP_WORD(tex->addr_v);
++        BW_OCEAN_FP_WORD(tex->levels);
++        BW_OCEAN_FP_WORD(tex->filter);
++        BW_OCEAN_FP_WORD(xb->tex_border[st]);
++        BW_OCEAN_FP_WORD(xb->tex_border_src[st] != 0);
++    }
++    for (i = 0; i < 4; i++)
++        BW_OCEAN_FP_WORD(bw_ocean_fingerprint_float(xb->fogc[i]));
++    BW_OCEAN_FP_WORD(xb->clip_plane_mode);
++    BW_OCEAN_FP_WORD(xb->dot_rgbmapping);
++    BW_OCEAN_FP_WORD(xb->other_stage_input);
++    if (program && ninstr && ninstr <= NV2A_VSH_SLOTS) {
++        BW_OCEAN_FP_WORD(1);
++        BW_OCEAN_FP_WORD(ninstr);
++        for (i = 0; i < ninstr; i++) {
++            BW_OCEAN_FP_WORD(program[i][0]);
++            BW_OCEAN_FP_WORD(program[i][1]);
++            BW_OCEAN_FP_WORD(program[i][2]);
++            BW_OCEAN_FP_WORD(program[i][3]);
++        }
++    } else {
++        BW_OCEAN_FP_WORD(0);
++        BW_OCEAN_FP_WORD(ninstr);
++    }
++#undef BW_OCEAN_FP_WORD
++    return hash;
++}
++
++static void bw_ocean_fingerprint_scope_reset(void)
++{
++    s_bw_ocean_scope_fingerprint = 0;
++    s_bw_ocean_scope_fingerprint_valid = 0;
++}
++
++static void bw_ocean_fingerprint_note(const BwXBatch *xb,
++                                      const uint32_t (*program)[4],
++                                      uint32_t ninstr)
++{
++    uint64_t fingerprint;
++    int mismatch;
++
++    if (xb->draw_marker != BW_X_DRAW_MARKER_OCEAN || !bw_audit_on())
++        return;
++    fingerprint = bw_ocean_batch_fingerprint(xb, program, ninstr);
++    mismatch = s_bw_ocean_scope_fingerprint_valid
++            && s_bw_ocean_scope_fingerprint != fingerprint;
++    if (!s_bw_ocean_scope_fingerprint_valid) {
++        s_bw_ocean_scope_fingerprint = fingerprint;
++        s_bw_ocean_scope_fingerprint_valid = 1;
++    }
++    bw_audit_ocean_fingerprint(fingerprint, mismatch);
++}
++
++static void bw_ocean_fingerprint_note_current(const BwXBatch *xb)
++{
++    const uint32_t (*program)[4] = NULL;
++    uint32_t ninstr = 0, s;
++
++    if (batch_uses_program()) {
++        for (s = s_bw_start; s < NV2A_VSH_SLOTS; s++)
++            if (s_bw_prog[s][3] & 1)
++                break;
++        if (s < NV2A_VSH_SLOTS) {
++            program = (const uint32_t (*)[4])s_bw_prog[s_bw_start];
++            ninstr = s - s_bw_start + 1;
++        }
++    }
++    bw_ocean_fingerprint_note(xb, program, ninstr);
++}
++
++#if defined(BW_METAL_TESTING)
++uint64_t bw_ocean_fingerprint_test_hash(const BwXBatch *xb,
++                                        const uint32_t (*program)[4],
++                                        uint32_t ninstr)
++{
++    return bw_ocean_batch_fingerprint(xb, program, ninstr);
++}
++
++void bw_ocean_fingerprint_test_scope_reset(void)
++{
++    bw_ocean_fingerprint_scope_reset();
++}
++
++void bw_ocean_fingerprint_test_collect(const BwXBatch *xb,
++                                       const uint32_t (*program)[4],
++                                       uint32_t ninstr)
++{
++    bw_ocean_fingerprint_note(xb, program, ninstr);
++}
++#endif
 +
 +static void bw_prog_load(uint32_t slot)
 +{
@@ -1737,6 +1927,7 @@
 +    vb.fog_mode = s_gpu.fog_mode;
 +    vb.fog_param[0] = s_gpu.fog_param[0];
 +    vb.fog_param[1] = s_gpu.fog_param[1];
++    bw_ocean_fingerprint_note(&vb.xb, vb.program, vb.ninstr);
 +    if (!s_xbackend->draw_vsh(&surf, &vb))
 +        return 0;
 +    gpu_vsh_verify(nv, nins, mask);
@@ -1908,11 +2099,10 @@
 +         * fixed-function batches, raw and transformed -- the one view that
 +         * tells a wrong matrix layout from wrong vertex data. */
 +        if (ftrace < 0)
-+            ftrace = getenv("RECOMP_FFP_TRACE") != NULL;
+             ftrace = getenv("RECOMP_FFP_TRACE") != NULL;
          if (ftrace && s_gpu.batches_ffp <= 4) {
              const float *m = s_gpu.composite;
-             float in[4];
-@@ -2975,14 +4390,7 @@ static void raster_batch_program(void)
+@@ -2975,14 +4582,7 @@ static void raster_batch_program(void)
              }
          }
      }
@@ -1928,7 +2118,7 @@
      {
          /* RECOMP_VSH_TRACE=<n>: print n program batches -- attribute setup,
           * raw inputs, key constants, and what came out. */
-@@ -3021,18 +4429,7 @@ static void raster_batch_program(void)
+@@ -3021,18 +4621,7 @@ static void raster_batch_program(void)
                          s_xf[i].pos[3]);
          }
      }
@@ -1948,7 +2138,7 @@
 
      switch (s_gpu.prim) {
      case NV_PRIM_TRIANGLES:
-@@ -3040,8 +4437,16 @@ static void raster_batch_program(void)
+@@ -3040,8 +4629,16 @@ static void raster_batch_program(void)
              raster_xf_clipped(&s_xf[i], &s_xf[i+1], &s_xf[i+2]);
          break;
      case NV_PRIM_TRIANGLE_STRIP:
@@ -1967,7 +2157,7 @@
          break;
      case NV_PRIM_TRIANGLE_FAN:
      case NV_PRIM_POLYGON:
-@@ -3060,13 +4465,20 @@ static void raster_batch_program(void)
+@@ -3060,13 +4657,20 @@ static void raster_batch_program(void)
              raster_xf_clipped(&s_xf[i], &s_xf[i+3], &s_xf[i+2]);
          }
          break;
@@ -1989,7 +2179,7 @@
  }
 
  static void raster_batch(void)
-@@ -3075,7 +4487,9 @@ static void raster_batch(void)
+@@ -3075,7 +4679,9 @@ static void raster_batch(void)
      uint32_t before = s_gpu.tris_drawn;
      int textured = 0;
 
@@ -2000,7 +2190,7 @@
          return;
      if (batch_uses_program() || batch_is_ffp()) {
          raster_batch_program();
-@@ -3083,8 +4497,10 @@ static void raster_batch(void)
+@@ -3083,8 +4689,10 @@ static void raster_batch(void)
      }
      if (!batch_is_screen_space()) {
          s_gpu.batches_untransformed++;
@@ -2011,7 +2201,7 @@
 
      /* Count why, once per batch: the texture stage cannot change inside one. */
      {
-@@ -3108,9 +4524,15 @@ static void raster_batch(void)
+@@ -3108,9 +4716,15 @@ static void raster_batch(void)
                             vertex_color(s_gpu.idx[i]));
          break;
      case NV_PRIM_TRIANGLE_STRIP:
@@ -2030,7 +2220,7 @@
          break;
      case NV_PRIM_TRIANGLE_FAN:
      case NV_PRIM_POLYGON:
-@@ -3204,6 +4626,55 @@ static void frame_trace_flip(void)
+@@ -3204,6 +4818,55 @@ static void frame_trace_flip(void)
      }
  }
 
@@ -2086,7 +2276,7 @@
  static void draw_primitive(void)
  {
      float v[4];
-@@ -3211,6 +4682,7 @@ static void draw_primitive(void)
+@@ -3211,6 +4874,7 @@ static void draw_primitive(void)
 
      if (!s_gpu.prim || !s_gpu.idx_count)
          return;
@@ -2094,7 +2284,7 @@
      s_gpu.draws++;
      if ((s_gpu.draws % 200) == 0)
          fprintf(stderr, "  [GPU] draw #%u\n", s_gpu.draws);
-@@ -3236,6 +4708,8 @@ static void draw_primitive(void)
+@@ -3236,6 +4900,8 @@ static void draw_primitive(void)
          uint32_t t0 = s_gpu.tris_drawn;
          uint64_t p0 = s_gpu.pixels;
          raster_batch();
@@ -2103,7 +2293,7 @@
          if (s_ftrace == 2) {
              fprintf(stderr, "[FTRACE] %s prim %u n %u surf %08X %ux%u+%u+%u"
                      " pitch %u | tex %s %08X %ux%u fmt %02X | blend %u %X/%X"
-@@ -3284,7 +4758,13 @@ static void draw_primitive(void)
+@@ -3284,7 +4950,13 @@ static void draw_primitive(void)
          }
      }
 
@@ -2118,7 +2308,7 @@
          static int shown;
          if (shown++ < 6) {
              fprintf(stderr, "  [GPU] prim %u, %u indices, pos attr:"
-@@ -3659,6 +5139,148 @@ static void tex_stage_method(uint32_t method, uint32_t param)
+@@ -3659,6 +5331,151 @@ static void tex_stage_method(uint32_t method, uint32_t param)
   * walks nothing, leaves DMA_GET behind PUT and the PFB flush unacknowledged.
   * Both run on the ack thread, so the state needs no lock. */
  static XboxFlipHold s_flip_hold;
@@ -2179,6 +2369,7 @@
 +
 +static void bw_ocean_marker_begin(void)
 +{
++    bw_ocean_fingerprint_scope_reset();
 +    s_gpu.draw_marker = s_bw_ocean_marker_pending == BW_OCEAN_MARKER_ARMED
 +                      ? BW_X_DRAW_MARKER_OCEAN : BW_X_DRAW_MARKER_NONE;
 +    s_gpu.draw_marker_copies = 0;
@@ -2194,6 +2385,7 @@
 +                               BW_DRAW_MARKER_OCEAN_DRAW);
 +    s_gpu.draw_marker = BW_X_DRAW_MARKER_NONE;
 +    s_gpu.draw_marker_copies = 0;
++    bw_ocean_fingerprint_scope_reset();
 +}
 +
 +static void bw_ocean_marker_frame_end(void)
@@ -2205,6 +2397,7 @@
 +        s_gpu.draw_marker = BW_X_DRAW_MARKER_NONE;
 +        s_gpu.draw_marker_copies = 0;
 +    }
++    bw_ocean_fingerprint_scope_reset();
 +}
 +
 +#if defined(BW_METAL_TESTING)
@@ -2267,7 +2460,7 @@
  static uint32_t s_vbl_count;        /* the vblank count last seen to move */
  static uint64_t s_vbl_moved_ns;
  /* The vblank count when the walk that reaches a FLIP_STALL began, which is
-@@ -3671,7 +5293,7 @@ static uint32_t s_walk_vbl;
+@@ -3671,7 +5488,7 @@ static uint32_t s_walk_vbl;
 
  void nv2a_pb_exec_walk_begin(void)
  {
@@ -2276,7 +2469,7 @@
  }
 
  /* RECOMP_FLIP_PACING: unset or 0 off (flips complete at once and frame
-@@ -3705,7 +5327,12 @@ int nv2a_pb_exec_flip_pacing(void)
+@@ -3705,7 +5522,12 @@ int nv2a_pb_exec_flip_pacing(void)
   * would only ever end on its timeout. */
  static uint32_t flip_clock(uint64_t now_ns, int *ok)
  {
@@ -2290,7 +2483,7 @@
      if (c != s_vbl_count) {
          s_vbl_count = c;
          s_vbl_moved_ns = now_ns;
-@@ -3744,20 +5371,161 @@ static void flip_hold_report(void)
+@@ -3744,20 +5566,161 @@ static void flip_hold_report(void)
      h->held_ns = 0;
  }
 
@@ -2456,7 +2649,7 @@
          s_gpu.aa_sx = s_gpu.aa_sy = 1.0f;
          /* Stencil state as the hardware resets it: GL_ALWAYS, masks 0xFF,
           * GL_KEEP, until the title says otherwise. */
-@@ -3844,7 +5612,7 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
+@@ -3844,7 +5807,7 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
 
          if (!r)
              return;
@@ -2465,7 +2658,7 @@
              uint32_t va = xbox_Nv2aFenceWordVa();
 
              if (va) {
-@@ -3913,6 +5681,8 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
+@@ -3913,6 +5876,8 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
          break;
      case 0x1E70: s_gpu.rc.stage_program = param; break;
      case 0x17F8: s_gpu.clip_plane_mode = param; break;
@@ -2474,7 +2667,7 @@
 
      /* Alpha test and fog. */
      case 0x0300: s_gpu.alpha_test = param; break;
-@@ -3959,6 +5729,11 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
+@@ -3959,6 +5924,11 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
              fprintf(stderr, "[FTRACE] clear %X surf %08X %ux%u colour %08X%c",
                      param, s_gpu.color_offset, s_gpu.clip_w, s_gpu.clip_h,
                      s_gpu.clear_color, 10);
@@ -2486,7 +2679,7 @@
          clear_surface(param);
          if (param & 0x01)                         /* Z */
              zbuf_clear();
-@@ -3966,11 +5741,23 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
+@@ -3966,11 +5936,23 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
 
      case NV097_SET_BEGIN_END:
          if (param) {
@@ -2510,7 +2703,7 @@
              /* Three ways a batch can have arrived, and only one is in use at
               * a time: vertices completed by SET_VERTEX4F, a payload written
               * with INLINE_ARRAY, or indices into the title's own arrays. */
-@@ -3981,6 +5768,7 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
+@@ -3981,6 +5963,7 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
              else
                  draw_primitive();
              s_gpu.prim = 0;
@@ -2518,7 +2711,7 @@
              s_gpu.inline_count = 0;
              s_gpu.imm_count = 0;
          }
-@@ -4015,6 +5803,7 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
+@@ -4015,6 +5998,7 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
 
      case NV097_ARRAY_ELEMENT16:
          /* Two 16-bit indices per parameter word. */
@@ -2526,7 +2719,7 @@
          if (s_gpu.prim && s_gpu.idx_count + 2 <= NV_MAX_INDICES) {
              s_gpu.idx[s_gpu.idx_count++] = (uint16_t)(param & 0xFFFF);
              s_gpu.idx[s_gpu.idx_count++] = (uint16_t)(param >> 16);
-@@ -4026,16 +5815,30 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
+@@ -4026,16 +6010,30 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
              s_gpu.idx[s_gpu.idx_count++] = param;
          break;
      case NV097_NO_OPERATION:
@@ -2559,7 +2752,7 @@
          return;
 
      case NV097_SET_FLIP_READ:
-@@ -4069,12 +5872,17 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
+@@ -4069,12 +6067,17 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
           * host frame, and that time counts against the hold. */
          uint64_t stall_ns = xbox_HostNowNs();
          int clock_ok;
@@ -2577,7 +2770,7 @@
          /* The stall ends when the buffer being read is the one just finished.
           * There is no scanout here to wait for, so that is now; when the
           * title may go on is the flip hold's (below). */
-@@ -4082,6 +5890,9 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
+@@ -4082,6 +6085,9 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
          /* And this is a completed swap, which is what a title's own swap
           * counter counts -- see xbox_Nv2aFrameCounterFlip. */
          xbox_Nv2aFrameCounterFlip();
@@ -2587,7 +2780,7 @@
          /* Hand the window a copy of the frame just finished.
           *
           * The buffer the title has finished is the one the last batch drew
-@@ -4096,18 +5907,29 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
+@@ -4096,18 +6102,29 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
              xbox_FramebufferWindowFrameStats(s_gpu.draws - draws_at_flip);
              draws_at_flip = s_gpu.draws;
          }
@@ -2623,7 +2816,7 @@
          {
              /* RECOMP_FB_DUMP_FLIPS: dump every presented frame, not one per
               * report -- a consecutive sequence, which is what a headless
-@@ -4125,13 +5947,22 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
+@@ -4125,13 +6142,22 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
                      if (f) { fclose(f); on = 1; }
                  }
                  s_flip_dumping = on;
@@ -2648,7 +2841,7 @@
 
          if (verbose) {
              static unsigned n;
-@@ -4151,6 +5982,14 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
+@@ -4151,6 +6177,14 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
           * early. */
          if (nv2a_pb_exec_flip_pacing()) {
              extern int nv2a_pb_scan_in_call(void);
@@ -2663,7 +2856,7 @@
              xbox_FlipHoldStall(&s_flip_hold, stall_vbl, stall_ns,
                                 clock_ok && !nv2a_pb_scan_in_call());
          }
-@@ -4162,13 +6001,16 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
+@@ -4162,13 +6196,16 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
          s_gpu.xf_mode = param;
          break;
      case 0x1E98:                                  /* _PROGRAM_CXT_WRITE_EN */
@@ -2680,7 +2873,7 @@
          break;
      case 0x1EA4:                                  /* _CONSTANT_LOAD */
          nv2a_vsh_set_constant_load(param);
-@@ -4244,6 +6086,7 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
+@@ -4244,6 +6281,7 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
          }
          if (method >= 0x0B00 && method < 0x0B80) {    /* TRANSFORM_PROGRAM(i) */
              nv2a_vsh_program_word(param);
@@ -2688,7 +2881,7 @@
              break;
          }
          if (method >= 0x0B80 && method < 0x0C00) {    /* TRANSFORM_CONSTANT(i) */
-@@ -4466,6 +6309,10 @@ void nv2a_pb_exec_report(void)
+@@ -4466,6 +6504,10 @@ void nv2a_pb_exec_report(void)
                      " x %.1f..%.1f  y %.1f..%.1f\n",
              s_gpu.draws, s_gpu.nonzero_draws, s_gpu.verts,
              s_gpu.min_x, s_gpu.max_x, s_gpu.min_y, s_gpu.max_y);
@@ -2699,7 +2892,7 @@
      /* One picture per report rather than per clear: a title clears hundreds of
       * times a second and nobody wants that many files. */
      if (!s_flip_dumping)
-@@ -4509,6 +6356,11 @@ void nv2a_pb_exec_report(void)
+@@ -4509,6 +6551,11 @@ void nv2a_pb_exec_report(void)
              fprintf(stderr, " v%u:%u/%u", s_gpu.xf_fmt[j] >> 8,
                      s_gpu.xf_fmt[j] & 15, (s_gpu.xf_fmt[j] >> 4) & 15);
          fprintf(stderr, "\n");
@@ -2711,7 +2904,7 @@
      }
 
      /* And of the batches that did rasterise, how many sampled anything. A menu
-@@ -4572,3 +6424,13 @@ void nv2a_pb_exec_report(void)
+@@ -4572,3 +6619,13 @@ void nv2a_pb_exec_report(void)
          s_unhandled_slot[(s_unhandled[i].method & 0x1FFC) / 4] = (uint16_t)(i + 1);
      fflush(stderr);
  }

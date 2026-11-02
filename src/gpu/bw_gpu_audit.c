@@ -14,6 +14,8 @@
  *     texture-stage program, every combiner input/output feature, every
  *     bound texture's format, addressing, filter and control bits, and the
  *     vertex program's opcodes and outputs;
+ *   - bounded aggregate hashes of stable render metadata for batches carrying
+ *     the explicit ocean marker (never texture bytes, vertices or addresses);
  *   - clears (flags, rectangle) and flips (the presented surface's format),
  *     and the DAC gamma ramps D3D writes (a display-chain step the
  *     pushbuffer never shows).
@@ -125,6 +127,40 @@ void bw_audit_method(uint32_t subch, uint32_t method, uint32_t param)
     } else {
         a->other++;
     }
+}
+
+/* ---- explicitly marked ocean fingerprints ------------------------------- */
+
+typedef struct {
+    uint64_t hash;
+    uint64_t batches;
+} AudOceanFingerprint;
+
+static AudOceanFingerprint s_ocean_fp[BW_AUDIT_OCEAN_FINGERPRINT_SLOTS];
+static uint32_t s_ocean_fp_count;
+static uint64_t s_ocean_fp_batches, s_ocean_fp_overflow, s_ocean_fp_mismatches;
+
+void bw_audit_ocean_fingerprint(uint64_t fingerprint, int scope_mismatch)
+{
+    uint32_t i;
+
+    if (!bw_audit_on())
+        return;
+    s_ocean_fp_batches++;
+    if (scope_mismatch)
+        s_ocean_fp_mismatches++;
+    for (i = 0; i < s_ocean_fp_count; i++)
+        if (s_ocean_fp[i].hash == fingerprint) {
+            s_ocean_fp[i].batches++;
+            return;
+        }
+    if (s_ocean_fp_count == BW_AUDIT_OCEAN_FINGERPRINT_SLOTS) {
+        s_ocean_fp_overflow++;
+        return;
+    }
+    s_ocean_fp[s_ocean_fp_count].hash = fingerprint;
+    s_ocean_fp[s_ocean_fp_count].batches = 1;
+    s_ocean_fp_count++;
 }
 
 /* Who uses each NV097 method, read off the code (2026-10-27, branch
@@ -825,12 +861,20 @@ static int cmp_cnt(const void *a, const void *b)
     return x->val < y->val ? -1 : 1;
 }
 
+static int cmp_ocean_fp(const void *a, const void *b)
+{
+    const AudOceanFingerprint *x = (const AudOceanFingerprint *)a;
+    const AudOceanFingerprint *y = (const AudOceanFingerprint *)b;
+    return x->hash < y->hash ? -1 : x->hash > y->hash;
+}
+
 static ULONGLONG s_t0;
 
 static void report(const char *why)
 {
     static const char *path;
     static AudCnt *sorted[AUD_SLOTS];
+    AudOceanFingerprint ocean_fp[BW_AUDIT_OCEAN_FINGERPRINT_SLOTS];
     FILE *f;
     uint32_t i, n = 0, s, last = ~0u;
     if (!path) {
@@ -903,6 +947,20 @@ static void report(const char *why)
             fprintf(f, "  [%s]", st);
         fputc('\n', f);
     }
+    memcpy(ocean_fp, s_ocean_fp, s_ocean_fp_count * sizeof ocean_fp[0]);
+    qsort(ocean_fp, s_ocean_fp_count, sizeof ocean_fp[0], cmp_ocean_fp);
+    fprintf(f, "\n== Marked ocean batch fingerprints (v%u FNV-1a-64; stable metadata only)\n",
+            BW_AUDIT_OCEAN_FINGERPRINT_VERSION);
+    fprintf(f, "  batches %llu, hashes %u/%u, table-overflow batches %llu, "
+               "within-scope mismatches %llu\n",
+            (unsigned long long)s_ocean_fp_batches, s_ocean_fp_count,
+            BW_AUDIT_OCEAN_FINGERPRINT_SLOTS,
+            (unsigned long long)s_ocean_fp_overflow,
+            (unsigned long long)s_ocean_fp_mismatches);
+    for (i = 0; i < s_ocean_fp_count; i++)
+        fprintf(f, "  %016llX %10llu batches\n",
+                (unsigned long long)ocean_fp[i].hash,
+                (unsigned long long)ocean_fp[i].batches);
     fclose(f);
 }
 

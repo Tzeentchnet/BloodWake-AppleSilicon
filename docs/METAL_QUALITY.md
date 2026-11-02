@@ -121,3 +121,28 @@ Its fixed-shape JSON always reports `bw_vfx_msaa_policy` as `unsupported`.
 On the recorded Apple M5 host, Metal reports 2x, 4x, and 8x sample counts as
 supported. Device capability is only a prerequisite: it does not satisfy
 attachment ownership, resolve correctness, performance, or visual gates.
+
+### Diagnostic MSAA smoke
+
+The standalone `tests/metal_msaa_smoke` target creates small synthetic
+multisample color and depth/stencil attachments, a sample-count-matched
+pipeline, a single-sample resolve texture, and synchronized readback:
+
+```sh
+cmake -S tests/metal_msaa_smoke -B build/test-metal-msaa-smoke \
+  -DCMAKE_BUILD_TYPE=Release
+cmake --build build/test-metal-msaa-smoke
+ctest --test-dir build/test-metal-msaa-smoke --output-on-failure
+build/test-metal-msaa-smoke/bw_metal_msaa_smoke
+```
+
+It validates clear color, accepted/rejected depth writes, stencil rejection,
+resolve/readback, explicit command-buffer errors, checked lower-bound resource
+bytes, and GPU timing when Metal exposes it. Unsupported sample counts are
+reported as skipped, not passed.
+
+The recorded Apple M5 passed 2x, 4x, and 8x. This proves the device/API
+mechanics on an 8x8 synthetic target only. It does not prove game-renderer
+attachment ownership, target switches, partial clears, guest seed/readback,
+resize/scaling, scene correctness, useful visual improvement, or acceptable
+retail memory and GPU cost.

@@ -124,6 +124,10 @@ class MacosDiagnosticTests(unittest.TestCase):
         remastered = diagnostic.diagnostic_env(
             self.root, self.prepared, 15, False, False, 4, 5, edition="remastered")
         self.assertEqual(remastered["BW_EDITION"], "remastered")
+        audio_disabled = diagnostic.diagnostic_env(
+            self.root, self.prepared, 15, False, False, 4, 5,
+            disable_audio=True)
+        self.assertEqual(audio_disabled["BW_MACOS_AUDIO"], "0")
         with self.assertRaisesRegex(ValueError, "edition must be original or remastered"):
             diagnostic.diagnostic_env(
                 self.root, self.prepared, 15, False, False, 4, 5, edition="Remastered")
@@ -403,6 +407,7 @@ class MacosDiagnosticTests(unittest.TestCase):
                   **kwargs):
             (output / "guest.log").write_bytes(b"no marker summary\n")
             self.assertEqual(kwargs["edition"], "original")
+            self.assertFalse(kwargs["disable_audio"])
             return 0
 
         output = io.StringIO()
@@ -416,8 +421,30 @@ class MacosDiagnosticTests(unittest.TestCase):
             result = diagnostic.main(arguments)
         self.assertEqual(result, 0)
         self.assertIn("Diagnostic edition: Original", output.getvalue())
+        self.assertIn("Diagnostic audio: enabled", output.getvalue())
         self.assertIn("0 received, 0 batch scopes, 0 rejected", output.getvalue())
         self.assertIn("zero observed ocean coverage", output.getvalue())
+
+    def test_cli_audio_disable_is_explicit_and_propagated(self):
+        arguments = self.main_arguments() + ["--disable-audio"]
+
+        def guest(_executable, output, _game_dir, _profile, _seconds, _quincunx, _audit,
+                  **kwargs):
+            (output / "guest.log").write_bytes(b"no marker summary\n")
+            self.assertTrue(kwargs["disable_audio"])
+            return 0
+
+        output = io.StringIO()
+        with mock.patch.object(diagnostic.sys, "platform", "darwin"), \
+             mock.patch.object(diagnostic, "ROOT", self.repository), \
+             mock.patch.object(diagnostic, "verify_prepared"), \
+             mock.patch.object(diagnostic, "toolkit_revision", return_value="pinned"), \
+             mock.patch.object(diagnostic, "verify_sandbox"), \
+             mock.patch.object(diagnostic, "run_guest", side_effect=guest), \
+             contextlib.redirect_stdout(output):
+            result = diagnostic.main(arguments)
+        self.assertEqual(result, 0)
+        self.assertIn("Diagnostic audio: disabled", output.getvalue())
 
     def test_relaunch_cap_reports_completed_markers_and_is_non_success(self):
         arguments = self.main_arguments() + [

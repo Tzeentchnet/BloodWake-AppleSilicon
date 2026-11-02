@@ -82,6 +82,12 @@ test coverage are in [VALIDATION.md](VALIDATION.md).
 - Added a read-only Metal sample-count probe with fixed-shape JSON and explicit
   error reporting. The recorded Apple M5 supports 2x, 4x, and 8x; project
   policy remains unsupported.
+- Added a standalone real-Metal MSAA smoke path. The Apple M5 passes synthetic
+  2x/4x/8x color, depth/stencil, resolve, readback, error, memory-lower-bound,
+  and timing checks without changing the game renderer or support policy.
+- Added bounded marker-only ocean fingerprints over stable copied metadata.
+  Private GPU audits report at most 32 aggregate hashes plus overflow and
+  within-scope mismatch counts; retail data and rendering are unchanged.
 
 ## Renderer performance
 

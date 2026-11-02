@@ -2375,6 +2375,8 @@ static uint32_t tex_levels_for_backend(const Texture *t)
     return tex_size_from_format(t->color) ? t->levels : 1;
 }
 
+static void bw_ocean_fingerprint_note_current(const BwXBatch *xb);
+
 /* The extended entry's batch state: all four stages, the combiners, the fog
  * colour and the clip-plane mode. Vertices are the caller's. */
 static void fill_xbatch(BwXBatch *xb, const Nv2aRenderState *rs)
@@ -2435,6 +2437,7 @@ static void backend_flush(int textured)
             fill_xbatch(&xb, &rs);
             xb.vertices = s_xverts;
             xb.count = s_bcount;
+            bw_ocean_fingerprint_note_current(&xb);
             s_xbackend->draw(&surf, &xb);
             s_gpu.tris_drawn += s_bcount / 3;
             s_bcount = 0;
@@ -3654,6 +3657,194 @@ static uint32_t  s_bw_vstamp[BW_VCACHE_N], s_bw_vslot[BW_VCACHE_N], s_bw_vbatch;
  * space, U untransformed (dropped), ? nothing drawn. */
 static char      s_bw_audit_path = '?';
 
+static uint64_t s_bw_ocean_scope_fingerprint;
+static int s_bw_ocean_scope_fingerprint_valid;
+
+static uint64_t bw_ocean_fingerprint_word(uint64_t hash, uint32_t value)
+{
+    unsigned i;
+    for (i = 0; i < 4; i++) {
+        hash ^= (uint8_t)(value >> (i * 8));
+        hash *= UINT64_C(1099511628211);
+    }
+    return hash;
+}
+
+static uint32_t bw_ocean_fingerprint_float(float value)
+{
+    uint32_t bits;
+    memcpy(&bits, &value, sizeof bits);
+    return bits;
+}
+
+static uint64_t bw_ocean_batch_fingerprint(const BwXBatch *xb,
+                                            const uint32_t (*program)[4],
+                                            uint32_t ninstr)
+{
+    const Nv2aRenderState *rs = xb->state;
+    const Nv2aCombiner *rc = xb->rc;
+    uint64_t hash = UINT64_C(14695981039346656037);
+    uint32_t i, st;
+#define BW_OCEAN_FP_WORD(value) \
+    hash = bw_ocean_fingerprint_word(hash, (uint32_t)(value))
+
+    BW_OCEAN_FP_WORD(0x42574F46u);
+    BW_OCEAN_FP_WORD(BW_AUDIT_OCEAN_FINGERPRINT_VERSION);
+    BW_OCEAN_FP_WORD(rs != NULL);
+    if (rs) {
+        BW_OCEAN_FP_WORD(rs->blend_enable);
+        BW_OCEAN_FP_WORD(rs->blend_src);
+        BW_OCEAN_FP_WORD(rs->blend_dst);
+        BW_OCEAN_FP_WORD(rs->blend_eq);
+        BW_OCEAN_FP_WORD(rs->blend_color);
+        BW_OCEAN_FP_WORD(rs->alpha_test_enable);
+        BW_OCEAN_FP_WORD(rs->alpha_func);
+        BW_OCEAN_FP_WORD(rs->alpha_ref);
+        BW_OCEAN_FP_WORD(rs->depth_test_enable);
+        BW_OCEAN_FP_WORD(rs->depth_func);
+        BW_OCEAN_FP_WORD(rs->depth_write);
+        BW_OCEAN_FP_WORD(rs->color_mask);
+        BW_OCEAN_FP_WORD(rs->cull_enable);
+        BW_OCEAN_FP_WORD(rs->cull_face);
+        BW_OCEAN_FP_WORD(rs->front_face);
+        BW_OCEAN_FP_WORD(rs->zeta_va != 0);
+        BW_OCEAN_FP_WORD(bw_ocean_fingerprint_float(rs->depth_min));
+        BW_OCEAN_FP_WORD(bw_ocean_fingerprint_float(rs->depth_max));
+        BW_OCEAN_FP_WORD(rs->stencil_enable);
+        BW_OCEAN_FP_WORD(rs->stencil_func);
+        BW_OCEAN_FP_WORD(rs->stencil_ref);
+        BW_OCEAN_FP_WORD(rs->stencil_func_mask);
+        BW_OCEAN_FP_WORD(rs->stencil_write_mask);
+        BW_OCEAN_FP_WORD(rs->stencil_fail);
+        BW_OCEAN_FP_WORD(rs->stencil_zfail);
+        BW_OCEAN_FP_WORD(rs->stencil_zpass);
+    }
+    BW_OCEAN_FP_WORD(rc != NULL);
+    if (rc) {
+        uint32_t stages = rc->control & 0xFFu;
+        BW_OCEAN_FP_WORD(rc->control);
+        BW_OCEAN_FP_WORD(rc->stage_program);
+        BW_OCEAN_FP_WORD(stages);
+        if (stages > 8)
+            stages = 8;
+        for (i = 0; i < stages; i++) {
+            BW_OCEAN_FP_WORD(rc->color_icw[i]);
+            BW_OCEAN_FP_WORD(rc->alpha_icw[i]);
+            BW_OCEAN_FP_WORD(rc->color_ocw[i]);
+            BW_OCEAN_FP_WORD(rc->alpha_ocw[i]);
+            BW_OCEAN_FP_WORD(rc->factor0[i]);
+            BW_OCEAN_FP_WORD(rc->factor1[i]);
+        }
+        BW_OCEAN_FP_WORD(rc->final0);
+        BW_OCEAN_FP_WORD(rc->final1);
+        BW_OCEAN_FP_WORD(rc->final_c0);
+        BW_OCEAN_FP_WORD(rc->final_c1);
+    }
+    for (st = 0; st < 4; st++) {
+        const Nv2aTexture *tex = &xb->tex[st];
+        BW_OCEAN_FP_WORD(xb->tex_valid[st] != 0);
+        if (!xb->tex_valid[st])
+            continue;
+        /* Guest offsets, host pointers, texels and vertices are deliberately
+         * absent; only the copied sampler and layout metadata is stable. */
+        BW_OCEAN_FP_WORD(xb->tex_normalized[st] != 0);
+        BW_OCEAN_FP_WORD(xb->tex_cube[st] != 0);
+        BW_OCEAN_FP_WORD(tex->width);
+        BW_OCEAN_FP_WORD(tex->height);
+        BW_OCEAN_FP_WORD(tex->pitch);
+        BW_OCEAN_FP_WORD(tex->color);
+        BW_OCEAN_FP_WORD(tex->addr_u);
+        BW_OCEAN_FP_WORD(tex->addr_v);
+        BW_OCEAN_FP_WORD(tex->levels);
+        BW_OCEAN_FP_WORD(tex->filter);
+        BW_OCEAN_FP_WORD(xb->tex_border[st]);
+        BW_OCEAN_FP_WORD(xb->tex_border_src[st] != 0);
+    }
+    for (i = 0; i < 4; i++)
+        BW_OCEAN_FP_WORD(bw_ocean_fingerprint_float(xb->fogc[i]));
+    BW_OCEAN_FP_WORD(xb->clip_plane_mode);
+    BW_OCEAN_FP_WORD(xb->dot_rgbmapping);
+    BW_OCEAN_FP_WORD(xb->other_stage_input);
+    if (program && ninstr && ninstr <= NV2A_VSH_SLOTS) {
+        BW_OCEAN_FP_WORD(1);
+        BW_OCEAN_FP_WORD(ninstr);
+        for (i = 0; i < ninstr; i++) {
+            BW_OCEAN_FP_WORD(program[i][0]);
+            BW_OCEAN_FP_WORD(program[i][1]);
+            BW_OCEAN_FP_WORD(program[i][2]);
+            BW_OCEAN_FP_WORD(program[i][3]);
+        }
+    } else {
+        BW_OCEAN_FP_WORD(0);
+        BW_OCEAN_FP_WORD(ninstr);
+    }
+#undef BW_OCEAN_FP_WORD
+    return hash;
+}
+
+static void bw_ocean_fingerprint_scope_reset(void)
+{
+    s_bw_ocean_scope_fingerprint = 0;
+    s_bw_ocean_scope_fingerprint_valid = 0;
+}
+
+static void bw_ocean_fingerprint_note(const BwXBatch *xb,
+                                      const uint32_t (*program)[4],
+                                      uint32_t ninstr)
+{
+    uint64_t fingerprint;
+    int mismatch;
+
+    if (xb->draw_marker != BW_X_DRAW_MARKER_OCEAN || !bw_audit_on())
+        return;
+    fingerprint = bw_ocean_batch_fingerprint(xb, program, ninstr);
+    mismatch = s_bw_ocean_scope_fingerprint_valid
+            && s_bw_ocean_scope_fingerprint != fingerprint;
+    if (!s_bw_ocean_scope_fingerprint_valid) {
+        s_bw_ocean_scope_fingerprint = fingerprint;
+        s_bw_ocean_scope_fingerprint_valid = 1;
+    }
+    bw_audit_ocean_fingerprint(fingerprint, mismatch);
+}
+
+static void bw_ocean_fingerprint_note_current(const BwXBatch *xb)
+{
+    const uint32_t (*program)[4] = NULL;
+    uint32_t ninstr = 0, s;
+
+    if (batch_uses_program()) {
+        for (s = s_bw_start; s < NV2A_VSH_SLOTS; s++)
+            if (s_bw_prog[s][3] & 1)
+                break;
+        if (s < NV2A_VSH_SLOTS) {
+            program = (const uint32_t (*)[4])s_bw_prog[s_bw_start];
+            ninstr = s - s_bw_start + 1;
+        }
+    }
+    bw_ocean_fingerprint_note(xb, program, ninstr);
+}
+
+#if defined(BW_METAL_TESTING)
+uint64_t bw_ocean_fingerprint_test_hash(const BwXBatch *xb,
+                                        const uint32_t (*program)[4],
+                                        uint32_t ninstr)
+{
+    return bw_ocean_batch_fingerprint(xb, program, ninstr);
+}
+
+void bw_ocean_fingerprint_test_scope_reset(void)
+{
+    bw_ocean_fingerprint_scope_reset();
+}
+
+void bw_ocean_fingerprint_test_collect(const BwXBatch *xb,
+                                       const uint32_t (*program)[4],
+                                       uint32_t ninstr)
+{
+    bw_ocean_fingerprint_note(xb, program, ninstr);
+}
+#endif
+
 static void bw_prog_load(uint32_t slot)
 {
     s_bw_load_slot = slot;
@@ -4196,6 +4387,7 @@ bw_tris:
     vb.fog_mode = s_gpu.fog_mode;
     vb.fog_param[0] = s_gpu.fog_param[0];
     vb.fog_param[1] = s_gpu.fog_param[1];
+    bw_ocean_fingerprint_note(&vb.xb, vb.program, vb.ninstr);
     if (!s_xbackend->draw_vsh(&surf, &vb))
         return 0;
     gpu_vsh_verify(nv, nins, mask);
@@ -5196,6 +5388,7 @@ static void bw_ocean_marker_nop(uint32_t param)
 
 static void bw_ocean_marker_begin(void)
 {
+    bw_ocean_fingerprint_scope_reset();
     s_gpu.draw_marker = s_bw_ocean_marker_pending == BW_OCEAN_MARKER_ARMED
                       ? BW_X_DRAW_MARKER_OCEAN : BW_X_DRAW_MARKER_NONE;
     s_gpu.draw_marker_copies = 0;
@@ -5211,6 +5404,7 @@ static void bw_ocean_marker_end(void)
                                BW_DRAW_MARKER_OCEAN_DRAW);
     s_gpu.draw_marker = BW_X_DRAW_MARKER_NONE;
     s_gpu.draw_marker_copies = 0;
+    bw_ocean_fingerprint_scope_reset();
 }
 
 static void bw_ocean_marker_frame_end(void)
@@ -5222,6 +5416,7 @@ static void bw_ocean_marker_frame_end(void)
         s_gpu.draw_marker = BW_X_DRAW_MARKER_NONE;
         s_gpu.draw_marker_copies = 0;
     }
+    bw_ocean_fingerprint_scope_reset();
 }
 
 #if defined(BW_METAL_TESTING)

@@ -123,8 +123,10 @@ rejected even when set to `0`.
   no-op.
 - Ocean draws now carry an explicit, false-positive-safe game-to-executor
   marker; a bounded Remastered flow recorded 512 scopes with zero rejection.
-  A realistic preset remains blocked on representative pass/fingerprint
-  validation. Retail water remains unchanged.
+  Bounded marker-only metadata fingerprints are implemented, but automated
+  runs did not reach a representative scene after instrumentation. A realistic
+  preset remains blocked on hands-on pass/fingerprint validation. Retail water
+  remains unchanged.
 - Physical controllers, guest USB, audible/sustained native audio, saves, FMV,
   other editions, and broad mission coverage are not validated Apple Silicon
   features.

@@ -172,6 +172,21 @@ selecting dummy audio. A bounded retail boot has exercised the CoreAudio
 device, title-driven APU/DSP setup, and APU interrupts; audible quality and
 sustained underrun behavior still require hands-on validation.
 
+For the isolated diagnostic runner, use `--disable-audio` only when a
+renderer/input investigation must continue after an explicit CoreAudio startup
+failure. It places `BW_MACOS_AUDIO=0` only in the private child environment,
+prints that audio is disabled, and leaves the default diagnostic behavior
+unchanged:
+
+```sh
+build/venv/bin/python tools/macos_diagnostic.py \
+  --exe "$PWD/build/bloodwake-macos/bloodwake" \
+  --prepared-tree "$PWD/game/prepare" \
+  --toolkit "$PWD/build/xboxrecomp" \
+  --output-dir "$HOME/bw-private-diagnostics/render-only-001" \
+  --edition remastered --disable-audio --seconds 45 --gpu-audit
+```
+
 For a synthetic-input diagnostic only, additionally build with
 `-DBW_EXPERIMENTAL_SYNTHETIC_INPUT=ON`. This requires the experimental keyboard
 hook build option and is off by default. A separate runtime opt-in,

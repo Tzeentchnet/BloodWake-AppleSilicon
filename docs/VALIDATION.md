@@ -79,7 +79,7 @@ wall-clock performance evidence.
 
 ## Current regression coverage
 
-- The Metal backend suite passes 313/313 tests, including texture-stage masks,
+- The Metal backend suite passes 314/314 tests, including texture-stage masks,
   combiner operations, cube reflection, mip selection, command-buffer and
   render-encoder batching, texture caching, upload-arena reuse, anisotropy
   selection/lifecycle, and invalid filtering rejection.
@@ -106,9 +106,13 @@ wall-clock performance evidence.
 - The Metal MSAA capability target passes 2/2 tests. The recorded Apple M5
   reports 2x, 4x, and 8x support; the probe explicitly retains the unsupported
   project policy.
-- The focused macOS diagnostic suite passes 33/33 tests, including strict
+- The standalone Metal MSAA smoke target passes 2/2 tests. The recorded Apple
+  M5 passes synthetic 2x/4x/8x color, depth/stencil, resolve, readback, and
+  explicit error checks; this is not game-renderer or visual evidence.
+- The focused macOS diagnostic suite passes 34/34 tests, including strict
   edition selection, bounded marker-summary parsing, typed relaunch outcomes,
-  integrity-failure precedence, and boot-cap reporting.
+  integrity-failure precedence, boot-cap reporting, and explicit audio
+  isolation with default audio preserved.
 - Nine LOD cases cover Original passthrough, defaults, disable/fix override,
   custom/clamped values, live changes, invalid rejection, and concurrent
   readers/writers.
@@ -132,7 +136,7 @@ wall-clock performance evidence.
 - The DMA ownership suite passed 13 tests normally and under focused TSan and
   ASan/UBSan runs.
 - The guest-memory inventory passed 21 synthetic tests, and the complete
-  Python suite now passes 102/102.
+  Python suite now passes 103/103.
 - The synthetic GPU capture suite passed 11 tests normally and under
   ASan/UBSan, with four focused TSan cases.
 - Windows and x86 execution were not validated on the Apple Silicon host.
@@ -167,6 +171,13 @@ were unchanged. It aggregated 41,348 ocean markers into 512 scoped batches
 with zero rejections. This validates the coalescing and one-shot executor
 lifetime in the exercised boot flow; representative calm/storm, day/night,
 shore, split-screen, reflection, and wake coverage remains outstanding.
+
+After adding marker-only metadata fingerprints, two audio-enabled private
+attempts stopped before guest execution because CoreAudio could not start. The
+explicit audio-isolation path then booted successfully, but automated and
+synthetic input did not reach an ocean scene. The private audit correctly
+reported zero hashes, zero overflow, and zero mismatches. No real-scene
+fingerprint stability claim is recorded; hands-on scene coverage is required.
 
 ## Integrity and privacy
 
