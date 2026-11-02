@@ -295,6 +295,12 @@ Applies to: Remastered. Default: **Off**.
 
 ## Audio
 
+On the native Apple Silicon host, guest audio and SDL output are enabled by
+default. `BW_MACOS_AUDIO=0` disables the complete native APU path;
+`BW_MACOS_AUDIO=1` enables it explicitly, and other values fail at startup.
+`RECOMP_AC97_READY` is presence-based and managed by the native host, so do
+not set it directly. These are advanced host controls, not launcher choices.
+
 ### Sound processor
 
 Accurate runs the Xbox's own sound chip programs (echo, 3D sound) as the console did. Simple skips them, for a slow PC. Applies to every edition.

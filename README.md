@@ -17,14 +17,19 @@ sustains the original title's 30 FPS cap.
 This is still a development build:
 
 - The Metal path now presents directly through `CAMetalLayer` and can render
-  into private, output-scaled colour and depth targets. Synthetic coverage is
-  complete, but scaled retail gameplay performance and visuals still need
-  hands-on validation.
+  into private, output-scaled colour and depth targets. A 4x retail run has
+  hands-on visual confirmation, but controlled scaled-performance measurements
+  and formal reference comparison remain outstanding.
 - The game-specific keyboard bridge and Metal quincunx approximation require
   explicit build or runtime opt-ins.
 - The quincunx approximation is not verified against NV2A hardware.
-- Guest audio, USB gamepads, physical-controller support, and broad mission,
-  save, FMV, and edition coverage are incomplete.
+- Native guest audio now uses deferred same-thread APU MMIO dispatch and SDL
+  output. Its dispatch, startup, failure, and shutdown paths have synthetic
+  and sanitizer coverage, and a bounded retail boot exercised CoreAudio and
+  the title-driven APU/DSP path. Audible output, quality, and sustained
+  gameplay have not yet been user-confirmed.
+- USB gamepads, physical-controller support, and broad mission, save, FMV,
+  and edition coverage are incomplete.
 - Measured gameplay averages 30 FPS, but p95 frame pacing remains about
   45-46 ms.
 

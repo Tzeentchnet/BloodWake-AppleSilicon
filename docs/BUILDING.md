@@ -18,12 +18,18 @@ and OpenSSL packages; with Homebrew, for example:
 export CMAKE_PREFIX_PATH="$(brew --prefix sdl2):$(brew --prefix openssl@3)"
 ```
 
-The native host currently refuses to start if `RECOMP_USB` or
-`RECOMP_AC97_READY` is present, even if its value is `0`: safe APU and OHCI
-MMIO dispatch is not implemented. Leave both unset for diagnostics; this does
-not provide working guest audio or a USB gamepad. Guest-created workers cannot
-all be joined yet, so after a guest return the host retains its resources and
-exits the boot process rather than attempting unsafe in-process teardown.
+Native audio is enabled by default. The host constructs the APU and SDL output
+first, then enables a same-thread deferred MMIO bridge; lock-taking model
+callbacks never run inside the POSIX signal handler. Set `BW_MACOS_AUDIO=0` to
+disable audio or `BW_MACOS_AUDIO=1` to request it explicitly. Other values are
+rejected. Do not set `RECOMP_AC97_READY` directly, even to `0`: it is a
+presence-based toolkit switch managed internally by the native host.
+
+Guest USB remains disabled. The host refuses `RECOMP_USB` even when its value
+is `0`, and the audio bridge does not dispatch OHCI faults. Guest-created
+workers still cannot all be joined safely, so after guest entry the process
+remains the lifetime boundary. On a startup failure, APU dispatch is disabled
+before the APU or guest memory is destroyed.
 
 When unset, the native host defaults `RECOMP_PB_EXEC=1` and
 `RECOMP_VBLANK=paced`. Existing values are preserved. Both switches are
@@ -133,6 +139,13 @@ BW_METAL_QUINCUNX_APPROX=1 \
 build/bloodwake-macos/bloodwake
 ```
 
+Audio is on by default in this command. Add `BW_MACOS_AUDIO=0` when isolating
+a non-audio issue. SDL audio-device startup is explicit: if no compatible
+48 kHz stereo output can be opened, native startup fails instead of silently
+selecting dummy audio. A bounded retail boot has exercised the CoreAudio
+device, title-driven APU/DSP setup, and APU interrupts; audible quality and
+sustained underrun behavior still require hands-on validation.
+
 For a synthetic-input diagnostic only, additionally build with
 `-DBW_EXPERIMENTAL_SYNTHETIC_INPUT=ON`. This requires the experimental keyboard
 hook build option and is off by default. A separate runtime opt-in,
@@ -166,15 +179,16 @@ build/venv/bin/python tools/macos_diagnostic.py \
 ```
 
 The runner creates isolated home, configuration, temporary and save paths,
-discards inherited game settings, and refuses USB and audio MMIO. It checks a
-macOS sandbox before starting: writes are allowed only under the output
-directory, network operations and process forks are denied, and TCP/UDP
-denial is probed for both IPv4 and IPv6. This is not a system-wide network
-firewall. The boot has a deadline of 1-300 seconds and an external deadline;
-combined standard output and error are capped at 32 MiB. Other files in the
-private directory are not subject to a total disk quota. By default, a
-guest-requested relaunch is saved privately but not executed. Exit 124
-indicates the guest's run limit, not a successful playability check.
+discards inherited game settings and host-audio overrides, starts the default
+native audio path, and refuses guest USB. It checks a macOS sandbox before
+starting: writes are allowed only under the output directory, network
+operations and process forks are denied, and TCP/UDP denial is probed for both
+IPv4 and IPv6. This is not a system-wide network firewall. The boot has a
+deadline of 1-300 seconds and an external deadline; combined standard output
+and error are capped at 32 MiB. Other files in the private directory are not
+subject to a total disk quota. By default, a guest-requested relaunch is saved
+privately but not executed. Exit 124 indicates the guest's run limit, not a
+successful playability check.
 
 To follow same-title relaunch requests, add `--follow-relaunches`. Each boot
 uses a separate sandboxed child and numbered private logs, audits and relaunch

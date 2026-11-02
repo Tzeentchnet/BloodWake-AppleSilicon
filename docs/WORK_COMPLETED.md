@@ -1,6 +1,6 @@
 # Apple Silicon work completed
 
-Updated 2026-10-31. This document records implemented Apple Silicon work.
+Updated 2026-11-01. This document records implemented Apple Silicon work.
 Current status and remaining work are in
 [APPLE_SILICON_HANDOFF.md](APPLE_SILICON_HANDOFF.md); measured results and
 test coverage are in [VALIDATION.md](VALIDATION.md).
@@ -17,8 +17,25 @@ test coverage are in [VALIDATION.md](VALIDATION.md).
   read-only prepared inputs, network and process-spawn denial, output limits,
   deadlines, executable and source fingerprints, and validated same-title
   relaunch handling.
-- Kept guest USB and APU MMIO disabled until safe dispatch, DMA ownership, and
-  shutdown lifetime rules are implemented.
+- Added default-on native APU audio with strict `BW_MACOS_AUDIO=0|1` control.
+  Direct `RECOMP_AC97_READY` remains rejected because it is presence-based;
+  guest USB remains disabled.
+- Added guarded same-thread deferred APU MMIO dispatch. The signal handler
+  validates the complete ARM64 access span, redirects the original guest
+  thread to ordinary context, and uses a second kernel signal return to
+  restore integer, SIMD, flags, mask, and interrupted control state.
+- Bound each guarded deferred stack to its APU-touching thread for the
+  installed lifetime and separated ownership from active-dispatch state. This
+  prevents a concurrent thread from reusing a stack while Darwin `_sigtramp`
+  is still consuming its signal frame.
+- Enabled dispatch only after successful APU construction and disabled it
+  before startup-failure shutdown or guest-memory teardown. Normal guest
+  return still uses process lifetime because all guest/device workers cannot
+  yet be retired in-process.
+- Rebuilt the native Release target and completed a 20-second bounded retail
+  boot with default-on CoreAudio, title-driven APU/DSP activity, and APU
+  interrupts at 4x direct-Metal scale. The run ended at its intentional limit;
+  one SDL underrun was observed and audible correctness remains unconfirmed.
 
 ## Metal renderer
 
@@ -101,8 +118,16 @@ test coverage are in [VALIDATION.md](VALIDATION.md).
 - Added synthetic DMA ownership models for generation-qualified leases, shared
   aliases, sub-page ownership, and synchronized handoff. These models are not
   connected to the runtime.
-- Added a test-only same-thread ARM64 MMIO trampoline with conservative
-  instruction-span validation. It is not connected to the game.
+- Promoted the bounded same-thread ARM64 trampoline into the native APU fault
+  bridge with conservative full-span instruction validation, 32 preallocated
+  slots, guarded stacks, a protected restore page, cancellation suppression,
+  and fail-closed nested/unrelated-fault behavior. OHCI remains excluded.
+- Added production-bridge regressions for a real protected-page load/store,
+  recursive model locking on the original guest thread, state preservation,
+  disabled forwarding, concurrent dispatch, startup controls, initialization
+  failure, and dispatch-before-shutdown ordering.
+- Repeated the concurrent production bridge in 100 separate stress processes
+  after fixing deferred-stack lifetime; all 100 completed successfully.
 - Reproduced APU/OHCI IRQ and shutdown lifetime failures, including queued and
   executing DPCs outliving device shutdown, and added a synthetic retirement
   model for admission, closure, cancellation, continuations, and quiescence.
@@ -116,7 +141,9 @@ test coverage are in [VALIDATION.md](VALIDATION.md).
   time, and memory measurements remain outstanding.
 - CPU/GPU ownership is coordinated only at the renderer's explicit surface
   boundaries; general guest aliases and concurrent CPU access are not solved.
-- Guest USB, physical gamepads, APU audio, FMV, saves, other editions, and
-  broad mission coverage are not complete Apple Silicon features.
+- Guest USB, physical gamepads, FMV, saves, other editions, and broad mission
+  coverage are not complete Apple Silicon features. Native APU audio is
+  implemented and regression-tested, but audible retail output, quality, and
+  sustained gameplay remain unconfirmed.
 - Unsupported states continue to fail explicitly instead of being guessed or
   skipped.

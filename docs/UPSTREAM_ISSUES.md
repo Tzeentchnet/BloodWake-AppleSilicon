@@ -179,9 +179,11 @@ needed.
 The original game entry point, window host and D3D11 renderer use Windows
 APIs. This fork now builds an experimental macOS host, Metal backend and
 portable APU/DSP integration; synthetic tests exercise their components.
-Guest USB and APU MMIO remain disabled until device callbacks can be
-dispatched safely, and no playable frame has been verified. These are porting
-tasks in this fork, not defects proven in the Windows build.
+The native host now dispatches APU MMIO on the original guest thread outside
+the signal handler and uses the existing SDL output backend. Guest USB remains
+disabled. A bounded retail boot exercised CoreAudio, title-driven APU/DSP
+setup, and APU interrupts, but audible output has not yet been verified. These
+are porting tasks in this fork, not defects proven in the Windows build.
 
 On POSIX, the carried OHCI model now rejects invalid or non-linear transfer
 buffers with an error instead of reporting an uncopied transfer as successful.
@@ -209,7 +211,10 @@ DPC can wait for the APU frame worker. Safe retirement needs a broader,
 fallible admission and quiescence contract covering guest workers, DPCs, IRQs,
 device access and guest-memory lifetime while keeping required workers alive.
 The native host consequently retains guest resources until process exit after
-guest entry; USB and APU MMIO must remain disabled.
+guest entry. This permits the APU to remain live for the boot without unsafe
+in-process destruction; startup-failure cleanup disables APU dispatch before
+shutdown. USB remains disabled because its DMA and OHCI lifetime contracts
+are not solved.
 
 The manual synthetic OHCI and APU callback probes in
 `tests/mmio_host/test_irq_shutdown_*` reproduce queued, executing, coalesced
@@ -302,19 +307,28 @@ counterexamples. Its assumptions, failure handling and unresolved integration
 requirements are detailed in
 [`tests/mmio_host/RETIREMENT_MODEL.md`](../tests/mmio_host/RETIREMENT_MODEL.md).
 
-#### Test-only MMIO dispatch experiment
+#### MMIO dispatch experiment and production APU path
 
 The macOS MMIO test suite also has a test-only same-thread trampoline
 experiment. It defers a trapped access outside the signal handler and uses a
 second signal return to restore the interrupted state. Synthetic tests include
-real APU and OHCI register callbacks, but registration, cancellation,
-reentrancy, address coverage and lifecycle safety are not established for the
-game. A bounded counterexample also shows that masking fault signals inside a
-callback can make nested device DMA hang. In a separate crossing-access probe,
-the fault address did not match the first word of the ARM64 pair instruction;
-the experimental handler rejected it. Any production dispatcher must validate
-the instruction's complete effective span, not just the reported address. The
-experiment is not connected to the native host.
+real APU and OHCI register callbacks. A bounded counterexample also shows that
+masking fault signals inside a callback can make nested device DMA hang. In a
+separate crossing-access probe, the fault address did not match the first word
+of the ARM64 pair instruction; the handler rejected it.
+
+The APU-only form is now connected to the native host. It preallocates guarded
+stacks and slots, validates each instruction's complete effective span before
+dispatch, runs the lock-taking callback on the original guest thread, and
+restores the captured machine state through a second genuine signal return.
+Each stack remains assigned to one APU-touching thread until uninstall, while
+a separate active flag tracks callbacks; this prevents another thread from
+reusing a still-live signal-return frame. Nested or unrelated faults fail
+closed, slot exhaustion fails explicitly, cancellation is suppressed during
+the callback, and dispatch is enabled only while the constructed APU is live.
+OHCI remains test-only because its DMA and lifecycle requirements are not
+satisfied. A bounded retail run exercised the path, but broader instruction
+coverage and audible output remain to be validated.
 
 ## Local toolchain note
 

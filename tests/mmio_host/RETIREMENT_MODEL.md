@@ -89,5 +89,7 @@ in-flight device accesses, and shutdown ownership/join semantics coordinated
 without lock-order deadlocks. No real cancellation, draining, data ownership,
 guest-memory lifetime, or eventual progress is established here. On failure
 or inability to prove quiescence, the safe production policy remains to retain
-resources through process exit after guest entry. USB and APU MMIO stay
-disabled.
+resources through process exit after guest entry. The native host now applies
+that policy to its default-on APU path and disables APU dispatch before any
+pre-guest cleanup. USB stays disabled; this model still does not justify
+in-process APU teardown.

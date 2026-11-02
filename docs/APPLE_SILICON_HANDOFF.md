@@ -1,6 +1,7 @@
 # Apple Silicon handoff
 
-Status updated 2026-11-01 after hands-on 4x Metal gameplay confirmation.
+Status updated 2026-11-01 after native APU dispatch implementation, sanitizer
+validation, and a bounded default-audio retail boot.
 
 ## Current status
 
@@ -33,9 +34,19 @@ hands-on confirmation rather than a formal reference comparison. Frame time
 and memory were not measured, so the older 640x480 numbers are not
 scaled-rendering measurements.
 
-The run had no sound, as expected: the macOS host currently disables guest
-APU MMIO because lock-safe trapped-MMIO dispatch is not implemented. Audio
-was not lost in the Metal presentation or scaling path.
+That 4x run had no sound because it predated the native APU dispatch path; it
+was not a Metal presentation or scaling regression. Native audio is now
+default-on through guarded same-thread deferred APU MMIO dispatch and the
+existing SDL output backend. Dispatch, configuration, startup failure, and
+pre-guest shutdown are regression-tested, but audible retail output and sound
+quality have not yet been confirmed by the user.
+
+A subsequent 20-second bounded retail boot initialized the CoreAudio driver at
+48 kHz stereo, started the title-controlled APU and both DSP programs, produced
+periodic DSP output reports, and delivered APU interrupts. It remained active
+until the intentional run limit without a deferred-dispatch or Metal error.
+One SDL underrun was logged. This confirms runtime integration, not that sound
+was audible or correct.
 
 ## Required opt-ins
 
@@ -49,8 +60,11 @@ The quincunx path is a narrowly scoped legacy Gaussian approximation, not
 verified NV2A filtering. Unsupported renderer states continue to fail
 explicitly.
 
-Guest USB and APU MMIO remain disabled. Do not set `RECOMP_USB` or
-`RECOMP_AC97_READY`, even to `0`; both are presence-based in the current host.
+Native audio requires no opt-in. `BW_MACOS_AUDIO=0` disables it;
+`BW_MACOS_AUDIO=1` enables it explicitly, and other values are rejected. Do
+not set `RECOMP_AC97_READY` directly, even to `0`; the presence-based switch
+is managed internally. Guest USB remains disabled, and `RECOMP_USB` is
+rejected even when set to `0`.
 
 ## Detailed records
 
@@ -72,8 +86,11 @@ Guest USB and APU MMIO remain disabled. Do not set `RECOMP_USB` or
   intervals in the measured scene.
 - Keyboard feedback, reconnect, focus-loss recovery, and the complete device
   lifecycle remain experimental.
-- Physical controllers, guest USB, audio, saves, FMV, other editions, and
-  broad mission coverage are not validated Apple Silicon features.
+- Physical controllers, guest USB, audible/sustained native audio, saves, FMV,
+  other editions, and broad mission coverage are not validated Apple Silicon
+  features.
+- The bounded audio boot logged one SDL underrun; latency, underrun behavior,
+  channel balance, and output quality need hands-on measurement.
 - General CPU/GPU guest-memory ownership, aliases, DMA lifetime, and safe
   in-process device shutdown are not solved.
 - Windows behavior after the Apple Silicon changes has not been revalidated.
@@ -106,10 +123,13 @@ Guest USB and APU MMIO remain disabled. Do not set `RECOMP_USB` or
 
 - Turn the current keyboard interaction into a repeatable regression covering
   press, release, focus loss, reconnect, and shutdown.
-- Implement safe MMIO dispatch, DMA ownership, IRQ/DPC retirement, and
-  callback quiescence before enabling OHCI or APU devices.
-- Add physical-controller and audio validation only after those contracts are
-  safe.
+- Obtain hands-on confirmation of audible output, channel balance, latency,
+  underruns, and sustained gameplay with the new APU path.
+- Preserve process lifetime after guest entry; complete DMA ownership,
+  IRQ/DPC retirement, and callback quiescence before attempting in-process
+  APU teardown or enabling OHCI.
+- Add physical-controller validation only after the remaining USB contracts
+  are safe.
 
 ### 4. Broaden product coverage
 

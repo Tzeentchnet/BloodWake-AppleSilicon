@@ -168,10 +168,13 @@ forwarding and teardown, every guest alias, multiple overlapping resources,
 allocator and mapping lifetime, arbitrary locks inside Metal or system
 libraries, or safe command publication and failure handling. The sanitizer
 runs cannot observe GPU races or physical aliases mapped at different host
-addresses. The dirty-surface guard and the USB/APU MMIO restrictions remain.
+addresses. The dirty-surface guard and general DMA restrictions remain.
 
-Until those requirements are met, keep guest USB and APU MMIO disabled; do
-not infer that the existing default heap mapping is safe for asynchronous DMA.
+The native host now enables a narrowly scoped APU MMIO bridge while retaining
+guest and device resources through process exit after guest entry. That does
+not connect these ownership models to the APU, make the default heap mapping
+safe for arbitrary asynchronous DMA, or justify enabling guest USB. Treat the
+audio path as experimental until sustained retail behavior is validated.
 
 ## Running
 

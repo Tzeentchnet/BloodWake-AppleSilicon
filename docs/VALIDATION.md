@@ -1,6 +1,6 @@
 # Apple Silicon validation
 
-Updated 2026-10-31. This document records measured behavior and regression
+Updated 2026-11-01. This document records measured behavior and regression
 coverage. Implementation history is in
 [WORK_COMPLETED.md](WORK_COMPLETED.md), and current priorities are in
 [APPLE_SILICON_HANDOFF.md](APPLE_SILICON_HANDOFF.md).
@@ -39,11 +39,43 @@ wall-clock performance evidence.
   (2560x1920). The user reported no visual issues during gameplay; no sticky
   Metal or command-buffer error was logged, and the process exited with status
   zero after the window was closed.
-- That 4x run had no sound because guest APU MMIO is intentionally disabled on
-  the current macOS host. It does not indicate a presentation/scaling audio
-  regression.
+- That 4x run had no sound because it predated the native APU dispatch
+  implementation. It does not indicate a presentation/scaling audio
+  regression, but it is also not evidence that the new audio path is audible.
 - Physical gamepads, feedback, reconnect behavior, focus-loss recovery, and
   the complete input lifecycle remain unverified.
+
+## Native audio validation
+
+- The native host now initializes the real carried APU and 48 kHz stereo SDL
+  output by default, then enables APU-only deferred fault dispatch. Startup
+  fails explicitly if audio-device initialization fails.
+- A protected-page regression executes real ARM64 APU stores and loads through
+  the production bridge. It verifies recursive lock acquisition on the
+  original guest thread, integer/SIMD/flags/signal-mask preservation, disabled
+  forwarding, and 1,600 concurrent callback dispatches.
+- Deferred stacks remain permanently assigned to their APU-touching thread
+  while installed, so a second thread cannot overwrite a signal frame that
+  `_sigtramp` is still returning through. The concurrent callback case passed
+  100/100 separate stress iterations after this ownership rule was added.
+- Native lifecycle fixtures cover default-on audio, explicit disable, invalid
+  values, rejection of direct presence-based toolkit control, APU startup
+  failure, and disabling dispatch before APU shutdown and memory teardown.
+- Focused production fault and lifecycle cases pass normally and under
+  ASan/UBSan and TSan. The nested fail-closed case retains its existing TSan
+  skip where the sanitizer blocks nested fault delivery; unrelated deliberate
+  detached-monitor and run-limit cases are excluded from the TSan lifecycle
+  fixture.
+- The real native Release target links successfully with the APU bridge. A
+  20-second bounded retail boot selected direct Metal at 2560x1920 and 4x
+  internal scale, initialized CoreAudio at 48 kHz stereo, started the APU and
+  both DSP programs, delivered APU interrupts, and reached 22,500 reported DSP
+  frames before the intentional run limit. It logged no deferred-dispatch or
+  Metal error and one SDL underrun. Exit status 124 was the expected
+  `BW_RUN_SECONDS` termination.
+- Audible retail output, sustained gameplay, underruns, latency, and channel
+  quality have not yet been confirmed; the bounded boot establishes device and
+  guest activity, not audible correctness.
 
 ## Current regression coverage
 
@@ -62,9 +94,16 @@ wall-clock performance evidence.
 - Focused Metal cases have also passed with ASan/UBSan and Metal validation.
 - The diagnostic runner passed 45 Python tests, including bounded execution,
   isolation, relaunch validation, and output handling.
+- The focused native diagnostic file passed 22/22 after adding host-audio
+  environment isolation.
+- The macOS host suite passed 8/8 normally and under ASan/UBSan. Under TSan,
+  seven cases passed and the existing nested-signal case was skipped because
+  the sanitizer blocks that delivery. The APU output suite passed 4/4.
 - Host, presenter, virtual-input, and audio/DSP suites passed their normal and
   focused sanitizer runs; presenter and input also passed focused TSan runs.
-- The MMIO host suite reached 34/34 with the synthetic retirement model.
+- The new production APU fault and native audio lifecycle cases pass normal,
+  focused ASan/UBSan, and focused TSan runs.
+- The MMIO host suite reached 35/35 with the synthetic retirement model.
   Counterexample tests demonstrate unsafe behavior; passing them does not mean
   production retirement is safe.
 - The DMA ownership suite passed 13 tests normally and under focused TSan and
