@@ -187,6 +187,13 @@ build/venv/bin/python tools/macos_diagnostic.py \
   --edition remastered --disable-audio --seconds 45 --gpu-audit
 ```
 
+Use `--headless-audio-audit` instead when guest APU/DSP progression and
+aggregate signal/cadence evidence must remain active without CoreAudio. This
+diagnostic-only sink is not audible, retains no samples, rejects inherited or
+requested sample-data writers, and is mutually exclusive with
+`--disable-audio`. The native host accepts it only inside the bounded runner;
+it never becomes an automatic fallback for audio-device failure.
+
 For a synthetic-input diagnostic only, additionally build with
 `-DBW_EXPERIMENTAL_SYNTHETIC_INPUT=ON`. This requires the experimental keyboard
 hook build option and is off by default. A separate runtime opt-in,
@@ -195,6 +202,28 @@ It queues and holds synthetic Return, Down and Z key presses inside this
 process before starting the guest; it does not generate physical or OS-level
 keystrokes. The hook logs when a guest state query sees Start, Down and A.
 This tests neither physical keyboard input nor menu navigation.
+
+The same experimental build also contains one deterministic poll-epoch script
+that does exercise the currently validated Remastered boot/menu path without
+OS keystrokes. Select it only through the runner:
+
+```sh
+build/venv/bin/python tools/macos_diagnostic.py \
+  --exe "$PWD/build/bloodwake-native-synthetic-input/bloodwake" \
+  --prepared-tree "$PWD/game/prepare" \
+  --toolkit "$PWD/build/xboxrecomp" \
+  --output-dir "$HOME/bw-private-diagnostics/scripted-remastered-001" \
+  --edition remastered --experimental-keyboard-hook \
+  --synthetic-input-script remastered-boot-menu-to-gameplay-v1 \
+  --headless-audio-audit --gpu-audit \
+  --follow-relaunches --max-boots 3 --total-seconds 300 --seconds 90
+```
+
+The script emits distinct Xbox-equivalent Start, D-pad Down, and A
+press/release packets on guest polling epochs, rejects unknown names, and
+releases state on completion, focus loss, and shutdown. Reaching `--max-boots`
+is intentionally reported as a non-success outcome even though aggregate
+marker/fingerprint evidence is still printed.
 
 ### Isolated native diagnostic
 
@@ -246,7 +275,11 @@ described above. `--experimental-keyboard-hook` opts into the experimental
 hook in a build containing it; inherited hook settings are otherwise discarded.
 With a synthetic-input diagnostic build, add `--synthetic-input` along with
 `--experimental-keyboard-hook` to opt into the held synthetic key presses.
-Inherited synthetic-input settings are also discarded.
+Alternatively, use `--synthetic-input-script
+remastered-boot-menu-to-gameplay-v1` with
+`--experimental-keyboard-hook --edition remastered` for deterministic
+poll-epoch navigation; the legacy and scripted modes are mutually exclusive.
+Inherited synthetic-input and headless-audio settings are discarded.
 Keep the output directory, including logs, saves and any
 guest data, private. A missing sandbox or failed isolation check aborts before
 guest execution.
@@ -255,9 +288,12 @@ guest execution.
 `original`; inherited edition values are discarded. After each bounded run,
 the runner reads only the fixed-format ocean-marker summaries from the private
 guest logs and prints aggregate received, batch-scope and rejected counts.
-Each boot contributes its final cumulative summary. Missing summaries are
-reported as zero observed ocean coverage, while malformed, non-monotonic,
-excessive or out-of-range summaries fail closed. Guest logs remain private.
+When `--gpu-audit` is active, it also prints aggregate fingerprinted-batch,
+distinct-hash, overflow, and within-scope mismatch counts without disclosing
+hash values. Each boot contributes its final cumulative summary. Missing
+summaries are reported as zero observed coverage, while malformed,
+non-monotonic, excessive, inconsistent, or out-of-range summaries fail
+closed. Guest logs remain private.
 
 ## Windows
 

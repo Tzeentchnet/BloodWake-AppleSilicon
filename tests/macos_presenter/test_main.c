@@ -9,12 +9,23 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <sys/mman.h>
 #include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
 
 #include "../../src/toolkit_patches/video/bw_framebuffer_metal.h"
+
+#if defined(BW_REAL_SETTINGS_PANEL_TEST)
+#include <limits.h>
+#include <sys/stat.h>
+
+#include "keyboard.h"
+#include "../../src/bw_edition.h"
+#include "../../src/bw_macos_mouse.h"
+#include "../../src/bw_macos_settings_panel.h"
+#endif
 
 #define WIDTH 640u
 #define HEIGHT 480u
@@ -36,6 +47,8 @@ typedef struct {
     atomic_int key_events, focus_events, controller_events, updates, presents;
     atomic_int f1_events, settings_regular_events;
     atomic_int panel_open, panel_toggles, panel_opens, panel_closes, panel_close_calls;
+    atomic_int panel_notifications, panel_open_notifications, panel_close_notifications;
+    atomic_int relative_mode, relative_enables, relative_disables;
     atomic_int gamma_calls, gamma_entered, gamma_release, producer_done;
     atomic_int worker_active, worker_stop, worker_ticks, worker_violation;
     atomic_int memory_dead, late_memory_access, atexit_called;
@@ -77,6 +90,385 @@ static void check_main(void)
     check(pthread_equal(pthread_self(), s_main), "SDL/input call left the main thread");
 }
 
+#if defined(BW_REAL_SETTINGS_PANEL_TEST)
+const bw_fix_info_t g_bw_fixes[BW_FIX_COUNT + 1] = {{0}};
+unsigned char g_bw_fix_on[BW_FIX_COUNT + 1];
+
+int _stricmp(const char *left, const char *right)
+{
+    return strcasecmp(left, right);
+}
+
+int _strnicmp(const char *left, const char *right, size_t count)
+{
+    return strncasecmp(left, right, count);
+}
+
+const char *bw_edition_name(bw_edition_t edition)
+{
+    return edition == BW_ED_REMASTERED ? "remastered" : "original";
+}
+
+const char *bw_edition_title(bw_edition_t edition)
+{
+    return edition == BW_ED_REMASTERED ? "Remastered" : "Original";
+}
+
+int bw_edition_parse(const char *value, bw_edition_t *out)
+{
+    if (!out)
+        return -1;
+    if (!value || !*value || !strcmp(value, "original")) {
+        *out = BW_ED_ORIGINAL;
+        return 0;
+    }
+    if (!strcmp(value, "remastered")) {
+        *out = BW_ED_REMASTERED;
+        return 0;
+    }
+    return -1;
+}
+
+typedef struct {
+    char current[32];
+    char pending[32];
+    int apply_calls;
+    int fail_apply;
+} PanelRuntimeSetting;
+
+static PanelRuntimeSetting s_panel_lod = {"far", "", 0, 0};
+static PanelRuntimeSetting s_panel_af = {"16", "", 0, 0};
+static char s_panel_root[PATH_MAX];
+static char s_panel_settings[PATH_MAX];
+static char s_panel_bad_settings[PATH_MAX];
+static char s_panel_bad_parent[PATH_MAX];
+static char s_panel_temp[PATH_MAX];
+static ino_t s_panel_initial_inode;
+static int s_panel_setup;
+
+static int panel_file_contains(const char *path, const char *needle)
+{
+    FILE *file = fopen(path, "rb");
+    char contents[8192];
+    size_t size;
+    if (!file)
+        return 0;
+    size = fread(contents, 1, sizeof contents - 1, file);
+    fclose(file);
+    contents[size] = 0;
+    return strstr(contents, needle) != NULL;
+}
+
+static int panel_write_text(const char *path, const char *text)
+{
+    FILE *file = fopen(path, "wb");
+    int wrote, closed;
+    if (!file)
+        return 0;
+    wrote = fputs(text, file) >= 0;
+    closed = fclose(file) == 0;
+    return wrote && closed;
+}
+
+static int panel_runtime_get(char *value, size_t value_len, void *context,
+                             char *err, size_t errlen)
+{
+    PanelRuntimeSetting *setting = context;
+    int written;
+    if (!value || !value_len) {
+        if (err && errlen)
+            snprintf(err, errlen, "synthetic current-value buffer is too small");
+        return -1;
+    }
+    written = snprintf(value, value_len, "%s", setting->current);
+    if (written < 0 || (size_t)written >= value_len) {
+        if (err && errlen)
+            snprintf(err, errlen, "synthetic current-value buffer is too small");
+        return -1;
+    }
+    return 0;
+}
+
+static int panel_lod_apply(const char *value, void *context,
+                           char *err, size_t errlen)
+{
+    PanelRuntimeSetting *setting = context;
+    setting->apply_calls++;
+    if (setting->fail_apply) {
+        if (err && errlen)
+            snprintf(err, errlen, "synthetic live LOD rejection");
+        return -1;
+    }
+    snprintf(setting->current, sizeof setting->current, "%s", value);
+    return 0;
+}
+
+static int panel_af_request(const char *value, void *context,
+                            char *err, size_t errlen)
+{
+    PanelRuntimeSetting *setting = context;
+    (void)err;
+    (void)errlen;
+    setting->apply_calls++;
+    snprintf(setting->pending, sizeof setting->pending, "%s", value);
+    return 0;
+}
+
+static void panel_check_first_open(void)
+{
+    bw_macos_settings_panel_test_state_t state;
+    bw_macos_settings_panel_test_row_t row;
+    struct stat current;
+    char error[1024] = {0};
+
+    check(bw_macos_settings_panel_test_state(&state) == 0,
+          "test seam reads the real AppKit controller");
+    check(state.controller_created && state.panel_created && state.visible,
+          "F1 creates and shows a real NSPanel");
+    check(state.main_thread, "the AppKit panel is owned by the process main thread");
+    check(state.row_count == bw_settings_count(),
+          "the panel creates one control for every schema setting");
+    check(state.no_pause_notice,
+          "the panel keeps the explicit gameplay-continues no-pause policy");
+    check(xbox_FramebufferKeyDown('A'),
+          "guest input is held before the presenter releases focus");
+    check(xbox_FramebufferKeyDown(XBOX_VK_RBUTTON) &&
+          bw_macos_mouse_captured() && atomic_load(&s->relative_mode),
+          "relative mouse capture is active before the F1 release path");
+
+    check(bw_macos_settings_panel_test_row("graphics", "antialiasing", &row) == 0,
+          "unsupported Metal control is present");
+    check(!row.enabled &&
+          row.apply_kind == BW_MACOS_SETTINGS_UNSUPPORTED &&
+          strstr(row.status, "Unavailable") &&
+          strstr(row.status, "Metal MSAA is not implemented") &&
+          strstr(row.support_reason, "Metal MSAA is not implemented"),
+          "unsupported control is disabled with its schema reason visible");
+
+    check(bw_macos_settings_panel_test_row("graphics", "draw_distance", &row) == 0 &&
+          row.enabled && row.apply_kind == BW_MACOS_SETTINGS_LIVE &&
+          !strcmp(row.value, "far") &&
+          strstr(row.status, "applies immediately"),
+          "live LOD control reflects its callback and apply mode");
+    check(bw_macos_settings_panel_test_select("graphics", "draw_distance",
+                                              "farther") == 0,
+          "LOD choice uses the actual AppKit control action");
+    check(s_panel_lod.apply_calls == 1 &&
+          !strcmp(s_panel_lod.current, "farther"),
+          "live LOD callback receives the selected value");
+    check(bw_macos_settings_panel_test_row("graphics", "draw_distance", &row) == 0 &&
+          !strcmp(row.value, "farther") &&
+          strstr(row.status, "applied immediately"),
+          "successful live apply is visible in the row");
+    check(stat(s_panel_settings, &current) == 0 &&
+          current.st_ino != s_panel_initial_inode,
+          "successful save atomically replaces the settings file");
+    check(access(s_panel_temp, F_OK) != 0 &&
+          panel_file_contains(s_panel_settings, "draw_distance=farther") &&
+          panel_file_contains(s_panel_settings, "SYNTHETIC_KEEP=preserved"),
+          "atomic save leaves no temporary file and preserves unknown settings");
+
+    check(bw_macos_settings_panel_test_row("graphics", "texture_filtering", &row) == 0 &&
+          row.enabled && row.apply_kind == BW_MACOS_SETTINGS_FRAME &&
+          !strcmp(row.value, "16") &&
+          strstr(row.status, "next frame"),
+          "anisotropy control is available as frame-boundary state");
+    check(bw_macos_settings_panel_test_select("graphics", "texture_filtering",
+                                              "8") == 0,
+          "anisotropy choice uses the actual AppKit control action");
+    check(s_panel_af.apply_calls == 1 &&
+          !strcmp(s_panel_af.pending, "8") &&
+          !strcmp(s_panel_af.current, "16"),
+          "frame-boundary callback records a request without mutating active AF");
+    check(bw_macos_settings_panel_test_row("graphics", "texture_filtering", &row) == 0 &&
+          strstr(row.status, "queued for the next frame"),
+          "frame-boundary request is visibly queued");
+
+    check(bw_macos_settings_panel_test_row("display", "mode", &row) == 0 &&
+          row.enabled && row.apply_kind == BW_MACOS_SETTINGS_RESTART &&
+          strstr(row.status, "Restart required"),
+          "restart-required control is available");
+    check(bw_macos_settings_panel_test_select("display", "mode",
+                                              "fullscreen") == 0 &&
+          bw_macos_settings_panel_test_row("display", "mode", &row) == 0 &&
+          !strcmp(row.value, "fullscreen") &&
+          strstr(row.status, "restart required"),
+          "restart-required choice remains visibly pending");
+
+    check(setenv("BW_SETTINGS", s_panel_bad_settings, 1) == 0,
+          "install isolated failing settings path");
+    check(bw_macos_settings_panel_test_select("display", "mode", "window") == 0,
+          "save failure is exercised through the AppKit control");
+    check(bw_macos_settings_panel_test_row("display", "mode", &row) == 0 &&
+          !strcmp(row.value, "fullscreen"),
+          "failed save restores the last persisted selection");
+    check(bw_macos_settings_panel_test_visible_error(error, sizeof error) &&
+          (strstr(error, "could not read settings file") ||
+           strstr(error, "could not create temporary settings file")),
+          "save failure is presented as an attached AppKit error sheet");
+    bw_macos_settings_panel_test_dismiss_error();
+    check(!bw_macos_settings_panel_test_visible_error(error, sizeof error),
+          "save error sheet can be dismissed without user interaction");
+    check(setenv("BW_SETTINGS", s_panel_settings, 1) == 0,
+          "restore isolated writable settings path");
+
+    s_panel_lod.fail_apply = 1;
+    check(bw_macos_settings_panel_test_select("graphics", "draw_distance",
+                                              "4") == 0,
+          "live apply failure is exercised through the AppKit control");
+    check(s_panel_lod.apply_calls == 2 &&
+          !strcmp(s_panel_lod.current, "farther"),
+          "failed live callback leaves the active LOD unchanged");
+    check(bw_macos_settings_panel_test_row("graphics", "draw_distance", &row) == 0 &&
+          !strcmp(row.value, "4") &&
+          strstr(row.status, "live apply failed"),
+          "saved-but-not-applied state remains visible in the row");
+    memset(error, 0, sizeof error);
+    check(bw_macos_settings_panel_test_visible_error(error, sizeof error) &&
+          strstr(error, "Saved for the next launch") &&
+          strstr(error, "synthetic live LOD rejection"),
+          "apply failure is presented as an attached AppKit error sheet");
+    check(panel_file_contains(s_panel_settings, "draw_distance=4") &&
+          access(s_panel_temp, F_OK) != 0,
+          "apply failure still leaves the atomic save available for restart");
+    bw_macos_settings_panel_test_dismiss_error();
+    s_panel_lod.fail_apply = 0;
+}
+
+static void panel_lifecycle_changed(int open, void *context)
+{
+    bw_macos_settings_panel_test_state_t state;
+    bw_macos_settings_panel_test_row_t row;
+    int opens;
+    (void)context;
+    check_main();
+    atomic_fetch_add(&s->panel_notifications, 1);
+    if (open) {
+        opens = atomic_fetch_add(&s->panel_open_notifications, 1) + 1;
+        if (opens == 1) {
+            panel_check_first_open();
+        } else if (opens == 2) {
+            check(bw_macos_settings_panel_test_state(&state) == 0 &&
+                  state.panel_created && state.visible && state.no_pause_notice,
+                  "second F1 open creates and shows the real panel again");
+            check(xbox_FramebufferKeyDown('C'),
+                  "guest key is held until the second F1 focus release");
+            check(bw_macos_settings_panel_test_row("display", "mode", &row) == 0 &&
+                  !strcmp(row.value, "fullscreen"),
+                  "reopened panel reads the restart-pending persisted value");
+            check(bw_macos_settings_panel_test_row("graphics", "draw_distance", &row) == 0 &&
+                  !strcmp(row.value, "farther"),
+                  "reopened live control reflects active LOD after failed apply");
+            check(bw_macos_settings_panel_test_row("graphics", "texture_filtering", &row) == 0 &&
+                  !strcmp(row.value, "16"),
+                  "reopened frame control reflects active AF before frame activation");
+        } else {
+            check(0, "unexpected extra panel open");
+        }
+    } else {
+        atomic_fetch_add(&s->panel_close_notifications, 1);
+        check(bw_macos_settings_panel_test_state(&state) == 0 &&
+              state.controller_created && !state.panel_created && !state.visible,
+              "second non-repeat F1 closes and releases the real NSPanel");
+        check(!xbox_FramebufferKeyDown('A') &&
+              !xbox_FramebufferKeyDown('B') &&
+              !xbox_FramebufferKeyDown(XBOX_VK_RBUTTON),
+              "opening F1 released held guest input and blocked panel-time input");
+        check(!bw_macos_mouse_captured() &&
+              !atomic_load(&s->relative_mode) &&
+              atomic_load(&s->relative_disables) == 1,
+              "opening F1 released relative mouse capture");
+    }
+}
+
+static void *panel_toggle_off_main(void *arg)
+{
+    int *result = arg;
+    *result = bw_macos_settings_panel_toggle();
+    return NULL;
+}
+
+static int panel_window_server_available(void)
+{
+    return bw_macos_settings_panel_test_window_server_available();
+}
+
+static int panel_integration_setup(void)
+{
+    struct timespec stamp;
+    struct stat initial;
+    pthread_t thread;
+    char cwd[PATH_MAX];
+    char error[512] = {0};
+    int off_main_result = 0;
+
+    if (!getcwd(cwd, sizeof cwd) ||
+        clock_gettime(CLOCK_REALTIME, &stamp) != 0)
+        return 0;
+    if (snprintf(s_panel_root, sizeof s_panel_root,
+                 "%s/presenter-panel-%lu-%ld", cwd,
+                 (unsigned long)getpid(), stamp.tv_nsec) >=
+        (int)sizeof s_panel_root ||
+        snprintf(s_panel_settings, sizeof s_panel_settings,
+                 "%s/settings.ini", s_panel_root) >=
+        (int)sizeof s_panel_settings ||
+        snprintf(s_panel_bad_parent, sizeof s_panel_bad_parent,
+                 "%s/not-a-directory", s_panel_root) >=
+        (int)sizeof s_panel_bad_parent ||
+        snprintf(s_panel_bad_settings, sizeof s_panel_bad_settings,
+                 "%s/settings.ini", s_panel_bad_parent) >=
+        (int)sizeof s_panel_bad_settings ||
+        snprintf(s_panel_temp, sizeof s_panel_temp, "%s.tmp.%lu",
+                 s_panel_settings, (unsigned long)getpid()) >=
+        (int)sizeof s_panel_temp)
+        return 0;
+    if (mkdir(s_panel_root, 0700) != 0)
+        return 0;
+    s_panel_setup = 1;
+    if (!panel_write_text(s_panel_settings,
+                          "[advanced]\nSYNTHETIC_KEEP=preserved\n") ||
+        !panel_write_text(s_panel_bad_parent, "not a directory") ||
+        stat(s_panel_settings, &initial) != 0)
+        return 0;
+    s_panel_initial_inode = initial.st_ino;
+    if (setenv("BW_SETTINGS", s_panel_settings, 1) != 0 ||
+        setenv("BW_MOUSE", "1", 1) != 0 ||
+        setenv("BW_MOUSE_CAPTURE", "hold", 1) != 0 ||
+        bw_macos_mouse_init_from_env(error, sizeof error) != 0)
+        return 0;
+    if (bw_settings_runtime_register("graphics", "draw_distance",
+                                     panel_runtime_get, panel_lod_apply,
+                                     &s_panel_lod, error, sizeof error) != 0 ||
+        bw_settings_runtime_register("graphics", "texture_filtering",
+                                     panel_runtime_get, panel_af_request,
+                                     &s_panel_af, error, sizeof error) != 0)
+        return 0;
+    bw_macos_settings_panel_test_set_lifecycle_callback(
+        panel_lifecycle_changed, NULL);
+    if (pthread_create(&thread, NULL, panel_toggle_off_main,
+                       &off_main_result) != 0)
+        return 0;
+    pthread_join(thread, NULL);
+    check(off_main_result == -1,
+          "off-main panel lifecycle calls are rejected");
+    return 1;
+}
+
+static void panel_integration_cleanup(void)
+{
+    if (s_panel_setup) {
+        unlink(s_panel_temp);
+        unlink(s_panel_settings);
+        unlink(s_panel_bad_parent);
+        rmdir(s_panel_root);
+    }
+    unsetenv("BW_SETTINGS");
+    unsetenv("BW_MOUSE");
+    unsetenv("BW_MOUSE_CAPTURE");
+}
+#endif
+
+#if !defined(BW_REAL_SETTINGS_PANEL_TEST)
 int bw_macos_settings_panel_toggle(void)
 {
     int was_open;
@@ -101,6 +493,7 @@ void bw_macos_settings_panel_close(void)
     if (atomic_exchange(&s->panel_open, 0))
         atomic_fetch_add(&s->panel_closes, 1);
 }
+#endif
 
 int bw_metal_backend_attach_presenter(void *layer, uint32_t width,
                                       uint32_t height, int vsync)
@@ -199,6 +592,7 @@ void xbox_InputSetMainPump(int on)
     atomic_store(&s->pump, on);
 }
 
+#if !defined(BW_REAL_SETTINGS_PANEL_TEST)
 void xbox_InputSdlInit(void)
 {
     check_main();
@@ -226,6 +620,21 @@ void xbox_InputSdlEvent(const SDL_Event *event)
     if (event->type == SDL_CONTROLLERDEVICEADDED)
         atomic_fetch_add(&s->controller_events, 1);
 }
+#else
+void xbox_InputInit(void)
+{
+    check_main();
+    check(atomic_load(&s->pump) == 1,
+          "main pump set before input enumeration");
+    sleep_ms(10);
+    atomic_store(&s->input_ready, 1);
+}
+
+void bw_InputRefreshControllers(void)
+{
+    check_main();
+}
+#endif
 
 int bw_test_pthread_create(pthread_t *thread, const pthread_attr_t *attr,
                            void *(*entry)(void *), void *arg)
@@ -263,6 +672,30 @@ const char * SDLCALL SDL_GetCurrentVideoDriver(void)
 }
 
 const char * SDLCALL SDL_GetError(void) { return "injected SDL failure"; }
+
+#if defined(BW_REAL_SETTINGS_PANEL_TEST)
+void SDLCALL SDL_StopTextInput(void)
+{
+    check_main();
+}
+
+int SDLCALL SDL_SetRelativeMouseMode(SDL_bool enabled)
+{
+    check_main();
+    atomic_store(&s->relative_mode, enabled == SDL_TRUE);
+    atomic_fetch_add(enabled == SDL_TRUE ? &s->relative_enables
+                                        : &s->relative_disables, 1);
+    return 0;
+}
+
+int SDLCALL SDL_ShowCursor(int toggle)
+{
+    check_main();
+    check(toggle == (atomic_load(&s->relative_mode) ? SDL_DISABLE : SDL_ENABLE),
+          "cursor visibility follows relative mouse capture");
+    return toggle;
+}
+#endif
 
 SDL_Window * SDLCALL SDL_CreateWindow(const char *title, int x, int y, int w, int h,
                                       Uint32 flags)
@@ -620,6 +1053,27 @@ static void push_settings_panel_events(void)
     push_key_event(SDL_KEYUP, SDLK_F1, 0);
 }
 
+#if defined(BW_REAL_SETTINGS_PANEL_TEST)
+static void push_settings_panel_integration_events(void)
+{
+    SDL_Event event;
+    push_key_event(SDL_KEYDOWN, SDLK_a, 0);
+    memset(&event, 0, sizeof event);
+    event.type = SDL_MOUSEBUTTONDOWN;
+    event.button.button = SDL_BUTTON_RIGHT;
+    SDL_PushEvent(&event);
+    push_key_event(SDL_KEYDOWN, SDLK_F1, 0);
+    push_key_event(SDL_KEYDOWN, SDLK_F1, 1);
+    push_key_event(SDL_KEYDOWN, SDLK_b, 0);
+    push_key_event(SDL_KEYUP, SDLK_F1, 0);
+    push_key_event(SDL_KEYDOWN, SDLK_F1, 0);
+    push_key_event(SDL_KEYDOWN, SDLK_c, 0);
+    push_key_event(SDL_KEYDOWN, SDLK_F1, 0);
+    push_key_event(SDL_KEYDOWN, SDLK_F1, 1);
+    push_key_event(SDL_KEYUP, SDLK_F1, 0);
+}
+#endif
+
 static uint8_t sample_base(unsigned channel, unsigned x, unsigned y)
 {
     static const unsigned start[3] = {11, 37, 73};
@@ -849,6 +1303,12 @@ static int guest_main(void)
         push_settings_panel_events();
         return 37;
     }
+#if defined(BW_REAL_SETTINGS_PANEL_TEST)
+    if (is_case("settings-panel-integration")) {
+        push_settings_panel_integration_events();
+        return 37;
+    }
+#endif
     if (is_case("close")) {
         SDL_Event event;
         check(pthread_create(&s_worker, NULL, usb_worker, NULL) == 0, "start USB-like worker");
@@ -939,6 +1399,14 @@ int main(int argc, char **argv)
     if (argc != 2)
         return 2;
     s_case = argv[1];
+#if defined(BW_REAL_SETTINGS_PANEL_TEST)
+    if (is_case("settings-panel-integration") &&
+        !panel_window_server_available()) {
+        fprintf(stderr,
+                "SKIP settings-panel-integration: no active macOS WindowServer session\n");
+        return 77;
+    }
+#endif
     s_main = pthread_self();
     s = mmap(NULL, sizeof *s, PROT_READ | PROT_WRITE, MAP_ANON | MAP_SHARED, -1, 0);
     if (s == MAP_FAILED)
@@ -952,6 +1420,15 @@ int main(int argc, char **argv)
         setenv("RECOMP_FB_WINDOW", "0", 1);
     if (is_case("metal-direct"))
         bw_sdl_framebuffer_expect_metal();
+#if defined(BW_REAL_SETTINGS_PANEL_TEST)
+    if (is_case("settings-panel-integration") &&
+        !panel_integration_setup()) {
+        fprintf(stderr, "FAIL settings-panel-integration: setup failed\n");
+        panel_integration_cleanup();
+        munmap(s, sizeof *s);
+        return 2;
+    }
+#endif
 
     if (runtime_case()) {
         pid_t child = fork();
@@ -1043,6 +1520,33 @@ int main(int argc, char **argv)
                 check(atomic_load(&s->settings_regular_events) == 2,
                       "guest keyboard input is blocked only while the panel is active");
             }
+#if defined(BW_REAL_SETTINGS_PANEL_TEST)
+            if (is_case("settings-panel-integration")) {
+                bw_macos_settings_panel_test_state_t state;
+                check(atomic_load(&s->panel_notifications) == 3 &&
+                      atomic_load(&s->panel_open_notifications) == 2 &&
+                      atomic_load(&s->panel_close_notifications) == 1,
+                      "only non-repeat F1 key-downs toggle the real panel");
+                check(bw_macos_settings_panel_test_state(&state) == 0 &&
+                      state.controller_created && !state.panel_created &&
+                      !state.visible && state.row_count == 0,
+                      "presenter shutdown closes and releases the real panel");
+                check(!xbox_FramebufferKeyDown(XBOX_VK_F1) &&
+                      !xbox_FramebufferKeyDown('A') &&
+                      !xbox_FramebufferKeyDown('B') &&
+                      !xbox_FramebufferKeyDown('C'),
+                      "F1 down/repeat/up are consumed and focus releases guest keys");
+                check(atomic_load(&s->relative_enables) == 1 &&
+                      atomic_load(&s->relative_disables) == 1 &&
+                      !bw_macos_mouse_captured(),
+                      "relative mouse mode is entered once and released by F1");
+                check(panel_file_contains(s_panel_settings, "mode=fullscreen") &&
+                      panel_file_contains(s_panel_settings, "texture_filtering=8") &&
+                      panel_file_contains(s_panel_settings, "draw_distance=4") &&
+                      access(s_panel_temp, F_OK) != 0,
+                      "isolated settings contain every successful panel save");
+            }
+#endif
             if (is_case("blocked-copy"))
                 check(atomic_load(&s->gamma_release),
                       "host waits for the in-flight snapshot before returning");
@@ -1066,6 +1570,10 @@ int main(int argc, char **argv)
         }
     }
     rc = atomic_load(&s->errors) ? 1 : 0;
+#if defined(BW_REAL_SETTINGS_PANEL_TEST)
+    if (is_case("settings-panel-integration"))
+        panel_integration_cleanup();
+#endif
     munmap(s, sizeof *s);
     return rc;
 }

@@ -87,6 +87,7 @@ add_library(bw_mmio_real_apu STATIC
     ../../src/toolkit_patches/apu/apu_vp.c
     ../../src/toolkit_patches/apu/apu_dsp.c
     ../../src/toolkit_patches/apu/bw_apu_xdsp.c
+    ../../src/toolkit_patches/apu/bw_audio_audit.c
     ../../src/toolkit_patches/apu/apu_sdl2.c
     ../../src/toolkit_patches/apu/apu_xaudio2.c
     "${XBOXRECOMP_DIR}/src/apu/apu_wav.c"

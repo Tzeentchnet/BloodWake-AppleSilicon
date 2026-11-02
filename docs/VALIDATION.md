@@ -1,6 +1,6 @@
 # Apple Silicon validation
 
-Updated 2026-11-01. This document records measured behavior and regression
+Updated 2026-11-02. This document records measured behavior and regression
 coverage. Implementation history is in
 [WORK_COMPLETED.md](WORK_COMPLETED.md), and current priorities are in
 [APPLE_SILICON_HANDOFF.md](APPLE_SILICON_HANDOFF.md).
@@ -76,6 +76,16 @@ wall-clock performance evidence.
 - Audible retail output, sustained gameplay, underruns, latency, and channel
   quality have not yet been confirmed; the bounded boot establishes device and
   guest activity, not audible correctness.
+- A diagnostic-only headless sink now keeps the title's APU/DSP path and
+  48 kHz stereo cadence active without opening CoreAudio. It retains no sample
+  data and is accepted only through the bounded native diagnostic runner; it
+  cannot be combined with disabled audio or sample-data writers.
+- In the scripted three-boot Remastered run, periodic audit reports observed
+  nonzero RMS and peaks in both channels with no clipping, queue overflow, or
+  internal audit failure. The analytical queue did record
+  scheduling underflows. These aggregates validate generated signal and
+  accounting only; they do not validate audible output, device latency, or
+  sound quality.
 
 ## Current regression coverage
 
@@ -87,14 +97,18 @@ wall-clock performance evidence.
   collapse, exact guest seeding, weighted box-filter readback, scaled colour
   and depth scissors, invalid scale rejection, SSAA minimum handling, and a
   live 1x-to-2x resize with depth/stencil preservation.
-- The macOS presenter suite passes 61/61 tests, including direct Metal
-  attachment, resize propagation, confirmation that direct mode skips CPU
-  gamma and SDL texture upload, F1 edge/repeat consumption, guest-input
-  release, panel lifecycle, and schema-driven panel-model behavior.
+- The macOS presenter suite has 62 CTest entries. In the current non-
+  WindowServer test context, 61 pass and the real-window AppKit integration
+  case skips explicitly. Coverage includes direct Metal attachment, resize
+  propagation, confirmation that direct mode skips CPU gamma and SDL texture
+  upload, F1 down/repeat/up consumption, guest-input and relative-mouse
+  release, main-thread panel/controller lifecycle, live LOD, frame-boundary
+  filtering, restart-pending state, atomic save, and visible apply/save errors.
 - The input integration suite passes 11/11 tests, including gameplay mouse
   capture, one-shot delta consumption, sensitivity/inversion/stick mapping,
-  focus-loss clearing, keyboard/controller coexistence, hotplug, slots, and
-  concurrent polling.
+  focus-loss clearing, keyboard/controller coexistence, hotplug, slots,
+  concurrent polling, and deterministic synthetic-script packet edges,
+  completion, cancellation, and reselection.
 - The hook-portability suite passes 9/9 tests, including the validated ocean
   marker boundary and retail fallback. Metal backend coverage verifies
   marked/unmarked batches, 4,096-marker coalescing into one scope,
@@ -109,23 +123,23 @@ wall-clock performance evidence.
 - The standalone Metal MSAA smoke target passes 2/2 tests. The recorded Apple
   M5 passes synthetic 2x/4x/8x color, depth/stencil, resolve, readback, and
   explicit error checks; this is not game-renderer or visual evidence.
-- The focused macOS diagnostic suite passes 34/34 tests, including strict
-  edition selection, bounded marker-summary parsing, typed relaunch outcomes,
-  integrity-failure precedence, boot-cap reporting, and explicit audio
-  isolation with default audio preserved.
+- The focused macOS diagnostic suite passes 40/40 tests, including strict
+  edition and built-in script selection, bounded marker/fingerprint summary
+  parsing, typed relaunch outcomes, integrity-failure precedence, boot-cap
+  reporting, explicit audio isolation, and strict headless-audit authorization
+  with default audio preserved.
 - Nine LOD cases cover Original passthrough, defaults, disable/fix override,
   custom/clamped values, live changes, invalid rejection, and concurrent
   readers/writers.
 - The standalone Metal smoke test passes, and the Release native `bloodwake`
   target builds successfully with the direct presenter and scaled-target path.
 - Focused Metal cases have also passed with ASan/UBSan and Metal validation.
-- The diagnostic runner passed 45 Python tests, including bounded execution,
-  isolation, relaunch validation, and output handling.
-- The focused native diagnostic file passed 22/22 after adding host-audio
-  environment isolation.
 - The macOS host suite passed 8/8 normally and under ASan/UBSan. Under TSan,
   seven cases passed and the existing nested-signal case was skipped because
-  the sanitizer blocks that delivery. The APU output suite passed 4/4.
+  the sanitizer blocks that delivery. The expanded APU/audio suite passed 6/6
+  normally, under ASan/UBSan, and under TSan.
+- The support/settings suite passes 13/13. Both the keyboard-experiment and
+  synthetic-input native Release targets build successfully.
 - Host, presenter, virtual-input, and audio/DSP suites passed their normal and
   focused sanitizer runs; presenter and input also passed focused TSan runs.
 - The new production APU fault and native audio lifecycle cases pass normal,
@@ -136,7 +150,7 @@ wall-clock performance evidence.
 - The DMA ownership suite passed 13 tests normally and under focused TSan and
   ASan/UBSan runs.
 - The guest-memory inventory passed 21 synthetic tests, and the complete
-  Python suite now passes 103/103.
+  Python suite now passes 109/109.
 - The synthetic GPU capture suite passed 11 tests normally and under
   ASan/UBSan, with four focused TSan cases.
 - Windows and x86 execution were not validated on the Apple Silicon host.
@@ -173,11 +187,26 @@ lifetime in the exercised boot flow; representative calm/storm, day/night,
 shore, split-screen, reflection, and wake coverage remains outstanding.
 
 After adding marker-only metadata fingerprints, two audio-enabled private
-attempts stopped before guest execution because CoreAudio could not start. The
-explicit audio-isolation path then booted successfully, but automated and
-synthetic input did not reach an ocean scene. The private audit correctly
-reported zero hashes, zero overflow, and zero mismatches. No real-scene
-fingerprint stability claim is recorded; hands-on scene coverage is required.
+attempts stopped before guest execution because CoreAudio could not start. An
+audio-disabled boot succeeded but changed title progression and did not reach
+an ocean scene. The diagnostic-only headless audio sink then preserved guest
+audio timing while a built-in poll-epoch script navigated Remastered from boot
+through menu input into gameplay:
+
+- Three boots completed and two validated same-title relaunches were followed.
+- The run stopped at its intentional boot limit with exit status 124.
+- The script completed its distinct Start, D-pad Down, and A press/release
+  sequence in the relevant boots without OS-generated input.
+- The aggregate contained 12,670 ocean markers, 154 scopes, and zero rejected
+  markers.
+- It contained 297 fingerprinted batches across 10 distinct aggregate hashes,
+  with zero table-overflow batches and zero within-scope mismatches.
+- Prepared-tree, toolkit, and executable integrity remained unchanged.
+
+This demonstrates marker ordering and fingerprint consistency in the
+automated boot-to-gameplay path. It does not establish visual correctness
+across calm/storm, day/night, shore, split-screen, reflection, wakes, or every
+mission. Actual hash values and all private logs remain uncommitted.
 
 ## Integrity and privacy
 

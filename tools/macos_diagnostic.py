@@ -25,6 +25,7 @@ MAX_RELAUNCH_BYTES = 16 + 260 + 3072
 MAX_RELAUNCH_BOOTS = 16
 SANDBOX = "/usr/bin/sandbox-exec"
 EDITIONS = ("original", "remastered")
+SYNTHETIC_INPUT_SCRIPTS = ("remastered-boot-menu-to-gameplay-v1",)
 OCEAN_MARKER_PREFIX = b"[GPU] ocean draw markers:"
 OCEAN_MARKER_PATTERN = re.compile(
     rb"\[GPU\] ocean draw markers: ([0-9]{1,20}) received, "
@@ -32,6 +33,17 @@ OCEAN_MARKER_PATTERN = re.compile(
 )
 MAX_OCEAN_MARKER_COUNT = (1 << 64) - 1
 MAX_OCEAN_MARKER_SUMMARIES = 4096
+OCEAN_FINGERPRINT_HEADER = (
+    b"== Marked ocean batch fingerprints (v1 FNV-1a-64; stable metadata only)"
+)
+OCEAN_FINGERPRINT_PATTERN = re.compile(
+    rb"  batches ([0-9]{1,20}), hashes ([0-9]{1,2})/32, "
+    rb"table-overflow batches ([0-9]{1,20}), "
+    rb"within-scope mismatches ([0-9]{1,20})"
+)
+OCEAN_FINGERPRINT_HASH_PATTERN = re.compile(
+    rb"  ([0-9A-F]{16}) +([0-9]{1,20}) batches"
+)
 
 
 @dataclass(frozen=True)
@@ -228,11 +240,20 @@ def verify_sandbox(profile, output, protected):
 
 def diagnostic_env(output, game_dir, seconds, quincunx, audit, input_fd, output_fd,
                    audit_name="gpu-audit.txt", keyboard_hook=False, synthetic_input=False,
-                   edition="original", disable_audio=False):
-    if synthetic_input and not keyboard_hook:
+                   edition="original", disable_audio=False, synthetic_input_script=None,
+                   audio_audit=False):
+    if (synthetic_input or synthetic_input_script) and not keyboard_hook:
         raise ValueError("synthetic input requires the experimental keyboard hook")
+    if synthetic_input and synthetic_input_script:
+        raise ValueError("legacy synthetic input and a synthetic input script are mutually exclusive")
+    if synthetic_input_script not in (None, *SYNTHETIC_INPUT_SCRIPTS):
+        raise ValueError("unknown synthetic input script")
     if edition not in EDITIONS:
         raise ValueError("edition must be original or remastered")
+    if synthetic_input_script and edition != "remastered":
+        raise ValueError("the synthetic input script requires the remastered edition")
+    if disable_audio and audio_audit:
+        raise ValueError("headless audio audit requires audio to remain enabled")
     env = {
         "PATH": "/usr/bin:/bin:/usr/sbin:/sbin",
         "HOME": str(output / "home"),
@@ -244,6 +265,7 @@ def diagnostic_env(output, game_dir, seconds, quincunx, audit, input_fd, output_
         "BW_GAME_DIR": str(game_dir),
         "BW_EDITION": edition,
         "BW_RUN_SECONDS": str(seconds),
+        "BW_NATIVE_DIAGNOSTIC": "1",
         "BW_NATIVE_CHILD": "1",
         "BW_NATIVE_LAUNCH_IN_FD": str(input_fd),
         "BW_NATIVE_LAUNCH_OUT_FD": str(output_fd),
@@ -254,8 +276,12 @@ def diagnostic_env(output, game_dir, seconds, quincunx, audit, input_fd, output_
         env["BW_MACOS_KEYBOARD_HOOK"] = "1"
     if synthetic_input:
         env["BW_SYNTHETIC_INPUT_DIAGNOSTIC"] = "1"
+    if synthetic_input_script:
+        env["BW_SYNTHETIC_INPUT_SCRIPT"] = synthetic_input_script
     if disable_audio:
         env["BW_MACOS_AUDIO"] = "0"
+    if audio_audit:
+        env["BW_HEADLESS_AUDIO_AUDIT"] = "1"
     if audit:
         env["BW_GPU_AUDIT"] = "1"
         env["BW_GPU_AUDIT_EVERY"] = "5"
@@ -330,7 +356,8 @@ def validate_relaunch(data):
 def run_guest_once(executable, output, game_dir, profile, seconds, quincunx, audit,
                    launch=b"", log_name="guest.log", audit_name="gpu-audit.txt",
                    timeout=None, log_limit=None, keyboard_hook=False, synthetic_input=False,
-                   edition="original", disable_audio=False):
+                   edition="original", disable_audio=False, synthetic_input_script=None,
+                   audio_audit=False):
     input_read = input_write = output_read = output_write = -1
     child = None
     try:
@@ -351,7 +378,8 @@ def run_guest_once(executable, output, game_dir, profile, seconds, quincunx, aud
         os.close(input_write)
         input_write = -1
         env = diagnostic_env(output, game_dir, seconds, quincunx, audit, input_read, output_write,
-                             audit_name, keyboard_hook, synthetic_input, edition, disable_audio)
+                             audit_name, keyboard_hook, synthetic_input, edition, disable_audio,
+                             synthetic_input_script, audio_audit)
         with open(output / log_name, "xb") as log:
             child = subprocess.Popen(
                 [SANDBOX, "-p", profile, str(executable), "--bw-native-child"],
@@ -382,11 +410,13 @@ def run_guest_once(executable, output, game_dir, profile, seconds, quincunx, aud
 
 def run_guest(executable, output, game_dir, profile, seconds, quincunx, audit,
               keyboard_hook=False, synthetic_input=False, edition="original",
-              disable_audio=False):
+              disable_audio=False, synthetic_input_script=None, audio_audit=False):
     result, relaunch, _ = run_guest_once(executable, output, game_dir, profile,
                                          seconds, quincunx, audit, keyboard_hook=keyboard_hook,
                                          synthetic_input=synthetic_input, edition=edition,
-                                         disable_audio=disable_audio)
+                                         disable_audio=disable_audio,
+                                         synthetic_input_script=synthetic_input_script,
+                                         audio_audit=audio_audit)
     if relaunch:
         (output / "relaunch.bin").write_bytes(relaunch)
         print("Guest requested a relaunch; request saved privately, not executed")
@@ -395,7 +425,8 @@ def run_guest(executable, output, game_dir, profile, seconds, quincunx, audit,
 
 def run_guest_relaunches(executable, output, game_dir, profile, seconds, quincunx,
                          audit, max_boots, total_seconds, keyboard_hook=False,
-                         synthetic_input=False, edition="original", disable_audio=False):
+                         synthetic_input=False, edition="original", disable_audio=False,
+                         synthetic_input_script=None, audio_audit=False):
     deadline = time.monotonic() + total_seconds
     log_remaining = MAX_LOG_BYTES
     launch = b""
@@ -410,7 +441,8 @@ def run_guest_relaunches(executable, output, game_dir, profile, seconds, quincun
             audit_name=f"gpu-audit-{boot:03d}.txt",
             timeout=min(seconds + 15, remaining), log_limit=log_remaining,
             keyboard_hook=keyboard_hook, synthetic_input=synthetic_input, edition=edition,
-            disable_audio=disable_audio)
+            disable_audio=disable_audio, synthetic_input_script=synthetic_input_script,
+            audio_audit=audio_audit)
         completed_boots = boot
         log_remaining -= log_size
         if relaunch:
@@ -483,6 +515,87 @@ def report_ocean_marker_counts(log_paths):
     return counts
 
 
+def gpu_audit_paths(output, follow_relaunches, completed_boots, max_boots):
+    if not follow_relaunches:
+        path = output / "gpu-audit.txt"
+        if completed_boots != 1:
+            raise RuntimeError("GPU audit boot count is invalid")
+        return [path] if path.is_file() else []
+
+    paths = sorted(output.glob("gpu-audit-*.txt"))
+    expected = [output / f"gpu-audit-{boot:03d}.txt"
+                for boot in range(1, completed_boots + 1)]
+    if (not 1 <= completed_boots <= max_boots or
+            (paths and paths != expected)):
+        raise RuntimeError("numbered GPU audits are out of sequence")
+    return paths
+
+
+def extract_ocean_fingerprint_counts(audit_paths):
+    batches = overflow = mismatches = 0
+    hashes = set()
+    for path in audit_paths:
+        summary = None
+        file_hashes = set()
+        file_row_batches = 0
+        in_section = False
+        with open(path, "rb") as stream:
+            for line in stream:
+                line = line.rstrip(b"\r\n")
+                if line == OCEAN_FINGERPRINT_HEADER:
+                    if in_section:
+                        raise RuntimeError("GPU audit contains duplicate ocean fingerprint sections")
+                    in_section = True
+                    continue
+                if not in_section:
+                    continue
+                match = OCEAN_FINGERPRINT_PATTERN.fullmatch(line)
+                if match:
+                    if summary is not None or file_hashes:
+                        raise RuntimeError("GPU audit contains misplaced ocean fingerprint summary")
+                    summary = tuple(int(value) for value in match.groups())
+                    continue
+                match = OCEAN_FINGERPRINT_HASH_PATTERN.fullmatch(line)
+                if match:
+                    fingerprint, count = match.groups()
+                    row_batches = int(count)
+                    if (summary is None or fingerprint in file_hashes or
+                            not 1 <= row_batches <= MAX_OCEAN_MARKER_COUNT or
+                            file_row_batches > MAX_OCEAN_MARKER_COUNT - row_batches):
+                        raise RuntimeError("GPU audit contains invalid ocean fingerprint rows")
+                    file_hashes.add(fingerprint)
+                    file_row_batches += row_batches
+                    continue
+                raise RuntimeError("GPU audit contains malformed ocean fingerprint data")
+        if not in_section or summary is None:
+            raise RuntimeError("GPU audit is missing the ocean fingerprint summary")
+        file_batches, file_hash_count, file_overflow, file_mismatches = summary
+        if (file_hash_count != len(file_hashes) or file_hash_count > 32 or
+                any(value > MAX_OCEAN_MARKER_COUNT
+                    for value in (file_batches, file_overflow, file_mismatches)) or
+                file_overflow > file_batches or file_mismatches > file_batches or
+                file_row_batches > file_batches or
+                file_row_batches + file_overflow != file_batches):
+            raise RuntimeError("GPU audit contains inconsistent ocean fingerprint counts")
+        for total, value in ((batches, file_batches), (overflow, file_overflow),
+                             (mismatches, file_mismatches)):
+            if total > MAX_OCEAN_MARKER_COUNT - value:
+                raise RuntimeError("aggregate ocean fingerprint count is out of range")
+        batches += file_batches
+        overflow += file_overflow
+        mismatches += file_mismatches
+        hashes.update(file_hashes)
+    return batches, len(hashes), overflow, mismatches
+
+
+def report_ocean_fingerprint_counts(audit_paths):
+    batches, hashes, overflow, mismatches = extract_ocean_fingerprint_counts(audit_paths)
+    suffix = "" if audit_paths else " (no audit summary; zero observed fingerprint coverage)"
+    print(f"Ocean fingerprints: {batches} batches, {hashes} distinct hashes, "
+          f"{overflow} overflow batches, {mismatches} scope mismatches{suffix}")
+    return batches, hashes, overflow, mismatches
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--exe", required=True, help="separately built native executable")
@@ -496,10 +609,14 @@ def main(argv=None):
     parser.add_argument("--gpu-audit", action="store_true", help="write the private GPU usage summary")
     parser.add_argument("--disable-audio", action="store_true",
                         help="disable native audio for an isolated non-audio diagnostic")
+    parser.add_argument("--headless-audio-audit", action="store_true",
+                        help="use the silent aggregate-only 48 kHz audio diagnostic sink")
     parser.add_argument("--experimental-keyboard-hook", action="store_true",
                         help="opt into the unverified game-specific keyboard hook")
     parser.add_argument("--synthetic-input", action="store_true",
                         help="send synthetic SDL keys to a diagnostic build; no physical keys")
+    parser.add_argument("--synthetic-input-script", choices=SYNTHETIC_INPUT_SCRIPTS,
+                        help="run a built-in poll-epoch input script; no physical keys")
     parser.add_argument("--follow-relaunches", action="store_true",
                         help="follow validated guest relaunches in separately sandboxed boots")
     parser.add_argument("--max-boots", type=int,
@@ -513,6 +630,14 @@ def main(argv=None):
         parser.error("--seconds must be between 1 and 300")
     if args.synthetic_input and not args.experimental_keyboard_hook:
         parser.error("--synthetic-input requires --experimental-keyboard-hook")
+    if args.synthetic_input_script and not args.experimental_keyboard_hook:
+        parser.error("--synthetic-input-script requires --experimental-keyboard-hook")
+    if args.synthetic_input and args.synthetic_input_script:
+        parser.error("--synthetic-input and --synthetic-input-script are mutually exclusive")
+    if args.disable_audio and args.headless_audio_audit:
+        parser.error("--disable-audio and --headless-audio-audit are mutually exclusive")
+    if args.synthetic_input_script and args.edition != "remastered":
+        parser.error("--synthetic-input-script requires --edition remastered")
     if not args.follow_relaunches and (args.max_boots is not None or args.total_seconds is not None):
         parser.error("--max-boots and --total-seconds require --follow-relaunches")
     if args.max_boots is not None and not 1 <= args.max_boots <= MAX_RELAUNCH_BOOTS:
@@ -542,7 +667,10 @@ def main(argv=None):
         executable_hash = digest_file(executable)
         print("Executable SHA-256:", executable_hash)
         print("Diagnostic edition:", args.edition.capitalize())
-        print("Diagnostic audio:", "disabled" if args.disable_audio else "enabled")
+        if args.headless_audio_audit:
+            print("Diagnostic audio: silent headless audit (not audible)")
+        else:
+            print("Diagnostic audio:", "disabled" if args.disable_audio else "enabled")
         result = None
         completed_boots = 0
         boot_limit_reached = False
@@ -557,7 +685,9 @@ def main(argv=None):
                     args.total_seconds if args.total_seconds is not None else 300,
                     keyboard_hook=args.experimental_keyboard_hook,
                     synthetic_input=args.synthetic_input, edition=args.edition,
-                    disable_audio=args.disable_audio)
+                    disable_audio=args.disable_audio,
+                    synthetic_input_script=args.synthetic_input_script,
+                    audio_audit=args.headless_audio_audit)
                 result = relaunch_result.guest_status
                 completed_boots = relaunch_result.completed_boots
                 boot_limit_reached = relaunch_result.boot_limit_reached
@@ -566,7 +696,9 @@ def main(argv=None):
                                    args.quincunx_approx, args.gpu_audit,
                                    keyboard_hook=args.experimental_keyboard_hook,
                                    synthetic_input=args.synthetic_input, edition=args.edition,
-                                   disable_audio=args.disable_audio)
+                                   disable_audio=args.disable_audio,
+                                   synthetic_input_script=args.synthetic_input_script,
+                                   audio_audit=args.headless_audio_audit)
                 completed_boots = 1
         finally:
             changed = snapshot_tree(prepared) != baseline
@@ -577,6 +709,11 @@ def main(argv=None):
         print("Prepared-tree, toolkit and executable integrity unchanged")
         report_ocean_marker_counts(
             guest_log_paths(output, args.follow_relaunches, completed_boots, max_boots))
+        if args.gpu_audit:
+            report_ocean_fingerprint_counts(
+                gpu_audit_paths(output, args.follow_relaunches, completed_boots, max_boots))
+        print(f"Guest boots: {completed_boots}; validated relaunches followed: "
+              f"{completed_boots - 1 if args.follow_relaunches else 0}")
         print("Private diagnostic output:", output)
         if boot_limit_reached:
             print(f"Diagnostic bounded limit reached: --max-boots stopped after "

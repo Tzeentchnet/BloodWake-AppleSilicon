@@ -33,10 +33,13 @@ This is still a development build:
 - A versioned in-stream marker now identifies validated ocean submissions and
   is copied into executor batches without changing retail rendering. A
   four-boot Remastered diagnostic observed 41,348 markers, 512 scoped ocean
-  batches, and zero rejected markers. Marked batches now have a bounded,
-  metadata-only private audit fingerprint; representative hands-on pass
-  coverage remains outstanding. A fail-closed MSAA evidence tool records
-  memory, timing, correctness, and visual-review gates. This Apple M5 reports
+  batches, and zero rejected markers. A later deterministic three-boot,
+  two-relaunch flow reached gameplay with 12,670 markers, 154 clean scopes,
+  and 297 fingerprinted batches across 10 aggregate hashes, with no marker
+  rejection, table overflow, or within-scope mismatch. Representative
+  calm/storm, lighting, shore, split-screen, reflection, and wake coverage
+  remains outstanding. A fail-closed MSAA evidence tool records memory,
+  timing, correctness, and visual-review gates. This Apple M5 reports
   2x/4x/8x capability and passes the standalone color/depth/resolve smoke
   path, but Metal MSAA remains unsupported.
 - Optional gameplay mouse input supports sensitivity, inversion, response,
@@ -45,22 +48,31 @@ This is still a development build:
 - The quincunx approximation is not verified against NV2A hardware.
 - Native guest audio now uses deferred same-thread APU MMIO dispatch and SDL
   output. Its dispatch, startup, failure, and shutdown paths have synthetic
-  and sanitizer coverage. The latest run reached 427,500 APU DSP frames and
-  53,436 EP output frames with no SDL underrun or deferred-dispatch error
-  logged. Audible correctness and output quality have not yet been explicitly
-  confirmed.
+  and sanitizer coverage. A recorded CoreAudio run reached 427,500 APU DSP
+  frames and 53,436 EP output frames with no SDL underrun or deferred-dispatch
+  error logged. Audible correctness and output quality have not yet been
+  explicitly confirmed. A diagnostic-only headless sink can preserve guest
+  audio timing when CoreAudio is unavailable; it retains no samples, reports
+  aggregate signal/cadence/queue metrics, and never claims that sound is
+  audible.
 - USB gamepads, physical-controller support, and broad mission, save, FMV,
   and edition coverage are incomplete.
-- Current regression results include 314/314 Metal backend tests, 61/61
-  presenter tests, 35/35 MMIO host tests, 8/8 normal and ASan/UBSan macOS host
-  tests, 11/11 input integration tests, 4/4 APU output tests, and 100/100
-  concurrent APU restore stress runs. The complete Python suite passes
-  103/103.
+- Current regression results include 314/314 Metal backend tests, all 62
+  presenter CTest entries (61 passed and the real-window AppKit case skipped
+  without WindowServer), 35/35 MMIO host tests, 8/8 normal and ASan/UBSan
+  macOS host tests, 11/11 input integration tests, 6/6 APU/audio tests,
+  13/13 support tests, and 100/100 concurrent APU restore stress runs. The
+  complete Python suite passes 109/109.
 - A post-roadmap 30-second isolated retail boot reached its configured limit
   with direct Metal at 2560x1920, native audio/DSP activity, 1,490 audited
   flips, 4,503 draws, 1,252,771 vertices, unchanged input trees/executable,
   and no sticky Metal error. This is automated integration evidence, not a
   hands-on F1/mouse/quality or audible-output check.
+- A built-in poll-epoch Remastered script now provides deterministic,
+  diagnostic-only menu-to-gameplay navigation without OS keystrokes. Combined
+  with the headless audio sink, it completed three private boots and two
+  validated relaunches, reached ocean rendering, and stopped at the configured
+  boot limit. Default physical input and CoreAudio behavior are unchanged.
 - Controlled wall-clock FPS, frame-time percentiles, and memory use have not
   yet been measured for the current 4x path. Historical 640x480 measurements
   remain in the validation record and must not be applied to this version;

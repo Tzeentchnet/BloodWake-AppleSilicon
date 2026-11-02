@@ -211,6 +211,117 @@ cleanup:
     SDL_Quit();
 }
 
+#ifdef BW_EXPERIMENTAL_SYNTHETIC_INPUT
+typedef struct {
+    unsigned wait_epochs;
+    unsigned press_epochs;
+    uint16_t digital;
+    int analog_a;
+} ExpectedScriptStep;
+
+static uint32_t poll_script_state(uint32_t handle, XBOX_GAMEPAD *pad)
+{
+    uint32_t args[2] = {handle, OUTPUT_AT};
+    check(call(sub_0016DE89, 2, args) == 0, "poll synthetic script state");
+    memcpy(pad, s_memory + OUTPUT_AT + 4, sizeof *pad);
+    return read32(OUTPUT_AT);
+}
+
+static void check_script_packet(uint32_t before, uint32_t after)
+{
+    check(after == before + 1, "synthetic script advances one packet per poll epoch");
+}
+
+static void check_script_released(const XBOX_GAMEPAD *pad)
+{
+    check((pad->wButtons & (XBOX_GAMEPAD_START | XBOX_GAMEPAD_DPAD_DOWN)) == 0 &&
+          pad->bAnalogButtons[XBOX_BUTTON_A] == 0,
+          "synthetic script poll is released");
+}
+
+static void synthetic_script_test(uint32_t handle)
+{
+    static const ExpectedScriptStep expected[] = {
+        {300, 4, XBOX_GAMEPAD_START, 0},
+        {120, 3, XBOX_GAMEPAD_DPAD_DOWN, 0},
+        { 12, 3, XBOX_GAMEPAD_DPAD_DOWN, 0},
+        { 12, 3, XBOX_GAMEPAD_DPAD_DOWN, 0},
+        { 12, 3, XBOX_GAMEPAD_DPAD_DOWN, 0},
+        { 60, 4, 0, 1},
+        {120, 4, 0, 1},
+        {120, 4, 0, 1},
+        {180, 4, 0, 1},
+        {180, 4, 0, 1},
+        {240, 4, 0, 1},
+    };
+    XBOX_GAMEPAD pad;
+    uint32_t packet, next;
+
+    xbox_InputKeysClear();
+    packet = poll_script_state(handle, &pad);
+    check_script_released(&pad);
+    next = poll_script_state(handle, &pad);
+    check_script_packet(packet, next);
+    check_script_released(&pad);
+    packet = next;
+    check(!bw_macos_input_bridge_select_synthetic_script("unknown"),
+          "unknown synthetic script is rejected");
+    next = poll_script_state(handle, &pad);
+    check_script_packet(packet, next);
+    check_script_released(&pad);
+    packet = next;
+
+    check(bw_macos_input_bridge_select_synthetic_script(
+              "remastered-boot-menu-to-gameplay-v1"),
+          "known synthetic script is selected explicitly");
+    for (size_t step = 0; step < sizeof expected / sizeof expected[0]; step++) {
+        for (unsigned epoch = 0; epoch < expected[step].wait_epochs; epoch++) {
+            next = poll_script_state(handle, &pad);
+            check_script_packet(packet, next);
+            check_script_released(&pad);
+            packet = next;
+        }
+        for (unsigned epoch = 0; epoch < expected[step].press_epochs; epoch++) {
+            next = poll_script_state(handle, &pad);
+            check_script_packet(packet, next);
+            check((pad.wButtons & (XBOX_GAMEPAD_START | XBOX_GAMEPAD_DPAD_DOWN)) ==
+                      expected[step].digital &&
+                  (pad.bAnalogButtons[XBOX_BUTTON_A] == 255) ==
+                      expected[step].analog_a,
+                  "synthetic script has one expected pressed button");
+            packet = next;
+        }
+        next = poll_script_state(handle, &pad);
+        check_script_packet(packet, next);
+        check_script_released(&pad);
+        packet = next;
+    }
+    next = poll_script_state(handle, &pad);
+    check_script_packet(packet, next);
+    check_script_released(&pad);
+    packet = next;
+
+    check(bw_macos_input_bridge_select_synthetic_script(
+              "remastered-boot-menu-to-gameplay-v1"),
+          "completed synthetic script can be selected again");
+    for (unsigned epoch = 0; epoch < expected[0].wait_epochs; epoch++) {
+        next = poll_script_state(handle, &pad);
+        check_script_packet(packet, next);
+        check_script_released(&pad);
+        packet = next;
+    }
+    next = poll_script_state(handle, &pad);
+    check_script_packet(packet, next);
+    check((pad.wButtons & XBOX_GAMEPAD_START) != 0,
+          "reselected synthetic script reaches its press edge");
+    packet = next;
+    bw_macos_input_bridge_cancel_synthetic_script();
+    next = poll_script_state(handle, &pad);
+    check_script_packet(packet, next);
+    check_script_released(&pad);
+}
+#endif
+
 static void disabled_test(void)
 {
     void (*functions[8])(void) = {
@@ -285,6 +396,7 @@ static void enabled_test(void)
           read32(OUTPUT_AT) != packet, "release and packet update");
 
 #ifdef BW_EXPERIMENTAL_SYNTHETIC_INPUT
+    synthetic_script_test(handle);
     bw_macos_input_bridge_trace_synthetic(1);
 #endif
     queued_keyboard_test(handle);

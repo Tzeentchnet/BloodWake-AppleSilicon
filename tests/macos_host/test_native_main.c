@@ -60,6 +60,10 @@ static void check_at(int ok, int line)
 #ifdef BW_EXPERIMENTAL_SYNTHETIC_INPUT
 void bw_macos_input_bridge_configure(int enabled) { (void)enabled; }
 void bw_macos_input_bridge_trace_synthetic(int enabled) { check(enabled); }
+int bw_macos_input_bridge_select_synthetic_script(const char *name)
+{
+    return name && !strcmp(name, "remastered-boot-menu-to-gameplay-v1");
+}
 #endif
 
 void bw_settings_apply(void) {}
@@ -229,8 +233,15 @@ void bw_metal_backend_stop(void) { did_cleanup |= 2; }
 MCPXAPUState *mcpx_apu_init_standalone(uint8_t *p)
 {
     const char *ready = getenv("RECOMP_AC97_READY");
+    const char *audit = getenv("BW_HEADLESS_AUDIO_AUDIT");
+    const char *backend_audit = getenv("RECOMP_AUDIO_HEADLESS_AUDIT");
     check(step == 4 && runtime_registrations == 8 && p == memory && !apu_started &&
           ready && !strcmp(ready, "1"));
+    if (audit)
+        check(!strcmp(audit, "1") && backend_audit &&
+              !strcmp(backend_audit, "1"));
+    else
+        check(!backend_audit);
     if (getenv("BW_TEST_APU_START_FAIL"))
         return NULL;
     apu_started = 1;
@@ -416,7 +427,12 @@ int main(int argc, char **argv)
     unsetenv("BW_RUN_SECONDS");
     unsetenv("BW_MACOS_KEYBOARD_HOOK");
     unsetenv("BW_MACOS_AUDIO");
+    unsetenv("BW_HEADLESS_AUDIO_AUDIT");
+    unsetenv("BW_NATIVE_DIAGNOSTIC");
+    unsetenv("RECOMP_AUDIO_HEADLESS_AUDIT");
+    unsetenv("RECOMP_AUDIO_WAV");
     unsetenv("BW_SYNTHETIC_INPUT_DIAGNOSTIC");
+    unsetenv("BW_SYNTHETIC_INPUT_SCRIPT");
     unsetenv("RECOMP_HEADLESS");
     check_scanner_requires_execution_switch();
     setenv("BW_SETTINGS", "none", 1);
@@ -476,6 +492,37 @@ int main(int argc, char **argv)
     if (invoke(argc, argv, "normal") == 0)
         return 22;
     unsetenv("BW_MACOS_AUDIO");
+    setenv("BW_HEADLESS_AUDIO_AUDIT", "0", 1);
+    if (invoke(argc, argv, "normal") == 0)
+        return 31;
+    setenv("BW_HEADLESS_AUDIO_AUDIT", "1", 1);
+    if (invoke(argc, argv, "normal") == 0)
+        return 32;
+    setenv("BW_NATIVE_DIAGNOSTIC", "1", 1);
+    if (invoke(argc, argv, "normal") == 0)
+        return 33;
+    setenv("BW_RUN_SECONDS", "301", 1);
+    if (invoke(argc, argv, "normal") == 0)
+        return 34;
+    setenv("BW_RUN_SECONDS", "300", 1);
+    setenv("BW_MACOS_AUDIO", "0", 1);
+    if (invoke(argc, argv, "normal") == 0)
+        return 35;
+    unsetenv("BW_MACOS_AUDIO");
+    setenv("RECOMP_AUDIO_WAV", "must-not-be-created.wav", 1);
+    if (invoke(argc, argv, "normal") == 0)
+        return 36;
+    check(access("must-not-be-created.wav", F_OK) != 0);
+    unsetenv("RECOMP_AUDIO_WAV");
+    if (invoke(argc, argv, "normal") != 0)
+        return 37;
+    unsetenv("BW_HEADLESS_AUDIO_AUDIT");
+    unsetenv("BW_NATIVE_DIAGNOSTIC");
+    unsetenv("BW_RUN_SECONDS");
+    setenv("RECOMP_AUDIO_HEADLESS_AUDIT", "1", 1);
+    if (invoke(argc, argv, "normal") == 0)
+        return 38;
+    unsetenv("RECOMP_AUDIO_HEADLESS_AUDIT");
     setenv("BW_TEST_APU_START_FAIL", "1", 1);
     if (invoke(argc, argv, "normal") == 0)
         return 23;
@@ -525,6 +572,33 @@ int main(int argc, char **argv)
 #endif
     unsetenv("BW_MACOS_KEYBOARD_HOOK");
     unsetenv("BW_SYNTHETIC_INPUT_DIAGNOSTIC");
+    setenv("BW_SYNTHETIC_INPUT_SCRIPT", "", 1);
+    if (invoke(argc, argv, "normal") == 0)
+        return 25;
+    setenv("BW_SYNTHETIC_INPUT_SCRIPT",
+           "remastered-boot-menu-to-gameplay-v1", 1);
+    if (invoke(argc, argv, "normal") == 0)
+        return 26;
+#ifdef BW_EXPERIMENTAL_SYNTHETIC_INPUT
+    setenv("BW_MACOS_KEYBOARD_HOOK", "1", 1);
+    setenv("BW_SYNTHETIC_INPUT_SCRIPT", "unknown", 1);
+    if (invoke(argc, argv, "normal") == 0)
+        return 27;
+    setenv("BW_SYNTHETIC_INPUT_SCRIPT",
+           "remastered-boot-menu-to-gameplay-v1", 1);
+    if (invoke(argc, argv, "normal") != 0)
+        return 28;
+    setenv("BW_SYNTHETIC_INPUT_DIAGNOSTIC", "1", 1);
+    if (invoke(argc, argv, "normal") == 0)
+        return 29;
+    unsetenv("BW_SYNTHETIC_INPUT_DIAGNOSTIC");
+#else
+    setenv("BW_MACOS_KEYBOARD_HOOK", "1", 1);
+    if (invoke(argc, argv, "normal") == 0)
+        return 30;
+#endif
+    unsetenv("BW_MACOS_KEYBOARD_HOOK");
+    unsetenv("BW_SYNTHETIC_INPUT_SCRIPT");
     unlink("bw-host-fixture/default.xbe");
     rmdir("bw-host-fixture");
     puts("native startup and process lifetime: synthetic checks passed");

@@ -6,6 +6,8 @@ void bw_macos_input_bridge_configure(int enabled);
 
 #ifdef BW_EXPERIMENTAL_SYNTHETIC_INPUT
 void bw_macos_input_bridge_trace_synthetic(int enabled);
+int bw_macos_input_bridge_select_synthetic_script(const char *name);
+void bw_macos_input_bridge_cancel_synthetic_script(void);
 #endif
 
 #endif

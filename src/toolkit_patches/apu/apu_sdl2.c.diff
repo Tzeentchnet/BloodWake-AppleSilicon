@@ -1,6 +1,6 @@
 --- xboxrecomp/src/apu/apu_sdl2.c
 +++ src/toolkit_patches/apu/apu_sdl2.c
-@@ -1,20 +1,11 @@
+@@ -1,20 +1,18 @@
 -/**
 - * SDL2 Audio Output Backend (POSIX hosts)
 +/*
@@ -12,22 +12,28 @@
 - * SDL's push API (SDL_QueueAudio) is the queue; its device thread pulls one
 - * device buffer per callback and pads a short pull with silence, which is
 - * why the pacing marks keep at least one device buffer queued.
-- *
++ * The APU submits 48 kHz signed 16-bit stereo frames. SDL copies them into
++ * its queue and feeds the actual host device; the APU paces against the
++ * queued frame count. SDL_AUDIODRIVER=dummy is an explicit, silent test
++ * device, not an automatic fallback when the host device fails.
+  *
 - * Headless runs (RECOMP_HEADLESS=1) use SDL's "dummy" driver unless
 - * SDL_AUDIODRIVER is already set: it drains the queue in real time without
 - * a device, so pacing behaves as on a real device and nothing reaches the
 - * speakers. SDL_AUDIODRIVER=coreaudio (or pulseaudio, pipewire)
 - * with RECOMP_HEADLESS=1 is the way to hear a headless run.
-+ * The APU submits 48 kHz signed 16-bit stereo frames. SDL copies them into
-+ * its queue and feeds the actual host device; the APU paces against the
-+ * queued frame count. SDL_AUDIODRIVER=dummy is an explicit, silent test
-+ * device, not an automatic fallback when the host device fails.
++ * RECOMP_AUDIO_HEADLESS_AUDIT=1 is host-managed by the isolated native
++ * diagnostic runner. It selects a bounded, clock-drained stereo sink that
++ * retains no samples and emits aggregate-only reports. It is not a fallback
++ * for SDL/CoreAudio startup failure and it never claims that sound is audible.
   */
 -
++#include "bw_audio_audit.h"
++#include <errno.h>
  #include <stdint.h>
  #include <stdio.h>
  #include <stdlib.h>
-@@ -24,40 +15,46 @@
+@@ -24,42 +22,75 @@
  #if !defined(_WIN32)
  
  #include <SDL.h>
@@ -65,9 +71,11 @@
 -static uint64_t  g_samples_queued;  /* samples handed to the queue, ever */
 -static int       g_dry;
 -static int64_t   g_underrun_logged_ms;
++static BwAudioAudit g_audit;
 +static int g_buf_samples = SDLA_BUF_SAMPLES_DEFAULT;
 +static int g_num_bufs = SDLA_NUM_BUFS_DEFAULT;
 +static int g_initialized;
++static int g_audit_mode;
 +static int g_audio_owned;
 +static int g_frames_written;
 +static _Atomic unsigned g_underruns;
@@ -98,18 +106,90 @@
 +    return (int)v;
  }
  
++static int audit_env_int(const char *name, int def, int lo, int hi, int *result)
++{
++    const char *e = getenv(name);
++    char *end;
++    long value;
++    if (!e) {
++        *result = def;
++        return 1;
++    }
++    if (!*e) {
++        fprintf(stderr, "[AUDIO-AUDIT] %s must be an integer from %d through %d\n",
++                name, lo, hi);
++        return 0;
++    }
++    errno = 0;
++    value = strtol(e, &end, 10);
++    if (errno || *end || value < lo || value > hi) {
++        fprintf(stderr, "[AUDIO-AUDIT] %s must be an integer from %d through %d\n",
++                name, lo, hi);
++        return 0;
++    }
++    *result = (int)value;
++    return 1;
++}
++
  static int64_t now_ms(void)
-@@ -70,72 +67,73 @@
+ {
+     struct timespec ts;
+@@ -67,92 +98,145 @@
+     return (int64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+ }
+ 
++static _Noreturn void audit_runtime_failure(void)
++{
++    fprintf(stderr, "[AUDIO-AUDIT] internal failure: %s; stopping\n",
++            bw_audio_audit_error(&g_audit));
++    abort();
++}
++
++const char *xa2_backend_name(void)
++{
++    return getenv("RECOMP_AUDIO_HEADLESS_AUDIT")
++         ? "headless aggregate audit sink (silent; not audible)" : "SDL2";
++}
++
  int xa2_init(void)
  {
      SDL_AudioSpec want, have;
 -    const char *e, *driver;
-+    const char *driver;
++    const char *audit, *driver;
  
 -    if (g_initialized) return 1;
 -
 +    if (g_initialized)
 +        return 1;
++    audit = getenv("RECOMP_AUDIO_HEADLESS_AUDIT");
++    if (audit) {
++        if (strcmp(audit, "1")) {
++            fprintf(stderr,
++                    "[AUDIO-AUDIT] RECOMP_AUDIO_HEADLESS_AUDIT must be exactly 1\n");
++            return 0;
++        }
++        if (!audit_env_int("RECOMP_AUDIO_BUF_SAMPLES",
++                           SDLA_BUF_SAMPLES_DEFAULT, SDLA_BUF_SAMPLES_MIN,
++                           SDLA_BUF_SAMPLES_MAX, &g_buf_samples) ||
++            !audit_env_int("RECOMP_AUDIO_BUF_COUNT",
++                           SDLA_NUM_BUFS_DEFAULT, SDLA_NUM_BUFS_MIN,
++                           SDLA_NUM_BUFS_MAX, &g_num_bufs))
++            return 0;
++        if (bw_audio_audit_init(&g_audit, g_buf_samples, g_num_bufs, NULL,
++                                NULL, stderr) != 0) {
++            fprintf(stderr, "[AUDIO-AUDIT] initialization failed: %s\n",
++                    bw_audio_audit_error(&g_audit));
++            return 0;
++        }
++        g_audit_mode = 1;
++        g_initialized = 1;
++        fprintf(stderr,
++                "[AUDIO-AUDIT] silent diagnostic sink initialized: "
++                "48000 Hz stereo s16, bounded to %d frames; "
++                "no device output and no sample data writes; sound is not audible\n",
++                g_buf_samples * (g_num_bufs + 1));
++        return 1;
++    }
      g_buf_samples = env_int("RECOMP_AUDIO_BUF_SAMPLES", SDLA_BUF_SAMPLES_DEFAULT,
                              SDLA_BUF_SAMPLES_MIN, SDLA_BUF_SAMPLES_MAX);
      g_num_bufs = env_int("RECOMP_AUDIO_BUF_COUNT", SDLA_NUM_BUFS_DEFAULT,
@@ -218,7 +298,20 @@
  }
  
  void xa2_shutdown(void)
-@@ -146,13 +144,13 @@
+ {
++    if (g_audit_mode) {
++        if (bw_audio_audit_finish(&g_audit) != 0)
++            audit_runtime_failure();
++        g_audit_mode = 0;
++        g_initialized = 0;
++        fprintf(stderr,
++                "[AUDIO-AUDIT] silent diagnostic sink shut down; "
++                "sound was not audible\n");
++        return;
++    }
+     if (g_dev) {
+         SDL_PauseAudioDevice(g_dev, 1);
+         SDL_ClearQueuedAudio(g_dev);
          SDL_CloseAudioDevice(g_dev);
          g_dev = 0;
      }
@@ -235,7 +328,7 @@
      g_initialized = 0;
  }
  
-@@ -161,19 +159,17 @@
+@@ -161,19 +245,24 @@
      return g_initialized;
  }
  
@@ -247,6 +340,13 @@
 -    if (!g_initialized || !g_dev || num_samples <= 0) return 0;
 -    if (SDL_QueueAudio(g_dev, samples,
 -                       (Uint32)num_samples * SDLA_CHANNELS * sizeof(int16_t)) != 0) {
++    int result;
++    if (g_audit_mode) {
++        result = bw_audio_audit_submit(&g_audit, samples, num_samples);
++        if (result < 0 || bw_audio_audit_report(&g_audit, 0) != 0)
++            audit_runtime_failure();
++        return result;
++    }
 +    if (!g_initialized || !g_dev || !samples || num_samples <= 0 ||
 +        (uint64_t)num_samples * SDLA_FRAME_BYTES > UINT32_MAX)
 +        return 0;
@@ -260,7 +360,7 @@
      return 1;
  }
  
-@@ -187,33 +183,27 @@
+@@ -187,54 +276,67 @@
      return g_num_bufs;
  }
  
@@ -273,10 +373,17 @@
 - * (the frame thread pausing) is not one. */
  int xa2_queued_samples(void)
  {
++    int queued;
      Uint32 bytes;
 -
 -    if (!g_initialized || !g_dev) return 0;
 +    unsigned underruns;
++    if (g_audit_mode) {
++        if (bw_audio_audit_queued(&g_audit, &queued) != 0 ||
++            bw_audio_audit_report(&g_audit, 0) != 0)
++            audit_runtime_failure();
++        return queued;
++    }
 +    if (!g_initialized || !g_dev)
 +        return 0;
      bytes = SDL_GetQueuedAudioSize(g_dev);
@@ -300,11 +407,21 @@
  }
  
  void xa2_expect_drain(void)
-@@ -223,18 +213,16 @@
+ {
++    if (g_audit_mode) {
++        if (bw_audio_audit_expect_drain(&g_audit) != 0 ||
++            bw_audio_audit_report(&g_audit, 0) != 0)
++            audit_runtime_failure();
++        return;
++    }
+     g_dry = 1;
+ }
  
  unsigned xa2_underruns(void)
  {
 -    return g_underruns;
++    if (g_audit_mode)
++        return bw_audio_audit_underruns(&g_audit);
 +    return atomic_load_explicit(&g_underruns, memory_order_relaxed);
  }
  
@@ -317,7 +434,13 @@
 -    if (!g_initialized || !g_dev) return 0;
 -    queued = SDL_GetQueuedAudioSize(g_dev) / (SDLA_CHANNELS * sizeof(int16_t));
 -    return g_samples_queued > queued ? g_samples_queued - queued : 0;
-+    uint64_t queued, submitted;
++    uint64_t played, queued, submitted;
++    if (g_audit_mode) {
++        if (bw_audio_audit_samples_played(&g_audit, &played) != 0 ||
++            bw_audio_audit_report(&g_audit, 0) != 0)
++            audit_runtime_failure();
++        return played;
++    }
 +    if (!g_initialized || !g_dev)
 +        return 0;
 +    submitted = atomic_load_explicit(&g_samples_queued, memory_order_relaxed);

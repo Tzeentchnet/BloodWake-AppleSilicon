@@ -9,7 +9,7 @@ locally exported definition data remain private and must not be committed.
 
 | Area | Current status | Next evidence or implementation boundary |
 | --- | --- | --- |
-| F1 settings | Implemented | Add a title-state pause hook only after menus, gameplay, cutscenes, and transitions can be distinguished safely. |
+| F1 settings | Implemented and integration-tested | Add a title-state pause hook only after menus, gameplay, cutscenes, and transitions can be distinguished safely. |
 | Gameplay mouse | Implemented | Validate sensitivity and steering/aim choices in sustained gameplay. |
 | Point-and-click menus | Blocked on menu UI mapping | Identify menu state and selectable rectangles, then map letterboxed drawable coordinates into the 640x480 guest UI. |
 | Ship/weapon profiles | Research blocked on field ownership | Instrument definition construction locally and prove named fields, units, ranges, aliases, and lifetimes before writing any override. |
@@ -18,7 +18,7 @@ locally exported definition data remain private and must not be committed.
 | Metal filtering | Implemented | Collect oblique water/cliff comparisons and GPU timings for 1x/4x/8x/16x. |
 | Metal MSAA | No-go; synthetic smoke complete | Apple M5 passes 2x/4x/8x synthetic color/depth/resolve, but game-scene attachment ownership and the controlled visual/GPU-time/memory matrix are still required. |
 | Upstream fixes | Verified | Re-run the offline parity checker whenever upstream changes. |
-| Realistic water | Fingerprint audit implemented; hands-on coverage blocked | Expand from 512 clean scoped batches to representative calm/storm, lighting, shore, split-screen, reflection, and wake captures before adding a shader variant. |
+| Realistic water | Runtime identification proven; representative visual coverage blocked | Expand the clean scripted marker/fingerprint evidence to calm/storm, lighting, shore, split-screen, reflection, and wake captures before adding a shader variant. |
 
 ## F1 runtime settings
 
@@ -40,6 +40,12 @@ read, validation, apply, and save failures. It does not force a pause: no
 validated title-state hook currently distinguishes every state in which
 synthesizing Start is safe, so the panel explicitly says the game continues.
 
+The presenter integration target exercises F1 down/repeat/up through the real
+presenter path, main-thread AppKit panel/controller lifecycle, guest-input and
+relative-mouse release, capability reasons, live LOD, frame-boundary
+anisotropy, restart-pending state, isolated atomic save, and visible apply/save
+errors. The real-window case skips only when WindowServer is unavailable.
+
 ## Mouse
 
 The SDL input wrapper now tracks synchronized relative motion, focus, capture,
@@ -59,6 +65,21 @@ guessing from rendered pixels would activate the wrong controls in unverified
 menus. The required next step is a read-only local inventory of menu state,
 selection, and control rectangles; clicks must enter the same guest A/B paths
 as controller input, with directional navigation retained as fallback.
+
+## Diagnostic automation
+
+The experimental synthetic-input build contains one strict built-in script,
+`remastered-boot-menu-to-gameplay-v1`. It drives Xbox-equivalent Start,
+D-pad Down, and A edges on guest polling epochs rather than wall time or OS
+keystrokes. It is available only through explicit Remastered diagnostic
+selection, rejects unknown names, and releases state on completion, focus
+loss, and shutdown. It does not make menu hitboxes or physical input proven.
+
+The bounded diagnostic runner also owns a headless 48 kHz stereo audio audit
+mode. It keeps guest APU/DSP timing active when CoreAudio is unavailable,
+retains no samples, rejects every sample-data writer, and reports only
+aggregate signal/queue/cadence metrics. It is never an automatic fallback and
+does not establish that sound is audible.
 
 ## Ship and weapon mod profiles
 
@@ -144,9 +165,15 @@ copied render/program/combiner/texture metadata only. Private GPU audits keep a
 fixed 32-entry aggregate table plus overflow and within-scope mismatch counts;
 they exclude addresses, vertices, texture bytes, names, and assets. Synthetic
 tests cover determinism, state differences, marker-only collection, bounds,
-scope lifetime, and unchanged rendering. Automated boots did not reach a
-representative ocean scene after this instrumentation was added, so real-scene
-hash stability remains a hands-on blocker.
+scope lifetime, and unchanged rendering.
+
+A deterministic three-boot, two-relaunch Remastered run with headless audio
+timing reached gameplay and produced 12,670 markers, 154 clean scopes, and 297
+fingerprinted batches across 10 aggregate hashes. Marker rejection,
+fingerprint-table overflow, and within-scope mismatch were all zero. This
+completes runtime identification for the exercised automated flow without
+publishing the private hash values. It does not cover every water scene or
+provide the representative visual comparison required for a shader change.
 
 After marker coverage is proven across calm/storm, day/night, shore,
 split-screen, reflection, and wake passes, the first optional preset may add

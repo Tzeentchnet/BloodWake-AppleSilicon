@@ -50,6 +50,7 @@ typedef struct {
     int backend_ready;
     int kernel_ready;
     int audio_enabled;
+    int audio_audit;
     int apu_dispatch_enabled;
     int guest_entered;
     int diagnostics_started;
@@ -283,13 +284,35 @@ static int env_default(const char *name, const char *value)
     return getenv(name) ? 0 : setenv(name, value, 0);
 }
 
+static int bounded_native_diagnostic(void)
+{
+    const char *marker = getenv("BW_NATIVE_DIAGNOSTIC");
+    const char *limit = getenv("BW_RUN_SECONDS");
+    char *end;
+    unsigned long seconds;
+    if (!marker || strcmp(marker, "1") || !limit || !*limit)
+        return 0;
+    errno = 0;
+    seconds = strtoul(limit, &end, 10);
+    return !errno && !*end && seconds >= 1 && seconds <= 300;
+}
+
 static int configure_native(void)
 {
     const char *gpu = getenv("BW_GPU");
     const char *watch = getenv("RECOMP_WATCH");
     const char *keyboard_hook = getenv("BW_MACOS_KEYBOARD_HOOK");
     const char *synthetic_input = getenv("BW_SYNTHETIC_INPUT_DIAGNOSTIC");
+    const char *synthetic_script = getenv("BW_SYNTHETIC_INPUT_SCRIPT");
     const char *audio = getenv("BW_MACOS_AUDIO");
+    const char *audio_audit = getenv("BW_HEADLESS_AUDIO_AUDIT");
+    static const char *const sample_writers[] = {
+        "RECOMP_AUDIO_WAV",
+        "BW_AUDIO_WAV6",
+        "BW_APU_STEMS",
+        "RECOMP_APU_VOICE_DUMP",
+        "BW_APU_GPDUMP",
+    };
     BwMouseConfig mouse;
     char mouse_error[160];
 
@@ -301,11 +324,54 @@ static int configure_native(void)
         fprintf(stderr, "[BW] BW_SYNTHETIC_INPUT_DIAGNOSTIC must be 0 or 1\n");
         return -1;
     }
+    if (synthetic_script && !*synthetic_script) {
+        fprintf(stderr, "[BW] BW_SYNTHETIC_INPUT_SCRIPT must name a built-in script\n");
+        return -1;
+    }
+    if (synthetic_script && synthetic_input && !strcmp(synthetic_input, "1")) {
+        fprintf(stderr, "[BW] select either the legacy synthetic input diagnostic "
+                        "or a synthetic input script, not both\n");
+        return -1;
+    }
     if (audio && strcmp(audio, "0") && strcmp(audio, "1")) {
         fprintf(stderr, "[BW] BW_MACOS_AUDIO must be 0 or 1\n");
         return -1;
     }
+    if (audio_audit && strcmp(audio_audit, "1")) {
+        fprintf(stderr, "[BW] BW_HEADLESS_AUDIO_AUDIT must be exactly 1 when set\n");
+        return -1;
+    }
     s_boot.audio_enabled = !audio || !strcmp(audio, "1");
+    s_boot.audio_audit = audio_audit != NULL;
+    if (getenv("RECOMP_AUDIO_HEADLESS_AUDIT")) {
+        fprintf(stderr, "[BW] RECOMP_AUDIO_HEADLESS_AUDIT is managed by the native host\n");
+        return -1;
+    }
+    if (s_boot.audio_audit) {
+        if (!s_boot.audio_enabled) {
+            fprintf(stderr,
+                    "[BW] the headless audio audit cannot be combined with disabled audio\n");
+            return -1;
+        }
+        if (!bounded_native_diagnostic()) {
+            fprintf(stderr,
+                    "[BW] the headless audio audit is available only through a bounded "
+                    "native diagnostic run\n");
+            return -1;
+        }
+        for (size_t i = 0; i < sizeof(sample_writers) / sizeof(sample_writers[0]); i++) {
+            if (getenv(sample_writers[i])) {
+                fprintf(stderr,
+                        "[BW] sample-data writers are unavailable during the "
+                        "headless audio audit\n");
+                return -1;
+            }
+        }
+        if (setenv("RECOMP_AUDIO_HEADLESS_AUDIT", "1", 0) != 0) {
+            fprintf(stderr, "[BW] cannot configure the headless audio audit\n");
+            return -1;
+        }
+    }
 #ifdef BW_EXPERIMENTAL_SYNTHETIC_INPUT
     if (synthetic_input && !strcmp(synthetic_input, "1")) {
         if (!keyboard_hook || strcmp(keyboard_hook, "1")) {
@@ -315,9 +381,25 @@ static int configure_native(void)
         bw_macos_input_bridge_trace_synthetic(1);
         fprintf(stderr, "[BW] synthetic SDL input diagnostic enabled; no physical keys are generated\n");
     }
+    if (synthetic_script) {
+        if (!bw_macos_input_bridge_select_synthetic_script(synthetic_script)) {
+            fprintf(stderr, "[BW] unknown BW_SYNTHETIC_INPUT_SCRIPT selection\n");
+            return -1;
+        }
+        if (!keyboard_hook || strcmp(keyboard_hook, "1")) {
+            fprintf(stderr, "[BW] synthetic input script requires the experimental keyboard hook\n");
+            return -1;
+        }
+        fprintf(stderr, "[BW] deterministic in-process synthetic input script enabled; "
+                        "no physical keys are generated\n");
+    }
 #else
     if (synthetic_input && !strcmp(synthetic_input, "1")) {
         fprintf(stderr, "[BW] synthetic input diagnostic was not included in this build\n");
+        return -1;
+    }
+    if (synthetic_script) {
+        fprintf(stderr, "[BW] synthetic input scripts were not included in this build\n");
         return -1;
     }
 #endif
@@ -388,7 +470,7 @@ static int configure_native(void)
     }
 #endif
 #ifdef BW_EXPERIMENTAL_SYNTHETIC_INPUT
-    if (synthetic_input && !strcmp(synthetic_input, "1")) {
+    if ((synthetic_input && !strcmp(synthetic_input, "1")) || synthetic_script) {
         const char *window = getenv("RECOMP_FB_WINDOW");
         const char *headless = getenv("RECOMP_HEADLESS");
         if (!window || !*window || *window == '0' ||
@@ -398,10 +480,15 @@ static int configure_native(void)
         }
     }
 #endif
-    fprintf(stderr, s_boot.audio_enabled
-            ? "[BW] native audio enabled with deferred APU MMIO dispatch; "
-              "guest USB is disabled\n"
-            : "[BW] native audio and guest USB are disabled\n");
+    if (s_boot.audio_audit)
+        fprintf(stderr,
+                "[BW] diagnostic-only headless audio audit enabled with deferred "
+                "APU MMIO dispatch; sound is not audible\n");
+    else
+        fprintf(stderr, s_boot.audio_enabled
+                ? "[BW] native audio enabled with deferred APU MMIO dispatch; "
+                  "guest USB is disabled\n"
+                : "[BW] native audio and guest USB are disabled\n");
     return 0;
 }
 

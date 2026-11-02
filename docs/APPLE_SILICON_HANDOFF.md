@@ -1,8 +1,8 @@
 # Apple Silicon handoff
 
-Status updated 2026-11-01 after the native F1 settings foundation, gameplay
-mouse input, live LOD, Metal anisotropic filtering, upstream parity audit, and
-the bounded default-audio retail boot.
+Status updated 2026-11-02 after the native F1 settings integration, gameplay
+mouse input, live LOD, Metal anisotropic filtering, upstream parity audit,
+deterministic menu-to-gameplay diagnostics, and bounded audio validation.
 
 ## Current status
 
@@ -58,6 +58,12 @@ motion to the steering or aim stick and releases capture on Escape, F1, focus
 loss, hide, or minimize. These additions are regression-tested and the native
 Release target builds.
 
+The presenter suite now includes a real AppKit integration target for F1
+down/repeat/up, main-thread panel/controller lifecycle, input and mouse
+release, capability reasons, live and restart-pending settings, isolated
+atomic save, and visible error sheets. The real-window case skips explicitly
+when WindowServer is unavailable.
+
 A post-change 30-second isolated Original-edition retail boot reached its
 intentional run limit with direct Metal attached at 2560x1920 and native
 audio/DSP active. Its 25-second GPU audit recorded 1,490 flips, 4,503 draws,
@@ -65,6 +71,18 @@ audio/DSP active. Its 25-second GPU audit recorded 1,490 flips, 4,503 draws,
 reported, and the prepared tree, toolkit, and executable remained unchanged.
 This proves current-build boot integration only. It did not exercise the F1
 panel, Remastered LOD/anisotropy, mouse capture/feel, or audible output.
+
+A later diagnostic-only Remastered flow combined a built-in poll-epoch
+menu-to-gameplay script with a silent headless audio sink that preserves APU
+timing without CoreAudio. Three boots completed, two validated relaunches were
+followed, and the run stopped at its configured boot limit. It aggregated
+12,670 ocean markers into 154 clean scopes and 297 fingerprinted batches
+across 10 aggregate hashes, with zero marker rejection, table overflow, or
+within-scope mismatch. Audio aggregates showed nonzero signal in both channels
+without clipping, overflow, or internal audit failure.
+This is deterministic technical evidence, not audible or representative
+visual validation; private hashes, logs, samples, and retail data remain
+uncommitted.
 
 ## Required opt-ins
 
@@ -122,16 +140,19 @@ rejected even when set to `0`.
   evidence. The F1 schema reports that limitation instead of accepting a
   no-op.
 - Ocean draws now carry an explicit, false-positive-safe game-to-executor
-  marker; a bounded Remastered flow recorded 512 scopes with zero rejection.
-  Bounded marker-only metadata fingerprints are implemented, but automated
-  runs did not reach a representative scene after instrumentation. A realistic
-  preset remains blocked on hands-on pass/fingerprint validation. Retail water
-  remains unchanged.
+  marker. A deterministic Remastered flow recorded 154 scopes and 297
+  fingerprinted batches across 10 aggregate hashes with no rejection,
+  overflow, or mismatch. A realistic preset remains blocked on representative
+  calm/storm, lighting, shore, split-screen, reflection, wake, and visual
+  coverage. Retail water remains unchanged.
 - Physical controllers, guest USB, audible/sustained native audio, saves, FMV,
   other editions, and broad mission coverage are not validated Apple Silicon
   features.
 - The bounded audio boot logged one SDL underrun; latency, underrun behavior,
   channel balance, and output quality need hands-on measurement.
+- The headless audio audit retains no samples and cannot prove audible output;
+  its analytical queue observed scheduling underflows, so it is signal/timing
+  instrumentation rather than a device-quality result.
 - General CPU/GPU guest-memory ownership, aliases, DMA lifetime, and safe
   in-process device shutdown are not solved.
 - Windows behavior after the Apple Silicon changes has not been revalidated.
@@ -169,7 +190,9 @@ rejected even when set to `0`.
   defining a profile schema or editor. Keep every retail-derived export
   private.
 - Validate the existing scoped ocean marker and state fingerprints across all
-  representative water passes before changing the Metal shader.
+  representative water passes before changing the Metal shader. The automated
+  boot-to-gameplay path is complete; the remaining boundary is scene and
+  visual coverage.
 - Run the MSAA matrix in [METAL_QUALITY.md](METAL_QUALITY.md); keep the setting
   unavailable if the measured benefit does not justify it.
 

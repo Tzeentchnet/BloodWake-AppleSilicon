@@ -98,7 +98,11 @@ class MacosDiagnosticTests(unittest.TestCase):
                                          "BW_EDITION": "remastered",
                                          "BW_SETTINGS": "unsafe",
                                          "BW_MACOS_KEYBOARD_HOOK": "1",
-                                         "BW_SYNTHETIC_INPUT_DIAGNOSTIC": "1"}, clear=True):
+                                         "BW_SYNTHETIC_INPUT_DIAGNOSTIC": "1",
+                                         "BW_SYNTHETIC_INPUT_SCRIPT": "unsafe",
+                                         "BW_HEADLESS_AUDIO_AUDIT": "1",
+                                         "BW_NATIVE_DIAGNOSTIC": "unsafe",
+                                         "RECOMP_AUDIO_HEADLESS_AUDIT": "1"}, clear=True):
             env = diagnostic.diagnostic_env(self.root, self.prepared, 15, False, False, 4, 5)
         self.assertNotIn("RECOMP_USB", env)
         self.assertNotIn("RECOMP_AC97_READY", env)
@@ -107,9 +111,13 @@ class MacosDiagnosticTests(unittest.TestCase):
         self.assertNotIn("BW_GPU_AUDIT", env)
         self.assertNotIn("BW_MACOS_KEYBOARD_HOOK", env)
         self.assertNotIn("BW_SYNTHETIC_INPUT_DIAGNOSTIC", env)
+        self.assertNotIn("BW_SYNTHETIC_INPUT_SCRIPT", env)
+        self.assertNotIn("BW_HEADLESS_AUDIO_AUDIT", env)
+        self.assertNotIn("RECOMP_AUDIO_HEADLESS_AUDIT", env)
         self.assertEqual(env["BW_SETTINGS"], "none")
         self.assertEqual(env["BW_EDITION"], "original")
         self.assertEqual(env["BW_RUN_SECONDS"], "15")
+        self.assertEqual(env["BW_NATIVE_DIAGNOSTIC"], "1")
         self.assertEqual(env["BW_NATIVE_LAUNCH_IN_FD"], "4")
         enabled = diagnostic.diagnostic_env(self.root, self.prepared, 15, True, True, 4, 5,
                                             keyboard_hook=True)
@@ -121,6 +129,13 @@ class MacosDiagnosticTests(unittest.TestCase):
         synthetic = diagnostic.diagnostic_env(self.root, self.prepared, 15, False, False, 4, 5,
                                                keyboard_hook=True, synthetic_input=True)
         self.assertEqual(synthetic["BW_SYNTHETIC_INPUT_DIAGNOSTIC"], "1")
+        scripted = diagnostic.diagnostic_env(
+            self.root, self.prepared, 15, False, False, 4, 5, keyboard_hook=True,
+            edition="remastered",
+            synthetic_input_script="remastered-boot-menu-to-gameplay-v1")
+        self.assertEqual(scripted["BW_SYNTHETIC_INPUT_SCRIPT"],
+                         "remastered-boot-menu-to-gameplay-v1")
+        self.assertNotIn("BW_SYNTHETIC_INPUT_DIAGNOSTIC", scripted)
         remastered = diagnostic.diagnostic_env(
             self.root, self.prepared, 15, False, False, 4, 5, edition="remastered")
         self.assertEqual(remastered["BW_EDITION"], "remastered")
@@ -128,12 +143,38 @@ class MacosDiagnosticTests(unittest.TestCase):
             self.root, self.prepared, 15, False, False, 4, 5,
             disable_audio=True)
         self.assertEqual(audio_disabled["BW_MACOS_AUDIO"], "0")
+        audio_audit = diagnostic.diagnostic_env(
+            self.root, self.prepared, 15, False, False, 4, 5,
+            audio_audit=True)
+        self.assertEqual(audio_audit["BW_HEADLESS_AUDIO_AUDIT"], "1")
+        self.assertEqual(audio_audit["BW_NATIVE_DIAGNOSTIC"], "1")
+        self.assertNotIn("BW_MACOS_AUDIO", audio_audit)
+        self.assertNotIn("RECOMP_AUDIO_HEADLESS_AUDIT", audio_audit)
+        with self.assertRaisesRegex(ValueError, "requires audio to remain enabled"):
+            diagnostic.diagnostic_env(
+                self.root, self.prepared, 15, False, False, 4, 5,
+                disable_audio=True, audio_audit=True)
         with self.assertRaisesRegex(ValueError, "edition must be original or remastered"):
             diagnostic.diagnostic_env(
                 self.root, self.prepared, 15, False, False, 4, 5, edition="Remastered")
         with self.assertRaisesRegex(ValueError, "requires the experimental keyboard hook"):
             diagnostic.diagnostic_env(self.root, self.prepared, 15, False, False, 4, 5,
                                       synthetic_input=True)
+        with self.assertRaisesRegex(ValueError, "unknown synthetic input script"):
+            diagnostic.diagnostic_env(
+                self.root, self.prepared, 15, False, False, 4, 5,
+                keyboard_hook=True, edition="remastered",
+                synthetic_input_script="unknown")
+        with self.assertRaisesRegex(ValueError, "requires the remastered edition"):
+            diagnostic.diagnostic_env(
+                self.root, self.prepared, 15, False, False, 4, 5,
+                keyboard_hook=True,
+                synthetic_input_script="remastered-boot-menu-to-gameplay-v1")
+        with self.assertRaisesRegex(ValueError, "mutually exclusive"):
+            diagnostic.diagnostic_env(
+                self.root, self.prepared, 15, False, False, 4, 5,
+                keyboard_hook=True, synthetic_input=True, edition="remastered",
+                synthetic_input_script="remastered-boot-menu-to-gameplay-v1")
 
     def test_sandbox_preflight_fails_closed(self):
         failure = subprocess.CompletedProcess([], 1, "", "sandbox denied setup")
@@ -317,6 +358,21 @@ class MacosDiagnosticTests(unittest.TestCase):
             self.assertTrue(call.kwargs["keyboard_hook"])
             self.assertTrue(call.kwargs["synthetic_input"])
 
+    def test_synthetic_script_is_passed_to_each_guest_boot(self):
+        request = self.launch_request()
+        script = "remastered-boot-menu-to-gameplay-v1"
+        with mock.patch.object(diagnostic, "run_guest_once",
+                               side_effect=[(0, request, 0), (0, b"", 0)]) as once, \
+             contextlib.redirect_stdout(io.StringIO()):
+            result = diagnostic.run_guest_relaunches(
+                Path("/native"), self.root, self.prepared, "profile", 20, False, False,
+                4, 30, keyboard_hook=True, edition="remastered",
+                synthetic_input_script=script)
+        self.assertEqual(result, diagnostic.RelaunchRunResult.guest_exit(0, 2))
+        for call in once.call_args_list:
+            self.assertTrue(call.kwargs["keyboard_hook"])
+            self.assertEqual(call.kwargs["synthetic_input_script"], script)
+
     def test_follow_relaunch_rejects_malformed_and_wrong_title_before_next_boot(self):
         for request in (b"bad", self.launch_request(b"D:\\other.xbe")):
             with self.subTest(request=request), \
@@ -388,6 +444,94 @@ class MacosDiagnosticTests(unittest.TestCase):
         self.assertEqual(failure.exception.code, 2)
         self.assertIn("--synthetic-input requires --experimental-keyboard-hook", errors.getvalue())
 
+    def test_audio_audit_cli_rejects_disabled_audio(self):
+        arguments = self.main_arguments() + [
+            "--headless-audio-audit", "--disable-audio",
+        ]
+        errors = io.StringIO()
+        with mock.patch.object(diagnostic.sys, "platform", "darwin"), \
+             contextlib.redirect_stderr(errors), self.assertRaises(SystemExit) as failure:
+            diagnostic.main(arguments)
+        self.assertEqual(failure.exception.code, 2)
+        self.assertIn("mutually exclusive", errors.getvalue())
+
+    def test_script_cli_requires_hook_remastered_and_known_name(self):
+        script = "remastered-boot-menu-to-gameplay-v1"
+        arguments = self.main_arguments()
+        cases = [
+            (["--synthetic-input-script", script, "--edition", "remastered"],
+             "--synthetic-input-script requires --experimental-keyboard-hook"),
+            (["--synthetic-input-script", script, "--experimental-keyboard-hook"],
+             "--synthetic-input-script requires --edition remastered"),
+            (["--synthetic-input-script", "unknown", "--experimental-keyboard-hook",
+              "--edition", "remastered"], "invalid choice"),
+        ]
+        for extra, expected in cases:
+            errors = io.StringIO()
+            with self.subTest(extra=extra), \
+                 mock.patch.object(diagnostic.sys, "platform", "darwin"), \
+                 contextlib.redirect_stderr(errors), self.assertRaises(SystemExit) as failure:
+                diagnostic.main(arguments + extra)
+            self.assertEqual(failure.exception.code, 2)
+            self.assertIn(expected, errors.getvalue())
+
+    def test_fingerprint_counts_are_aggregated_without_reporting_hashes(self):
+        empty = self.root / "empty-audit"
+        empty.mkdir()
+        self.assertEqual(diagnostic.gpu_audit_paths(empty, True, 2, 4), [])
+        no_audit = io.StringIO()
+        with contextlib.redirect_stdout(no_audit):
+            diagnostic.report_ocean_fingerprint_counts([])
+        self.assertIn("zero observed fingerprint coverage", no_audit.getvalue())
+
+        first = self.root / "gpu-audit-001.txt"
+        second = self.root / "gpu-audit-002.txt"
+        first.write_bytes(
+            diagnostic.OCEAN_FINGERPRINT_HEADER + b"\n"
+            b"  batches 7, hashes 2/32, table-overflow batches 0, "
+            b"within-scope mismatches 0\n"
+            b"  1111111111111111          3 batches\n"
+            b"  2222222222222222          4 batches\n")
+        second.write_bytes(
+            diagnostic.OCEAN_FINGERPRINT_HEADER + b"\n"
+            b"  batches 9, hashes 2/32, table-overflow batches 1, "
+            b"within-scope mismatches 2\n"
+            b"  2222222222222222          5 batches\n"
+            b"  3333333333333333          3 batches\n")
+        self.assertEqual(
+            diagnostic.gpu_audit_paths(self.root, True, 2, 4),
+            [first, second])
+        self.assertEqual(
+            diagnostic.extract_ocean_fingerprint_counts([first, second]),
+            (16, 3, 1, 2))
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            diagnostic.report_ocean_fingerprint_counts([first, second])
+        self.assertIn("16 batches, 3 distinct hashes", output.getvalue())
+        self.assertNotIn("1111111111111111", output.getvalue())
+
+    def test_fingerprint_parser_rejects_malformed_or_inconsistent_evidence(self):
+        audit = self.root / "gpu-audit.txt"
+        prefix = diagnostic.OCEAN_FINGERPRINT_HEADER + b"\n"
+        invalid_sections = (
+            b"  batches 1, hashes 1/32, table-overflow batches 0, "
+            b"within-scope mismatches 0\nmalformed row\n",
+            b"  batches 2, hashes 1/32, table-overflow batches 0, "
+            b"within-scope mismatches 0\n"
+            b"  1111111111111111          1 batches\n",
+            b"  batches 1, hashes 1/32, table-overflow batches 0, "
+            b"within-scope mismatches 2\n"
+            b"  1111111111111111          1 batches\n",
+            b"  1111111111111111          1 batches\n"
+            b"  batches 1, hashes 1/32, table-overflow batches 0, "
+            b"within-scope mismatches 0\n",
+        )
+        for section in invalid_sections:
+            with self.subTest(section=section):
+                audit.write_bytes(prefix + section)
+                with self.assertRaisesRegex(RuntimeError, "ocean fingerprint"):
+                    diagnostic.extract_ocean_fingerprint_counts([audit])
+
     def test_cli_rejects_unknown_or_noncanonical_editions(self):
         base_arguments = self.main_arguments()
         for edition in ("enhanced", "Original", "Remastered"):
@@ -408,6 +552,7 @@ class MacosDiagnosticTests(unittest.TestCase):
             (output / "guest.log").write_bytes(b"no marker summary\n")
             self.assertEqual(kwargs["edition"], "original")
             self.assertFalse(kwargs["disable_audio"])
+            self.assertFalse(kwargs["audio_audit"])
             return 0
 
         output = io.StringIO()
@@ -445,6 +590,29 @@ class MacosDiagnosticTests(unittest.TestCase):
             result = diagnostic.main(arguments)
         self.assertEqual(result, 0)
         self.assertIn("Diagnostic audio: disabled", output.getvalue())
+
+    def test_headless_audio_audit_is_explicit_and_propagated(self):
+        arguments = self.main_arguments() + ["--headless-audio-audit"]
+
+        def guest(_executable, output, _game_dir, _profile, _seconds, _quincunx, _audit,
+                  **kwargs):
+            (output / "guest.log").write_bytes(b"no marker summary\n")
+            self.assertTrue(kwargs["audio_audit"])
+            self.assertFalse(kwargs["disable_audio"])
+            return 0
+
+        output = io.StringIO()
+        with mock.patch.object(diagnostic.sys, "platform", "darwin"), \
+             mock.patch.object(diagnostic, "ROOT", self.repository), \
+             mock.patch.object(diagnostic, "verify_prepared"), \
+             mock.patch.object(diagnostic, "toolkit_revision", return_value="pinned"), \
+             mock.patch.object(diagnostic, "verify_sandbox"), \
+             mock.patch.object(diagnostic, "run_guest", side_effect=guest), \
+             contextlib.redirect_stdout(output):
+            result = diagnostic.main(arguments)
+        self.assertEqual(result, 0)
+        self.assertIn("Diagnostic audio: silent headless audit (not audible)",
+                      output.getvalue())
 
     def test_relaunch_cap_reports_completed_markers_and_is_non_success(self):
         arguments = self.main_arguments() + [

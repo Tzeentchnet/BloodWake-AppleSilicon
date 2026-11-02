@@ -24,6 +24,7 @@ endif()
 find_package(SDL2 2.0.14 REQUIRED)
 find_package(Threads REQUIRED)
 find_library(APPKIT_FRAMEWORK AppKit REQUIRED)
+find_library(APPLICATIONSERVICES_FRAMEWORK ApplicationServices REQUIRED)
 get_target_property(SDL_INCLUDE_DIRS SDL2::SDL2 INTERFACE_INCLUDE_DIRECTORIES)
 set(PRESENTER "${CMAKE_CURRENT_LIST_DIR}/../../src/toolkit_patches/video/fb_present_sdl.c")
 add_executable(bw_macos_presenter_test test_main.c fake_presenter.c)
@@ -96,3 +97,32 @@ target_include_directories(bw_macos_settings_panel_model_test PRIVATE ../../src)
 target_link_libraries(bw_macos_settings_panel_model_test PRIVATE "${APPKIT_FRAMEWORK}")
 add_test(NAME presenter_settings_panel_model COMMAND bw_macos_settings_panel_model_test)
 set_tests_properties(presenter_settings_panel_model PROPERTIES TIMEOUT 20)
+
+add_executable(bw_macos_settings_panel_integration_test
+    test_main.c
+    fake_presenter.c
+    ../../src/bw_macos_settings_panel.m
+    ../../src/bw_settings.c
+    ../../src/bw_macos_mouse.c
+    ../../src/toolkit_patches/input/keyboard.c
+    ../../src/toolkit_patches/input/keyboard_sdl.c
+    "${XBOXRECOMP_DIR}/src/input/input_map.c")
+target_compile_definitions(bw_macos_settings_panel_integration_test PRIVATE
+    SDL_MAIN_HANDLED
+    BW_REAL_SETTINGS_PANEL_TEST=1
+    BW_MACOS_SETTINGS_PANEL_TESTING=1)
+target_include_directories(bw_macos_settings_panel_integration_test PRIVATE
+    ${SDL_INCLUDE_DIRS}
+    ../../src
+    "${XBOXRECOMP_DIR}/src"
+    "${XBOXRECOMP_DIR}/src/video"
+    "${XBOXRECOMP_DIR}/src/input")
+target_link_libraries(bw_macos_settings_panel_integration_test PRIVATE
+    Threads::Threads
+    "${APPKIT_FRAMEWORK}"
+    "${APPLICATIONSERVICES_FRAMEWORK}")
+add_test(NAME presenter_settings_panel_integration
+    COMMAND bw_macos_settings_panel_integration_test settings-panel-integration)
+set_tests_properties(presenter_settings_panel_integration PROPERTIES
+    TIMEOUT 30
+    SKIP_RETURN_CODE 77)

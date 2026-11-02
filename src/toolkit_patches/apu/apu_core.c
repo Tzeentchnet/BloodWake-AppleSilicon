@@ -818,6 +818,16 @@ static void bw_gain_period(int16_t period[][2], int n)
  * a 5.1 device is given (the header is rewritten every second). */
 extern int xa2_output_channels(void);
 
+static const char *apu_output_backend_name(void)
+{
+#if defined(_WIN32)
+    return XA2_BACKEND_NAME;
+#else
+    extern const char *xa2_backend_name(void);
+    return xa2_backend_name();
+#endif
+}
+
 static void apu_wav6_write(const int16_t *s, int n)
 {
     static FILE *f;
@@ -987,14 +997,15 @@ void mcpx_apu_monitor_init(MCPXAPUState *d, Error **errp)
         d->monitor.queued_bytes_low  = low * SAMPLE_BYTES;
         d->monitor.queued_bytes_high = high * SAMPLE_BYTES;
         fprintf(stderr, "[APU] Using %s audio backend (pacing: %d..%d samples queued)\n",
-                XA2_BACKEND_NAME, low, high);
+                apu_output_backend_name(), low, high);
         if (high < 2 * MIXER_FRAME_SAMPLES)
             fprintf(stderr, "[APU] device buffers hold under two EP periods;"
                             " expect underruns\n");
         return;
     }
 #if defined(_WIN32)
-    fprintf(stderr, "[APU] %s unavailable, falling back to waveOut\n", XA2_BACKEND_NAME);
+    fprintf(stderr, "[APU] %s unavailable, falling back to waveOut\n",
+            apu_output_backend_name());
 
     WAVEFORMATEX wfx = { 0 };
     wfx.wFormatTag      = WAVE_FORMAT_PCM;
@@ -1029,8 +1040,9 @@ void mcpx_apu_monitor_init(MCPXAPUState *d, Error **errp)
     fprintf(stderr, "[APU] waveOut audio output initialized (48kHz stereo 16-bit, %d buffers)\n",
             WAVEOUT_NUM_BUFS);
 #else
-    fprintf(stderr, "[APU] %s unavailable; cannot start audio\n", XA2_BACKEND_NAME);
-    error_setg(errp, "%s audio output is unavailable", XA2_BACKEND_NAME);
+    fprintf(stderr, "[APU] %s unavailable; cannot start audio\n",
+            apu_output_backend_name());
+    error_setg(errp, "%s audio output is unavailable", apu_output_backend_name());
 #endif
 }
 

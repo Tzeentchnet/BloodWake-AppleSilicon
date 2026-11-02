@@ -15,11 +15,33 @@ add_subdirectory("${BW_ROOT}/src/xemu_dsp" "${CMAKE_CURRENT_BINARY_DIR}/xemu_dsp
 
 add_executable(bw_apu_output_test
     test_main.c
+    "${BW_ROOT}/src/toolkit_patches/apu/bw_audio_audit.c"
     "${BW_ROOT}/src/toolkit_patches/apu/apu_sdl2.c"
     "${BW_ROOT}/src/toolkit_patches/apu/apu_xaudio2.c")
-target_include_directories(bw_apu_output_test PRIVATE "${XBOXRECOMP_DIR}/src/apu")
-target_link_libraries(bw_apu_output_test PRIVATE SDL2::SDL2)
+target_include_directories(bw_apu_output_test PRIVATE
+    "${BW_ROOT}/src/toolkit_patches/apu" "${XBOXRECOMP_DIR}/src/apu")
+target_link_libraries(bw_apu_output_test PRIVATE SDL2::SDL2 Threads::Threads)
 set_target_properties(bw_apu_output_test PROPERTIES C_STANDARD 11 C_STANDARD_REQUIRED ON)
+
+add_executable(bw_audio_audit_test
+    test_audio_audit.c
+    "${BW_ROOT}/src/toolkit_patches/apu/bw_audio_audit.c")
+target_include_directories(bw_audio_audit_test PRIVATE
+    "${BW_ROOT}/src/toolkit_patches/apu")
+target_link_libraries(bw_audio_audit_test PRIVATE Threads::Threads)
+set_target_properties(bw_audio_audit_test PROPERTIES C_STANDARD 11 C_STANDARD_REQUIRED ON)
+
+add_executable(bw_audio_audit_backend_test
+    test_audio_audit_backend.c
+    "${BW_ROOT}/src/toolkit_patches/apu/bw_audio_audit.c"
+    "${BW_ROOT}/src/toolkit_patches/apu/apu_sdl2.c"
+    "${BW_ROOT}/src/toolkit_patches/apu/apu_xaudio2.c")
+target_include_directories(bw_audio_audit_backend_test PRIVATE
+    "${BW_ROOT}/src/toolkit_patches/apu" "${XBOXRECOMP_DIR}/src/apu")
+target_link_libraries(bw_audio_audit_backend_test PRIVATE
+    SDL2::SDL2 Threads::Threads)
+set_target_properties(bw_audio_audit_backend_test PROPERTIES
+    C_STANDARD 11 C_STANDARD_REQUIRED ON)
 
 add_executable(bw_dsp_test test_dsp.c)
 target_include_directories(bw_dsp_test PRIVATE "${BW_ROOT}/src/xemu_dsp")
@@ -33,6 +55,7 @@ add_executable(bw_apu_lifecycle_test
     "${BW_ROOT}/src/toolkit_patches/apu/apu_vp.c"
     "${BW_ROOT}/src/toolkit_patches/apu/apu_dsp.c"
     "${BW_ROOT}/src/toolkit_patches/apu/bw_apu_xdsp.c"
+    "${BW_ROOT}/src/toolkit_patches/apu/bw_audio_audit.c"
     "${BW_ROOT}/src/toolkit_patches/apu/apu_sdl2.c"
     "${BW_ROOT}/src/toolkit_patches/apu/apu_xaudio2.c"
     "${XBOXRECOMP_DIR}/src/apu/apu_wav.c"
@@ -45,6 +68,9 @@ target_include_directories(bw_apu_lifecycle_test PRIVATE
     "${XBOXRECOMP_DIR}/src/nv2a")
 target_link_libraries(bw_apu_lifecycle_test PRIVATE bw_xemu_dsp SDL2::SDL2 Threads::Threads)
 if(NOT APPLE)
+    target_link_libraries(bw_apu_output_test PRIVATE m)
+    target_link_libraries(bw_audio_audit_test PRIVATE m)
+    target_link_libraries(bw_audio_audit_backend_test PRIVATE m)
     target_link_libraries(bw_dsp_test PRIVATE m)
     target_link_libraries(bw_apu_lifecycle_test PRIVATE m)
 endif()
@@ -54,6 +80,8 @@ enable_testing()
 add_test(NAME bw_apu_output COMMAND bw_apu_output_test)
 set_tests_properties(bw_apu_output PROPERTIES ENVIRONMENT
     "SDL_AUDIODRIVER=dummy;RECOMP_AUDIO_BUF_COUNT=8;RECOMP_AUDIO_BUF_SAMPLES=512")
+add_test(NAME bw_audio_audit COMMAND bw_audio_audit_test)
+add_test(NAME bw_audio_audit_backend COMMAND bw_audio_audit_backend_test)
 add_test(NAME bw_dsp COMMAND bw_dsp_test)
 add_test(NAME bw_apu_lifecycle COMMAND bw_apu_lifecycle_test)
 set_tests_properties(bw_apu_lifecycle PROPERTIES ENVIRONMENT

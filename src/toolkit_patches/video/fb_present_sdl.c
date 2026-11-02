@@ -58,6 +58,9 @@
 #include <SDL_metal.h>
 #include "bw_framebuffer_metal.h"
 #include "../../bw_macos_settings_panel.h"
+#ifdef BW_EXPERIMENTAL_SYNTHETIC_INPUT
+#include "../../bw_macos_input_bridge.h"
+#endif
 #endif
 
 extern ptrdiff_t xbox_GetMemoryOffset(void);
@@ -585,6 +588,9 @@ static void release_guest_input(Uint32 window_id)
     lost.window.windowID = window_id;
     lost.window.event = SDL_WINDOWEVENT_FOCUS_LOST;
     xbox_InputSdlEvent(&lost);
+#ifdef BW_EXPERIMENTAL_SYNTHETIC_INPUT
+    bw_macos_input_bridge_cancel_synthetic_script();
+#endif
 }
 
 static int settings_panel_consumes(const SDL_Event *event)
@@ -808,10 +814,18 @@ int xbox_HostWindowMain(int (*guest_main)(void))
                 if (!settings_panel_consumes(&ev) &&
                     !settings_panel_blocks_guest_input(&ev))
                     xbox_InputSdlEvent(&ev);
+#ifdef BW_EXPERIMENTAL_SYNTHETIC_INPUT
+                if (ev.type == SDL_WINDOWEVENT &&
+                    ev.window.event == SDL_WINDOWEVENT_FOCUS_LOST)
+                    bw_macos_input_bridge_cancel_synthetic_script();
+#endif
 #else
                 xbox_InputSdlEvent(&ev);
 #endif
                 if (ev.type == SDL_QUIT) {
+#ifdef BW_EXPERIMENTAL_SYNTHETIC_INPUT
+                    bw_macos_input_bridge_cancel_synthetic_script();
+#endif
                     fprintf(stderr, "  [FBWIN] window closed\n");
                     fflush(stderr);
                     _exit(0);
@@ -905,6 +919,9 @@ int xbox_HostWindowMain(int (*guest_main)(void))
             break;
     }
 
+#ifdef BW_EXPERIMENTAL_SYNTHETIC_INPUT
+    bw_macos_input_bridge_cancel_synthetic_script();
+#endif
     /* No frame copy may still touch guest memory when the host resumes. */
     atomic_store_explicit(&s_running, 0, memory_order_seq_cst);
     while (atomic_load_explicit(&s_in_present, memory_order_seq_cst))
@@ -929,6 +946,9 @@ int xbox_HostWindowMain(int (*guest_main)(void))
     return s_guest_rc;
 
 startup_failed:
+#ifdef BW_EXPERIMENTAL_SYNTHETIC_INPUT
+    bw_macos_input_bridge_cancel_synthetic_script();
+#endif
 #if defined(__APPLE__)
     if (metal_view)
         SDL_Metal_DestroyView(metal_view);

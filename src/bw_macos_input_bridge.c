@@ -37,6 +37,46 @@ static atomic_uint s_observed;
 #ifdef BW_EXPERIMENTAL_SYNTHETIC_INPUT
 static atomic_int s_trace_synthetic;
 
+typedef enum {
+    BW_SCRIPT_START,
+    BW_SCRIPT_DPAD_DOWN,
+    BW_SCRIPT_A
+} BwScriptButton;
+
+typedef struct {
+    uint32_t wait_epochs;
+    uint32_t press_epochs;
+    BwScriptButton button;
+} BwScriptStep;
+
+enum {
+    BW_SCRIPT_WAIT,
+    BW_SCRIPT_PRESS,
+    BW_SCRIPT_RELEASE
+};
+
+static const char s_script_name[] = "remastered-boot-menu-to-gameplay-v1";
+static const BwScriptStep s_script_steps[] = {
+    {300, 4, BW_SCRIPT_START},
+    {120, 3, BW_SCRIPT_DPAD_DOWN},
+    { 12, 3, BW_SCRIPT_DPAD_DOWN},
+    { 12, 3, BW_SCRIPT_DPAD_DOWN},
+    { 12, 3, BW_SCRIPT_DPAD_DOWN},
+    { 60, 4, BW_SCRIPT_A},
+    {120, 4, BW_SCRIPT_A},
+    {120, 4, BW_SCRIPT_A},
+    {180, 4, BW_SCRIPT_A},
+    {180, 4, BW_SCRIPT_A},
+    {240, 4, BW_SCRIPT_A},
+};
+
+static struct {
+    size_t step;
+    uint32_t remaining;
+    int phase;
+    int active;
+} s_script;
+
 void bw_macos_input_bridge_trace_synthetic(int enabled)
 {
     atomic_store_explicit(&s_trace_synthetic, enabled != 0, memory_order_release);
@@ -46,9 +86,95 @@ static pthread_mutex_t s_lock = PTHREAD_MUTEX_INITIALIZER;
 static uint32_t s_generation, s_handle;
 static int s_initialized;
 
+#ifdef BW_EXPERIMENTAL_SYNTHETIC_INPUT
+static const char *script_button_name(BwScriptButton button)
+{
+    switch (button) {
+    case BW_SCRIPT_START: return "Start";
+    case BW_SCRIPT_DPAD_DOWN: return "D-pad Down";
+    case BW_SCRIPT_A: return "A";
+    }
+    return "?";
+}
+
+static void cancel_script_locked(void)
+{
+    memset(&s_script, 0, sizeof s_script);
+}
+
+int bw_macos_input_bridge_select_synthetic_script(const char *name)
+{
+    int selected = name && !strcmp(name, s_script_name);
+    pthread_mutex_lock(&s_lock);
+    cancel_script_locked();
+    if (selected) {
+        s_script.remaining = s_script_steps[0].wait_epochs;
+        s_script.phase = BW_SCRIPT_WAIT;
+        s_script.active = 1;
+    }
+    pthread_mutex_unlock(&s_lock);
+    return selected;
+}
+
+void bw_macos_input_bridge_cancel_synthetic_script(void)
+{
+    pthread_mutex_lock(&s_lock);
+    cancel_script_locked();
+    pthread_mutex_unlock(&s_lock);
+}
+
+static void apply_script_locked(XBOX_INPUT_STATE *state)
+{
+    const BwScriptStep *step;
+    if (!s_script.active)
+        return;
+    step = &s_script_steps[s_script.step];
+    if (s_script.phase == BW_SCRIPT_WAIT) {
+        if (s_script.remaining) {
+            s_script.remaining--;
+            return;
+        }
+        s_script.phase = BW_SCRIPT_PRESS;
+        s_script.remaining = step->press_epochs;
+        fprintf(stderr, "[BW-INPUT] synthetic script step %zu %s press\n",
+                s_script.step + 1, script_button_name(step->button));
+    } else if (s_script.phase == BW_SCRIPT_RELEASE) {
+        fprintf(stderr, "[BW-INPUT] synthetic script step %zu %s release\n",
+                s_script.step + 1, script_button_name(step->button));
+        s_script.step++;
+        if (s_script.step == sizeof s_script_steps / sizeof s_script_steps[0]) {
+            cancel_script_locked();
+            fprintf(stderr, "[BW-INPUT] synthetic script completed\n");
+            return;
+        }
+        s_script.phase = BW_SCRIPT_WAIT;
+        s_script.remaining = s_script_steps[s_script.step].wait_epochs;
+        return;
+    }
+
+    switch (step->button) {
+    case BW_SCRIPT_START:
+        state->Gamepad.wButtons |= XBOX_GAMEPAD_START;
+        break;
+    case BW_SCRIPT_DPAD_DOWN:
+        state->Gamepad.wButtons |= XBOX_GAMEPAD_DPAD_DOWN;
+        break;
+    case BW_SCRIPT_A:
+        state->Gamepad.bAnalogButtons[XBOX_BUTTON_A] = 255;
+        break;
+    }
+    if (!--s_script.remaining)
+        s_script.phase = BW_SCRIPT_RELEASE;
+}
+#endif
+
 void bw_macos_input_bridge_configure(int enabled)
 {
     atomic_store_explicit(&s_enabled, enabled != 0, memory_order_release);
+#ifdef BW_EXPERIMENTAL_SYNTHETIC_INPUT
+    if (!enabled)
+        bw_macos_input_bridge_cancel_synthetic_script();
+#endif
 }
 
 static int enabled(void)
@@ -191,8 +317,12 @@ void sub_0016DC8B(void)
     arguments(args, 1);
     pthread_mutex_lock(&s_lock);
     valid = s_handle && args[0] == s_handle;
-    if (valid)
+    if (valid) {
         s_handle = 0;
+#ifdef BW_EXPERIMENTAL_SYNTHETIC_INPUT
+        cancel_script_locked();
+#endif
+    }
     pthread_mutex_unlock(&s_lock);
     if (!valid)
         invalid("controller close");
@@ -259,6 +389,7 @@ void sub_0016DE89(void)
                              &state.Gamepad.sThumbRX, &state.Gamepad.sThumbRY,
                              &state.dwPacketNumber);
 #ifdef BW_EXPERIMENTAL_SYNTHETIC_INPUT
+        apply_script_locked(&state);
         synthetic_seen = atomic_load_explicit(&s_trace_synthetic, memory_order_acquire) &&
             (state.Gamepad.wButtons & (XBOX_GAMEPAD_START | XBOX_GAMEPAD_DPAD_DOWN)) ==
                 (XBOX_GAMEPAD_START | XBOX_GAMEPAD_DPAD_DOWN) &&

@@ -414,6 +414,8 @@ bw_carried_patch(xbox_apu "src/apu/apu_xaudio2.c"
 if(APPLE)
     bw_carried_patch(xbox_apu "src/apu/apu_sdl2.c"
                      "50fb404a92489a66d34d59447c6e16bf07d24c393dcb0a5afbba3b41f1d710d2")
+    target_sources(xbox_apu PRIVATE
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/toolkit_patches/apu/bw_audio_audit.c")
 endif()
 
 # D-003 B: the executor hands transformed batches to the GPU back end with

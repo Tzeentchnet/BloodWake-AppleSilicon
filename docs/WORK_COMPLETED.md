@@ -1,6 +1,6 @@
 # Apple Silicon work completed
 
-Updated 2026-11-01. This document records implemented Apple Silicon work.
+Updated 2026-11-02. This document records implemented Apple Silicon work.
 Current status and remaining work are in
 [APPLE_SILICON_HANDOFF.md](APPLE_SILICON_HANDOFF.md); measured results and
 test coverage are in [VALIDATION.md](VALIDATION.md).
@@ -36,6 +36,11 @@ test coverage are in [VALIDATION.md](VALIDATION.md).
   boot with default-on CoreAudio, title-driven APU/DSP activity, and APU
   interrupts at 4x direct-Metal scale. The run ended at its intentional limit;
   one SDL underrun was observed and audible correctness remains unconfirmed.
+- Added a diagnostic-only headless audio sink authorized by the bounded native
+  runner. It keeps 48 kHz stereo APU/DSP timing active without CoreAudio,
+  retains no samples, and reports synchronized aggregate signal, silence,
+  clipping, queue, cadence, jitter, and latency metrics. Default CoreAudio
+  startup and failure behavior remain unchanged.
 
 ## Metal renderer
 
@@ -88,6 +93,10 @@ test coverage are in [VALIDATION.md](VALIDATION.md).
 - Added bounded marker-only ocean fingerprints over stable copied metadata.
   Private GPU audits report at most 32 aggregate hashes plus overflow and
   within-scope mismatch counts; retail data and rendering are unchanged.
+- Combined deterministic menu navigation with the headless audio sink in a
+  private three-boot/two-relaunch Remastered flow. It produced 12,670 markers,
+  154 clean scopes, and 297 fingerprinted batches across 10 aggregate hashes,
+  with zero marker rejection, table overflow, or within-scope mismatch.
 
 ## Renderer performance
 
@@ -117,11 +126,21 @@ test coverage are in [VALIDATION.md](VALIDATION.md).
   controller connection changes.
 - Added a separately compiled synthetic-input diagnostic that verifies a guest
   state query can observe Start, Down, and A.
+- Added a strict built-in `remastered-boot-menu-to-gameplay-v1` script. It
+  generates direct Xbox-equivalent Start, D-pad Down, and A press/release
+  packets on guest polling epochs, requires the diagnostic synthetic-input
+  build and Remastered selection, and releases state on completion, focus
+  loss, and shutdown.
 - Added a floating AppKit F1 panel built from the shared settings schema.
   It consumes F1 before guest input, releases held input, reports
   live/frame/restart/unsupported state, applies subsystem-owned live values,
   and saves through the strict atomic INI writer. It does not synthesize an
   unsafe pause.
+- Added a real AppKit/presenter integration target covering F1 down/repeat/up,
+  main-thread panel/controller lifecycle, input and mouse release, capability
+  reasons, live LOD, frame-boundary filtering, restart-pending state, isolated
+  atomic save, and visible error sheets. Its real-window case skips explicitly
+  when WindowServer is unavailable.
 - Added configurable gameplay mouse input through the native controller
   bridge, including synchronized relative deltas, focus/capture release,
   sensitivity, inversion, response curve, left/right stick selection, and
@@ -179,12 +198,15 @@ test coverage are in [VALIDATION.md](VALIDATION.md).
 - Guest USB, physical gamepads, FMV, saves, other editions, and broad mission
   coverage are not complete Apple Silicon features. Native APU audio is
   implemented and regression-tested, but audible retail output, quality, and
-  sustained gameplay remain unconfirmed.
+  sustained gameplay remain unconfirmed. The headless audit validates
+  aggregate signal/timing only and is not an audible-output fallback.
 - Gameplay mouse input is implemented, but point-and-click menu hitboxes need
   validated title UI state and geometry. Ship/weapon profiles need proven
-  definition fields/ownership. Realistic water now has an inert explicit draw
-  marker but still needs representative pass-coverage captures before any
-  shader change; none is represented by a placeholder or silent no-op.
+  definition fields/ownership. Realistic water now has runtime-validated
+  explicit markers and consistent metadata fingerprints in the automated
+  boot-to-gameplay flow, but still needs representative pass-coverage and
+  visual captures before any shader change; none is represented by a
+  placeholder or silent no-op.
 - Metal MSAA remains deliberately unsupported until the controlled
   visual/GPU-time/memory gate in `METAL_QUALITY.md` justifies it.
 - Unsupported states continue to fail explicitly instead of being guessed or

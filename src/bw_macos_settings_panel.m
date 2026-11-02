@@ -1,4 +1,7 @@
 #import <AppKit/AppKit.h>
+#ifdef BW_MACOS_SETTINGS_PANEL_TESTING
+#import <ApplicationServices/ApplicationServices.h>
+#endif
 
 #include <stdio.h>
 #include <string.h>
@@ -206,6 +209,9 @@ static NSString *base_status(const bw_setting_info_t *info)
 @property(nonatomic, strong) NSPanel *panel;
 @property(nonatomic, strong) NSMutableArray<BWSettingRow *> *rows;
 @property(nonatomic, strong) id keyMonitor;
+#ifdef BW_MACOS_SETTINGS_PANEL_TESTING
+@property(nonatomic, strong) NSAlert *testAlert;
+#endif
 - (BOOL)openPanel;
 - (void)settingChanged:(NSPopUpButton *)sender;
 @end
@@ -307,6 +313,9 @@ static NSString *base_status(const bw_setting_info_t *info)
     alert.alertStyle = NSAlertStyleWarning;
     alert.messageText = @"The setting was not applied";
     alert.informativeText = message.length ? message : @"An unknown settings error occurred.";
+#ifdef BW_MACOS_SETTINGS_PANEL_TESTING
+    self.testAlert = alert;
+#endif
     [alert beginSheetModalForWindow:self.panel completionHandler:nil];
 }
 
@@ -481,6 +490,9 @@ static NSString *base_status(const bw_setting_info_t *info)
         self.panel.delegate = nil;
         self.panel = nil;
         [self.rows removeAllObjects];
+#ifdef BW_MACOS_SETTINGS_PANEL_TESTING
+        self.testAlert = nil;
+#endif
     }
 }
 
@@ -488,18 +500,181 @@ static NSString *base_status(const bw_setting_info_t *info)
 
 static BWSettingsPanelController *s_controller;
 
+#ifdef BW_MACOS_SETTINGS_PANEL_TESTING
+static bw_macos_settings_panel_test_lifecycle_fn s_test_lifecycle;
+static void *s_test_lifecycle_context;
+
+static void test_copy_string(char *out, size_t out_len, NSString *value)
+{
+    if (!out || !out_len)
+        return;
+    snprintf(out, out_len, "%s", value.UTF8String ?: "");
+}
+
+static BWSettingRow *test_find_row(const char *section, const char *key)
+{
+    if (!section || !key)
+        return nil;
+    for (BWSettingRow *row in s_controller.rows)
+        if (!strcmp(row->info.section, section) &&
+            !strcmp(row->info.key, key))
+            return row;
+    return nil;
+}
+
+static BOOL test_view_contains(NSView *view, NSString *text)
+{
+    if ([view isKindOfClass:[NSTextField class]] &&
+        [[(NSTextField *)view stringValue] containsString:text])
+        return YES;
+    for (NSView *child in view.subviews)
+        if (test_view_contains(child, text))
+            return YES;
+    return NO;
+}
+
+static void test_notify_lifecycle(int open)
+{
+    if (s_test_lifecycle)
+        s_test_lifecycle(open, s_test_lifecycle_context);
+}
+
+void bw_macos_settings_panel_test_set_lifecycle_callback(
+    bw_macos_settings_panel_test_lifecycle_fn callback, void *context)
+{
+    s_test_lifecycle = callback;
+    s_test_lifecycle_context = context;
+}
+
+int bw_macos_settings_panel_test_window_server_available(void)
+{
+    CFDictionaryRef session = CGSessionCopyCurrentDictionary();
+    CGDirectDisplayID display = CGMainDisplayID();
+    int available = session && display != kCGNullDirectDisplay &&
+                    CGDisplayIsActive(display);
+    if (session)
+        CFRelease(session);
+    return available;
+}
+
+int bw_macos_settings_panel_test_state(
+    bw_macos_settings_panel_test_state_t *out)
+{
+    @autoreleasepool {
+        if (!out || ![NSThread isMainThread])
+            return -1;
+        memset(out, 0, sizeof *out);
+        out->controller_created = s_controller != nil;
+        out->panel_created =
+            [s_controller.panel isKindOfClass:[NSPanel class]];
+        out->visible = s_controller.panel.visible;
+        out->main_thread = [NSThread isMainThread];
+        out->row_count = s_controller.rows.count;
+        out->no_pause_notice =
+            test_view_contains(s_controller.panel.contentView,
+                               @"the game is not paused");
+        return 0;
+    }
+}
+
+int bw_macos_settings_panel_test_row(
+    const char *section, const char *key,
+    bw_macos_settings_panel_test_row_t *out)
+{
+    @autoreleasepool {
+        BWSettingRow *row;
+        if (!out || ![NSThread isMainThread])
+            return -1;
+        row = test_find_row(section, key);
+        if (!row)
+            return -1;
+        memset(out, 0, sizeof *out);
+        out->enabled = row.button.enabled;
+        out->apply_kind = bw_macos_settings_classify(&row->info);
+        test_copy_string(out->value, sizeof out->value,
+                         row.button.selectedItem.representedObject);
+        test_copy_string(out->status, sizeof out->status,
+                         row.status.stringValue);
+        snprintf(out->support_reason, sizeof out->support_reason, "%s",
+                 row->info.support_reason ?: "");
+        return 0;
+    }
+}
+
+int bw_macos_settings_panel_test_select(const char *section, const char *key,
+                                        const char *value)
+{
+    @autoreleasepool {
+        BWSettingRow *row;
+        NSString *selected;
+        if (!value || ![NSThread isMainThread])
+            return -1;
+        row = test_find_row(section, key);
+        if (!row || !row.button.enabled)
+            return -1;
+        selected = string_from_utf8(value);
+        [s_controller selectValue:selected inButton:row.button];
+        if (![row.button.selectedItem.representedObject
+                isEqualToString:selected])
+            return -1;
+        [s_controller settingChanged:row.button];
+        return 0;
+    }
+}
+
+int bw_macos_settings_panel_test_visible_error(char *message,
+                                               size_t message_len)
+{
+    @autoreleasepool {
+        NSAlert *alert;
+        if (![NSThread isMainThread])
+            return 0;
+        alert = s_controller.testAlert;
+        if (!alert || s_controller.panel.attachedSheet != alert.window)
+            return 0;
+        test_copy_string(message, message_len, alert.informativeText);
+        return 1;
+    }
+}
+
+void bw_macos_settings_panel_test_dismiss_error(void)
+{
+    @autoreleasepool {
+        NSWindow *sheet;
+        if (![NSThread isMainThread])
+            return;
+        sheet = s_controller.panel.attachedSheet;
+        if (sheet) {
+            [s_controller.panel endSheet:sheet
+                              returnCode:NSModalResponseCancel];
+            [sheet orderOut:nil];
+        }
+        s_controller.testAlert = nil;
+    }
+}
+#endif
+
 int bw_macos_settings_panel_toggle(void)
 {
     @autoreleasepool {
+        int result;
         if (![NSThread isMainThread])
             return -1;
         if (!s_controller)
             s_controller = [[BWSettingsPanelController alloc] init];
         if (s_controller.panel.visible) {
             [s_controller.panel close];
+#ifdef BW_MACOS_SETTINGS_PANEL_TESTING
+            test_notify_lifecycle(0);
+#endif
             return 0;
         }
-        return [s_controller openPanel] ? 1 : -1;
+        result = [s_controller openPanel] ? 1 : -1;
+#ifdef BW_MACOS_SETTINGS_PANEL_TESTING
+        if (result > 0)
+            test_notify_lifecycle(1);
+#endif
+        return result;
     }
 }
 
