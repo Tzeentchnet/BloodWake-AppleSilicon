@@ -1,0 +1,34 @@
+{
+  "schema_version": 1,
+  "upstream": {
+    "commit": "e631edddfe56d22344e9f696923aeb6d78a9e7ba",
+    "merge_base_at_recording": "0bee18112cf0fd28373b3addd9bc83cc137acd0f",
+    "fix_registry_path": "src/bw_fixes.def",
+    "fix_registry_sha256": "26745410cb8ee0156ea4568fab7b4d950cd847f564d34cae97d25046ad38d76a",
+    "fix_count": 42
+  },
+  "native_fix_sources": [
+    "src/bw_edition.c",
+    "src/bw_settings.c",
+    "src/bw_hifps_hooks.c",
+    "src/bw_widescreen.c",
+    "src/bw_remaster_hooks.c",
+    "src/bw_audio_hooks.c",
+    "src/bw_fix_hooks.c",
+    "src/bw_visextra_hooks.c",
+    "src/bw_ocean_native.c",
+    "src/gpu/bw_vfx_lod_native.c"
+  ],
+  "classified_unmerged_commits": [
+    {
+      "commit": "6a4f115efa32286b9b73b681939e60754185daf4",
+      "classification": "windows-d3d11-install-time-shader-warmup",
+      "disposition": "Do not port the DX11 warm-up to Metal. Reassess generic installer hardening separately."
+    },
+    {
+      "commit": "e631edddfe56d22344e9f696923aeb6d78a9e7ba",
+      "classification": "windows-d3d11-shader-warmup-corrections",
+      "disposition": "Do not port DX11 cache behavior to Metal. Preserve the non-fatal install-record principle in any future native installer."
+    }
+  ]
+}

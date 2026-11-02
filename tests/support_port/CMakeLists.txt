@@ -31,7 +31,7 @@ target_compile_options(bw_support_port_test PRIVATE
     -Wall -Wextra -Werror -fno-omit-frame-pointer)
 
 enable_testing()
-foreach(case settings edition save_retry save_race save_fallback save_conflict wait state debug diagnostics events_only host)
+foreach(case settings edition fix_registry save_retry save_race save_fallback save_conflict wait state debug diagnostics events_only host)
     add_test(NAME "support_${case}" COMMAND bw_support_port_test "${case}")
     set_tests_properties("support_${case}" PROPERTIES TIMEOUT 20)
 endforeach()

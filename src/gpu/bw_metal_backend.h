@@ -37,6 +37,12 @@ int bw_metal_backend_attach_presenter(void *metal_layer, uint32_t drawable_width
 int bw_metal_backend_resize_presenter(uint32_t drawable_width,
                                       uint32_t drawable_height);
 
+/* Request Metal anisotropy for filtered textures with mip chains. The value
+ * must be 1, 2, 4, 8 or 16. Immutable sampler variants are selected at the
+ * next executor flip; point-sampled and unmipped textures remain 1x. */
+int bw_metal_backend_set_anisotropy(unsigned anisotropy);
+unsigned bw_metal_backend_anisotropy(void);
+
 /* Start after the toolkit has mapped guest memory and before the guest submits
  * GPU work. The host must set RECOMP_PB_EXEC before the toolkit starts its
  * poll thread; it is presence-based, so even "0" enables execution. Executor

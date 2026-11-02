@@ -33,6 +33,11 @@ int bw_metal_backend_resize_presenter(uint32_t width, uint32_t height)
     return 1;
 }
 
+int bw_macos_settings_panel_toggle(void) { return 0; }
+int bw_macos_settings_panel_is_open(void) { return 0; }
+void bw_macos_settings_panel_close(void) {}
+void bw_macos_mouse_sdl_event(const SDL_Event *event) { (void)event; }
+
 static _Alignas(16) uint8_t s_memory[2u * 1024u * 1024u];
 static atomic_int s_guest_calls;
 static int s_headless;

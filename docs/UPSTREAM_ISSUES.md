@@ -4,6 +4,9 @@ These are local findings, not submitted issues or claims of game compatibility.
 Reproduce any upstream report with synthetic inputs; do not attach game files,
 generated C, private logs, captures or screenshots.
 
+The Blood Wake gameplay-fix and branch-sync baseline is tracked separately in
+[UPSTREAM_BASELINE.md](UPSTREAM_BASELINE.md).
+
 ## xboxrecomp
 
 Baseline: commit `f0f8a461496a4f23d9b0aeaa284b8d70ba7ab82b`, macOS

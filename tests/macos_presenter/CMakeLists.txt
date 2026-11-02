@@ -5,6 +5,7 @@ if(NOT APPLE)
     message(FATAL_ERROR "The native SDL presenter tests require macOS")
 endif()
 
+enable_language(OBJC)
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
 set(XBOXRECOMP_DIR "${CMAKE_CURRENT_LIST_DIR}/../../build/xboxrecomp" CACHE PATH
@@ -22,6 +23,7 @@ endif()
 
 find_package(SDL2 2.0.14 REQUIRED)
 find_package(Threads REQUIRED)
+find_library(APPKIT_FRAMEWORK AppKit REQUIRED)
 get_target_property(SDL_INCLUDE_DIRS SDL2::SDL2 INTERFACE_INCLUDE_DIRECTORIES)
 set(PRESENTER "${CMAKE_CURRENT_LIST_DIR}/../../src/toolkit_patches/video/fb_present_sdl.c")
 add_executable(bw_macos_presenter_test test_main.c fake_presenter.c)
@@ -37,6 +39,7 @@ foreach(case
         headless headless-window-off no-callback wrong-thread
         init-fail dummy-driver offscreen-driver window-fail hidden-window
         renderer-fail logical-size-fail event-fail thread-fail
+        settings-panel
         frame-32 frame-16 frame-contig lost-completion blocked-copy late-worker
         close texture-fail update-fail render-fail invalid-format invalid-address
         late-present-error metal-headless metal-direct metal-1x metal-xzero-1x metal-contig metal-2x1
@@ -83,3 +86,13 @@ target_link_libraries(bw_macos_presenter_real_test PRIVATE xbox_input platform S
 add_test(NAME presenter_real_headless COMMAND bw_macos_presenter_real_test headless)
 add_test(NAME presenter_real_dummy_rejected COMMAND bw_macos_presenter_real_test dummy)
 set_tests_properties(presenter_real_headless presenter_real_dummy_rejected PROPERTIES TIMEOUT 20)
+
+add_executable(bw_macos_settings_panel_model_test
+    test_settings_panel_model.m ../../src/bw_macos_settings_panel.m)
+set_source_files_properties(
+    test_settings_panel_model.m ../../src/bw_macos_settings_panel.m
+    PROPERTIES COMPILE_OPTIONS "-fobjc-arc")
+target_include_directories(bw_macos_settings_panel_model_test PRIVATE ../../src)
+target_link_libraries(bw_macos_settings_panel_model_test PRIVATE "${APPKIT_FRAMEWORK}")
+add_test(NAME presenter_settings_panel_model COMMAND bw_macos_settings_panel_model_test)
+set_tests_properties(presenter_settings_panel_model PROPERTIES TIMEOUT 20)

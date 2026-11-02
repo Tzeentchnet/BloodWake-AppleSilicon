@@ -57,6 +57,7 @@
 #include <mach/mach_vm.h>
 #include <SDL_metal.h>
 #include "bw_framebuffer_metal.h"
+#include "../../bw_macos_settings_panel.h"
 #endif
 
 extern ptrdiff_t xbox_GetMemoryOffset(void);
@@ -575,6 +576,55 @@ static void check_present_error(void)
     }
 }
 
+#if defined(__APPLE__)
+static void release_guest_input(Uint32 window_id)
+{
+    SDL_Event lost;
+    memset(&lost, 0, sizeof lost);
+    lost.type = SDL_WINDOWEVENT;
+    lost.window.windowID = window_id;
+    lost.window.event = SDL_WINDOWEVENT_FOCUS_LOST;
+    xbox_InputSdlEvent(&lost);
+}
+
+static int settings_panel_consumes(const SDL_Event *event)
+{
+    int open;
+    if ((event->type != SDL_KEYDOWN && event->type != SDL_KEYUP) ||
+        event->key.keysym.sym != SDLK_F1)
+        return 0;
+    if (event->type == SDL_KEYDOWN && !event->key.repeat) {
+        open = bw_macos_settings_panel_toggle();
+        if (open > 0)
+            release_guest_input(event->key.windowID);
+        else if (open < 0) {
+            fprintf(stderr, "  [FBWIN] cannot toggle the macOS settings panel\n");
+            fflush(stderr);
+        }
+    }
+    return 1;
+}
+
+static int settings_panel_blocks_guest_input(const SDL_Event *event)
+{
+    if (!bw_macos_settings_panel_is_open())
+        return 0;
+    switch (event->type) {
+    case SDL_KEYDOWN:
+    case SDL_KEYUP:
+    case SDL_TEXTEDITING:
+    case SDL_TEXTINPUT:
+    case SDL_MOUSEMOTION:
+    case SDL_MOUSEBUTTONDOWN:
+    case SDL_MOUSEBUTTONUP:
+    case SDL_MOUSEWHEEL:
+        return 1;
+    default:
+        return 0;
+    }
+}
+#endif
+
 int xbox_HostWindowMain(int (*guest_main)(void))
 {
     SDL_Window *win = NULL;
@@ -754,7 +804,13 @@ int xbox_HostWindowMain(int (*guest_main)(void))
             do {
                 /* Keys for the pad stand-in, and the window events that
                  * release them; it only reads the event. */
+#if defined(__APPLE__)
+                if (!settings_panel_consumes(&ev) &&
+                    !settings_panel_blocks_guest_input(&ev))
+                    xbox_InputSdlEvent(&ev);
+#else
                 xbox_InputSdlEvent(&ev);
+#endif
                 if (ev.type == SDL_QUIT) {
                     fprintf(stderr, "  [FBWIN] window closed\n");
                     fflush(stderr);
@@ -862,6 +918,10 @@ int xbox_HostWindowMain(int (*guest_main)(void))
     check_present_error();
     fprintf(stderr, "  [FBWIN] guest returned\n");
     fflush(stderr);
+
+#if defined(__APPLE__)
+    bw_macos_settings_panel_close();
+#endif
 
     /* Detached guest/USB workers may still use SDL and guest memory. The host
      * stops those it can before unmapping, or exits the process without

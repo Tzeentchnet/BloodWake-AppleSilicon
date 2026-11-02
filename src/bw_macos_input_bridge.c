@@ -1,5 +1,6 @@
 #include "bw_hook_platform.h"
 #include "bw_macos_input_bridge.h"
+#include "bw_macos_mouse.h"
 #include "keyboard.h"
 
 #include <pthread.h>
@@ -254,6 +255,9 @@ void sub_0016DE89(void)
     pthread_mutex_lock(&s_lock);
     if (s_handle && args[0] == s_handle) {
         xbox_InputKeyboardState(&state);
+        bw_macos_mouse_apply(&state.Gamepad.sThumbLX, &state.Gamepad.sThumbLY,
+                             &state.Gamepad.sThumbRX, &state.Gamepad.sThumbRY,
+                             &state.dwPacketNumber);
 #ifdef BW_EXPERIMENTAL_SYNTHETIC_INPUT
         synthetic_seen = atomic_load_explicit(&s_trace_synthetic, memory_order_acquire) &&
             (state.Gamepad.wButtons & (XBOX_GAMEPAD_START | XBOX_GAMEPAD_DPAD_DOWN)) ==

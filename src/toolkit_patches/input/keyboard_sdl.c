@@ -9,6 +9,7 @@
 #undef xbox_InputSdlEvent
 
 #include "xinput_xbox.h"
+#include "../../bw_macos_mouse.h"
 
 extern void bw_InputRefreshControllers(void);
 
@@ -21,6 +22,7 @@ void xbox_InputSdlInit(void)
 void xbox_InputSdlEvent(const SDL_Event *event)
 {
     bw_upstream_InputSdlEvent(event);
+    bw_macos_mouse_sdl_event(event);
     if (event->type == SDL_CONTROLLERDEVICEADDED ||
         event->type == SDL_CONTROLLERDEVICEREMOVED ||
         event->type == SDL_CONTROLLERDEVICEREMAPPED ||

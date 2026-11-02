@@ -94,6 +94,7 @@ set_tests_properties(metal_shared-backing-unprotected-alias-counterexample PROPE
     LABELS "experiment;counterexample" TIMEOUT 20)
 
 foreach(case semaphore-release semaphore-concurrent visual
+             anisotropy anisotropy-original anisotropy-invalid
              render-scale render-scale-aa render-scale-partial render-scale-box
              render-scale-depth render-scale-auto render-scale-invalid render-scale-ssaa-min
              seed-order command-batching perspective blend color-mask alpha-test pipeline-cache cull full-rect depth-clear
@@ -302,6 +303,6 @@ add_executable(bw_metal_lod_test test_lod.c ../../src/gpu/bw_vfx_lod_native.c)
 target_include_directories(bw_metal_lod_test PRIVATE ../../src)
 target_link_libraries(bw_metal_lod_test PRIVATE Threads::Threads)
 set_target_properties(bw_metal_lod_test PROPERTIES C_STANDARD 11 C_STANDARD_REQUIRED ON)
-foreach(case original default off fix-off override clamp named-off)
+foreach(case original default off fix-off override clamp named-off runtime concurrent)
     add_test(NAME "metal_lod_${case}" COMMAND bw_metal_lod_test "${case}")
 endforeach()

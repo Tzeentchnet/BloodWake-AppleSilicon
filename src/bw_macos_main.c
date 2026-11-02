@@ -2,6 +2,7 @@
 #include "bw_edition.h"
 #include "bw_framelog.h"
 #include "bw_macos_boot.h"
+#include "bw_macos_mouse.h"
 #ifdef BW_EXPERIMENTAL_MACOS_KEYBOARD_HOOK
 #include "bw_macos_input_bridge.h"
 #endif
@@ -10,6 +11,7 @@
 #include "bw_settings.h"
 #include "bw_widescreen.h"
 #include "gpu/bw_metal_backend.h"
+#include "gpu/bw_vfx_lod_native.h"
 #include "toolkit_patches/bw_runtime_lifecycle.h"
 #include "toolkit_patches/video/bw_framebuffer_metal.h"
 
@@ -54,6 +56,195 @@ typedef struct {
 } BwNativeBoot;
 
 static BwNativeBoot s_boot;
+static int s_input_hook_enabled;
+
+static int lod_current(char *value, size_t value_len, void *context,
+                       char *err, size_t errlen)
+{
+    float scale = bw_vfx_lod_scale();
+    const char *choice = NULL;
+    (void)context;
+    if (scale == 1.0f) choice = "original";
+    else if (scale == 2.0f) choice = "far";
+    else if (scale == 3.0f) choice = "farther";
+    else if (scale == 4.0f) choice = "4";
+    else if (scale == 5.0f) choice = "5";
+    else if (scale == 6.0f) choice = "6";
+    else if (scale == 7.0f) choice = "7";
+    else if (scale == 8.0f) choice = "8";
+    if (!choice) {
+        if (err && errlen) {
+            snprintf(err, errlen, "current LOD scale %.3g is an advanced value", scale);
+            err[errlen - 1] = 0;
+        }
+        return -1;
+    }
+    if (!value || !value_len || snprintf(value, value_len, "%s", choice) >= (int)value_len) {
+        if (err && errlen) {
+            snprintf(err, errlen, "LOD setting output buffer is too small");
+            err[errlen - 1] = 0;
+        }
+        return -1;
+    }
+    return 0;
+}
+
+static int lod_apply(const char *value, void *context, char *err, size_t errlen)
+{
+    float scale;
+    (void)context;
+    if (!strcmp(value, "original")) scale = 1.0f;
+    else if (!strcmp(value, "far")) scale = 2.0f;
+    else if (!strcmp(value, "farther")) scale = 3.0f;
+    else scale = (float)atoi(value);
+    return bw_vfx_lod_set_scale(scale, err, errlen);
+}
+
+static int anisotropy_current(char *value, size_t value_len, void *context,
+                              char *err, size_t errlen)
+{
+    unsigned anisotropy = bw_metal_backend_anisotropy();
+    int n;
+    (void)context;
+    n = anisotropy == 1 ? snprintf(value, value_len, "off")
+                        : snprintf(value, value_len, "%u", anisotropy);
+    if (!value || !value_len || n < 0 || (size_t)n >= value_len) {
+        if (err && errlen) {
+            snprintf(err, errlen, "texture-filter setting output buffer is too small");
+            err[errlen - 1] = 0;
+        }
+        return -1;
+    }
+    return 0;
+}
+
+static int anisotropy_apply(const char *value, void *context, char *err, size_t errlen)
+{
+    unsigned anisotropy = !strcmp(value, "off") ? 1u : (unsigned)strtoul(value, NULL, 10);
+    (void)context;
+    if (bw_metal_backend_set_anisotropy(anisotropy))
+        return 0;
+    if (err && errlen) {
+        snprintf(err, errlen, "Metal anisotropy must be off, 4x, 8x or 16x");
+        err[errlen - 1] = 0;
+    }
+    return -1;
+}
+
+enum {
+    MOUSE_ENABLED,
+    MOUSE_SENSITIVITY,
+    MOUSE_INVERT_Y,
+    MOUSE_RESPONSE,
+    MOUSE_STICK,
+    MOUSE_CAPTURE,
+};
+
+static int mouse_current(char *value, size_t value_len, void *context,
+                         char *err, size_t errlen)
+{
+    BwMouseConfig config;
+    const char *text = NULL;
+    int n;
+    bw_macos_mouse_get_config(&config);
+    switch ((int)(uintptr_t)context) {
+    case MOUSE_ENABLED: text = config.enabled ? "on" : "off"; break;
+    case MOUSE_INVERT_Y: text = config.invert_y ? "on" : "off"; break;
+    case MOUSE_RESPONSE: text = config.accelerated ? "accelerated" : "linear"; break;
+    case MOUSE_STICK:
+        text = config.stick == BW_MOUSE_STICK_AIM ? "aim" : "steering";
+        break;
+    case MOUSE_CAPTURE:
+        text = config.capture == BW_MOUSE_CAPTURE_TOGGLE ? "toggle" : "hold";
+        break;
+    case MOUSE_SENSITIVITY:
+        n = snprintf(value, value_len, "%.3g", config.sensitivity);
+        if (value && value_len && n >= 0 && (size_t)n < value_len)
+            return 0;
+        if (err && errlen) {
+            snprintf(err, errlen, "mouse setting output buffer is too small");
+            err[errlen - 1] = 0;
+        }
+        return -1;
+    default:
+        break;
+    }
+    n = text ? snprintf(value, value_len, "%s", text) : -1;
+    if (!value || !value_len || n < 0 || (size_t)n >= value_len) {
+        if (err && errlen) {
+            snprintf(err, errlen, "mouse setting output buffer is too small");
+            err[errlen - 1] = 0;
+        }
+        return -1;
+    }
+    return 0;
+}
+
+static int mouse_apply(const char *value, void *context, char *err, size_t errlen)
+{
+    BwMouseConfig config;
+    bw_macos_mouse_get_config(&config);
+    switch ((int)(uintptr_t)context) {
+    case MOUSE_ENABLED:
+        if (!strcmp(value, "on") && !s_input_hook_enabled) {
+            if (err && errlen) {
+                snprintf(err, errlen,
+                         "gameplay mouse requires the experimental macOS input hook");
+                err[errlen - 1] = 0;
+            }
+            return -1;
+        }
+        config.enabled = !strcmp(value, "on");
+        break;
+    case MOUSE_SENSITIVITY: config.sensitivity = strtof(value, NULL); break;
+    case MOUSE_INVERT_Y: config.invert_y = !strcmp(value, "on"); break;
+    case MOUSE_RESPONSE: config.accelerated = !strcmp(value, "accelerated"); break;
+    case MOUSE_STICK:
+        config.stick = !strcmp(value, "aim") ? BW_MOUSE_STICK_AIM
+                                             : BW_MOUSE_STICK_STEERING;
+        break;
+    case MOUSE_CAPTURE:
+        config.capture = !strcmp(value, "toggle") ? BW_MOUSE_CAPTURE_TOGGLE
+                                                  : BW_MOUSE_CAPTURE_HOLD;
+        break;
+    default:
+        if (err && errlen) {
+            snprintf(err, errlen, "unknown gameplay mouse setting");
+            err[errlen - 1] = 0;
+        }
+        return -1;
+    }
+    return bw_macos_mouse_set_config(&config, err, errlen);
+}
+
+static int register_runtime_settings(char *err, size_t errlen)
+{
+    static const struct {
+        const char *key;
+        uintptr_t context;
+    } mouse_settings[] = {
+        { "mouse", MOUSE_ENABLED },
+        { "mouse_sensitivity", MOUSE_SENSITIVITY },
+        { "mouse_invert_y", MOUSE_INVERT_Y },
+        { "mouse_response", MOUSE_RESPONSE },
+        { "mouse_stick", MOUSE_STICK },
+        { "mouse_capture", MOUSE_CAPTURE },
+    };
+    if (bw_settings_runtime_register("graphics", "draw_distance",
+                                     lod_current, lod_apply, NULL, err, errlen) != 0)
+        return -1;
+    if (bw_settings_runtime_register("graphics", "texture_filtering",
+                                     anisotropy_current, anisotropy_apply,
+                                     NULL, err, errlen) != 0)
+        return -1;
+    for (size_t i = 0; i < sizeof mouse_settings / sizeof mouse_settings[0]; i++)
+        if (bw_settings_runtime_register("controls", mouse_settings[i].key,
+                                         mouse_current, mouse_apply,
+                                         (void *)mouse_settings[i].context,
+                                         err, errlen) != 0)
+            return -1;
+    return 0;
+}
 
 static void *metal_monitor(void *arg)
 {
@@ -99,6 +290,8 @@ static int configure_native(void)
     const char *keyboard_hook = getenv("BW_MACOS_KEYBOARD_HOOK");
     const char *synthetic_input = getenv("BW_SYNTHETIC_INPUT_DIAGNOSTIC");
     const char *audio = getenv("BW_MACOS_AUDIO");
+    BwMouseConfig mouse;
+    char mouse_error[160];
 
     if (keyboard_hook && strcmp(keyboard_hook, "0") && strcmp(keyboard_hook, "1")) {
         fprintf(stderr, "[BW] BW_MACOS_KEYBOARD_HOOK must be 0 or 1\n");
@@ -129,7 +322,8 @@ static int configure_native(void)
     }
 #endif
 #ifdef BW_EXPERIMENTAL_MACOS_KEYBOARD_HOOK
-    bw_macos_input_bridge_configure(keyboard_hook && !strcmp(keyboard_hook, "1"));
+    s_input_hook_enabled = keyboard_hook && !strcmp(keyboard_hook, "1");
+    bw_macos_input_bridge_configure(s_input_hook_enabled);
     if (keyboard_hook && !strcmp(keyboard_hook, "1"))
         fprintf(stderr, "[BW] experimental game-specific keyboard hook enabled; "
                         "ABI and guest behavior are not fully verified\n");
@@ -139,6 +333,16 @@ static int configure_native(void)
         return -1;
     }
 #endif
+    if (bw_macos_mouse_init_from_env(mouse_error, sizeof mouse_error) != 0) {
+        fprintf(stderr, "[BW] %s\n", mouse_error);
+        return -1;
+    }
+    bw_macos_mouse_get_config(&mouse);
+    if (mouse.enabled && !s_input_hook_enabled) {
+        fprintf(stderr, "[BW] gameplay mouse requires BW_MACOS_KEYBOARD_HOOK=1 "
+                        "and a build containing the experimental input hook\n");
+        return -1;
+    }
 
     if (gpu && strcasecmp(gpu, "metal")) {
         fprintf(stderr, "[BW] BW_GPU must be 'metal' on the native macOS host\n");
@@ -327,6 +531,10 @@ static int guest_main(void)
         return 1;
     }
     s_boot.backend_ready = 1;
+    if (register_runtime_settings(err, sizeof err) != 0) {
+        fprintf(stderr, "[BW] cannot register runtime settings: %s\n", err);
+        return 1;
+    }
 
     if (s_boot.audio_enabled) {
         g_apu_state = mcpx_apu_init_standalone((uint8_t *)xbox_GetMemoryBase());

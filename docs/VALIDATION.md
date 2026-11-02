@@ -79,16 +79,25 @@ wall-clock performance evidence.
 
 ## Current regression coverage
 
-- The Metal backend suite passes 306/306 tests, including texture-stage masks,
+- The Metal backend suite passes 311/311 tests, including texture-stage masks,
   combiner operations, cube reflection, mip selection, command-buffer and
-  render-encoder batching, texture caching, and upload-arena reuse.
+  render-encoder batching, texture caching, upload-arena reuse, anisotropy
+  selection/lifecycle, and invalid filtering rejection.
 - Eight dedicated scaling cases cover forced 2x private targets, guest-AA
   collapse, exact guest seeding, weighted box-filter readback, scaled colour
   and depth scissors, invalid scale rejection, SSAA minimum handling, and a
   live 1x-to-2x resize with depth/stencil preservation.
-- The macOS presenter suite passes 59/59 tests, including direct Metal
-  attachment, resize propagation, and confirmation that direct mode skips CPU
-  gamma and SDL texture upload.
+- The macOS presenter suite passes 61/61 tests, including direct Metal
+  attachment, resize propagation, confirmation that direct mode skips CPU
+  gamma and SDL texture upload, F1 edge/repeat consumption, guest-input
+  release, panel lifecycle, and schema-driven panel-model behavior.
+- The input integration suite passes 11/11 tests, including gameplay mouse
+  capture, one-shot delta consumption, sensitivity/inversion/stick mapping,
+  focus-loss clearing, keyboard/controller coexistence, hotplug, slots, and
+  concurrent polling.
+- Nine LOD cases cover Original passthrough, defaults, disable/fix override,
+  custom/clamped values, live changes, invalid rejection, and concurrent
+  readers/writers.
 - The standalone Metal smoke test passes, and the Release native `bloodwake`
   target builds successfully with the direct presenter and scaled-target path.
 - Focused Metal cases have also passed with ASan/UBSan and Metal validation.
@@ -113,11 +122,30 @@ wall-clock performance evidence.
 - The synthetic GPU capture suite passed 11 tests normally and under
   ASan/UBSan, with four focused TSan cases.
 - Windows and x86 execution were not validated on the Apple Silicon host.
+- The offline upstream report passes with all 42 fixes, 15 settings fix
+  references, and 10 native fix sources matching the recorded `e631edd`
+  baseline.
 
 The direct-present and scaled-target paths now also have hands-on 4x visual
 confirmation. Formal reference comparison and controlled frame-time and
 memory measurements remain outstanding, so no scaled-performance claim is
 recorded yet.
+
+After the runtime-settings, LOD/filtering, and mouse changes, a fresh
+keyboard-enabled Release executable completed a 30-second isolated
+Original-edition retail boot:
+
+- Direct Metal attached at 2560x1920.
+- Native audio initialized and periodic APU/DSP output remained active.
+- The 25-second GPU audit recorded 1,490 flips, 4,503 draws, 1,252,771
+  vertices, and 1,490 clears.
+- The executable reached `BW_RUN_SECONDS` intentionally, with no sticky Metal
+  or command-buffer error.
+- Prepared-tree, toolkit, and executable integrity were unchanged.
+
+That bounded boot did not interact with F1, enable Remastered LOD/anisotropy,
+capture the mouse, judge rendered output, or confirm audible sound. Those
+remain hands-on validation items.
 
 ## Integrity and privacy
 

@@ -161,6 +161,8 @@ extern int bw_metal_test_current_depth(uint32_t va, uint32_t *width, uint32_t *h
                                        int *private_storage);
 extern void bw_metal_test_set_present_size(uint32_t width, uint32_t height);
 extern int bw_metal_test_write_surface_pixel(uint32_t x, uint32_t y, uint32_t argb);
+extern unsigned bw_metal_test_sampler_anisotropy(int min_linear, unsigned mip_mode);
+extern void bw_metal_test_apply_pending_render_settings(void);
 
 #define CHECK(condition) do { \
     if (!(condition)) { \
@@ -172,6 +174,23 @@ extern int bw_metal_test_write_surface_pixel(uint32_t x, uint32_t y, uint32_t ar
 static void method(uint32_t method_number, uint32_t value)
 {
     nv2a_pb_exec_method(0, method_number, value);
+}
+
+static void anisotropy_test(unsigned expected)
+{
+    CHECK(bw_metal_backend_anisotropy() == expected);
+    CHECK(bw_metal_test_sampler_anisotropy(0, 0) == 1);
+    CHECK(bw_metal_test_sampler_anisotropy(0, 2) == 1);
+    CHECK(bw_metal_test_sampler_anisotropy(1, 0) == 1);
+    CHECK(bw_metal_test_sampler_anisotropy(1, 1) == expected);
+    CHECK(bw_metal_test_sampler_anisotropy(1, 2) == expected);
+    CHECK(bw_metal_backend_set_anisotropy(4));
+    CHECK(bw_metal_backend_anisotropy() == 4);
+    CHECK(bw_metal_test_sampler_anisotropy(1, 2) == expected);
+    bw_metal_test_apply_pending_render_settings();
+    CHECK(bw_metal_test_sampler_anisotropy(1, 2) == 4);
+    CHECK(!bw_metal_backend_set_anisotropy(3));
+    CHECK(bw_metal_backend_anisotropy() == 4);
 }
 
 static void method_float(uint32_t method_number, float value)
@@ -5254,6 +5273,8 @@ int main(int argc, char **argv)
     unsetenv("BW_METAL_RENDER_SCALE");
     unsetenv("BW_VFX_NATIVE_RES");
     unsetenv("BW_VFX_SSAA");
+    unsetenv("BW_VFX");
+    unsetenv("BW_VFX_AF");
     unsetenv("RECOMP_WINDOW_SCALE");
     if (!strcmp(argv[1], "render-scale-auto")) {
         setenv("BW_METAL_RENDER_SCALE", "auto", 1);
@@ -5267,6 +5288,16 @@ int main(int argc, char **argv)
         setenv("RECOMP_WINDOW_SCALE", "2", 1);
     } else if (!strncmp(argv[1], "render-scale", sizeof("render-scale") - 1u)) {
         setenv("BW_METAL_RENDER_SCALE", "2", 1);
+    } else if (!strcmp(argv[1], "anisotropy")) {
+        s_edition = BW_ED_REMASTERED;
+        g_bw_fix_on[BW_FIX_VFX_ANISO] = 1;
+        setenv("BW_VFX_AF", "8", 1);
+    } else if (!strcmp(argv[1], "anisotropy-original")) {
+        setenv("BW_VFX_AF", "16", 1);
+    } else if (!strcmp(argv[1], "anisotropy-invalid")) {
+        s_edition = BW_ED_REMASTERED;
+        g_bw_fix_on[BW_FIX_VFX_ANISO] = 1;
+        setenv("BW_VFX_AF", "3", 1);
     }
     setenv("BW_IMMEDIATE_PRESENT", "1", 1);
     memset(s_mem, 0, sizeof s_mem);
@@ -5295,6 +5326,12 @@ int main(int argc, char **argv)
         bw_metal_backend_stop();
         return s_failed ? 1 : 0;
     }
+    if (!strcmp(argv[1], "anisotropy-invalid")) {
+        CHECK(!bw_metal_backend_start_for_test(s_mem, sizeof s_mem));
+        CHECK(bw_metal_backend_error() && strstr(bw_metal_backend_error(), "BW_VFX_AF"));
+        bw_metal_backend_stop();
+        return s_failed ? 1 : 0;
+    }
     if (!strncmp(argv[1], "framebuffer-info-", 17) ||
         !strncmp(argv[1], "extended-reject-", 16) ||
         !strncmp(argv[1], "extended-bc1-inactive-kernel-",
@@ -5310,6 +5347,10 @@ int main(int argc, char **argv)
     setup_surface(strcmp(argv[1], "screen-combiner") != 0);
     if (!strcmp(argv[1], "visual"))
         visual_test();
+    else if (!strcmp(argv[1], "anisotropy"))
+        anisotropy_test(8);
+    else if (!strcmp(argv[1], "anisotropy-original"))
+        anisotropy_test(1);
     else if (!strcmp(argv[1], "render-scale"))
         render_scale_test();
     else if (!strcmp(argv[1], "render-scale-aa"))

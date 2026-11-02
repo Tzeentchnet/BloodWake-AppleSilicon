@@ -34,6 +34,8 @@ typedef struct {
     atomic_int errors, guest_calls, init_calls, input_ready, pump;
     atomic_int quit_calls, window_destroyed, renderer_destroyed, texture_destroyed;
     atomic_int key_events, focus_events, controller_events, updates, presents;
+    atomic_int f1_events, settings_regular_events;
+    atomic_int panel_open, panel_toggles, panel_opens, panel_closes, panel_close_calls;
     atomic_int gamma_calls, gamma_entered, gamma_release, producer_done;
     atomic_int worker_active, worker_stop, worker_ticks, worker_violation;
     atomic_int memory_dead, late_memory_access, atexit_called;
@@ -73,6 +75,31 @@ static void check(int ok, const char *message)
 static void check_main(void)
 {
     check(pthread_equal(pthread_self(), s_main), "SDL/input call left the main thread");
+}
+
+int bw_macos_settings_panel_toggle(void)
+{
+    int was_open;
+    check_main();
+    atomic_fetch_add(&s->panel_toggles, 1);
+    was_open = atomic_load(&s->panel_open);
+    atomic_store(&s->panel_open, !was_open);
+    atomic_fetch_add(was_open ? &s->panel_closes : &s->panel_opens, 1);
+    return !was_open;
+}
+
+int bw_macos_settings_panel_is_open(void)
+{
+    check_main();
+    return atomic_load(&s->panel_open);
+}
+
+void bw_macos_settings_panel_close(void)
+{
+    check_main();
+    atomic_fetch_add(&s->panel_close_calls, 1);
+    if (atomic_exchange(&s->panel_open, 0))
+        atomic_fetch_add(&s->panel_closes, 1);
 }
 
 int bw_metal_backend_attach_presenter(void *layer, uint32_t width,
@@ -183,8 +210,17 @@ void xbox_InputSdlInit(void)
 void xbox_InputSdlEvent(const SDL_Event *event)
 {
     check_main();
-    if (event->type == SDL_KEYDOWN)
+    if (event->type == SDL_KEYDOWN) {
         atomic_fetch_add(&s->key_events, 1);
+        if (event->key.keysym.sym == SDLK_F1)
+            atomic_fetch_add(&s->f1_events, 1);
+        if (event->key.keysym.sym == SDLK_a ||
+            event->key.keysym.sym == SDLK_b ||
+            event->key.keysym.sym == SDLK_c)
+            atomic_fetch_add(&s->settings_regular_events, 1);
+    }
+    if (event->type == SDL_KEYUP && event->key.keysym.sym == SDLK_F1)
+        atomic_fetch_add(&s->f1_events, 1);
     if (event->type == SDL_WINDOWEVENT && event->window.event == SDL_WINDOWEVENT_FOCUS_LOST)
         atomic_fetch_add(&s->focus_events, 1);
     if (event->type == SDL_CONTROLLERDEVICEADDED)
@@ -555,6 +591,35 @@ static void push_input_events(void)
     SDL_PushEvent(&event);
 }
 
+static void push_key_event(Uint32 type, SDL_Keycode key, Uint8 repeat)
+{
+    SDL_Event event;
+    memset(&event, 0, sizeof event);
+    event.type = type;
+    event.key.keysym.sym = key;
+    event.key.repeat = repeat;
+    SDL_PushEvent(&event);
+}
+
+static void push_settings_panel_events(void)
+{
+    push_key_event(SDL_KEYDOWN, SDLK_a, 0);
+    push_key_event(SDL_KEYDOWN, SDLK_F1, 0);
+    push_key_event(SDL_KEYDOWN, SDLK_F1, 1);
+    push_key_event(SDL_KEYDOWN, SDLK_b, 0);
+    push_key_event(SDL_KEYUP, SDLK_F1, 0);
+    push_key_event(SDL_KEYDOWN, SDLK_F1, 0);
+    push_key_event(SDL_KEYUP, SDLK_F1, 0);
+    push_key_event(SDL_KEYDOWN, SDLK_c, 0);
+    push_key_event(SDL_KEYDOWN, SDLK_F1, 0);
+    push_key_event(SDL_KEYUP, SDLK_F1, 0);
+    push_key_event(SDL_KEYDOWN, SDLK_F1, 0);
+    push_key_event(SDL_KEYUP, SDLK_F1, 0);
+    push_key_event(SDL_KEYDOWN, SDLK_F1, 0);
+    push_key_event(SDL_KEYDOWN, SDLK_F1, 1);
+    push_key_event(SDL_KEYUP, SDLK_F1, 0);
+}
+
 static uint8_t sample_base(unsigned channel, unsigned x, unsigned y)
 {
     static const unsigned start[3] = {11, 37, 73};
@@ -780,6 +845,10 @@ static int guest_main(void)
         return metal_guest();
     if (is_case("lost-completion"))
         return 37;
+    if (is_case("settings-panel")) {
+        push_settings_panel_events();
+        return 37;
+    }
     if (is_case("close")) {
         SDL_Event event;
         check(pthread_create(&s_worker, NULL, usb_worker, NULL) == 0, "start USB-like worker");
@@ -957,6 +1026,22 @@ int main(int argc, char **argv)
                       atomic_load(&s->controller_events), "keyboard, focus and hotplug reach input");
                 check(atomic_load(&s->worker_active), "controller worker survives presenter return");
                 check(xbox_HostWindowMain(guest_main) != 0, "presenter cannot restart with live workers");
+            }
+            if (is_case("settings-panel")) {
+                check(atomic_load(&s->panel_toggles) == 5,
+                      "F1 repeat and key-up never toggle the panel");
+                check(atomic_load(&s->panel_opens) == 3 &&
+                      atomic_load(&s->panel_closes) == 3 &&
+                      !atomic_load(&s->panel_open),
+                      "panel opens, closes, reopens, and is closed at shutdown");
+                check(atomic_load(&s->panel_close_calls) == 1,
+                      "presenter closes the panel when the guest returns");
+                check(atomic_load(&s->focus_events) == 3,
+                      "each open releases guest focus state");
+                check(!atomic_load(&s->f1_events),
+                      "F1 down, repeat, and matching key-up are consumed");
+                check(atomic_load(&s->settings_regular_events) == 2,
+                      "guest keyboard input is blocked only while the panel is active");
             }
             if (is_case("blocked-copy"))
                 check(atomic_load(&s->gamma_release),

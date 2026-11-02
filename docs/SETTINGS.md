@@ -4,6 +4,10 @@ Every choice in the launcher, tab by tab. The launcher saves them in `%LOCALAPPD
 
 *Generated from the launcher's own settings table (`src/bw_settings.c`, the same table `bloodwake.exe --settings-schema` prints), so it matches the build. "Under the hood" is the switch each choice sets: `fix:+NAME` turns a registered change on, `fix:-NAME` off, `env:NAME=value` sets an environment variable (advanced; the launcher handles all of this).*
 
+The native schema also reports renderer availability and whether a choice is
+live, applies at a frame boundary, or requires restart. F1 uses that metadata;
+unsupported Metal controls are disabled rather than silently accepted.
+
 ## Edition
 
 ### Edition
@@ -146,6 +150,10 @@ Applies to: Remastered. Default: **4x**.
 | 4x (default) | `fix:+VFX_MSAA;env:BW_VFX_MSAA=4` |
 | 8x | `fix:+VFX_MSAA;env:BW_VFX_MSAA=8` |
 
+This setting is DX11-only. Metal reports it as unsupported pending the
+controlled visual, memory, and GPU-time gate in
+[METAL_QUALITY.md](METAL_QUALITY.md).
+
 ### Texture filtering
 
 Keeps textures sharp when seen at an angle, like the water and the cliffs far away.
@@ -159,6 +167,9 @@ Applies to: Remastered. Default: **16x**.
 | 8x | `fix:+VFX_ANISO;env:BW_VFX_AF=8` |
 | 16x (default) | `fix:+VFX_ANISO;env:BW_VFX_AF=16` |
 
+On Metal this applies at an executor flip boundary only to linear, mipmapped
+textures. Point-sampled and unmipped textures remain 1x.
+
 ### Detail distance
 
 How far away boats and buildings keep their full detail. Farther looks better and costs a little speed.
@@ -170,6 +181,14 @@ Applies to: Remastered. Default: **Far (2x)**.
 | As the console | `fix:-VFX_DRAW_DISTANCE` |
 | Far (2x) (default) | `fix:+VFX_DRAW_DISTANCE;env:BW_VFX_LOD=2` |
 | Farther (3x) | `fix:+VFX_DRAW_DISTANCE;env:BW_VFX_LOD=3` |
+| 4x | `fix:+VFX_DRAW_DISTANCE;env:BW_VFX_LOD=4` |
+| 5x | `fix:+VFX_DRAW_DISTANCE;env:BW_VFX_LOD=5` |
+| 6x | `fix:+VFX_DRAW_DISTANCE;env:BW_VFX_LOD=6` |
+| 7x | `fix:+VFX_DRAW_DISTANCE;env:BW_VFX_LOD=7` |
+| 8x | `fix:+VFX_DRAW_DISTANCE;env:BW_VFX_LOD=8` |
+
+The native Remastered hook applies this value live. Original remains fixed at
+1x.
 
 ### Ambient occlusion
 
@@ -558,3 +577,56 @@ Applies to: Original and Remastered. Default: **Off**.
 |---|---|
 | Off (default) | (no switch) |
 | On | `env:RECOMP_KEYBOARD=1` |
+
+### Gameplay mouse
+
+Uses relative mouse movement as an Xbox stick. Hold or toggle the right mouse
+button to capture it; Escape, F1, or losing focus releases it.
+
+Applies to: Original and Remastered on native macOS. Default: **Off**.
+
+| Choice | Under the hood |
+|---|---|
+| Off (default) | (no switch) |
+| On | `env:BW_MOUSE=1` |
+
+### Mouse sensitivity
+
+| Choice | Under the hood |
+|---|---|
+| Low (0.5x) | `env:BW_MOUSE_SENSITIVITY=0.5` |
+| Normal (1x) (default) | (no switch) |
+| High (1.5x) | `env:BW_MOUSE_SENSITIVITY=1.5` |
+| Very high (2x) | `env:BW_MOUSE_SENSITIVITY=2` |
+
+### Invert mouse Y
+
+| Choice | Under the hood |
+|---|---|
+| Off (default) | (no switch) |
+| On | `env:BW_MOUSE_INVERT_Y=1` |
+
+### Mouse response
+
+| Choice | Under the hood |
+|---|---|
+| Linear (default) | (no switch) |
+| Accelerated | `env:BW_MOUSE_RESPONSE=accelerated` |
+
+### Mouse controls
+
+| Choice | Under the hood |
+|---|---|
+| Steering (left stick) (default) | (no switch) |
+| Aim / camera (right stick) | `env:BW_MOUSE_STICK=aim` |
+
+### Mouse capture
+
+| Choice | Under the hood |
+|---|---|
+| Hold right button (default) | (no switch) |
+| Toggle with right button | `env:BW_MOUSE_CAPTURE=toggle` |
+
+Gameplay mouse choices are live in F1 and require the experimental native
+input-hook build plus `BW_MACOS_KEYBOARD_HOOK=1`. The cursor stays visible
+while uncaptured. Point-and-click menu hitboxes are not yet implemented.

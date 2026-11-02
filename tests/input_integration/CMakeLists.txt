@@ -34,12 +34,15 @@ list(REMOVE_ITEM INPUT_SOURCES keyboard_sdl.c)
 list(APPEND INPUT_SOURCES "${CMAKE_CURRENT_LIST_DIR}/../../src/toolkit_patches/input/xinput_device.c")
 list(APPEND INPUT_SOURCES "${CMAKE_CURRENT_LIST_DIR}/../../src/toolkit_patches/input/keyboard.c")
 list(APPEND INPUT_SOURCES "${CMAKE_CURRENT_LIST_DIR}/../../src/toolkit_patches/input/keyboard_sdl.c")
+list(APPEND INPUT_SOURCES "${CMAKE_CURRENT_LIST_DIR}/../../src/bw_macos_mouse.c")
 set_target_properties(xbox_input PROPERTIES SOURCES "${INPUT_SOURCES}")
+target_include_directories(xbox_input PRIVATE "${CMAKE_CURRENT_LIST_DIR}/../../src")
 
 add_executable(bw_input_integration
     test_main.c
     ../../src/toolkit_patches/usb/usb_gamepad.c)
 target_include_directories(bw_input_integration PRIVATE
+    ../../src
     "${XBOXRECOMP_DIR}/src"
     "${XBOXRECOMP_DIR}/src/input"
     "${XBOXRECOMP_DIR}/src/usb")
@@ -68,17 +71,18 @@ add_test(NAME input_macos_bridge_diagnostic COMMAND bw_macos_input_diagnostic_te
 add_test(NAME input_macos_bridge_telemetry COMMAND bw_macos_input_diagnostic_test)
 add_test(NAME input_keyboard_usb COMMAND bw_input_integration keyboard)
 add_test(NAME input_keyboard_disabled COMMAND bw_input_integration keyboard-disabled)
+add_test(NAME input_mouse_gameplay COMMAND bw_input_integration mouse)
 add_test(NAME input_controller_usb COMMAND bw_input_integration controller)
 add_test(NAME input_controller_without_keyboard COMMAND bw_input_integration controller-only)
 add_test(NAME input_controller_hotplug COMMAND bw_input_integration hotplug)
 add_test(NAME input_controller_slots COMMAND bw_input_integration slots)
 add_test(NAME input_controller_concurrent COMMAND bw_input_integration concurrent)
-set_tests_properties(input_macos_bridge_abi input_macos_bridge_diagnostic input_macos_bridge_telemetry input_keyboard_usb input_controller_usb input_controller_hotplug input_controller_slots input_controller_concurrent PROPERTIES
+set_tests_properties(input_macos_bridge_abi input_macos_bridge_diagnostic input_macos_bridge_telemetry input_keyboard_usb input_mouse_gameplay input_controller_usb input_controller_hotplug input_controller_slots input_controller_concurrent PROPERTIES
     ENVIRONMENT "SDL_VIDEODRIVER=dummy;SDL_AUDIODRIVER=dummy;RECOMP_KEYBOARD=1")
 set_tests_properties(input_macos_bridge_telemetry PROPERTIES
     PASS_REGULAR_EXPRESSION "synthetic Start/Down/A state")
 set_tests_properties(input_keyboard_disabled input_controller_without_keyboard PROPERTIES
     ENVIRONMENT "SDL_VIDEODRIVER=dummy;SDL_AUDIODRIVER=dummy;RECOMP_KEYBOARD=0")
-set_tests_properties(input_keyboard_usb input_keyboard_disabled input_controller_usb input_controller_without_keyboard input_controller_hotplug input_controller_slots input_controller_concurrent
+set_tests_properties(input_keyboard_usb input_keyboard_disabled input_mouse_gameplay input_controller_usb input_controller_without_keyboard input_controller_hotplug input_controller_slots input_controller_concurrent
     PROPERTIES SKIP_RETURN_CODE 77)
 set_tests_properties(input_controller_concurrent PROPERTIES TIMEOUT 20)

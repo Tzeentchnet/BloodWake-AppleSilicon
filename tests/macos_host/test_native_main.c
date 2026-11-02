@@ -1,6 +1,8 @@
 #define _DARWIN_C_SOURCE 1
 #include "bw_edition.h"
 #include "bw_macos_boot.h"
+#include "bw_macos_mouse.h"
+#include "bw_settings.h"
 #include "toolkit_patches/video/bw_framebuffer_metal.h"
 #include <xbox/xboxrecomp.h>
 
@@ -36,6 +38,14 @@ static unsigned pb_methods;
 static int metal_expected;
 static BwMetalFramebufferCallback metal_framebuffer_callback;
 static _Atomic int metal_error;
+static unsigned runtime_registrations;
+static float lod_scale = 2.0f;
+static unsigned metal_anisotropy = 16;
+static BwMouseConfig mouse_config = {
+    .sensitivity = 1.0f,
+    .stick = BW_MOUSE_STICK_STEERING,
+    .capture = BW_MOUSE_CAPTURE_HOLD,
+};
 
 static void check_at(int ok, int line)
 {
@@ -54,6 +64,57 @@ void bw_macos_input_bridge_trace_synthetic(int enabled) { check(enabled); }
 
 void bw_settings_apply(void) {}
 void bw_settings_print_schema(FILE *f) { fputs("{}\n", f); }
+int bw_settings_runtime_register(const char *section, const char *key,
+                                 bw_setting_runtime_get_fn get_current,
+                                 bw_setting_runtime_apply_fn apply,
+                                 void *context, char *err, size_t errlen)
+{
+    char value[32];
+    check(step == 4 && get_current && apply);
+    if (!strcmp(key, "draw_distance"))
+        check(!strcmp(section, "graphics") &&
+              get_current(value, sizeof value, context, err, errlen) == 0 &&
+              !strcmp(value, "far"));
+    else if (!strcmp(key, "texture_filtering"))
+        check(!strcmp(section, "graphics") &&
+              get_current(value, sizeof value, context, err, errlen) == 0 &&
+              !strcmp(value, "16"));
+    else {
+        check(!strcmp(section, "controls"));
+        check(get_current(value, sizeof value, context, err, errlen) == 0 && value[0]);
+    }
+    runtime_registrations++;
+    return 0;
+}
+int bw_macos_mouse_init_from_env(char *err, size_t errlen)
+{
+    (void)err;
+    (void)errlen;
+    mouse_config.enabled = 0;
+    return 0;
+}
+void bw_macos_mouse_get_config(BwMouseConfig *config) { *config = mouse_config; }
+int bw_macos_mouse_set_config(const BwMouseConfig *config, char *err, size_t errlen)
+{
+    (void)err;
+    (void)errlen;
+    mouse_config = *config;
+    return 0;
+}
+float bw_vfx_lod_scale(void) { return lod_scale; }
+int bw_vfx_lod_set_scale(float scale, char *err, size_t errlen)
+{
+    (void)err;
+    (void)errlen;
+    lod_scale = scale;
+    return 0;
+}
+unsigned bw_metal_backend_anisotropy(void) { return metal_anisotropy; }
+int bw_metal_backend_set_anisotropy(unsigned value)
+{
+    metal_anisotropy = value;
+    return 1;
+}
 int bw_edition_init(char *err, size_t n) { (void)err; (void)n; step = 1; return 0; }
 void bw_edition_apply_image_fixes(const void *p, size_t n)
 {
@@ -168,7 +229,7 @@ void bw_metal_backend_stop(void) { did_cleanup |= 2; }
 MCPXAPUState *mcpx_apu_init_standalone(uint8_t *p)
 {
     const char *ready = getenv("RECOMP_AC97_READY");
-    check(step == 4 && p == memory && !apu_started &&
+    check(step == 4 && runtime_registrations == 8 && p == memory && !apu_started &&
           ready && !strcmp(ready, "1"));
     if (getenv("BW_TEST_APU_START_FAIL"))
         return NULL;

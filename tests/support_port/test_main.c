@@ -47,6 +47,28 @@ static void reset_environment(void)
         unsetenv(names[i]);
 }
 
+static char s_runtime_setting[32] = "far";
+
+static int runtime_get(char *value, size_t value_len, void *context,
+                       char *err, size_t errlen)
+{
+    int n;
+    (void)context;
+    (void)err;
+    (void)errlen;
+    n = snprintf(value, value_len, "%s", s_runtime_setting);
+    return n >= 0 && (size_t)n < value_len ? 0 : -1;
+}
+
+static int runtime_apply(const char *value, void *context, char *err, size_t errlen)
+{
+    (void)context;
+    (void)err;
+    (void)errlen;
+    snprintf(s_runtime_setting, sizeof s_runtime_setting, "%s", value);
+    return 0;
+}
+
 static int make_dir(const char *path)
 {
     return mkdir(path, 0700) == 0;
@@ -111,6 +133,9 @@ static void remove_fixture(const char *path)
 static int test_settings(const char *cwd)
 {
     char expected[512], err[256];
+    bw_setting_info_t info;
+    bw_setting_option_info_t option;
+    int found_aa = 0, found_af = 0, found_lod = 0;
     CHECK(setenv("HOME", cwd, 1) == 0);
     snprintf(expected, sizeof expected, "%s/.config/BloodWake/settings.ini", cwd);
     CHECK(!strcmp(bw_settings_path(), expected));
@@ -147,6 +172,57 @@ static int test_settings(const char *cwd)
     CHECK(fclose(f) == 0);
     CHECK(file_contains("schema.json", "\"presets\""));
     CHECK(file_contains("schema.json", "\"settings\""));
+    CHECK(file_contains("schema.json", "\"availability\""));
+    CHECK(file_contains("schema.json", "\"apply\": \"unsupported\""));
+    CHECK(bw_settings_count() == 52);
+    CHECK(bw_settings_get_info(0, &info) == 0);
+    CHECK(!strcmp(info.section, "edition") && !strcmp(info.key, "edition"));
+    CHECK(info.option_count == 2 && info.supported);
+    CHECK(bw_settings_get_option(0, 1, &option) == 0);
+    CHECK(!strcmp(option.value, "remastered"));
+    for (size_t i = 0; i < bw_settings_count(); i++) {
+        CHECK(bw_settings_get_info(i, &info) == 0);
+        if (!strcmp(info.section, "graphics") && !strcmp(info.key, "antialiasing")) {
+            CHECK(!info.supported && !strcmp(info.availability, "windows-d3d11"));
+            found_aa = 1;
+        } else if (!strcmp(info.section, "graphics") &&
+                   !strcmp(info.key, "texture_filtering")) {
+            CHECK(info.supported && !strcmp(info.apply_mode, "frame"));
+            found_af = 1;
+        } else if (!strcmp(info.section, "graphics") &&
+                   !strcmp(info.key, "draw_distance")) {
+            CHECK(info.supported && !strcmp(info.apply_mode, "live"));
+            CHECK(info.option_count == 8);
+            found_lod = 1;
+        }
+    }
+    CHECK(found_aa && found_af && found_lod);
+    CHECK(bw_settings_validate_value("display", "mode", "window", err, sizeof err) == 0);
+    CHECK(bw_settings_validate_value("display", "mode", "invalid", err, sizeof err) != 0);
+    CHECK(strstr(err, "not one of its choices") != NULL);
+    CHECK(bw_settings_write_value("display", "mode", "window", err, sizeof err) == 0);
+    CHECK(file_contains("choices.ini", "mode=window"));
+    CHECK(file_contains("choices.ini", "BW_CUSTOM_TEST=file-value"));
+    CHECK(bw_settings_write_value("display", "mode", "invalid", err, sizeof err) != 0);
+    CHECK(file_contains("choices.ini", "mode=window"));
+    CHECK(bw_settings_write_value("advanced", "BW_CUSTOM_TEST", "new", err, sizeof err) != 0);
+    CHECK(file_contains("choices.ini", "BW_CUSTOM_TEST=file-value"));
+    CHECK(bw_settings_runtime_register("graphics", "draw_distance",
+                                       runtime_get, runtime_apply, NULL,
+                                       err, sizeof err) == 0);
+    CHECK(bw_settings_runtime_get("graphics", "draw_distance",
+                                  expected, sizeof expected, err, sizeof err) == 0);
+    CHECK(!strcmp(expected, "far"));
+    CHECK(bw_settings_runtime_apply("graphics", "draw_distance",
+                                    "8", err, sizeof err) == 0);
+    CHECK(!strcmp(s_runtime_setting, "8"));
+    CHECK(bw_settings_runtime_apply("graphics", "draw_distance",
+                                    "invalid", err, sizeof err) != 0);
+    CHECK(!strcmp(s_runtime_setting, "8"));
+    CHECK(bw_settings_runtime_register("graphics", "draw_distance",
+                                       runtime_get, runtime_apply, NULL,
+                                       err, sizeof err) != 0);
+    CHECK(strstr(err, "already has a runtime owner") != NULL);
     return 1;
 }
 
@@ -223,6 +299,40 @@ static int test_edition(const char *cwd)
     CHECK(bw_edition_prepare_saves() != NULL);
     CHECK(file_contains("original/editions/remastered/UDATA/title/slot", "edited isolated save"));
     CHECK(file_contains("original/UDATA/title/slot", "synthetic original save"));
+    return 1;
+}
+
+static int test_fix_registry(void)
+{
+    char err[256];
+    int kind_counts[BW_FIXKIND_RUNTIME + 1] = { 0 };
+
+    CHECK(BW_FIX_COUNT == 42);
+    CHECK(setenv("BW_EDITION", "original", 1) == 0);
+    CHECK(setenv("BW_FIX", "all", 1) == 0);
+    CHECK(bw_edition_init(err, sizeof err) == 0);
+    for (int i = 0; i < BW_FIX_COUNT; i++)
+        CHECK(!g_bw_fix_on[i]);
+
+    CHECK(setenv("BW_EDITION", "remastered", 1) == 0);
+    CHECK(unsetenv("BW_FIX") == 0);
+    CHECK(bw_edition_init(err, sizeof err) == 0);
+    for (int i = 0; i < BW_FIX_COUNT; i++) {
+        const bw_fix_info_t *fix = &g_bw_fixes[i];
+        int expected = (fix->editions & BW_ED_BIT(BW_ED_REMASTERED)) && fix->dflt;
+        CHECK(fix->name && *fix->name);
+        CHECK(fix->editions == BW_ED_RX);
+        CHECK(fix->dflt == 0 || fix->dflt == 1);
+        CHECK(fix->kind >= BW_FIXKIND_IMAGE && fix->kind <= BW_FIXKIND_RUNTIME);
+        CHECK(g_bw_fix_on[i] == expected);
+        for (int j = 0; j < i; j++)
+            CHECK(strcmp(fix->name, g_bw_fixes[j].name) != 0);
+        kind_counts[fix->kind]++;
+    }
+    CHECK(g_bw_fixes[BW_FIX_COUNT].name == NULL);
+    CHECK(kind_counts[BW_FIXKIND_IMAGE] > 0);
+    CHECK(kind_counts[BW_FIXKIND_HOOK] > 0);
+    CHECK(kind_counts[BW_FIXKIND_RUNTIME] > 0);
     return 1;
 }
 
@@ -565,6 +675,7 @@ int main(int argc, char **argv)
     reset_environment();
     if (!strcmp(argv[1], "settings")) ok = test_settings(cwd);
     else if (!strcmp(argv[1], "edition")) ok = test_edition(cwd);
+    else if (!strcmp(argv[1], "fix_registry")) ok = test_fix_registry();
     else if (!strcmp(argv[1], "save_retry")) ok = test_save_retry(cwd);
     else if (!strcmp(argv[1], "save_race")) ok = test_save_race(cwd);
     else if (!strcmp(argv[1], "save_fallback")) ok = test_save_fallback(cwd);

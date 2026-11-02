@@ -4,6 +4,7 @@
 
 #include <float.h>
 #include <errno.h>
+#include <limits.h>
 #include <math.h>
 #include <stdatomic.h>
 #include <stdarg.h>
@@ -11,6 +12,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 
 #include "bw_metal_backend.h"
 #include "bw_backend_sync.h"
@@ -188,7 +190,9 @@ static NSMutableDictionary<NSNumber *, BWMetalDepthSurface *> *s_depth_surfaces;
 static NSMutableDictionary<NSData *, id<MTLDepthStencilState>> *s_depth_states;
 static id<MTLDepthStencilState> s_clear_depth_states[4];
 static id<MTLSamplerState> s_sampler;
-static id<MTLSamplerState> s_samplers[3][3][2][2][3];
+static id<MTLSamplerState> s_samplers[5][3][3][2][2][3];
+static atomic_uint s_requested_anisotropy;
+static unsigned s_active_anisotropy = 1;
 static id<MTLTexture> s_surface;
 static id<MTLTexture> s_inactive_texture;
 static id<MTLTexture> s_inactive_cube_texture;
@@ -201,6 +205,48 @@ static int s_frame_timing_enabled;
 static int flush_commands(void);
 static id<MTLCommandBuffer> pending_command(void);
 static int preserve_depth_surfaces(void);
+
+static int valid_anisotropy(unsigned value)
+{
+    return value == 1u || value == 2u || value == 4u || value == 8u || value == 16u;
+}
+
+static unsigned anisotropy_index(unsigned value)
+{
+    switch (value) {
+    case 2: return 1;
+    case 4: return 2;
+    case 8: return 3;
+    case 16: return 4;
+    default: return 0;
+    }
+}
+
+static unsigned sampler_anisotropy(int min_linear, unsigned mip_mode)
+{
+    return min_linear && mip_mode ? s_active_anisotropy : 1u;
+}
+
+static void apply_pending_render_settings(void)
+{
+    s_active_anisotropy =
+        atomic_load_explicit(&s_requested_anisotropy, memory_order_acquire);
+}
+
+int bw_metal_backend_set_anisotropy(unsigned anisotropy)
+{
+    if (!valid_anisotropy(anisotropy))
+        return 0;
+    atomic_store_explicit(&s_requested_anisotropy, anisotropy, memory_order_release);
+    return 1;
+}
+
+unsigned bw_metal_backend_anisotropy(void)
+{
+    unsigned value =
+        atomic_load_explicit(&s_requested_anisotropy, memory_order_acquire);
+    return valid_anisotropy(value) ? value : 1u;
+}
 
 static void end_draw_encoder(void)
 {
@@ -2794,8 +2840,9 @@ static void metal_draw_extended(const Nv2aSurface *surface, const BwXBatch *batc
                        ? batch->tex[stage].addr_u - 1u : 2u;
             unsigned v = (texture_mask & (1u << stage)) && batch->tex[stage].addr_v <= 2u
                        ? batch->tex[stage].addr_v - 1u : 2u;
+            unsigned aniso = anisotropy_index(sampler_anisotropy(min_linear, mip_mode));
             [encoder setFragmentSamplerState:
-                s_samplers[u][v][min_linear][mag_linear][mip_mode] atIndex:stage];
+                s_samplers[aniso][u][v][min_linear][mag_linear][mip_mode] atIndex:stage];
         }
         [encoder setDepthStencilState:depth_state];
         [encoder setStencilReferenceValue:batch->state->stencil_ref & 0xFFu];
@@ -3119,6 +3166,7 @@ static void metal_flip(void)
             metal_fail("flip occurred without a successful surface readback");
             return;
         }
+        apply_pending_render_settings();
         uint64_t now = xbox_HostNowNs();
         if (now && s_last_flip_ns && now > s_last_flip_ns &&
             s_frame_time_count < METAL_MAX_FRAME_SAMPLES) {
@@ -3256,26 +3304,30 @@ static int initialize_metal(void)
         MTLSamplerAddressModeClampToEdge,
     };
     sampler.lodMinClamp = 0.0f;
-    for (unsigned u = 0; u < 3; u++) {
-        for (unsigned v = 0; v < 3; v++) {
-            sampler.sAddressMode = modes[u];
-            sampler.tAddressMode = modes[v];
-            for (unsigned min_linear = 0; min_linear < 2; min_linear++)
-                for (unsigned mag_linear = 0; mag_linear < 2; mag_linear++)
-                    for (unsigned mip_mode = 0; mip_mode < 3; mip_mode++) {
-                        sampler.minFilter = min_linear ? MTLSamplerMinMagFilterLinear
-                                                       : MTLSamplerMinMagFilterNearest;
-                        sampler.magFilter = mag_linear ? MTLSamplerMinMagFilterLinear
-                                                       : MTLSamplerMinMagFilterNearest;
-                        sampler.mipFilter = mip_mode == 2u ? MTLSamplerMipFilterLinear
-                                          : mip_mode == 1u ? MTLSamplerMipFilterNearest
-                                                           : MTLSamplerMipFilterNotMipmapped;
-                        sampler.lodMaxClamp = mip_mode ? FLT_MAX : 0.0f;
-                        s_samplers[u][v][min_linear][mag_linear][mip_mode] =
-                            [s_device newSamplerStateWithDescriptor:sampler];
-                        if (!s_samplers[u][v][min_linear][mag_linear][mip_mode])
-                            return metal_fail("extended sampler creation failed");
-                    }
+    const unsigned anisotropy_values[5] = {1, 2, 4, 8, 16};
+    for (unsigned a = 0; a < 5; a++) {
+        sampler.maxAnisotropy = anisotropy_values[a];
+        for (unsigned u = 0; u < 3; u++) {
+            for (unsigned v = 0; v < 3; v++) {
+                sampler.sAddressMode = modes[u];
+                sampler.tAddressMode = modes[v];
+                for (unsigned min_linear = 0; min_linear < 2; min_linear++)
+                    for (unsigned mag_linear = 0; mag_linear < 2; mag_linear++)
+                        for (unsigned mip_mode = 0; mip_mode < 3; mip_mode++) {
+                            sampler.minFilter = min_linear ? MTLSamplerMinMagFilterLinear
+                                                           : MTLSamplerMinMagFilterNearest;
+                            sampler.magFilter = mag_linear ? MTLSamplerMinMagFilterLinear
+                                                           : MTLSamplerMinMagFilterNearest;
+                            sampler.mipFilter = mip_mode == 2u ? MTLSamplerMipFilterLinear
+                                              : mip_mode == 1u ? MTLSamplerMipFilterNearest
+                                                               : MTLSamplerMipFilterNotMipmapped;
+                            sampler.lodMaxClamp = mip_mode ? FLT_MAX : 0.0f;
+                            s_samplers[a][u][v][min_linear][mag_linear][mip_mode] =
+                                [s_device newSamplerStateWithDescriptor:sampler];
+                            if (!s_samplers[a][u][v][min_linear][mag_linear][mip_mode])
+                                return metal_fail("extended anisotropic sampler creation failed");
+                        }
+            }
         }
     }
     return 1;
@@ -3299,6 +3351,31 @@ static int start_with_regions(void *guest_memory, size_t low_size,
     s_guest = (uintptr_t)guest_memory;
     s_guest_regions[0] = (MetalGuestRegion){0, low_size};
     s_guest_regions[1] = (MetalGuestRegion){contig_va, contig_end};
+    {
+        const char *vfx = getenv("BW_VFX");
+        const char *af = getenv("BW_VFX_AF");
+        unsigned anisotropy = 1;
+        if (bw_edition_at_least(BW_ED_REMASTERED) && !(vfx && !strcmp(vfx, "0"))) {
+            anisotropy = bw_fix_enabled(BW_FIX_VFX_ANISO) ? 16u : 1u;
+            if (af && *af) {
+                char *end = NULL;
+                unsigned long parsed;
+                if (!strcasecmp(af, "off"))
+                    anisotropy = 1;
+                else if (!strcasecmp(af, "on"))
+                    anisotropy = 16;
+                else {
+                    parsed = strtoul(af, &end, 10);
+                    if (!end || *end || parsed > UINT_MAX ||
+                        !valid_anisotropy((unsigned)parsed))
+                        return metal_fail("BW_VFX_AF must be off, on, 1, 2, 4, 8 or 16");
+                    anisotropy = (unsigned)parsed;
+                }
+            }
+        }
+        atomic_store_explicit(&s_requested_anisotropy, anisotropy, memory_order_release);
+        s_active_anisotropy = anisotropy;
+    }
     s_pending_command = nil;
     s_draw_encoder = nil;
     s_draw_color = nil;
@@ -3425,12 +3502,15 @@ void bw_metal_backend_stop(void)
     s_inactive_texture = nil;
     s_inactive_cube_texture = nil;
     s_sampler = nil;
-    for (unsigned u = 0; u < 3; u++)
-        for (unsigned v = 0; v < 3; v++)
-            for (unsigned min_linear = 0; min_linear < 2; min_linear++)
-                for (unsigned mag_linear = 0; mag_linear < 2; mag_linear++)
-                    for (unsigned mip_mode = 0; mip_mode < 3; mip_mode++)
-                        s_samplers[u][v][min_linear][mag_linear][mip_mode] = nil;
+    for (unsigned a = 0; a < 5; a++)
+        for (unsigned u = 0; u < 3; u++)
+            for (unsigned v = 0; v < 3; v++)
+                for (unsigned min_linear = 0; min_linear < 2; min_linear++)
+                    for (unsigned mag_linear = 0; mag_linear < 2; mag_linear++)
+                        for (unsigned mip_mode = 0; mip_mode < 3; mip_mode++)
+                            s_samplers[a][u][v][min_linear][mag_linear][mip_mode] = nil;
+    s_active_anisotropy = 1;
+    atomic_store_explicit(&s_requested_anisotropy, 1, memory_order_release);
     s_pipelines = nil;
     s_clear_pipelines = nil;
     s_color_surfaces = nil;
@@ -3461,3 +3541,15 @@ void bw_metal_backend_stop(void)
     memset(s_guest_regions, 0, sizeof s_guest_regions);
     memset(&s_current, 0, sizeof s_current);
 }
+
+#ifdef BW_METAL_TESTING
+unsigned bw_metal_test_sampler_anisotropy(int min_linear, unsigned mip_mode)
+{
+    return sampler_anisotropy(min_linear, mip_mode);
+}
+
+void bw_metal_test_apply_pending_render_settings(void)
+{
+    apply_pending_render_settings();
+}
+#endif

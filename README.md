@@ -11,27 +11,50 @@ This project is not affiliated with the game's or hardware's rights holders.
 ## Current status
 
 The current arm64 build boots into the game and has been user-confirmed for
-menu navigation and interactive play. A measured 640x480 retail workload
-sustains the original title's 30 FPS cap.
+menu navigation and interactive play. The current verified direct-Metal
+configuration uses 4x scaling to render into 2560x1920 private colour and
+depth targets, then presents at 2560x1920. The guest framebuffer contract
+remains 640x480, but that is not the current internal rendering or
+presentation resolution.
 
 This is still a development build:
 
 - The Metal path now presents directly through `CAMetalLayer` and can render
-  into private, output-scaled colour and depth targets. A 4x retail run has
-  hands-on visual confirmation, but controlled scaled-performance measurements
-  and formal reference comparison remain outstanding.
+  into private, output-scaled colour and depth targets. The latest interactive
+  4x run reached 3,963 post-relaunch flips and 1,747,600 draws, then exited
+  normally when the window closed. No sticky Metal or command-buffer error
+  was logged.
 - The game-specific keyboard bridge and Metal quincunx approximation require
   explicit build or runtime opt-ins.
+- F1 now opens a native settings panel. It applies proven-live LOD, Metal
+  filtering, and mouse controls through subsystem-owned callbacks, labels
+  restart-required choices, and disables unsupported Metal settings with a
+  reason.
+- Optional gameplay mouse input supports sensitivity, inversion, response,
+  steering/aim stick selection, and hold/toggle relative capture. Native
+  point-and-click menu hitboxes are still a planned reverse-engineering task.
 - The quincunx approximation is not verified against NV2A hardware.
 - Native guest audio now uses deferred same-thread APU MMIO dispatch and SDL
   output. Its dispatch, startup, failure, and shutdown paths have synthetic
-  and sanitizer coverage, and a bounded retail boot exercised CoreAudio and
-  the title-driven APU/DSP path. Audible output, quality, and sustained
-  gameplay have not yet been user-confirmed.
+  and sanitizer coverage. The latest run reached 427,500 APU DSP frames and
+  53,436 EP output frames with no SDL underrun or deferred-dispatch error
+  logged. Audible correctness and output quality have not yet been explicitly
+  confirmed.
 - USB gamepads, physical-controller support, and broad mission, save, FMV,
   and edition coverage are incomplete.
-- Measured gameplay averages 30 FPS, but p95 frame pacing remains about
-  45-46 ms.
+- Current regression results include 311/311 Metal backend tests, 61/61
+  presenter tests, 35/35 MMIO host tests, 8/8 normal and ASan/UBSan macOS host
+  tests, 11/11 input integration tests, 4/4 APU output tests, and 100/100
+  concurrent APU restore stress runs.
+- A post-roadmap 30-second isolated retail boot reached its configured limit
+  with direct Metal at 2560x1920, native audio/DSP activity, 1,490 audited
+  flips, 4,503 draws, 1,252,771 vertices, unchanged input trees/executable,
+  and no sticky Metal error. This is automated integration evidence, not a
+  hands-on F1/mouse/quality or audible-output check.
+- Controlled wall-clock FPS, frame-time percentiles, and memory use have not
+  yet been measured for the current 4x path. Historical 640x480 measurements
+  remain in the validation record and must not be applied to this version;
+  formal visual reference comparison also remains outstanding.
 
 See [Apple Silicon status](docs/APPLE_SILICON_HANDOFF.md),
 [work completed](docs/WORK_COMPLETED.md), and
@@ -88,8 +111,11 @@ Run the prepared build:
 
 ```sh
 BW_GAME_DIR="$PWD/game/prepare/game/disc" \
+RECOMP_KEYBOARD=1 \
 BW_MACOS_KEYBOARD_HOOK=1 \
+BW_MOUSE=1 \
 BW_METAL_QUINCUNX_APPROX=1 \
+BW_METAL_RENDER_SCALE=auto \
 ./build/bloodwake-macos/bloodwake
 ```
 
@@ -106,6 +132,10 @@ are in [BUILDING.md](docs/BUILDING.md).
   integrity checks
 - [SETTINGS.md](docs/SETTINGS.md) - runtime and edition settings
 - [UPSTREAM_ISSUES.md](docs/UPSTREAM_ISSUES.md) - portability findings
+- [NATIVE_FEATURE_ROADMAP.md](docs/NATIVE_FEATURE_ROADMAP.md) - F1, mouse,
+  modding, quality, upstream, and water work plan
+- [METAL_QUALITY.md](docs/METAL_QUALITY.md) - LOD/filtering behavior and the
+  Metal MSAA go/no-go gate
 - [GPU_CAPTURE.md](docs/GPU_CAPTURE.md) - synthetic capture fixture
 - [GUEST_MEMORY_INVENTORY.md](docs/GUEST_MEMORY_INVENTORY.md) - memory-access
   inventory

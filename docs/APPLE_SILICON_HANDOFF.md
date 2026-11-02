@@ -1,7 +1,8 @@
 # Apple Silicon handoff
 
-Status updated 2026-11-01 after native APU dispatch implementation, sanitizer
-validation, and a bounded default-audio retail boot.
+Status updated 2026-11-01 after the native F1 settings foundation, gameplay
+mouse input, live LOD, Metal anisotropic filtering, upstream parity audit, and
+the bounded default-audio retail boot.
 
 ## Current status
 
@@ -48,6 +49,23 @@ until the intentional run limit without a deferred-dispatch or Metal error.
 One SDL underrun was logged. This confirms runtime integration, not that sound
 was audible or correct.
 
+The current source also adds a schema-driven AppKit panel opened by F1,
+validated atomic settings persistence, and explicit live/frame/restart/
+unsupported capability metadata. Remastered LOD is live from 1x through 8x.
+Metal applies 1x/4x/8x/16x anisotropy at a flip boundary only to linear,
+mipmapped stages. Optional gameplay mouse input maps synchronized relative
+motion to the steering or aim stick and releases capture on Escape, F1, focus
+loss, hide, or minimize. These additions are regression-tested and the native
+Release target builds.
+
+A post-change 30-second isolated Original-edition retail boot reached its
+intentional run limit with direct Metal attached at 2560x1920 and native
+audio/DSP active. Its 25-second GPU audit recorded 1,490 flips, 4,503 draws,
+1,252,771 vertices, and 1,490 clears; no sticky Metal/command-buffer error was
+reported, and the prepared tree, toolkit, and executable remained unchanged.
+This proves current-build boot integration only. It did not exercise the F1
+panel, Remastered LOD/anisotropy, mouse capture/feel, or audible output.
+
 ## Required opt-ins
 
 The currently verified path requires:
@@ -55,6 +73,9 @@ The currently verified path requires:
 - A build containing `BW_EXPERIMENTAL_MACOS_KEYBOARD_HOOK=ON`
 - `BW_MACOS_KEYBOARD_HOOK=1` at runtime
 - `BW_METAL_QUINCUNX_APPROX=1` at runtime
+
+Gameplay mouse is optional and additionally requires `BW_MOUSE=1`. F1 itself
+requires no extra runtime switch in the native build.
 
 The quincunx path is a narrowly scoped legacy Gaussian approximation, not
 verified NV2A filtering. Unsupported renderer states continue to fail
@@ -74,6 +95,12 @@ rejected even when set to `0`.
   confirmation, regression coverage, integrity checks, and test commands.
 - [BUILDING.md](BUILDING.md) contains build, run, and isolated diagnostic
   instructions.
+- [NATIVE_FEATURE_ROADMAP.md](NATIVE_FEATURE_ROADMAP.md) records the F1,
+  mouse-menu, mod-editor, quality, upstream, and realistic-water work plan.
+- [METAL_QUALITY.md](METAL_QUALITY.md) records native LOD/filtering behavior
+  and the current MSAA no-go gate.
+- [UPSTREAM_BASELINE.md](UPSTREAM_BASELINE.md) records the 42-fix baseline and
+  the classified DX11-only upstream commits.
 
 ## Remaining limitations
 
@@ -84,8 +111,18 @@ rejected even when set to `0`.
 - Quincunx filtering is approximate and not hardware-verified.
 - Frame pacing reaches the 30 FPS average target but retains 45-46 ms p95
   intervals in the measured scene.
-- Keyboard feedback, reconnect, focus-loss recovery, and the complete device
-  lifecycle remain experimental.
+- Keyboard feedback, reconnect, and the complete device lifecycle remain
+  experimental. Synthetic focus-loss and mouse-capture release are covered.
+- Native point-and-click menu hitboxes are not implemented; directional
+  controller/keyboard navigation remains the fallback.
+- Ship/weapon stat profiles and the standalone editor are blocked until local
+  instrumentation proves named fields, ranges, definition ownership, and
+  lifetime. No retail files are modified.
+- Metal MSAA remains unsupported pending controlled visual/GPU-time/memory
+  evidence. The F1 schema reports that limitation instead of accepting a
+  no-op.
+- A realistic water preset is blocked until ocean draws have an explicit,
+  false-positive-safe game-to-executor marker. Retail water remains unchanged.
 - Physical controllers, guest USB, audible/sustained native audio, saves, FMV,
   other editions, and broad mission coverage are not validated Apple Silicon
   features.
@@ -110,19 +147,30 @@ rejected even when set to `0`.
 - Investigate the remaining frame-pacing jitter without weakening correctness
   or silently skipping unsupported work.
 
-### 2. Complete renderer validation
+### 2. Validate the new runtime controls
 
-- Validate quincunx weights, sample positions, edge rules, and rounding against
-  suitable hardware evidence, or retain the approximation label.
-- Extend mission coverage and implement any newly observed state families as
-  coherent renderer features.
-- Preserve explicit error propagation and render-target/texture invalidation
-  at every new ownership boundary.
+- Exercise F1 open/close, failed saves, live LOD/filtering, restart-pending
+  values, and gameplay mouse capture through menus, gameplay, pause, mission
+  transitions, resize, fullscreen, and focus loss.
+- Tune mouse sensitivity/response from hands-on play without changing the
+  default-off policy.
+- Capture oblique water/cliff comparisons and GPU timing for each anisotropy
+  choice.
 
-### 3. Complete input and device lifecycles
+### 3. Complete evidence-gated roadmap research
 
-- Turn the current keyboard interaction into a repeatable regression covering
-  press, release, focus loss, reconnect, and shutdown.
+- Inventory menu state and control rectangles before adding point-and-click
+  activation; never infer click targets from framebuffer colour alone.
+- Inventory ship/weapon definition construction and ownership locally before
+  defining a profile schema or editor. Keep every retail-derived export
+  private.
+- Add a scoped ocean submission marker and validate all water passes before
+  changing the Metal shader.
+- Run the MSAA matrix in [METAL_QUALITY.md](METAL_QUALITY.md); keep the setting
+  unavailable if the measured benefit does not justify it.
+
+### 4. Complete input, audio, and device lifecycles
+
 - Obtain hands-on confirmation of audible output, channel balance, latency,
   underruns, and sustained gameplay with the new APU path.
 - Preserve process lifetime after guest entry; complete DMA ownership,
@@ -131,7 +179,7 @@ rejected even when set to `0`.
 - Add physical-controller validation only after the remaining USB contracts
   are safe.
 
-### 4. Broaden product coverage
+### 5. Broaden product coverage
 
 - Validate saves across a fresh process.
 - Determine whether representative missions require FMV and implement or

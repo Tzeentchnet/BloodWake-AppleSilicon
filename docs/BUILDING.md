@@ -124,6 +124,31 @@ input-enabled build has now been user-confirmed for menu navigation and
 in-game play; detailed reconnect, focus-loss and lifecycle behavior remain
 unverified.
 
+Press F1 in the native window to open the floating settings panel. F1 and its
+matching release are consumed before guest input, and opening the panel clears
+held keys and relative mouse capture. The panel does not force a pause because
+the title has no validated all-state pause hook; gameplay continues and the
+panel says so. Live LOD, anisotropic filtering, and mouse choices apply through
+their owning subsystem. Other valid choices are saved and marked as requiring
+a restart. Unsupported DX11-only choices are disabled with a reason.
+
+Gameplay mouse input additionally requires `BW_MOUSE=1`. Hold the right mouse
+button for relative capture by default; set `BW_MOUSE_CAPTURE=toggle` to toggle
+capture instead. Escape, F1, focus loss, hiding, and minimizing release the
+pointer and clear pending deltas. Optional advanced values are:
+
+```text
+BW_MOUSE_SENSITIVITY=0.25..4
+BW_MOUSE_INVERT_Y=0|1
+BW_MOUSE_RESPONSE=linear|accelerated
+BW_MOUSE_STICK=steering|aim
+BW_MOUSE_CAPTURE=hold|toggle
+```
+
+Invalid values stop startup explicitly. The cursor is visible while
+uncaptured. Point-and-click menu hitboxes are not implemented; controller and
+keyboard directional navigation remain the menu fallback.
+
 An isolated retail run has verified guest initialization, enumeration,
 controller open, device-change and sustained state-poll calls with this hook
 active while the scripted 3D scene ran at its 30 FPS cap. A separate synthetic
@@ -135,6 +160,7 @@ is still experimental. Run an input-enabled build with:
 ```sh
 BW_GAME_DIR="$PWD/game/prepare/game/disc" \
 BW_MACOS_KEYBOARD_HOOK=1 \
+BW_MOUSE=1 \
 BW_METAL_QUINCUNX_APPROX=1 \
 build/bloodwake-macos/bloodwake
 ```

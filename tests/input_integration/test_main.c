@@ -1,6 +1,7 @@
 #include "keyboard_sdl.h"
 #include "usb_gamepad.h"
 #include "xinput_xbox.h"
+#include "bw_macos_mouse.h"
 
 #include <SDL.h>
 #include <pthread.h>
@@ -37,6 +38,25 @@ static void focus_lost(void)
     memset(&event, 0, sizeof(event));
     event.type = SDL_WINDOWEVENT;
     event.window.event = SDL_WINDOWEVENT_FOCUS_LOST;
+    xbox_InputSdlEvent(&event);
+}
+
+static void mouse_button(Uint32 type, Uint8 button)
+{
+    SDL_Event event;
+    memset(&event, 0, sizeof event);
+    event.type = type;
+    event.button.button = button;
+    xbox_InputSdlEvent(&event);
+}
+
+static void mouse_motion(int x, int y)
+{
+    SDL_Event event;
+    memset(&event, 0, sizeof event);
+    event.type = SDL_MOUSEMOTION;
+    event.motion.xrel = x;
+    event.motion.yrel = y;
     xbox_InputSdlEvent(&event);
 }
 
@@ -92,6 +112,68 @@ static void keyboard_disabled_test(void)
           "explicitly disabled keyboard does not drive the USB report");
     key(SDL_KEYUP, SDLK_RETURN);
     key(SDL_KEYUP, SDLK_z);
+}
+
+static void mouse_test(void)
+{
+    BwMouseConfig config;
+    int16_t lx = 1000, ly = 0, rx = 0, ry = 0;
+    uint32_t packet = 10;
+    char err[128];
+
+    setenv("BW_MOUSE", "1", 1);
+    setenv("BW_MOUSE_SENSITIVITY", "1", 1);
+    setenv("BW_MOUSE_STICK", "steering", 1);
+    setenv("BW_MOUSE_CAPTURE", "hold", 1);
+    check(bw_macos_mouse_init_from_env(err, sizeof err) == 0, "valid mouse environment");
+    xbox_InputSdlInit();
+    mouse_button(SDL_MOUSEBUTTONDOWN, SDL_BUTTON_RIGHT);
+    check(bw_macos_mouse_captured(), "right button enters relative capture");
+    mouse_motion(10, -5);
+    check(bw_macos_mouse_apply(&lx, &ly, &rx, &ry, &packet),
+          "relative motion produces stick input");
+    check(lx == 20480 && ly == 10240 && rx == 0 && ry == 0,
+          "linear motion maps to the steering stick");
+    check(packet > 10, "mouse motion advances the packet number");
+    check(!bw_macos_mouse_apply(&lx, &ly, &rx, &ry, &packet),
+          "relative deltas are consumed once");
+
+    bw_macos_mouse_get_config(&config);
+    config.sensitivity = 0.5f;
+    config.invert_y = 1;
+    config.accelerated = 0;
+    config.stick = BW_MOUSE_STICK_AIM;
+    config.capture = BW_MOUSE_CAPTURE_TOGGLE;
+    check(bw_macos_mouse_set_config(&config, err, sizeof err) == 0,
+          "live mouse configuration");
+    lx = ly = rx = ry = 0;
+    mouse_motion(4, 2);
+    check(bw_macos_mouse_apply(&lx, &ly, &rx, &ry, &packet),
+          "configured aim motion produces input");
+    check(lx == 0 && ly == 0 && rx == 4096 && ry == 2048,
+          "sensitivity, inversion, and aim stick apply");
+    mouse_button(SDL_MOUSEBUTTONDOWN, SDL_BUTTON_RIGHT);
+    check(!bw_macos_mouse_captured(), "toggle capture releases on the next click");
+
+    config.sensitivity = 0.0f;
+    check(bw_macos_mouse_set_config(&config, err, sizeof err) != 0 &&
+          strstr(err, "0.25 to 4"), "invalid sensitivity is rejected");
+    config.sensitivity = 1.0f;
+    config.capture = BW_MOUSE_CAPTURE_HOLD;
+    check(bw_macos_mouse_set_config(&config, err, sizeof err) == 0,
+          "restore hold capture");
+    mouse_button(SDL_MOUSEBUTTONDOWN, SDL_BUTTON_RIGHT);
+    check(bw_macos_mouse_captured(), "capture can be re-entered");
+    mouse_motion(100, 100);
+    focus_lost();
+    check(!bw_macos_mouse_captured(), "focus loss releases capture");
+    lx = ly = rx = ry = 0;
+    check(!bw_macos_mouse_apply(&lx, &ly, &rx, &ry, &packet),
+          "focus loss clears pending motion");
+    unsetenv("BW_MOUSE");
+    unsetenv("BW_MOUSE_SENSITIVITY");
+    unsetenv("BW_MOUSE_STICK");
+    unsetenv("BW_MOUSE_CAPTURE");
 }
 
 static int controller_test(int keyboard_enabled)
@@ -333,10 +415,11 @@ int main(int argc, char **argv)
 {
     int result;
     if (argc != 2 || (strcmp(argv[1], "keyboard") && strcmp(argv[1], "keyboard-disabled") &&
+                      strcmp(argv[1], "mouse") &&
                       strcmp(argv[1], "controller") && strcmp(argv[1], "controller-only") &&
                       strcmp(argv[1], "hotplug") && strcmp(argv[1], "slots") &&
                       strcmp(argv[1], "concurrent"))) {
-        fprintf(stderr, "Usage: %s keyboard|keyboard-disabled|controller|controller-only|"
+        fprintf(stderr, "Usage: %s keyboard|keyboard-disabled|mouse|controller|controller-only|"
                         "hotplug|slots|concurrent\n", argv[0]);
         return 1;
     }
@@ -357,6 +440,9 @@ int main(int argc, char **argv)
         result = failures ? 1 : 0;
     } else if (!strcmp(argv[1], "keyboard-disabled")) {
         keyboard_disabled_test();
+        result = failures ? 1 : 0;
+    } else if (!strcmp(argv[1], "mouse")) {
+        mouse_test();
         result = failures ? 1 : 0;
     } else if (!strcmp(argv[1], "controller")) {
         result = controller_test(1);

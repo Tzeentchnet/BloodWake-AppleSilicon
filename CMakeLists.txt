@@ -143,6 +143,7 @@ if(APPLE)
 set(GAME_SOURCES
     src/bw_macos_main.c
     src/bw_macos_boot.c
+    src/bw_macos_settings_panel.m
     src/bw_posix_fault.c
     src/recomp_manual.c
     src/bw_profile.c
@@ -222,7 +223,10 @@ if(APPLE)
         target_compile_definitions(${PROJECT_NAME} PRIVATE BW_EXPERIMENTAL_SYNTHETIC_INPUT=1)
         target_compile_definitions(xbox_video PRIVATE BW_EXPERIMENTAL_SYNTHETIC_INPUT=1)
     endif()
-    set_source_files_properties(src/gpu/bw_metal_backend.m PROPERTIES
+    set_source_files_properties(
+        src/gpu/bw_metal_backend.m
+        src/bw_macos_settings_panel.m
+        PROPERTIES
         COMPILE_OPTIONS "-fobjc-arc")
     set_source_files_properties(src/bw_ocean_native.c PROPERTIES
         COMPILE_OPTIONS "-ffp-contract=off;-frounding-math")
@@ -267,6 +271,7 @@ target_include_directories(${PROJECT_NAME} PRIVATE
 
 # Windows SDK libraries needed at link time
 if(APPLE)
+    find_library(BW_APPKIT_FRAMEWORK AppKit REQUIRED)
     find_library(BW_FOUNDATION_FRAMEWORK Foundation REQUIRED)
     find_library(BW_METAL_FRAMEWORK Metal REQUIRED)
     find_library(BW_QUARTZCORE_FRAMEWORK QuartzCore REQUIRED)
@@ -277,7 +282,7 @@ if(APPLE)
         "${XBOXRECOMP_DIR}/src"
         "${XBOXRECOMP_DIR}/src/kernel")
     target_link_libraries(${PROJECT_NAME} PRIVATE
-        "${BW_FOUNDATION_FRAMEWORK}" "${BW_METAL_FRAMEWORK}"
+        "${BW_APPKIT_FRAMEWORK}" "${BW_FOUNDATION_FRAMEWORK}" "${BW_METAL_FRAMEWORK}"
         "${BW_QUARTZCORE_FRAMEWORK}" "${BW_COREGRAPHICS_FRAMEWORK}")
 else()
     target_link_libraries(${PROJECT_NAME} PRIVATE
@@ -375,7 +380,10 @@ if(APPLE)
                      "4c3d0c320f1e678fa3a1ae9db1052affe32f2ebe03489e14871a02af13e18bbe")
     bw_carried_patch(xbox_input "src/input/keyboard.c"
                      "cf4cc96718246341823e40e2ae276e49f1ec2fc550f2a115cabec81c1a1d1424")
-    target_include_directories(xbox_input PRIVATE "${XBOXRECOMP_DIR}/src/input")
+    target_sources(xbox_input PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src/bw_macos_mouse.c")
+    target_include_directories(xbox_input PRIVATE
+        "${CMAKE_CURRENT_SOURCE_DIR}/src"
+        "${XBOXRECOMP_DIR}/src/input")
 endif()
 
 # TK-14: the APU's sequencer sample-limit tick (ISTS bit 3) fires every 2048

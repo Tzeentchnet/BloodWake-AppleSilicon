@@ -16,13 +16,22 @@
 #ifdef _WIN32
 #include <windows.h>
 #include <shlobj.h>
+#include <direct.h>
+#include <io.h>
+#include <process.h>
 #else
 #include "platform/win32_compat.h"
+#include <errno.h>
+#include <fcntl.h>
+#include <pthread.h>
+#include <sys/stat.h>
+#include <unistd.h>
 #define _snprintf snprintf
 static int bw_putenv(const char *name, const char *value);
 #define _putenv_s bw_putenv
 #endif
 #include <ctype.h>
+#include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -46,6 +55,13 @@ typedef struct {
     const char *editions;       /* "all", or "remastered" (and every later edition) */
     BwOpt opt[8];
 } BwSetting;
+
+typedef struct {
+    const char *section, *key;
+    const char *availability;
+    const char *apply_mode;
+    const char *reason;
+} BwSettingMeta;
 
 #define ON_OFF(ID) { { "on", "On", "fix:+" #ID }, { "off", "Off", "fix:-" #ID } }
 
@@ -153,7 +169,12 @@ static const BwSetting s_set[] = {
       "far", "remastered",
       { { "original", "As the console", "fix:-VFX_DRAW_DISTANCE" },
         { "far", "Far (2x)", "fix:+VFX_DRAW_DISTANCE;env:BW_VFX_LOD=2" },
-        { "farther", "Farther (3x)", "fix:+VFX_DRAW_DISTANCE;env:BW_VFX_LOD=3" } } },
+        { "farther", "Farther (3x)", "fix:+VFX_DRAW_DISTANCE;env:BW_VFX_LOD=3" },
+        { "4", "4x", "fix:+VFX_DRAW_DISTANCE;env:BW_VFX_LOD=4" },
+        { "5", "5x", "fix:+VFX_DRAW_DISTANCE;env:BW_VFX_LOD=5" },
+        { "6", "6x", "fix:+VFX_DRAW_DISTANCE;env:BW_VFX_LOD=6" },
+        { "7", "7x", "fix:+VFX_DRAW_DISTANCE;env:BW_VFX_LOD=7" },
+        { "8", "8x", "fix:+VFX_DRAW_DISTANCE;env:BW_VFX_LOD=8" } } },
     { "Graphics", "graphics", "ambient_occlusion", "Ambient occlusion",
       "Soft shadows where things meet (under ledges, around boats). Adds depth; off in "
       "Balanced and Original because the original didn't have it.",
@@ -328,8 +349,76 @@ static const BwSetting s_set[] = {
       "off", "all",
       { { "off", "Off", "" },
         { "on", "On", "env:RECOMP_KEYBOARD=1" } } },
+    { "Controls", "controls", "mouse", "Gameplay mouse",
+      "Use relative mouse movement as an Xbox stick. Hold or toggle the right mouse button "
+      "to capture it; Escape, F1, or losing focus releases it.",
+      "off", "all",
+      { { "off", "Off", "" },
+        { "on", "On", "env:BW_MOUSE=1" } } },
+    { "Controls", "controls", "mouse_sensitivity", "Mouse sensitivity",
+      "Scales relative mouse movement before it reaches the selected stick.",
+      "1", "all",
+      { { "0.5", "Low (0.5x)", "env:BW_MOUSE_SENSITIVITY=0.5" },
+        { "1", "Normal (1x)", "" },
+        { "1.5", "High (1.5x)", "env:BW_MOUSE_SENSITIVITY=1.5" },
+        { "2", "Very high (2x)", "env:BW_MOUSE_SENSITIVITY=2" } } },
+    { "Controls", "controls", "mouse_invert_y", "Invert mouse Y",
+      "Reverses vertical gameplay mouse movement.",
+      "off", "all",
+      { { "off", "Off", "" },
+        { "on", "On", "env:BW_MOUSE_INVERT_Y=1" } } },
+    { "Controls", "controls", "mouse_response", "Mouse response",
+      "Linear maps every count evenly. Accelerated gives larger movements more stick range.",
+      "linear", "all",
+      { { "linear", "Linear", "" },
+        { "accelerated", "Accelerated", "env:BW_MOUSE_RESPONSE=accelerated" } } },
+    { "Controls", "controls", "mouse_stick", "Mouse controls",
+      "Map relative movement to the steering stick or the aim/camera stick.",
+      "steering", "all",
+      { { "steering", "Steering (left stick)", "" },
+        { "aim", "Aim / camera (right stick)", "env:BW_MOUSE_STICK=aim" } } },
+    { "Controls", "controls", "mouse_capture", "Mouse capture",
+      "Hold keeps relative mode active while the right button is held. Toggle keeps it active "
+      "until the next right click or an explicit release.",
+      "hold", "all",
+      { { "hold", "Hold right button", "" },
+        { "toggle", "Toggle with right button", "env:BW_MOUSE_CAPTURE=toggle" } } },
 };
 #define BW_NSET ((int)(sizeof s_set / sizeof s_set[0]))
+
+/* Omitted settings are portable and restart-required. Keep Metal capability
+ * exceptions explicit so a native UI never presents a DX11 effect as active. */
+static const BwSettingMeta s_meta[] = {
+    { "graphics", "antialiasing", "windows-d3d11", "restart",
+      "Metal MSAA is not implemented; use render scaling while it is evaluated." },
+    { "graphics", "texture_filtering", "all", "frame", "" },
+    { "graphics", "draw_distance", "all", "live", "" },
+    { "controls", "mouse", "macos-metal", "live", "" },
+    { "controls", "mouse_sensitivity", "macos-metal", "live", "" },
+    { "controls", "mouse_invert_y", "macos-metal", "live", "" },
+    { "controls", "mouse_response", "macos-metal", "live", "" },
+    { "controls", "mouse_stick", "macos-metal", "live", "" },
+    { "controls", "mouse_capture", "macos-metal", "live", "" },
+    { "graphics", "ambient_occlusion", "windows-d3d11", "restart",
+      "The ambient-occlusion pass is available only in the DX11 VFX backend." },
+    { "graphics", "bloom", "windows-d3d11", "restart",
+      "The bloom pass is available only in the DX11 VFX backend." },
+    { "graphics", "sharpen", "windows-d3d11", "restart",
+      "The sharpening pass is available only in the DX11 VFX backend." },
+    { "graphics", "fxaa", "windows-d3d11", "restart",
+      "The FXAA pass is available only in the DX11 VFX backend." },
+    { "graphics", "smooth_gradients", "windows-d3d11", "restart",
+      "High-precision VFX targets are available only in the DX11 backend." },
+    { "graphics", "sharp_text", "windows-d3d11", "restart",
+      "The contour text filter is available only in the DX11 VFX backend." },
+    { "graphics", "smooth_hud_edges", "windows-d3d11", "restart",
+      "The HUD edge filter is available only in the DX11 VFX backend." },
+    { "graphics", "hdr", "windows-d3d11", "restart",
+      "HDR output is available only in the DX11 VFX backend." },
+    { "graphics", "oled_care", "windows-d3d11", "restart",
+      "OLED-care post-processing is available only in the DX11 VFX backend." },
+};
+#define BW_NMETA ((int)(sizeof s_meta / sizeof s_meta[0]))
 
 /* ---- Remastered's presets (D-021) ------------------------------------------
  * Picking one in the launcher sets every setting in BW_PRESET_SETS: to the
@@ -408,6 +497,38 @@ const char *bw_settings_path(void)
 #define BW_MAXKV 160
 typedef struct { char sec[32], key[64], val[256]; } BwKv;
 
+#define BW_MAX_RUNTIME_SETTINGS 24
+typedef struct {
+    const BwSetting *setting;
+    bw_setting_runtime_get_fn get_current;
+    bw_setting_runtime_apply_fn apply;
+    void *context;
+} BwRuntimeSetting;
+
+static BwRuntimeSetting s_runtime[BW_MAX_RUNTIME_SETTINGS];
+static int s_runtime_count;
+
+#ifdef _WIN32
+static SRWLOCK s_settings_lock = SRWLOCK_INIT;
+static void settings_lock(void) { AcquireSRWLockExclusive(&s_settings_lock); }
+static void settings_unlock(void) { ReleaseSRWLockExclusive(&s_settings_lock); }
+#else
+static pthread_mutex_t s_settings_lock = PTHREAD_MUTEX_INITIALIZER;
+static void settings_lock(void) { pthread_mutex_lock(&s_settings_lock); }
+static void settings_unlock(void) { pthread_mutex_unlock(&s_settings_lock); }
+#endif
+
+static void set_error(char *err, size_t errlen, const char *fmt, ...)
+{
+    va_list ap;
+    if (!err || !errlen)
+        return;
+    va_start(ap, fmt);
+    vsnprintf(err, errlen, fmt, ap);
+    va_end(ap);
+    err[errlen - 1] = 0;
+}
+
 static void trim(char *s)
 {
     char *e;
@@ -464,6 +585,381 @@ static const char *find_kv(const BwKv *kv, int n, const char *sec, const char *k
         if (!_stricmp(kv[i].sec, sec) && !_stricmp(kv[i].key, key))
             return kv[i].val;
     return NULL;
+}
+
+static const BwSetting *find_setting(const char *section, const char *key, int *index)
+{
+    int i;
+    if (!section || !key)
+        return NULL;
+    for (i = 0; i < BW_NSET; i++)
+        if (!_stricmp(s_set[i].section, section) && !_stricmp(s_set[i].key, key)) {
+            if (index)
+                *index = i;
+            return &s_set[i];
+        }
+    return NULL;
+}
+
+static const BwSettingMeta *setting_meta(const BwSetting *setting)
+{
+    int i;
+    for (i = 0; i < BW_NMETA; i++)
+        if (!_stricmp(s_meta[i].section, setting->section) &&
+            !_stricmp(s_meta[i].key, setting->key))
+            return &s_meta[i];
+    return NULL;
+}
+
+static int availability_supported(const char *availability)
+{
+    if (!availability || !strcmp(availability, "all"))
+        return 1;
+#ifdef _WIN32
+    return !strcmp(availability, "windows-d3d11");
+#elif defined(__APPLE__)
+    return !strcmp(availability, "macos-metal");
+#else
+    return 0;
+#endif
+}
+
+size_t bw_settings_count(void)
+{
+    return BW_NSET;
+}
+
+int bw_settings_get_info(size_t index, bw_setting_info_t *out)
+{
+    const BwSetting *setting;
+    const BwSettingMeta *meta;
+    size_t count = 0;
+    if (!out || index >= (size_t)BW_NSET)
+        return -1;
+    setting = &s_set[index];
+    meta = setting_meta(setting);
+    while (count < 8 && setting->opt[count].value)
+        count++;
+    out->tab = setting->tab;
+    out->section = setting->section;
+    out->key = setting->key;
+    out->label = setting->label;
+    out->tip = setting->tip;
+    out->default_value = setting->dflt;
+    out->editions = setting->editions;
+    out->availability = meta ? meta->availability : "all";
+    out->apply_mode = meta ? meta->apply_mode : "restart";
+    out->support_reason = meta ? meta->reason : "";
+    out->option_count = count;
+    out->supported = availability_supported(out->availability);
+    return 0;
+}
+
+int bw_settings_get_option(size_t setting_index, size_t option_index,
+                           bw_setting_option_info_t *out)
+{
+    const BwSetting *setting;
+    if (!out || setting_index >= (size_t)BW_NSET || option_index >= 8)
+        return -1;
+    setting = &s_set[setting_index];
+    if (!setting->opt[option_index].value)
+        return -1;
+    out->value = setting->opt[option_index].value;
+    out->label = setting->opt[option_index].label;
+    return 0;
+}
+
+int bw_settings_validate_value(const char *section, const char *key,
+                               const char *value, char *err, size_t errlen)
+{
+    const BwSetting *setting = find_setting(section, key, NULL);
+    int i;
+    if (err && errlen)
+        err[0] = 0;
+    if (!setting) {
+        set_error(err, errlen, "unknown setting %s.%s",
+                  section ? section : "(null)", key ? key : "(null)");
+        return -1;
+    }
+    if (!value) {
+        set_error(err, errlen, "%s.%s has no value", section, key);
+        return -1;
+    }
+    for (i = 0; i < 8 && setting->opt[i].value; i++)
+        if (!_stricmp(setting->opt[i].value, value))
+            return 0;
+    set_error(err, errlen, "%s.%s = %s is not one of its choices",
+              section, key, value);
+    return -1;
+}
+
+static const char *effective_apply_mode(const BwSetting *setting)
+{
+    const BwSettingMeta *meta = setting_meta(setting);
+    const char *availability = meta ? meta->availability : "all";
+    if (!availability_supported(availability))
+        return "unsupported";
+    return meta ? meta->apply_mode : "restart";
+}
+
+int bw_settings_runtime_register(const char *section, const char *key,
+                                 bw_setting_runtime_get_fn get_current,
+                                 bw_setting_runtime_apply_fn apply,
+                                 void *context, char *err, size_t errlen)
+{
+    const BwSetting *setting = find_setting(section, key, NULL);
+    int i, result = -1;
+    if (err && errlen)
+        err[0] = 0;
+    if (!setting) {
+        set_error(err, errlen, "unknown setting %s.%s",
+                  section ? section : "(null)", key ? key : "(null)");
+        return -1;
+    }
+    if (!strcmp(effective_apply_mode(setting), "unsupported")) {
+        set_error(err, errlen, "%s.%s is unsupported on this renderer", section, key);
+        return -1;
+    }
+    if (!strcmp(effective_apply_mode(setting), "restart")) {
+        set_error(err, errlen, "%s.%s requires a restart", section, key);
+        return -1;
+    }
+    if (!get_current || !apply) {
+        set_error(err, errlen, "%s.%s needs both runtime callbacks", section, key);
+        return -1;
+    }
+    settings_lock();
+    for (i = 0; i < s_runtime_count; i++)
+        if (s_runtime[i].setting == setting) {
+            set_error(err, errlen, "%s.%s already has a runtime owner", section, key);
+            goto done;
+        }
+    if (s_runtime_count >= BW_MAX_RUNTIME_SETTINGS) {
+        set_error(err, errlen, "too many runtime settings are registered");
+        goto done;
+    }
+    s_runtime[s_runtime_count].setting = setting;
+    s_runtime[s_runtime_count].get_current = get_current;
+    s_runtime[s_runtime_count].apply = apply;
+    s_runtime[s_runtime_count].context = context;
+    s_runtime_count++;
+    result = 0;
+done:
+    settings_unlock();
+    return result;
+}
+
+static int runtime_handler(const char *section, const char *key,
+                           BwRuntimeSetting *out, char *err, size_t errlen)
+{
+    const BwSetting *setting = find_setting(section, key, NULL);
+    int i;
+    if (!setting) {
+        set_error(err, errlen, "unknown setting %s.%s",
+                  section ? section : "(null)", key ? key : "(null)");
+        return -1;
+    }
+    if (!strcmp(effective_apply_mode(setting), "unsupported")) {
+        set_error(err, errlen, "%s.%s is unsupported on this renderer", section, key);
+        return -1;
+    }
+    if (!strcmp(effective_apply_mode(setting), "restart")) {
+        set_error(err, errlen, "%s.%s requires a restart", section, key);
+        return -1;
+    }
+    settings_lock();
+    for (i = 0; i < s_runtime_count; i++)
+        if (s_runtime[i].setting == setting) {
+            *out = s_runtime[i];
+            settings_unlock();
+            return 0;
+        }
+    settings_unlock();
+    set_error(err, errlen, "%s.%s has no runtime owner", section, key);
+    return -1;
+}
+
+int bw_settings_runtime_get(const char *section, const char *key,
+                            char *value, size_t value_len,
+                            char *err, size_t errlen)
+{
+    BwRuntimeSetting handler;
+    if (err && errlen)
+        err[0] = 0;
+    if (!value || !value_len) {
+        set_error(err, errlen, "%s.%s has no output buffer",
+                  section ? section : "(null)", key ? key : "(null)");
+        return -1;
+    }
+    value[0] = 0;
+    if (runtime_handler(section, key, &handler, err, errlen) != 0)
+        return -1;
+    return handler.get_current(value, value_len, handler.context, err, errlen);
+}
+
+int bw_settings_runtime_apply(const char *section, const char *key,
+                              const char *value, char *err, size_t errlen)
+{
+    BwRuntimeSetting handler;
+    if (err && errlen)
+        err[0] = 0;
+    if (bw_settings_validate_value(section, key, value, err, errlen) != 0)
+        return -1;
+    if (runtime_handler(section, key, &handler, err, errlen) != 0)
+        return -1;
+    return handler.apply(value, handler.context, err, errlen);
+}
+
+static int make_parent_dirs(const char *path, char *err, size_t errlen)
+{
+    char copy[MAX_PATH];
+    size_t i, n = strlen(path);
+    if (n >= sizeof copy) {
+        set_error(err, errlen, "settings path is too long");
+        return -1;
+    }
+    memcpy(copy, path, n + 1);
+    for (i = 1; i < n; i++) {
+        int made;
+        if (copy[i] != '/' && copy[i] != '\\')
+            continue;
+        if (i == 2 && copy[1] == ':')
+            continue;
+        copy[i] = 0;
+#ifdef _WIN32
+        made = _mkdir(copy);
+#else
+        made = mkdir(copy, 0700);
+#endif
+        if (made != 0 && errno != EEXIST) {
+            set_error(err, errlen, "could not create settings directory %s: %s",
+                      copy, strerror(errno));
+            return -1;
+        }
+        copy[i] = path[i];
+    }
+    return 0;
+}
+
+static int write_kv_atomic(const char *path, const BwKv *kv, int n,
+                           char *err, size_t errlen)
+{
+    char temp[MAX_PATH + 48];
+    const char *section = NULL;
+    FILE *f;
+    int i, ok = 1;
+#ifdef _WIN32
+    unsigned long pid = (unsigned long)_getpid();
+#else
+    unsigned long pid = (unsigned long)getpid();
+#endif
+    if (make_parent_dirs(path, err, errlen) != 0)
+        return -1;
+    if (snprintf(temp, sizeof temp, "%s.tmp.%lu", path, pid) < 0 ||
+        strlen(temp) >= sizeof temp - 1) {
+        set_error(err, errlen, "temporary settings path is too long");
+        return -1;
+    }
+    f = fopen(temp, "wb");
+    if (!f) {
+        set_error(err, errlen, "could not create temporary settings file %s: %s",
+                  temp, strerror(errno));
+        return -1;
+    }
+#ifndef _WIN32
+    chmod(temp, 0600);
+#endif
+    for (i = 0; i < n && ok; i++) {
+        if (!section || _stricmp(section, kv[i].sec)) {
+            if (i && fputc('\n', f) == EOF)
+                ok = 0;
+            if (ok && fprintf(f, "[%s]\n", kv[i].sec) < 0)
+                ok = 0;
+            section = kv[i].sec;
+        }
+        if (ok && fprintf(f, "%s=%s\n", kv[i].key, kv[i].val) < 0)
+            ok = 0;
+    }
+    if (ok && fflush(f) != 0)
+        ok = 0;
+#ifdef _WIN32
+    if (ok && _commit(_fileno(f)) != 0)
+        ok = 0;
+#else
+    if (ok && fsync(fileno(f)) != 0)
+        ok = 0;
+#endif
+    if (fclose(f) != 0)
+        ok = 0;
+    if (!ok) {
+        set_error(err, errlen, "could not write settings file %s: %s",
+                  temp, strerror(errno));
+        remove(temp);
+        return -1;
+    }
+#ifdef _WIN32
+    if (!MoveFileExA(temp, path, MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+        set_error(err, errlen, "could not replace settings file %s (Windows error %lu)",
+                  path, (unsigned long)GetLastError());
+        remove(temp);
+        return -1;
+    }
+#else
+    if (rename(temp, path) != 0) {
+        set_error(err, errlen, "could not replace settings file %s: %s",
+                  path, strerror(errno));
+        remove(temp);
+        return -1;
+    }
+#endif
+    return 0;
+}
+
+int bw_settings_write_value(const char *section, const char *key,
+                            const char *value, char *err, size_t errlen)
+{
+    BwKv kv[BW_MAXKV];
+    const char *path;
+    int n, i, found = -1, result = -1;
+    if (err && errlen)
+        err[0] = 0;
+    if (bw_settings_validate_value(section, key, value, err, errlen) != 0)
+        return -1;
+    path = bw_settings_path();
+    if (!path) {
+        set_error(err, errlen, "settings persistence is disabled by BW_SETTINGS");
+        return -1;
+    }
+    settings_lock();
+    n = read_file(path, kv, BW_MAXKV);
+    if (n < 0) {
+        if (errno != ENOENT) {
+            set_error(err, errlen, "could not read settings file %s: %s",
+                      path, strerror(errno));
+            goto done;
+        }
+        n = 0;
+    }
+    for (i = 0; i < n; i++)
+        if (!_stricmp(kv[i].sec, section) && !_stricmp(kv[i].key, key))
+            found = i;
+    if (found < 0) {
+        if (n >= BW_MAXKV) {
+            set_error(err, errlen, "settings file has too many entries");
+            goto done;
+        }
+        found = n++;
+        _snprintf(kv[found].sec, sizeof kv[found].sec, "%s", section);
+        _snprintf(kv[found].key, sizeof kv[found].key, "%s", key);
+    }
+    _snprintf(kv[found].val, sizeof kv[found].val, "%s", value);
+    kv[found].sec[sizeof kv[found].sec - 1] = 0;
+    kv[found].key[sizeof kv[found].key - 1] = 0;
+    kv[found].val[sizeof kv[found].val - 1] = 0;
+    result = write_kv_atomic(path, kv, n, err, errlen);
+done:
+    settings_unlock();
+    return result;
 }
 
 static int env_set(const char *name)
@@ -721,6 +1217,19 @@ void bw_settings_print_schema(FILE *f)
         js(f, st->dflt);
         fprintf(f, ", \"editions\": ");
         js(f, st->editions);
+        {
+            const BwSettingMeta *meta = setting_meta(st);
+            const char *availability = meta ? meta->availability : "all";
+            const char *apply_mode = meta ? meta->apply_mode : "restart";
+            const char *reason = meta ? meta->reason : "";
+            fprintf(f, ", \"availability\": ");
+            js(f, availability);
+            fprintf(f, ", \"supported\": %s", availability_supported(availability) ? "true" : "false");
+            fprintf(f, ", \"apply\": ");
+            js(f, availability_supported(availability) ? apply_mode : "unsupported");
+            fprintf(f, ", \"support_reason\": ");
+            js(f, reason);
+        }
         fprintf(f, ",\n     \"tip\": ");
         js(f, st->tip);
         fprintf(f, ",\n     \"options\": [");

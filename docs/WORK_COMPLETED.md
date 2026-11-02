@@ -65,6 +65,11 @@ test coverage are in [VALIDATION.md](VALIDATION.md).
 - Added a narrowly scoped, explicit `BW_METAL_QUINCUNX_APPROX=1` fallback for
   the title's quincunx resolve. It uses the legacy Gaussian approximation and
   is not verified NV2A filtering.
+- Added immutable Metal anisotropic sampler variants from 1x through 16x.
+  Only linear, mipmapped stages select anisotropy; point and unmipped stages
+  stay 1x, and live changes take effect at a flip boundary.
+- Converted Remastered LOD from a boot-only cache to validated atomic 1x-8x
+  runtime state. Original remains fixed at 1x.
 
 ## Renderer performance
 
@@ -94,6 +99,15 @@ test coverage are in [VALIDATION.md](VALIDATION.md).
   controller connection changes.
 - Added a separately compiled synthetic-input diagnostic that verifies a guest
   state query can observe Start, Down, and A.
+- Added a floating AppKit F1 panel built from the shared settings schema.
+  It consumes F1 before guest input, releases held input, reports
+  live/frame/restart/unsupported state, applies subsystem-owned live values,
+  and saves through the strict atomic INI writer. It does not synthesize an
+  unsafe pause.
+- Added configurable gameplay mouse input through the native controller
+  bridge, including synchronized relative deltas, focus/capture release,
+  sensitivity, inversion, response curve, left/right stick selection, and
+  larger-magnitude merging with keyboard/controller axes.
 - The current input-enabled build is user-confirmed for menu navigation and
   in-game play. Feedback, reconnect, focus-loss, and complete device-lifecycle
   behavior remain experimental.
@@ -108,6 +122,9 @@ test coverage are in [VALIDATION.md](VALIDATION.md).
 - Added explicit sticky errors for unsupported renderer states, invalid spans,
   allocation failures, and Metal command failures rather than silently
   dropping work.
+- Added an offline Blood Wake upstream parity manifest/checker covering the
+  42-entry fix registry, settings fix references, native source wiring, branch
+  divergence, and the two classified DX11 warm-up commits.
 
 ## Memory and device research
 
@@ -145,5 +162,11 @@ test coverage are in [VALIDATION.md](VALIDATION.md).
   coverage are not complete Apple Silicon features. Native APU audio is
   implemented and regression-tested, but audible retail output, quality, and
   sustained gameplay remain unconfirmed.
+- Gameplay mouse input is implemented, but point-and-click menu hitboxes need
+  validated title UI state and geometry. Ship/weapon profiles need proven
+  definition fields/ownership, and realistic water needs an explicit ocean
+  draw marker; none is represented by a placeholder or silent no-op.
+- Metal MSAA remains deliberately unsupported until the controlled
+  visual/GPU-time/memory gate in `METAL_QUALITY.md` justifies it.
 - Unsupported states continue to fail explicitly instead of being guessed or
   skipped.
