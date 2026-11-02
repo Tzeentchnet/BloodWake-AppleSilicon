@@ -287,6 +287,8 @@ typedef struct {
 static struct {
     VertexAttr attr[NV_VERTEX_ATTRS];
     uint32_t   prim;                    /* SET_BEGIN_END parameter, 0 = ended */
+    uint8_t    draw_marker;             /* BW_X_DRAW_MARKER_* for this BEGIN/END scope */
+    uint32_t   draw_marker_copies;      /* extended batches handed the marker */
     uint32_t   idx[NV_MAX_INDICES];     /* DRAW_ARRAYS starts are 24-bit */
     uint32_t   idx_count;
     /* INLINE_ARRAY payload: vertices written straight into the pushbuffer
@@ -2406,6 +2408,9 @@ static void fill_xbatch(BwXBatch *xb, const Nv2aRenderState *rs)
     xb->clip_plane_mode = s_gpu.clip_plane_mode;
     xb->dot_rgbmapping = s_gpu.dot_rgbmapping;
     xb->other_stage_input = s_gpu.other_stage_input;
+    xb->draw_marker = s_gpu.draw_marker;
+    if (xb->draw_marker == BW_X_DRAW_MARKER_OCEAN)
+        s_gpu.draw_marker_copies++;
 }
 
 /* `textured`: the batch carried texture coordinates, so the bound texture is
@@ -5135,18 +5140,84 @@ static void tex_stage_method(uint32_t method, uint32_t param)
  * Both run on the ack thread, so the state needs no lock. */
 static XboxFlipHold s_flip_hold;
 
-/* Blood Wake carried patch (D-015, Remastered widescreen): in-stream markers.
- * The game-side hooks (src/bw_remaster_hooks.c) write NV097 NO_OPERATION
- * with a parameter tagged 0xB1D3 in its top 16 bits through the game's own
- * D3D, around the 2D it draws; the back end registers a handler here and
- * gets each one in stream order, between the draws. With no handler (every
- * edition but an enhanced one with widescreen on) nothing is registered
- * and the game writes none, so the NOP case below runs as before. */
+/* Blood Wake carried patch: in-stream markers. Game-side hooks write NV097
+ * NO_OPERATION with a parameter tagged 0xB1D3 through the game's own D3D.
+ * The widescreen back end receives its scoped 2D operations through this
+ * handler. The executor itself consumes the one-shot ocean operation below;
+ * both kinds stay in command order with the draws they describe. */
 static void (*s_bw_nop_marker)(uint32_t);
 
 void bw_set_nop_marker_handler(void (*fn)(uint32_t))
 {
     s_bw_nop_marker = fn;
+}
+
+enum {
+    BW_OCEAN_MARKER_IDLE = 0,
+    BW_OCEAN_MARKER_ARMED,
+    BW_OCEAN_MARKER_INVALID
+};
+static uint8_t s_bw_ocean_marker_pending;
+static unsigned long s_bw_ocean_markers, s_bw_ocean_marker_batches;
+static unsigned long s_bw_ocean_marker_rejected;
+
+static void bw_ocean_marker_reject(const char *reason, uint32_t param)
+{
+    s_bw_ocean_marker_rejected++;
+    if (s_bw_ocean_marker_rejected <= 4)
+        fprintf(stderr, "[GPU] ocean draw marker rejected (%s, %08X); "
+                        "the draw stays retail\n", reason, param);
+}
+
+/* The marker and the draw are decoded on this executor thread. It arms only
+ * the next BEGIN/END scope; the scope value is then copied into every
+ * extended batch derived synchronously from that draw and cleared at END. */
+static void bw_ocean_marker_nop(uint32_t param)
+{
+    s_bw_ocean_markers++;
+    if (s_gpu.prim) {
+        s_gpu.draw_marker = BW_X_DRAW_MARKER_NONE;
+        s_bw_ocean_marker_pending = BW_OCEAN_MARKER_IDLE;
+        bw_ocean_marker_reject("inside a draw", param);
+    } else if (param != BW_DRAW_MARKER_OCEAN_DRAW) {
+        s_bw_ocean_marker_pending = BW_OCEAN_MARKER_INVALID;
+        bw_ocean_marker_reject("unknown version", param);
+    } else if (s_bw_ocean_marker_pending != BW_OCEAN_MARKER_IDLE) {
+        s_bw_ocean_marker_pending = BW_OCEAN_MARKER_INVALID;
+        bw_ocean_marker_reject("more than one marker before a draw", param);
+    } else {
+        s_bw_ocean_marker_pending = BW_OCEAN_MARKER_ARMED;
+    }
+}
+
+static void bw_ocean_marker_begin(void)
+{
+    s_gpu.draw_marker = s_bw_ocean_marker_pending == BW_OCEAN_MARKER_ARMED
+                      ? BW_X_DRAW_MARKER_OCEAN : BW_X_DRAW_MARKER_NONE;
+    s_gpu.draw_marker_copies = 0;
+    if (s_gpu.draw_marker == BW_X_DRAW_MARKER_OCEAN)
+        s_bw_ocean_marker_batches++;
+    s_bw_ocean_marker_pending = BW_OCEAN_MARKER_IDLE;
+}
+
+static void bw_ocean_marker_end(void)
+{
+    if (s_gpu.draw_marker == BW_X_DRAW_MARKER_OCEAN && !s_gpu.draw_marker_copies)
+        bw_ocean_marker_reject("marked draw produced no extended batch",
+                               BW_DRAW_MARKER_OCEAN_DRAW);
+    s_gpu.draw_marker = BW_X_DRAW_MARKER_NONE;
+    s_gpu.draw_marker_copies = 0;
+}
+
+static void bw_ocean_marker_frame_end(void)
+{
+    if (s_bw_ocean_marker_pending != BW_OCEAN_MARKER_IDLE || s_gpu.draw_marker) {
+        bw_ocean_marker_reject("not consumed before the frame ended",
+                               BW_DRAW_MARKER_OCEAN_DRAW);
+        s_bw_ocean_marker_pending = BW_OCEAN_MARKER_IDLE;
+        s_gpu.draw_marker = BW_X_DRAW_MARKER_NONE;
+        s_gpu.draw_marker_copies = 0;
+    }
 }
 
 /* Blood Wake carried patch: the least presentation interval a swap gets.
@@ -5366,6 +5437,7 @@ static void bw_present_immediate(void)
         const char *e = getenv("BW_IMMEDIATE_PRESENT");
         on = !(e && e[0] == '0');
     }
+    bw_ocean_marker_frame_end();
     if (!on)
         return;
     if (shown++ == 0) {
@@ -5652,11 +5724,23 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
 
     case NV097_SET_BEGIN_END:
         if (param) {
+            if (s_gpu.prim) {
+                s_bw_ocean_marker_pending = BW_OCEAN_MARKER_IDLE;
+                s_gpu.draw_marker = BW_X_DRAW_MARKER_NONE;
+                bw_ocean_marker_reject("nested draw scope", BW_DRAW_MARKER_OCEAN_DRAW);
+            } else {
+                bw_ocean_marker_begin();
+            }
             s_gpu.prim = param;
             s_gpu.idx_count = 0;
             s_gpu.inline_count = 0;
             s_gpu.imm_count = 0;
         } else {
+            if (!s_gpu.prim && s_bw_ocean_marker_pending != BW_OCEAN_MARKER_IDLE) {
+                bw_ocean_marker_reject("END without a marked BEGIN",
+                                       BW_DRAW_MARKER_OCEAN_DRAW);
+                s_bw_ocean_marker_pending = BW_OCEAN_MARKER_IDLE;
+            }
             /* Three ways a batch can have arrived, and only one is in use at
              * a time: vertices completed by SET_VERTEX4F, a payload written
              * with INLINE_ARRAY, or indices into the title's own arrays. */
@@ -5667,6 +5751,7 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
             else
                 draw_primitive();
             s_gpu.prim = 0;
+            bw_ocean_marker_end();
             s_gpu.inline_count = 0;
             s_gpu.imm_count = 0;
         }
@@ -5713,9 +5798,16 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
             s_gpu.idx[s_gpu.idx_count++] = param;
         break;
     case NV097_NO_OPERATION:
-        if (s_bw_nop_marker && (param >> 16) == 0xB1D3u) {
-            s_bw_nop_marker(param);              /* Blood Wake: a widescreen marker */
-            return;
+        if ((param >> 16) == BW_DRAW_MARKER_TAG) {
+            uint32_t op = (param >> 8) & 0xFFu;
+            if (op == BW_DRAW_MARKER_OP_OCEAN_DRAW) {
+                bw_ocean_marker_nop(param);
+                return;
+            }
+            if (s_bw_nop_marker) {
+                s_bw_nop_marker(param);          /* Blood Wake: a widescreen marker */
+                return;
+            }
         }
         /* Non-zero, it is one of D3D's software methods, which the GPU traps
          * to D3D's interrupt handler on the console. Only the swap's interval
@@ -5766,6 +5858,7 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
         int snapshot_ok, synchronized;
         uint32_t snapshot_va, snapshot_pitch, snapshot_aa_sy;
         uint32_t stall_vbl;
+        bw_ocean_marker_frame_end();
         (void)flip_clock(stall_ns, &clock_ok);
         stall_vbl = s_walk_vbl;
         if (s_ftrace == 2)
@@ -6199,6 +6292,10 @@ void nv2a_pb_exec_report(void)
                     " x %.1f..%.1f  y %.1f..%.1f\n",
             s_gpu.draws, s_gpu.nonzero_draws, s_gpu.verts,
             s_gpu.min_x, s_gpu.max_x, s_gpu.min_y, s_gpu.max_y);
+    if (s_bw_ocean_markers || s_bw_ocean_marker_rejected)
+        fprintf(stderr, "[GPU] ocean draw markers: %lu received, %lu batch scopes, "
+                        "%lu rejected\n", s_bw_ocean_markers,
+                s_bw_ocean_marker_batches, s_bw_ocean_marker_rejected);
     /* One picture per report rather than per clear: a title clears hundreds of
      * times a second and nobody wants that many files. */
     if (!s_flip_dumping)

@@ -16,9 +16,9 @@ locally exported definition data remain private and must not be committed.
 | Standalone mod editor | Planned after the shared schema | Build only after the runtime parser can validate and apply a useful profile with synthetic fixtures. |
 | Adjustable LOD | Implemented | Validate 1x-8x visually in both editions; Original remains fixed at 1x. |
 | Metal filtering | Implemented | Collect oblique water/cliff comparisons and GPU timings for 1x/4x/8x/16x. |
-| Metal MSAA | No-go pending evidence | Run the controlled visual/GPU-time/memory matrix in `METAL_QUALITY.md`; do not expose the DX11 control on Metal before it passes. |
+| Metal MSAA | No-go; harness implemented | Fill and evaluate the controlled visual/GPU-time/memory record in `METAL_QUALITY.md`; do not expose the DX11 control on Metal before it passes. |
 | Upstream fixes | Verified | Re-run the offline parity checker whenever upstream changes. |
-| Realistic water | Blocked on ocean draw identity | Add an explicit scoped game-to-executor marker and validate every ocean pass before adding a shader variant. |
+| Realistic water | Marker implemented; capture validation pending | Validate marker coverage and state fingerprints across every ocean pass before adding a shader variant. |
 
 ## F1 runtime settings
 
@@ -99,7 +99,9 @@ point-sampled and unmipped stages remain 1x.
 
 Metal MSAA remains explicitly unsupported. The memory lower bounds, required
 surface/resolve ownership, and go/no-go measurements are in
-[METAL_QUALITY.md](METAL_QUALITY.md).
+[METAL_QUALITY.md](METAL_QUALITY.md). The standalone evidence tool validates a
+machine-readable record and returns no-go whenever measurements, correctness
+checks, or visual review are missing.
 
 ## Upstream parity
 
@@ -118,16 +120,18 @@ policy.
 ## Realistic water
 
 The current Metal path reproduces the retail register-combiner ocean and cube
-reflection programs. CPU-native ocean evaluation is not a draw marker, and a
-combiner/texture fingerprint alone may match non-water reflective geometry.
+reflection programs. A validated native ocean boundary now appends a versioned
+NOP through the title's push buffer. The executor scopes it to the next
+BEGIN/END draw, copies the classification synchronously into each extended
+batch, clears it at END/frame boundaries, and rejects duplicate, unknown,
+inside-draw, or unconsumed markers. Marked and unmarked draws still select the
+same retail Metal path.
 
-The realistic preset must therefore wait for an explicit, one-shot marker
-scoped around each validated ocean submission. The executor should copy that
-marker into the extended batch and Metal should require both the marker and a
-recorded state/program consistency fingerprint. Missing or mismatched evidence
+A combiner/texture fingerprint alone may match non-water reflective geometry,
+so it remains only a consistency check. Missing or mismatched marker evidence
 must select retail rendering and report the unknown state rather than guess.
 
-After classification is proven across calm/storm, day/night, shore,
+After marker coverage is proven across calm/storm, day/night, shore,
 split-screen, reflection, and wake passes, the first optional preset may add
 restrained Fresnel-weighted reflection and roughness/specular shaping using
 existing inputs. Retail remains the exact default. Depth absorption,

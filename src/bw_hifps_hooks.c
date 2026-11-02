@@ -85,6 +85,7 @@
 #include <math.h>
 
 #include "bw_edition.h"
+#include "bw_draw_marker.h"
 #include "bw_hook_platform.h"
 #if defined(_WIN32)
 #include "gpu/bw_d3d11.h"
@@ -1373,17 +1374,37 @@ static ObEntry *ob_slot(uint64_t h, uint32_t gen)
 #define OB_LERP_FIELDS 5
 static const uint32_t s_ob_lerp_off[OB_LERP_FIELDS] = { 0x08u, 0x0Cu, 0x1Cu, 0x20u, 0x24u };
 
+static unsigned long s_ob_marker_unknown;
+
+static void ob_finish_draw_marker(int marker_ok, uint32_t flags, uint32_t side,
+                                  uint32_t base, uint32_t stride)
+{
+    if (!bw_edition_at_least(BW_ED_REMASTERED))
+        return;
+    if (!marker_ok) {
+        if (++s_ob_marker_unknown == 1)
+            fprintf(stderr, "[BW] ocean draw marker: unrecognized render batch "
+                    "(flags %08X count %u base %08X stride %u); keeping retail classification\n",
+                    flags, side, base, stride);
+        return;
+    }
+    /* The validated call is inside Ocean_FillVertices. Appending the NOP
+     * before that caller resumes puts it in the command stream before the
+     * corresponding tile submission, where the executor consumes it. */
+    bw_draw_marker_emit(BW_DRAW_MARKER_OCEAN_DRAW);
+}
+
 void sub_00098130(void)
 {
     uint32_t flags, side, base, stride, nv, len, i, esp0, frame[3];
     uint64_t h = 1469598103934665603ull;
     ObEntry *e, *ep;
-    int called = 0, lerp;
+    int called = 0, lerp, marker_ok;
     if (HU32(g_esp) != 0x00037CC2u || g_ecx != WW_VA) {
         sub_00098130_gen();                      /* hulls, the secondary water: the game's own */
         return;
     }
-    if (!s_on || !s_oceancache || s_water_on_frame) {
+    if (bw_is_original()) {
         bw_ocean_eval();
         return;
     }
@@ -1391,10 +1412,18 @@ void sub_00098130(void)
     side = HU32(g_esp + 8);
     base = HU32(WW_VA + 0xCCBCu);                /* vertex 0, x */
     stride = HU32(WW_VA + 0xCCD8u);
-    nv = side;                                  /* vertices: 5 x 5 per tile (seen: 25 written) */
-    if (stride != OB_STRIDE || side == 0 || nv > OB_MAXV || base < 0x00010000u
-        || HU32(WW_VA + 0xCCB8u) != base + 8u) {   /* not the layout read above */
+    marker_ok = (flags & 0x1Fu) == 0x1Du && stride == OB_STRIDE
+             && side != 0 && side <= OB_MAXV && base >= 0x00010000u
+             && HU32(WW_VA + 0xCCB8u) == base + 8u;
+    if (!s_on || !s_oceancache || s_water_on_frame) {
         bw_ocean_eval();
+        ob_finish_draw_marker(marker_ok, flags, side, base, stride);
+        return;
+    }
+    nv = side;                                  /* vertices: 5 x 5 per tile (seen: 25 written) */
+    if (!marker_ok) {                            /* not the layout read above */
+        bw_ocean_eval();
+        ob_finish_draw_marker(0, flags, side, base, stride);
         return;
     }
     if (!s_ob) {
@@ -1404,6 +1433,7 @@ void sub_00098130(void)
         if (!s_ob) {
             s_oceancache = 0;
             bw_ocean_eval();
+            ob_finish_draw_marker(1, flags, side, base, stride);
             return;
         }
     }
@@ -1491,4 +1521,5 @@ void sub_00098130(void)
         memcpy(HP(base), e->bytes, len);
     }
     g_esp = esp0 + 12;                       /* the function's own `ret 8`, once */
+    ob_finish_draw_marker(1, flags, side, base, stride);
 }

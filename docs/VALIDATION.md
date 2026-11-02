@@ -79,7 +79,7 @@ wall-clock performance evidence.
 
 ## Current regression coverage
 
-- The Metal backend suite passes 311/311 tests, including texture-stage masks,
+- The Metal backend suite passes 313/313 tests, including texture-stage masks,
   combiner operations, cube reflection, mip selection, command-buffer and
   render-encoder batching, texture caching, upload-arena reuse, anisotropy
   selection/lifecycle, and invalid filtering rejection.
@@ -95,6 +95,13 @@ wall-clock performance evidence.
   capture, one-shot delta consumption, sensitivity/inversion/stick mapping,
   focus-loss clearing, keyboard/controller coexistence, hotplug, slots, and
   concurrent polling.
+- The hook-portability suite passes 9/9 tests, including the validated ocean
+  marker boundary and retail fallback. Metal backend coverage verifies
+  marked/unmarked batches, one-shot scope, duplicate/unknown rejection, no
+  carry-over, and byte-identical retail output.
+- The MSAA evidence harness passes 9/9 Python tests covering 2x/4x/8x memory
+  costs, strict schemas, non-finite and overflow rejection, missing evidence,
+  and exact decision-threshold boundaries.
 - Nine LOD cases cover Original passthrough, defaults, disable/fix override,
   custom/clamped values, live changes, invalid rejection, and concurrent
   readers/writers.

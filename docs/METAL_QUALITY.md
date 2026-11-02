@@ -52,3 +52,53 @@ reference crops containing hulls, rigging, shorelines, particles, HUD, and
 alpha-tested edges at 1x, 2x, and 4x render scale. If that evidence does not
 justify multisampling, native render scale and the validated guest AA path
 remain the Metal alternatives.
+
+### Evidence harness
+
+`tools/metal_msaa_evidence.py` is a standalone decision harness. It does not
+create multisample resources, alter rendering, or make `BW_VFX_MSAA` supported.
+It accepts only the currently documented BGRA8/Z24S8 attachment pair, 2x/4x/8x
+sample counts, 1x/2x/4x render-scale labels, and positive Metal texture
+dimensions no larger than 16384. All retained-attachment, resolve-target, and
+minimum resolve-traffic calculations use checked unsigned 64-bit arithmetic.
+
+Fix the limits before collecting a run, then create a JSON record template.
+For example, this records a 4x cell whose attachment limit is exactly the
+187.5 MiB lower bound; it is not a project-wide approval policy:
+
+```sh
+python3 tools/metal_msaa_evidence.py template \
+  --width 2560 --height 1920 --sample-count 4 --render-scale 4 \
+  --color-format bgra8unorm \
+  --depth-stencil-format depth24unorm_stencil8 \
+  --max-attachment-bytes 196608000 \
+  --max-gpu-time-regression-percent 10 \
+  --max-resolve-gpu-time-ms 1 \
+  --min-measured-frames 600 \
+  --output build/metal-msaa-4x.json
+```
+
+The generated record deliberately contains null evidence and therefore
+evaluates to no-go. A controlled A/B collector must fill the shared device,
+OS, build, scene, GPU timer, protocol, and run-order fields; warm-up and frame
+counts; monotonic baseline/MSAA GPU-time percentiles; resolve p95; measured
+peak attachment bytes; every named correctness check; and SHA-256-identified
+baseline/MSAA crops for every required visual feature. At least one crop must
+show an improvement, all crops must remain correct, and the reviewer must
+affirm a visible benefit beyond render scaling.
+
+Evaluate the completed record with:
+
+```sh
+python3 tools/metal_msaa_evidence.py evaluate build/metal-msaa-4x.json \
+  --output build/metal-msaa-4x-report.json
+```
+
+The evaluator exits 0 only for `go`, 1 for a valid `no-go`, and 2 for malformed
+or unsafe input. Missing evidence, failed correctness or visual checks,
+non-monotonic timing data, an implausible measured peak below the computed
+lower bound, or any limit exceedance is no-go. A `go` applies only to that
+recorded matrix cell; it neither enables MSAA nor changes the current
+unsupported status. Every intended sample-count/render-scale cell and the
+renderer ownership cases listed above still require review before any future
+implementation decision.

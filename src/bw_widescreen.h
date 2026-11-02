@@ -33,6 +33,7 @@
 #define BW_WIDESCREEN_H
 
 #include <stdint.h>
+#include "bw_draw_marker.h"
 
 /* After bw_edition_init(). main.c calls it once the boot knows whether it is
  * a gameplay boot (launch data "SPLASH" mode 1) or the title and menus; the
@@ -54,17 +55,15 @@ float bw_ws_k(void);
  * NV097 NO_OPERATION (method 0x0100, header 0x00040100) with a parameter whose
  * top 16 bits are BW_WS_MARK_TAG. D3D's own software methods carry small
  * values (0x300..0x324 region), so the tag can't collide. The carried
- * executor hands such a NOP to the handler the back end registers
- * (bw_set_nop_marker_handler) and drops it; with no handler (Original) the
- * game never writes one. */
-#define BW_WS_NOP_HEADER   0x00040100u      /* count 1, subchannel 0, method 0x100 */
-#define BW_WS_MARK_TAG     0xB1D3u
-#define BW_WS_MARK(op, arg) ((BW_WS_MARK_TAG << 16) | ((uint32_t)(op) << 8) | ((uint32_t)(arg) & 0xFFu))
-enum {
-    BW_WS_OP_2D_BEGIN = 1,      /* arg = what: BW_WS_WHAT_* */
-    BW_WS_OP_2D_END   = 2,
-    BW_WS_OP_3D_43    = 3,      /* arg = 1: this view's 3D is 4:3 (pillarboxed) */
-};
+ * executor hands the 2D operations to the handler the back end registers
+ * (bw_set_nop_marker_handler) and drops them. The generic marker transport
+ * also carries the executor-owned one-shot ocean operation. */
+#define BW_WS_NOP_HEADER   BW_DRAW_MARKER_NOP_HEADER
+#define BW_WS_MARK_TAG     BW_DRAW_MARKER_TAG
+#define BW_WS_MARK(op, arg) BW_DRAW_MARKER_MAKE((op), (arg))
+#define BW_WS_OP_2D_BEGIN  BW_DRAW_MARKER_OP_2D_BEGIN
+#define BW_WS_OP_2D_END    BW_DRAW_MARKER_OP_2D_END
+#define BW_WS_OP_3D_43     BW_DRAW_MARKER_OP_3D_43
 #define BW_WS_WHAT_OVERLAY 0x20u   /* Overlay_FlushBatches: the HUD, menus, text */
 #define BW_WS_WHAT_MOVIE 0x40u     /* Movie_DrawQuad: a Bink frame */
 

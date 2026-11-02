@@ -30,6 +30,10 @@ This is still a development build:
   filtering, and mouse controls through subsystem-owned callbacks, labels
   restart-required choices, and disables unsupported Metal settings with a
   reason.
+- A versioned in-stream marker now identifies validated ocean submissions and
+  is copied into executor batches without changing retail rendering. A
+  fail-closed MSAA evidence tool records memory, timing, correctness, and
+  visual-review gates; Metal MSAA remains unsupported.
 - Optional gameplay mouse input supports sensitivity, inversion, response,
   steering/aim stick selection, and hold/toggle relative capture. Native
   point-and-click menu hitboxes are still a planned reverse-engineering task.
@@ -42,7 +46,7 @@ This is still a development build:
   confirmed.
 - USB gamepads, physical-controller support, and broad mission, save, FMV,
   and edition coverage are incomplete.
-- Current regression results include 311/311 Metal backend tests, 61/61
+- Current regression results include 313/313 Metal backend tests, 61/61
   presenter tests, 35/35 MMIO host tests, 8/8 normal and ASan/UBSan macOS host
   tests, 11/11 input integration tests, 4/4 APU output tests, and 100/100
   concurrent APU restore stress runs.

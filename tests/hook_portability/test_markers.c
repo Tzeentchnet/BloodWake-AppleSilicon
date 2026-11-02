@@ -10,7 +10,7 @@ static uint32_t guest_words[0x10000];
 ptrdiff_t g_xbox_mem_offset;
 BW_HOOK_TLS uint32_t g_eax, g_ecx, g_edx, g_esp;
 static float ws_k = 1.0f;
-static uint32_t parameters[2], expected_eax, expected_ecx, expected_edx;
+static uint32_t parameters[3], expected_eax, expected_ecx, expected_edx;
 static unsigned marker_count, guest_calls, summaries;
 
 float bw_ws_k(void) { return ws_k; }
@@ -18,7 +18,7 @@ void bw_edition_add_summary(void (*fn)(void)) { assert(fn); summaries++; }
 
 static void emit_guest(void)
 {
-    assert(marker_count < 2 && g_ecx == BW_WS_NOP_HEADER);
+    assert(marker_count < 3 && g_ecx == BW_DRAW_MARKER_NOP_HEADER);
     assert(guest_words[g_esp / 4] == 0x00126300u);
     parameters[marker_count++] = g_edx;
     g_eax = g_ecx = g_edx = 0;
@@ -58,6 +58,11 @@ int main(void)
     assert(parameters[0] == BW_WS_MARK(BW_WS_OP_2D_BEGIN, BW_WS_WHAT_OVERLAY));
     assert(parameters[1] == BW_WS_MARK(BW_WS_OP_2D_END, BW_WS_WHAT_OVERLAY));
     assert(g_eax == 0x11u && g_ecx == 0x22u && g_edx == 0x33u && g_esp == sp + 4);
+    expected_eax = g_eax; expected_ecx = g_ecx; expected_edx = g_edx;
+    bw_draw_marker_emit(BW_DRAW_MARKER_OCEAN_DRAW);
+    assert(marker_count == 3 && parameters[2] == BW_DRAW_MARKER_OCEAN_DRAW);
+    assert(g_eax == expected_eax && g_ecx == expected_ecx && g_edx == expected_edx &&
+           g_esp == sp + 4);
     puts("guest marker dispatch tests passed");
     return 0;
 }

@@ -2079,6 +2079,76 @@ static void extended_basic_test(void)
     CHECK(pixel(0, 0) == 0xFF102030u);
 }
 
+static uint8_t s_ocean_marker_seen[8];
+static unsigned s_ocean_marker_seen_count;
+
+static void ocean_marker_probe_draw(const Nv2aSurface *surface, const BwXBatch *batch)
+{
+    CHECK(surface && batch && s_ocean_marker_seen_count < 8);
+    if (batch && s_ocean_marker_seen_count < 8)
+        s_ocean_marker_seen[s_ocean_marker_seen_count++] = batch->draw_marker;
+}
+
+static void ocean_marker_batches_test(void)
+{
+    static const BwXBackend probe = {.draw = ocean_marker_probe_draw};
+    Nv2aCombiner rc = synthetic_combiner();
+
+    setup_combiner(&rc);
+    triangle(0xFFFFFFFFu);
+    bw_backend_ext_register(&probe);
+
+    draw(3);
+    method(0x0100, BW_DRAW_MARKER_OCEAN_DRAW);
+    draw(3);
+    draw(3);
+
+    method(0x0100, BW_DRAW_MARKER_OCEAN_DRAW);
+    method(0x17FC, 5);
+    method(0x17FC, 0);
+    draw(3);
+
+    method(0x0100, BW_DRAW_MARKER_OCEAN_DRAW);
+    method(0x0100, BW_DRAW_MARKER_OCEAN_DRAW);
+    draw(3);
+
+    method(0x0100, BW_DRAW_MARKER_MAKE(BW_DRAW_MARKER_OP_OCEAN_DRAW, 2));
+    draw(3);
+
+    CHECK(s_ocean_marker_seen_count == 6);
+    CHECK(s_ocean_marker_seen[0] == BW_X_DRAW_MARKER_NONE);
+    CHECK(s_ocean_marker_seen[1] == BW_X_DRAW_MARKER_OCEAN);
+    CHECK(s_ocean_marker_seen[2] == BW_X_DRAW_MARKER_NONE);
+    CHECK(s_ocean_marker_seen[3] == BW_X_DRAW_MARKER_NONE);
+    CHECK(s_ocean_marker_seen[4] == BW_X_DRAW_MARKER_NONE);
+    CHECK(s_ocean_marker_seen[5] == BW_X_DRAW_MARKER_NONE);
+    bw_backend_ext_register(NULL);
+}
+
+static void ocean_marker_retail_test(void)
+{
+    Nv2aCombiner rc = synthetic_combiner();
+    const uint32_t source = 0x8064C832u;
+    uint32_t unmarked, marked;
+
+    setup_dxt1_texture(0xF800u, 0x001Fu, 0);
+    setup_combiner(&rc);
+    triangle(source);
+    clear(0xFF102030u);
+    draw(3);
+    flip();
+    expect_no_error();
+    unmarked = pixel(4, 3);
+
+    clear(0xFF102030u);
+    method(0x0100, BW_DRAW_MARKER_OCEAN_DRAW);
+    draw(3);
+    flip();
+    expect_no_error();
+    marked = pixel(4, 3);
+    CHECK(marked == unmarked);
+}
+
 static void extended_texture_cache_test(void)
 {
     Nv2aCombiner rc = synthetic_combiner();
@@ -5463,6 +5533,10 @@ int main(int argc, char **argv)
         xrgb_single_rejection_test(argv[1]);
     else if (!strcmp(argv[1], "extended-basic"))
         extended_basic_test();
+    else if (!strcmp(argv[1], "ocean-marker-batches"))
+        ocean_marker_batches_test();
+    else if (!strcmp(argv[1], "ocean-marker-retail"))
+        ocean_marker_retail_test();
     else if (!strcmp(argv[1], "extended-texture-cache"))
         extended_texture_cache_test();
     else if (!strcmp(argv[1], "extended-combiner"))

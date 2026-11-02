@@ -19,6 +19,12 @@
 #include <stdint.h>
 #include "nv2a_backend.h"
 #include "nv2a_combiner.h"
+#include "../../bw_draw_marker.h"
+
+enum {
+    BW_X_DRAW_MARKER_NONE = 0,
+    BW_X_DRAW_MARKER_OCEAN = 1
+};
 
 typedef struct {
     float x, y, z, rhw;         /* surface pixels, z as produced, 1/w */
@@ -43,6 +49,7 @@ typedef struct {
     uint32_t other_stage_input; /* SET_SHADER_OTHER_STAGE_INPUT: stage 2's source in 16-19, 3's in 20-23 */
     uint32_t tex_border[4];     /* SET_TEXTURE_BORDER_COLOR (0xAARRGGBB) per stage */
     uint8_t tex_border_src[4];  /* FORMAT's border source: 1 = that colour, 0 = the texture's edge */
+    uint8_t draw_marker;        /* BW_X_DRAW_MARKER_*; copied from the in-stream batch scope */
 } BwXBatch;
 
 /* Vertex programs on the GPU. Instead of running the title's vertex program
@@ -114,6 +121,8 @@ typedef struct {
 } BwXVsOut;                     /* 32 floats */
 
 typedef struct {
+    /* Draw callbacks are synchronous. The batch, including draw_marker, is
+     * borrowed only for the call and must be copied if it is needed later. */
     void (*draw)(const Nv2aSurface *s, const BwXBatch *b);
     /* Optional. Returns 1 if it drew the batch, 0 to have the executor
      * transform it on the CPU instead. */

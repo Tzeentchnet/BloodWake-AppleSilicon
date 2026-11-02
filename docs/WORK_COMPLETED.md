@@ -70,6 +70,13 @@ test coverage are in [VALIDATION.md](VALIDATION.md).
   stay 1x, and live changes take effect at a flip boundary.
 - Converted Remastered LOD from a boot-only cache to validated atomic 1x-8x
   runtime state. Original remains fixed at 1x.
+- Added a versioned in-stream ocean draw marker at the validated native ocean
+  boundary. The executor scopes it to one BEGIN/END draw, copies it into
+  extended batches, rejects invalid/carry-over state, and preserves the exact
+  retail Metal path for both marked and unmarked draws.
+- Added a standalone, fail-closed Metal MSAA evidence tool for checked
+  attachment/resolve memory costs and controlled timing, correctness, and
+  visual-review records. It does not enable Metal MSAA.
 
 ## Renderer performance
 
@@ -164,8 +171,9 @@ test coverage are in [VALIDATION.md](VALIDATION.md).
   sustained gameplay remain unconfirmed.
 - Gameplay mouse input is implemented, but point-and-click menu hitboxes need
   validated title UI state and geometry. Ship/weapon profiles need proven
-  definition fields/ownership, and realistic water needs an explicit ocean
-  draw marker; none is represented by a placeholder or silent no-op.
+  definition fields/ownership. Realistic water now has an inert explicit draw
+  marker but still needs representative pass-coverage captures before any
+  shader change; none is represented by a placeholder or silent no-op.
 - Metal MSAA remains deliberately unsupported until the controlled
   visual/GPU-time/memory gate in `METAL_QUALITY.md` justifies it.
 - Unsupported states continue to fail explicitly instead of being guessed or

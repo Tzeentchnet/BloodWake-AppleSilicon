@@ -52,5 +52,6 @@ set_tests_properties(hooks-unpaced-warning PROPERTIES
     PASS_REGULAR_EXPRESSION "RECOMP_FLIP_PACING is off, so the target is not enforced")
 add_test(NAME hooks-widescreen-unavailable COMMAND hook_integration widescreen)
 add_test(NAME hooks-marker-dispatch COMMAND hook_markers)
+add_test(NAME hooks-ocean-marker-boundary COMMAND hook_integration ocean-marker)
 add_test(NAME hooks-ocean-fenv-and-fallback COMMAND hook_ocean)
 add_test(NAME hooks-mission-file-case COMMAND hook_mission_files)

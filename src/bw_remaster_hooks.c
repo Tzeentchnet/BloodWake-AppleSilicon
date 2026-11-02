@@ -158,19 +158,12 @@ static void ws_emit_summary(void)
             s_ws_emitted[1], s_ws_emitted[2], s_ws_emitted[3]);
 }
 
-static void ws_emit(uint32_t param)
+void bw_draw_marker_emit(uint32_t param)
 {
-    uint32_t sa = g_eax, sc = g_ecx, sd = g_edx, op = (param >> 8) & 0xFFu;
-    if (op < 4 && bw_hook_increment(&s_ws_emitted[op]) == 1 && op == 1)
-        bw_edition_add_summary(ws_emit_summary);
-    /* Once. Before TK-38 (the pushbuffer walker lost commands at ring wraps;
-     * fixed by D9, main 831bb19) about 1 in 1,000 markers went missing (runs
-     * ...-mk10/-mk12a); with the fix, written and received counts match
-     * exactly (runs ...-tk38a/-tk38b). The back end's set/clear flag, cleared
-     * at every flip, stays as the safety net. */
+    uint32_t sa = g_eax, sc = g_ecx, sd = g_edx;
     g_esp -= 4;
     RH_MEM32(g_esp) = 0x00126300u;          /* a return address for its ret to pop */
-    g_ecx = BW_WS_NOP_HEADER;
+    g_ecx = BW_DRAW_MARKER_NOP_HEADER;
     g_edx = param;
 #if defined(_WIN32)
     D3DDevice_SetRenderState_Simple_00126300();
@@ -178,6 +171,19 @@ static void ws_emit(uint32_t param)
     bw_hook_call_guest(0x00126300u);
 #endif
     g_eax = sa; g_ecx = sc; g_edx = sd;
+}
+
+static void ws_emit(uint32_t param)
+{
+    uint32_t op = (param >> 8) & 0xFFu;
+    if (op < 4 && bw_hook_increment(&s_ws_emitted[op]) == 1 && op == 1)
+        bw_edition_add_summary(ws_emit_summary);
+    /* Once. Before TK-38 (the pushbuffer walker lost commands at ring wraps;
+     * fixed by D9, main 831bb19) about 1 in 1,000 markers went missing (runs
+     * ...-mk10/-mk12a); with the fix, written and received counts match
+     * exactly (runs ...-tk38a/-tk38b). The back end's set/clear flag, cleared
+     * at every flip, stays as the safety net. */
+    bw_draw_marker_emit(param);
 }
 
 /* ---- 1. the projection: Hor+ ----------------------------------------------
