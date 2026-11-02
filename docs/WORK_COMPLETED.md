@@ -72,11 +72,16 @@ test coverage are in [VALIDATION.md](VALIDATION.md).
   runtime state. Original remains fixed at 1x.
 - Added a versioned in-stream ocean draw marker at the validated native ocean
   boundary. The executor scopes it to one BEGIN/END draw, copies it into
-  extended batches, rejects invalid/carry-over state, and preserves the exact
-  retail Metal path for both marked and unmarked draws.
+  extended batches, coalesces repeated valid preparation markers, rejects
+  invalid/carry-over state, and preserves the exact retail Metal path for both
+  marked and unmarked draws. A bounded four-boot Remastered run recorded
+  41,348 markers, 512 scopes, and zero rejections.
 - Added a standalone, fail-closed Metal MSAA evidence tool for checked
   attachment/resolve memory costs and controlled timing, correctness, and
   visual-review records. It does not enable Metal MSAA.
+- Added a read-only Metal sample-count probe with fixed-shape JSON and explicit
+  error reporting. The recorded Apple M5 supports 2x, 4x, and 8x; project
+  policy remains unsupported.
 
 ## Renderer performance
 

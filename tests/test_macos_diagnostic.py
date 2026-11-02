@@ -95,6 +95,7 @@ class MacosDiagnosticTests(unittest.TestCase):
     def test_guest_environment_is_allowlisted_and_opt_in(self):
         with mock.patch.dict(os.environ, {"RECOMP_USB": "1", "RECOMP_AC97_READY": "0",
                                          "BW_MACOS_AUDIO": "0",
+                                         "BW_EDITION": "remastered",
                                          "BW_SETTINGS": "unsafe",
                                          "BW_MACOS_KEYBOARD_HOOK": "1",
                                          "BW_SYNTHETIC_INPUT_DIAGNOSTIC": "1"}, clear=True):
@@ -107,6 +108,7 @@ class MacosDiagnosticTests(unittest.TestCase):
         self.assertNotIn("BW_MACOS_KEYBOARD_HOOK", env)
         self.assertNotIn("BW_SYNTHETIC_INPUT_DIAGNOSTIC", env)
         self.assertEqual(env["BW_SETTINGS"], "none")
+        self.assertEqual(env["BW_EDITION"], "original")
         self.assertEqual(env["BW_RUN_SECONDS"], "15")
         self.assertEqual(env["BW_NATIVE_LAUNCH_IN_FD"], "4")
         enabled = diagnostic.diagnostic_env(self.root, self.prepared, 15, True, True, 4, 5,
@@ -119,6 +121,12 @@ class MacosDiagnosticTests(unittest.TestCase):
         synthetic = diagnostic.diagnostic_env(self.root, self.prepared, 15, False, False, 4, 5,
                                                keyboard_hook=True, synthetic_input=True)
         self.assertEqual(synthetic["BW_SYNTHETIC_INPUT_DIAGNOSTIC"], "1")
+        remastered = diagnostic.diagnostic_env(
+            self.root, self.prepared, 15, False, False, 4, 5, edition="remastered")
+        self.assertEqual(remastered["BW_EDITION"], "remastered")
+        with self.assertRaisesRegex(ValueError, "edition must be original or remastered"):
+            diagnostic.diagnostic_env(
+                self.root, self.prepared, 15, False, False, 4, 5, edition="Remastered")
         with self.assertRaisesRegex(ValueError, "requires the experimental keyboard hook"):
             diagnostic.diagnostic_env(self.root, self.prepared, 15, False, False, 4, 5,
                                       synthetic_input=True)
@@ -280,7 +288,7 @@ class MacosDiagnosticTests(unittest.TestCase):
              contextlib.redirect_stdout(io.StringIO()):
             result = diagnostic.run_guest_relaunches(
                 Path("/native"), self.root, self.prepared, "profile", 20, False, True, 4, 30)
-        self.assertEqual(result, 0)
+        self.assertEqual(result, diagnostic.RelaunchRunResult.guest_exit(0, 2))
         self.assertEqual((self.root / "relaunch-001.bin").read_bytes(), request)
         first, second = once.call_args_list
         self.assertEqual(first.kwargs["launch"], b"")
@@ -299,7 +307,7 @@ class MacosDiagnosticTests(unittest.TestCase):
             result = diagnostic.run_guest_relaunches(
                 Path("/native"), self.root, self.prepared, "profile", 20, False, False,
                 4, 30, keyboard_hook=True, synthetic_input=True)
-        self.assertEqual(result, 0)
+        self.assertEqual(result, diagnostic.RelaunchRunResult.guest_exit(0, 2))
         self.assertEqual(once.call_count, 2)
         for call in once.call_args_list:
             self.assertTrue(call.kwargs["keyboard_hook"])
@@ -319,13 +327,16 @@ class MacosDiagnosticTests(unittest.TestCase):
         request = self.launch_request()
         with mock.patch.object(diagnostic, "run_guest_once", return_value=(7, request, 0)) as once:
             self.assertEqual(diagnostic.run_guest_relaunches(
-                Path("/native"), self.root, self.prepared, "profile", 20, False, False, 4, 30), 7)
+                Path("/native"), self.root, self.prepared, "profile", 20, False, False, 4, 30),
+                diagnostic.RelaunchRunResult.guest_exit(7, 1))
             self.assertEqual(once.call_count, 1)
         (self.root / "relaunch-001.bin").unlink()
         with mock.patch.object(diagnostic, "run_guest_once", return_value=(0, request, 0)) as once:
-            with self.assertRaisesRegex(RuntimeError, "relaunch limit"):
+            self.assertEqual(
                 diagnostic.run_guest_relaunches(
-                    Path("/native"), self.root, self.prepared, "profile", 20, False, False, 1, 30)
+                    Path("/native"), self.root, self.prepared, "profile", 20,
+                    False, False, 1, 30),
+                diagnostic.RelaunchRunResult.boot_limit(1))
             self.assertEqual(once.call_count, 1)
         with mock.patch.object(diagnostic, "run_guest_once") as once, \
              mock.patch.object(diagnostic.time, "monotonic", side_effect=[10, 40]):
@@ -333,6 +344,24 @@ class MacosDiagnosticTests(unittest.TestCase):
                 diagnostic.run_guest_relaunches(
                     Path("/native"), self.root, self.prepared, "profile", 20, False, False, 4, 30)
             once.assert_not_called()
+
+    def test_numbered_guest_logs_match_completed_boots_exactly(self):
+        first = self.root / "guest-001.log"
+        second = self.root / "guest-002.log"
+        first.write_bytes(b"first complete boot\n")
+        second.write_bytes(b"second complete boot\n")
+        self.assertEqual(
+            diagnostic.guest_log_paths(self.root, True, 2, 4),
+            [first, second])
+
+        partial = self.root / "guest-003.log"
+        partial.write_bytes(b"partial boot\n")
+        with self.assertRaisesRegex(RuntimeError, "missing or out of sequence"):
+            diagnostic.guest_log_paths(self.root, True, 2, 4)
+        partial.unlink()
+        second.unlink()
+        with self.assertRaisesRegex(RuntimeError, "missing or out of sequence"):
+            diagnostic.guest_log_paths(self.root, True, 2, 4)
 
     def main_arguments(self):
         executable = self.root / "binary"
@@ -354,6 +383,225 @@ class MacosDiagnosticTests(unittest.TestCase):
             diagnostic.main(arguments)
         self.assertEqual(failure.exception.code, 2)
         self.assertIn("--synthetic-input requires --experimental-keyboard-hook", errors.getvalue())
+
+    def test_cli_rejects_unknown_or_noncanonical_editions(self):
+        base_arguments = self.main_arguments()
+        for edition in ("enhanced", "Original", "Remastered"):
+            with self.subTest(edition=edition):
+                arguments = base_arguments + ["--edition", edition]
+                errors = io.StringIO()
+                with mock.patch.object(diagnostic.sys, "platform", "darwin"), \
+                     contextlib.redirect_stderr(errors), self.assertRaises(SystemExit) as failure:
+                    diagnostic.main(arguments)
+                self.assertEqual(failure.exception.code, 2)
+                self.assertIn("invalid choice", errors.getvalue())
+
+    def test_cli_defaults_to_original(self):
+        arguments = self.main_arguments()
+
+        def guest(_executable, output, _game_dir, _profile, _seconds, _quincunx, _audit,
+                  **kwargs):
+            (output / "guest.log").write_bytes(b"no marker summary\n")
+            self.assertEqual(kwargs["edition"], "original")
+            return 0
+
+        output = io.StringIO()
+        with mock.patch.object(diagnostic.sys, "platform", "darwin"), \
+             mock.patch.object(diagnostic, "ROOT", self.repository), \
+             mock.patch.object(diagnostic, "verify_prepared"), \
+             mock.patch.object(diagnostic, "toolkit_revision", return_value="pinned"), \
+             mock.patch.object(diagnostic, "verify_sandbox"), \
+             mock.patch.object(diagnostic, "run_guest", side_effect=guest), \
+             contextlib.redirect_stdout(output):
+            result = diagnostic.main(arguments)
+        self.assertEqual(result, 0)
+        self.assertIn("Diagnostic edition: Original", output.getvalue())
+        self.assertIn("0 received, 0 batch scopes, 0 rejected", output.getvalue())
+        self.assertIn("zero observed ocean coverage", output.getvalue())
+
+    def test_relaunch_cap_reports_completed_markers_and_is_non_success(self):
+        arguments = self.main_arguments() + [
+            "--follow-relaunches", "--max-boots", "2",
+        ]
+
+        def capped(_executable, output, *_args, **_kwargs):
+            (output / "guest-001.log").write_bytes(
+                b"[GPU] ocean draw markers: 5 received, 3 batch scopes, 1 rejected\n")
+            (output / "guest-002.log").write_bytes(
+                b"[GPU] ocean draw markers: 7 received, 4 batch scopes, 0 rejected\n")
+            return diagnostic.RelaunchRunResult.boot_limit(2)
+
+        output = io.StringIO()
+        errors = io.StringIO()
+        with mock.patch.object(diagnostic.sys, "platform", "darwin"), \
+             mock.patch.object(diagnostic, "ROOT", self.repository), \
+             mock.patch.object(diagnostic, "verify_prepared"), \
+             mock.patch.object(diagnostic, "toolkit_revision", return_value="pinned") as toolkit, \
+             mock.patch.object(diagnostic, "snapshot_tree",
+                               return_value={"unchanged": 1}) as snapshot, \
+             mock.patch.object(diagnostic, "digest_file", return_value="hash") as digest, \
+             mock.patch.object(diagnostic, "verify_sandbox"), \
+             mock.patch.object(diagnostic, "run_guest_relaunches", side_effect=capped), \
+             contextlib.redirect_stdout(output), contextlib.redirect_stderr(errors):
+            result = diagnostic.main(arguments)
+        self.assertEqual(result, 1)
+        self.assertEqual(toolkit.call_count, 2)
+        self.assertEqual(snapshot.call_count, 2)
+        self.assertEqual(digest.call_count, 2)
+        self.assertIn("Prepared-tree, toolkit and executable integrity unchanged",
+                      output.getvalue())
+        self.assertIn("Ocean markers: 12 received, 7 batch scopes, 1 rejected",
+                      output.getvalue())
+        self.assertNotIn("Guest exit status:", output.getvalue())
+        self.assertIn("--max-boots stopped after 2 completed boots", errors.getvalue())
+
+    def test_relaunch_cap_preserves_malformed_summary_failure(self):
+        arguments = self.main_arguments() + [
+            "--follow-relaunches", "--max-boots", "1",
+        ]
+
+        def capped(_executable, output, *_args, **_kwargs):
+            (output / "guest-001.log").write_bytes(
+                b"[GPU] ocean draw markers: malformed\n")
+            return diagnostic.RelaunchRunResult.boot_limit(1)
+
+        output = io.StringIO()
+        errors = io.StringIO()
+        with mock.patch.object(diagnostic.sys, "platform", "darwin"), \
+             mock.patch.object(diagnostic, "ROOT", self.repository), \
+             mock.patch.object(diagnostic, "verify_prepared"), \
+             mock.patch.object(diagnostic, "toolkit_revision", return_value="pinned") as toolkit, \
+             mock.patch.object(diagnostic, "verify_sandbox"), \
+             mock.patch.object(diagnostic, "run_guest_relaunches", side_effect=capped), \
+             contextlib.redirect_stdout(output), contextlib.redirect_stderr(errors):
+            result = diagnostic.main(arguments)
+        self.assertEqual(result, 1)
+        self.assertEqual(toolkit.call_count, 2)
+        self.assertIn("Prepared-tree, toolkit and executable integrity unchanged",
+                      output.getvalue())
+        self.assertIn("Diagnostic failed: guest log contains a malformed ocean marker summary",
+                      errors.getvalue())
+        self.assertNotIn("bounded limit reached", errors.getvalue())
+
+    def test_relaunch_cap_integrity_failure_takes_precedence(self):
+        arguments = self.main_arguments() + [
+            "--follow-relaunches", "--max-boots", "1",
+        ]
+
+        def capped(_executable, output, *_args, **_kwargs):
+            (output / "guest-001.log").write_bytes(
+                b"[GPU] ocean draw markers: 1 received, 1 batch scopes, 0 rejected\n")
+            return diagnostic.RelaunchRunResult.boot_limit(1)
+
+        output = io.StringIO()
+        errors = io.StringIO()
+        with mock.patch.object(diagnostic.sys, "platform", "darwin"), \
+             mock.patch.object(diagnostic, "ROOT", self.repository), \
+             mock.patch.object(diagnostic, "verify_prepared"), \
+             mock.patch.object(diagnostic, "toolkit_revision", return_value="pinned"), \
+             mock.patch.object(diagnostic, "snapshot_tree", return_value={"unchanged": 1}), \
+             mock.patch.object(diagnostic, "digest_file",
+                               side_effect=["before", "after"]), \
+             mock.patch.object(diagnostic, "verify_sandbox"), \
+             mock.patch.object(diagnostic, "run_guest_relaunches", side_effect=capped), \
+             mock.patch.object(diagnostic, "report_ocean_marker_counts") as report, \
+             contextlib.redirect_stdout(output), contextlib.redirect_stderr(errors):
+            result = diagnostic.main(arguments)
+        self.assertEqual(result, 1)
+        report.assert_not_called()
+        self.assertIn("Diagnostic failed: toolkit or executable changed", errors.getvalue())
+        self.assertNotIn("bounded limit reached", errors.getvalue())
+
+    def test_ordinary_relaunch_completion_reports_success(self):
+        arguments = self.main_arguments() + [
+            "--follow-relaunches", "--max-boots", "3",
+        ]
+
+        def completed(_executable, output, *_args, **_kwargs):
+            (output / "guest-001.log").write_bytes(
+                b"[GPU] ocean draw markers: 2 received, 1 batch scopes, 0 rejected\n")
+            (output / "guest-002.log").write_bytes(
+                b"[GPU] ocean draw markers: 3 received, 2 batch scopes, 0 rejected\n")
+            return diagnostic.RelaunchRunResult.guest_exit(0, 2)
+
+        output = io.StringIO()
+        errors = io.StringIO()
+        with mock.patch.object(diagnostic.sys, "platform", "darwin"), \
+             mock.patch.object(diagnostic, "ROOT", self.repository), \
+             mock.patch.object(diagnostic, "verify_prepared"), \
+             mock.patch.object(diagnostic, "toolkit_revision", return_value="pinned"), \
+             mock.patch.object(diagnostic, "verify_sandbox"), \
+             mock.patch.object(diagnostic, "run_guest_relaunches", side_effect=completed), \
+             contextlib.redirect_stdout(output), contextlib.redirect_stderr(errors):
+            result = diagnostic.main(arguments)
+        self.assertEqual(result, 0)
+        self.assertEqual(errors.getvalue(), "")
+        self.assertIn("Ocean markers: 5 received, 3 batch scopes, 0 rejected",
+                      output.getvalue())
+        self.assertIn("Guest exit status: 0", output.getvalue())
+
+    def test_relaunch_run_limit_preserves_guest_status(self):
+        arguments = self.main_arguments() + [
+            "--follow-relaunches", "--max-boots", "3",
+        ]
+
+        def limited(_executable, output, *_args, **_kwargs):
+            (output / "guest-001.log").write_bytes(b"configured run limit\n")
+            return diagnostic.RelaunchRunResult.guest_exit(124, 1)
+
+        output = io.StringIO()
+        errors = io.StringIO()
+        with mock.patch.object(diagnostic.sys, "platform", "darwin"), \
+             mock.patch.object(diagnostic, "ROOT", self.repository), \
+             mock.patch.object(diagnostic, "verify_prepared"), \
+             mock.patch.object(diagnostic, "toolkit_revision", return_value="pinned"), \
+             mock.patch.object(diagnostic, "verify_sandbox"), \
+             mock.patch.object(diagnostic, "run_guest_relaunches", side_effect=limited), \
+             contextlib.redirect_stdout(output), contextlib.redirect_stderr(errors):
+            result = diagnostic.main(arguments)
+        self.assertEqual(result, 124)
+        self.assertEqual(errors.getvalue(), "")
+        self.assertIn("Guest exit status: 124", output.getvalue())
+
+    def test_missing_ocean_marker_summary_reports_zero_coverage(self):
+        log = self.root / "guest.log"
+        log.write_bytes(b"unrelated guest output\n")
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            counts = diagnostic.report_ocean_marker_counts([log])
+        self.assertEqual(counts, (0, 0, 0))
+        self.assertIn("no marker summary; zero observed ocean coverage", output.getvalue())
+
+    def test_malformed_ocean_marker_summaries_are_rejected(self):
+        log = self.root / "guest.log"
+        malformed = (
+            b"[GPU] ocean draw markers: 1 received, missing fields\n",
+            b"[GPU] ocean draw markers: 18446744073709551616 received, "
+            b"1 batch scopes, 0 rejected\n",
+            b"[GPU] ocean draw markers: 2 received, 2 batch scopes, 0 rejected\n"
+            b"[GPU] ocean draw markers: 1 received, 1 batch scopes, 0 rejected\n",
+        )
+        for contents in malformed:
+            with self.subTest(contents=contents):
+                log.write_bytes(contents)
+                with self.assertRaisesRegex(RuntimeError, "malformed|out-of-range|non-monotonic"):
+                    diagnostic.extract_ocean_marker_counts([log])
+
+    def test_ocean_marker_summaries_use_each_boots_final_bounded_counts(self):
+        first = self.root / "guest-001.log"
+        second = self.root / "guest-002.log"
+        first.write_bytes(
+            b"private output is ignored\n"
+            b"[GPU] ocean draw markers: 8 received, 6 batch scopes, 1 rejected\n"
+            b"[GPU] ocean draw markers: 13 received, 10 batch scopes, 2 rejected\r\n")
+        second.write_bytes(
+            b"[GPU] ocean draw markers: 3 received, 2 batch scopes, 0 rejected\n")
+        self.assertEqual(
+            diagnostic.extract_ocean_marker_counts([first, second]),
+            ((16, 12, 2), 3))
+        with mock.patch.object(diagnostic, "MAX_OCEAN_MARKER_SUMMARIES", 2):
+            with self.assertRaisesRegex(RuntimeError, "too many"):
+                diagnostic.extract_ocean_marker_counts([first, second])
 
     def test_preflight_failure_never_launches_guest_and_rechecks_integrity(self):
         arguments = self.main_arguments()

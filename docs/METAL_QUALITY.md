@@ -102,3 +102,22 @@ recorded matrix cell; it neither enables MSAA nor changes the current
 unsupported status. Every intended sample-count/render-scale cell and the
 renderer ownership cases listed above still require review before any future
 implementation decision.
+
+### Device capability probe
+
+The standalone `tests/metal_msaa_capability` target queries
+`-[MTLDevice supportsTextureSampleCount:]` for 2x, 4x, and 8x without creating
+multisample resources or changing renderer policy:
+
+```sh
+cmake -S tests/metal_msaa_capability -B build/test-metal-msaa-capability \
+  -DCMAKE_BUILD_TYPE=Release
+cmake --build build/test-metal-msaa-capability
+ctest --test-dir build/test-metal-msaa-capability --output-on-failure
+build/test-metal-msaa-capability/bw_metal_msaa_capability
+```
+
+Its fixed-shape JSON always reports `bw_vfx_msaa_policy` as `unsupported`.
+On the recorded Apple M5 host, Metal reports 2x, 4x, and 8x sample counts as
+supported. Device capability is only a prerequisite: it does not satisfy
+attachment ownership, resolve correctness, performance, or visual gates.

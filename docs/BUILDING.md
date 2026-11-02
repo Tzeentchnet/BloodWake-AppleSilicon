@@ -201,7 +201,7 @@ build/venv/bin/python tools/macos_diagnostic.py \
   --prepared-tree "$PWD/game/prepare" \
   --toolkit "$PWD/build/xboxrecomp" \
   --output-dir "$HOME/bw-private-diagnostics/boot-001" \
-  --seconds 45 --gpu-audit
+  --edition original --seconds 45 --gpu-audit
 ```
 
 The runner creates isolated home, configuration, temporary and save paths,
@@ -235,6 +235,14 @@ Inherited synthetic-input settings are also discarded.
 Keep the output directory, including logs, saves and any
 guest data, private. A missing sandbox or failed isolation check aborts before
 guest execution.
+
+`--edition` strictly accepts `original` or `remastered` and defaults to
+`original`; inherited edition values are discarded. After each bounded run,
+the runner reads only the fixed-format ocean-marker summaries from the private
+guest logs and prints aggregate received, batch-scope and rejected counts.
+Each boot contributes its final cumulative summary. Missing summaries are
+reported as zero observed ocean coverage, while malformed, non-monotonic,
+excessive or out-of-range summaries fail closed. Guest logs remain private.
 
 ## Windows
 

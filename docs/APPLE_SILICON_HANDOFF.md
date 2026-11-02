@@ -121,8 +121,10 @@ rejected even when set to `0`.
 - Metal MSAA remains unsupported pending controlled visual/GPU-time/memory
   evidence. The F1 schema reports that limitation instead of accepting a
   no-op.
-- A realistic water preset is blocked until ocean draws have an explicit,
-  false-positive-safe game-to-executor marker. Retail water remains unchanged.
+- Ocean draws now carry an explicit, false-positive-safe game-to-executor
+  marker; a bounded Remastered flow recorded 512 scopes with zero rejection.
+  A realistic preset remains blocked on representative pass/fingerprint
+  validation. Retail water remains unchanged.
 - Physical controllers, guest USB, audible/sustained native audio, saves, FMV,
   other editions, and broad mission coverage are not validated Apple Silicon
   features.
@@ -164,8 +166,8 @@ rejected even when set to `0`.
 - Inventory ship/weapon definition construction and ownership locally before
   defining a profile schema or editor. Keep every retail-derived export
   private.
-- Add a scoped ocean submission marker and validate all water passes before
-  changing the Metal shader.
+- Validate the existing scoped ocean marker and state fingerprints across all
+  representative water passes before changing the Metal shader.
 - Run the MSAA matrix in [METAL_QUALITY.md](METAL_QUALITY.md); keep the setting
   unavailable if the measured benefit does not justify it.
 

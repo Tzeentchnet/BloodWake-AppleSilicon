@@ -1,11 +1,13 @@
 """Run one native guest boot in a private, bounded macOS sandbox."""
 
 import argparse
+from dataclasses import dataclass
 import hashlib
 import importlib.util
 import json
 import os
 from pathlib import Path
+import re
 import selectors
 import stat
 import struct
@@ -13,6 +15,7 @@ import subprocess
 import sys
 import tempfile
 import time
+from typing import Optional
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -21,6 +24,29 @@ MAX_LOG_BYTES = 32 * 1024 * 1024
 MAX_RELAUNCH_BYTES = 16 + 260 + 3072
 MAX_RELAUNCH_BOOTS = 16
 SANDBOX = "/usr/bin/sandbox-exec"
+EDITIONS = ("original", "remastered")
+OCEAN_MARKER_PREFIX = b"[GPU] ocean draw markers:"
+OCEAN_MARKER_PATTERN = re.compile(
+    rb"\[GPU\] ocean draw markers: ([0-9]{1,20}) received, "
+    rb"([0-9]{1,20}) batch scopes, ([0-9]{1,20}) rejected"
+)
+MAX_OCEAN_MARKER_COUNT = (1 << 64) - 1
+MAX_OCEAN_MARKER_SUMMARIES = 4096
+
+
+@dataclass(frozen=True)
+class RelaunchRunResult:
+    guest_status: Optional[int]
+    completed_boots: int
+    boot_limit_reached: bool
+
+    @classmethod
+    def guest_exit(cls, status, completed_boots):
+        return cls(status, completed_boots, False)
+
+    @classmethod
+    def boot_limit(cls, completed_boots):
+        return cls(None, completed_boots, True)
 
 
 def digest_file(path):
@@ -201,9 +227,12 @@ def verify_sandbox(profile, output, protected):
 
 
 def diagnostic_env(output, game_dir, seconds, quincunx, audit, input_fd, output_fd,
-                   audit_name="gpu-audit.txt", keyboard_hook=False, synthetic_input=False):
+                   audit_name="gpu-audit.txt", keyboard_hook=False, synthetic_input=False,
+                   edition="original"):
     if synthetic_input and not keyboard_hook:
         raise ValueError("synthetic input requires the experimental keyboard hook")
+    if edition not in EDITIONS:
+        raise ValueError("edition must be original or remastered")
     env = {
         "PATH": "/usr/bin:/bin:/usr/sbin:/sbin",
         "HOME": str(output / "home"),
@@ -213,7 +242,7 @@ def diagnostic_env(output, game_dir, seconds, quincunx, audit, input_fd, output_
         "RECOMP_SAVE_DIR": str(output / "saves"),
         "BW_SETTINGS": "none",
         "BW_GAME_DIR": str(game_dir),
-        "BW_EDITION": "original",
+        "BW_EDITION": edition,
         "BW_RUN_SECONDS": str(seconds),
         "BW_NATIVE_CHILD": "1",
         "BW_NATIVE_LAUNCH_IN_FD": str(input_fd),
@@ -298,7 +327,8 @@ def validate_relaunch(data):
 
 def run_guest_once(executable, output, game_dir, profile, seconds, quincunx, audit,
                    launch=b"", log_name="guest.log", audit_name="gpu-audit.txt",
-                   timeout=None, log_limit=None, keyboard_hook=False, synthetic_input=False):
+                   timeout=None, log_limit=None, keyboard_hook=False, synthetic_input=False,
+                   edition="original"):
     input_read = input_write = output_read = output_write = -1
     child = None
     try:
@@ -319,7 +349,7 @@ def run_guest_once(executable, output, game_dir, profile, seconds, quincunx, aud
         os.close(input_write)
         input_write = -1
         env = diagnostic_env(output, game_dir, seconds, quincunx, audit, input_read, output_write,
-                             audit_name, keyboard_hook, synthetic_input)
+                             audit_name, keyboard_hook, synthetic_input, edition)
         with open(output / log_name, "xb") as log:
             child = subprocess.Popen(
                 [SANDBOX, "-p", profile, str(executable), "--bw-native-child"],
@@ -349,10 +379,10 @@ def run_guest_once(executable, output, game_dir, profile, seconds, quincunx, aud
 
 
 def run_guest(executable, output, game_dir, profile, seconds, quincunx, audit,
-              keyboard_hook=False, synthetic_input=False):
+              keyboard_hook=False, synthetic_input=False, edition="original"):
     result, relaunch, _ = run_guest_once(executable, output, game_dir, profile,
                                          seconds, quincunx, audit, keyboard_hook=keyboard_hook,
-                                         synthetic_input=synthetic_input)
+                                         synthetic_input=synthetic_input, edition=edition)
     if relaunch:
         (output / "relaunch.bin").write_bytes(relaunch)
         print("Guest requested a relaunch; request saved privately, not executed")
@@ -361,10 +391,11 @@ def run_guest(executable, output, game_dir, profile, seconds, quincunx, audit,
 
 def run_guest_relaunches(executable, output, game_dir, profile, seconds, quincunx,
                          audit, max_boots, total_seconds, keyboard_hook=False,
-                         synthetic_input=False):
+                         synthetic_input=False, edition="original"):
     deadline = time.monotonic() + total_seconds
     log_remaining = MAX_LOG_BYTES
     launch = b""
+    completed_boots = 0
     for boot in range(1, max_boots + 1):
         remaining = deadline - time.monotonic()
         if remaining <= 0:
@@ -374,19 +405,77 @@ def run_guest_relaunches(executable, output, game_dir, profile, seconds, quincun
             launch=launch, log_name=f"guest-{boot:03d}.log",
             audit_name=f"gpu-audit-{boot:03d}.txt",
             timeout=min(seconds + 15, remaining), log_limit=log_remaining,
-            keyboard_hook=keyboard_hook, synthetic_input=synthetic_input)
+            keyboard_hook=keyboard_hook, synthetic_input=synthetic_input, edition=edition)
+        completed_boots = boot
         log_remaining -= log_size
         if relaunch:
             with open(output / f"relaunch-{boot:03d}.bin", "xb") as record:
                 record.write(relaunch)
         if result != 0 or not relaunch:
-            return result
+            return RelaunchRunResult.guest_exit(result, completed_boots)
         validate_relaunch(relaunch)
         if boot == max_boots:
-            raise RuntimeError("guest relaunch limit reached")
+            return RelaunchRunResult.boot_limit(completed_boots)
         launch = relaunch
         print(f"Following validated guest relaunch for boot {boot + 1}")
-    raise RuntimeError("guest relaunch limit reached")
+    raise RuntimeError("relaunch loop ended without a result")
+
+
+def guest_log_paths(output, follow_relaunches, completed_boots, max_boots):
+    if not follow_relaunches:
+        path = output / "guest.log"
+        if completed_boots != 1 or not path.is_file():
+            raise RuntimeError("guest log is missing")
+        return [path]
+
+    paths = sorted(output.glob("guest-*.log"))
+    expected = [output / f"guest-{boot:03d}.log"
+                for boot in range(1, completed_boots + 1)]
+    if not 1 <= completed_boots <= max_boots or paths != expected:
+        raise RuntimeError("numbered guest logs are missing or out of sequence")
+    return paths
+
+
+def extract_ocean_marker_counts(log_paths):
+    totals = [0, 0, 0]
+    summary_count = 0
+    for path in log_paths:
+        previous = None
+        with open(path, "rb") as stream:
+            for line in stream:
+                if OCEAN_MARKER_PREFIX not in line:
+                    continue
+                summary_count += 1
+                if summary_count > MAX_OCEAN_MARKER_SUMMARIES:
+                    raise RuntimeError("guest logs contain too many ocean marker summaries")
+                match = OCEAN_MARKER_PATTERN.fullmatch(line.rstrip(b"\r\n"))
+                if match is None:
+                    raise RuntimeError("guest log contains a malformed ocean marker summary")
+                counts = tuple(int(value) for value in match.groups())
+                if any(value > MAX_OCEAN_MARKER_COUNT for value in counts):
+                    raise RuntimeError("guest log contains an out-of-range ocean marker count")
+                if previous is not None and any(value < old for value, old in zip(counts, previous)):
+                    raise RuntimeError("guest log contains non-monotonic ocean marker counts")
+                previous = counts
+        if previous is not None:
+            for index, value in enumerate(previous):
+                if totals[index] > MAX_OCEAN_MARKER_COUNT - value:
+                    raise RuntimeError("aggregate ocean marker count is out of range")
+                totals[index] += value
+    return tuple(totals), summary_count
+
+
+def report_ocean_marker_counts(log_paths):
+    counts, summary_count = extract_ocean_marker_counts(log_paths)
+    received, batches, rejected = counts
+    suffix = ""
+    if not summary_count:
+        suffix = " (no marker summary; zero observed ocean coverage)"
+    elif not batches:
+        suffix = " (zero observed ocean coverage)"
+    print(f"Ocean markers: {received} received, {batches} batch scopes, "
+          f"{rejected} rejected{suffix}")
+    return counts
 
 
 def main(argv=None):
@@ -396,6 +485,8 @@ def main(argv=None):
     parser.add_argument("--toolkit", required=True, help="clean pinned toolkit checkout")
     parser.add_argument("--output-dir", required=True, help="new private directory outside the repository")
     parser.add_argument("--seconds", type=int, default=45, help="single-boot deadline (1-300 seconds)")
+    parser.add_argument("--edition", choices=EDITIONS, default="original",
+                        help="guest edition (default: original)")
     parser.add_argument("--quincunx-approx", action="store_true", help="opt into the unverified approximation")
     parser.add_argument("--gpu-audit", action="store_true", help="write the private GPU usage summary")
     parser.add_argument("--experimental-keyboard-hook", action="store_true",
@@ -443,22 +534,30 @@ def main(argv=None):
         baseline = snapshot_tree(prepared)
         executable_hash = digest_file(executable)
         print("Executable SHA-256:", executable_hash)
+        print("Diagnostic edition:", args.edition.capitalize())
         result = None
+        completed_boots = 0
+        boot_limit_reached = False
+        max_boots = args.max_boots if args.max_boots is not None else 4
         try:
             verify_sandbox(profile, output, game_dir / "default.xbe")
             if args.follow_relaunches:
-                result = run_guest_relaunches(
+                relaunch_result = run_guest_relaunches(
                     executable, output, game_dir, profile, args.seconds,
                     args.quincunx_approx, args.gpu_audit,
-                    args.max_boots if args.max_boots is not None else 4,
+                    max_boots,
                     args.total_seconds if args.total_seconds is not None else 300,
                     keyboard_hook=args.experimental_keyboard_hook,
-                    synthetic_input=args.synthetic_input)
+                    synthetic_input=args.synthetic_input, edition=args.edition)
+                result = relaunch_result.guest_status
+                completed_boots = relaunch_result.completed_boots
+                boot_limit_reached = relaunch_result.boot_limit_reached
             else:
                 result = run_guest(executable, output, game_dir, profile, args.seconds,
                                    args.quincunx_approx, args.gpu_audit,
                                    keyboard_hook=args.experimental_keyboard_hook,
-                                   synthetic_input=args.synthetic_input)
+                                   synthetic_input=args.synthetic_input, edition=args.edition)
+                completed_boots = 1
         finally:
             changed = snapshot_tree(prepared) != baseline
             if toolkit_revision(toolkit) != revision or digest_file(executable) != executable_hash:
@@ -466,7 +565,14 @@ def main(argv=None):
             if changed:
                 raise RuntimeError("prepared tree changed during the diagnostic")
         print("Prepared-tree, toolkit and executable integrity unchanged")
+        report_ocean_marker_counts(
+            guest_log_paths(output, args.follow_relaunches, completed_boots, max_boots))
         print("Private diagnostic output:", output)
+        if boot_limit_reached:
+            print(f"Diagnostic bounded limit reached: --max-boots stopped after "
+                  f"{completed_boots} completed boots while another relaunch was requested",
+                  file=sys.stderr)
+            return 1
         print("Guest exit status:", result, "(124 means its configured run limit was reached)")
         return result if result >= 0 else 128 - result
     except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as error:

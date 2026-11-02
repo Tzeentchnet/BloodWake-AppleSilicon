@@ -16,9 +16,9 @@ locally exported definition data remain private and must not be committed.
 | Standalone mod editor | Planned after the shared schema | Build only after the runtime parser can validate and apply a useful profile with synthetic fixtures. |
 | Adjustable LOD | Implemented | Validate 1x-8x visually in both editions; Original remains fixed at 1x. |
 | Metal filtering | Implemented | Collect oblique water/cliff comparisons and GPU timings for 1x/4x/8x/16x. |
-| Metal MSAA | No-go; harness implemented | Fill and evaluate the controlled visual/GPU-time/memory record in `METAL_QUALITY.md`; do not expose the DX11 control on Metal before it passes. |
+| Metal MSAA | No-go; harness and capability probe implemented | The Apple M5 supports 2x/4x/8x, but a diagnostic rendering path and the controlled visual/GPU-time/memory matrix are still required. |
 | Upstream fixes | Verified | Re-run the offline parity checker whenever upstream changes. |
-| Realistic water | Marker implemented; capture validation pending | Validate marker coverage and state fingerprints across every ocean pass before adding a shader variant. |
+| Realistic water | Marker validated in bounded boot flow | Expand from 512 clean scoped batches to representative scene/pass coverage and state fingerprints before adding a shader variant. |
 
 ## F1 runtime settings
 
@@ -123,9 +123,15 @@ The current Metal path reproduces the retail register-combiner ocean and cube
 reflection programs. A validated native ocean boundary now appends a versioned
 NOP through the title's push buffer. The executor scopes it to the next
 BEGIN/END draw, copies the classification synchronously into each extended
-batch, clears it at END/frame boundaries, and rejects duplicate, unknown,
-inside-draw, or unconsumed markers. Marked and unmarked draws still select the
-same retail Metal path.
+batch, clears it at END/frame boundaries, coalesces repeated identical markers
+while the next scope is armed, and rejects conflicting, unknown, inside-draw,
+or unconsumed markers. Marked and unmarked draws still select the same retail
+Metal path.
+
+A bounded four-boot Remastered diagnostic followed validated relaunches and
+recorded 41,348 received markers, 512 batch scopes, and zero rejected markers.
+This validates command ordering and lifetime in the exercised boot flow, not
+all water passes or visual classification across representative gameplay.
 
 A combiner/texture fingerprint alone may match non-water reflective geometry,
 so it remains only a consistency check. Missing or mismatched marker evidence

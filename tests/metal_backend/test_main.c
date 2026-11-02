@@ -163,6 +163,8 @@ extern void bw_metal_test_set_present_size(uint32_t width, uint32_t height);
 extern int bw_metal_test_write_surface_pixel(uint32_t x, uint32_t y, uint32_t argb);
 extern unsigned bw_metal_test_sampler_anisotropy(int min_linear, unsigned mip_mode);
 extern void bw_metal_test_apply_pending_render_settings(void);
+extern void bw_ocean_marker_test_counts(unsigned long *received, unsigned long *scopes,
+                                        unsigned long *rejected);
 
 #define CHECK(condition) do { \
     if (!(condition)) { \
@@ -2079,49 +2081,100 @@ static void extended_basic_test(void)
     CHECK(pixel(0, 0) == 0xFF102030u);
 }
 
-static uint8_t s_ocean_marker_seen[8];
+#define OCEAN_MARKER_REPEAT_COUNT 4096u
+
+static uint8_t s_ocean_marker_seen[16];
 static unsigned s_ocean_marker_seen_count;
 
 static void ocean_marker_probe_draw(const Nv2aSurface *surface, const BwXBatch *batch)
 {
-    CHECK(surface && batch && s_ocean_marker_seen_count < 8);
-    if (batch && s_ocean_marker_seen_count < 8)
+    CHECK(surface && batch && s_ocean_marker_seen_count < sizeof s_ocean_marker_seen);
+    if (batch && s_ocean_marker_seen_count < sizeof s_ocean_marker_seen)
         s_ocean_marker_seen[s_ocean_marker_seen_count++] = batch->draw_marker;
+}
+
+static void check_ocean_marker_counts(unsigned long received, unsigned long scopes,
+                                      unsigned long rejected)
+{
+    unsigned long actual_received = 0, actual_scopes = 0, actual_rejected = 0;
+    bw_ocean_marker_test_counts(&actual_received, &actual_scopes, &actual_rejected);
+    CHECK(actual_received == received);
+    CHECK(actual_scopes == scopes);
+    CHECK(actual_rejected == rejected);
 }
 
 static void ocean_marker_batches_test(void)
 {
     static const BwXBackend probe = {.draw = ocean_marker_probe_draw};
     Nv2aCombiner rc = synthetic_combiner();
+    const unsigned long repeated = OCEAN_MARKER_REPEAT_COUNT;
 
     setup_combiner(&rc);
     triangle(0xFFFFFFFFu);
     bw_backend_ext_register(&probe);
 
     draw(3);
+    for (unsigned i = 0; i < OCEAN_MARKER_REPEAT_COUNT; i++)
+        method(0x0100, BW_DRAW_MARKER_OCEAN_DRAW);
+    check_ocean_marker_counts(repeated, 0, 0);
+    draw(3);
+    draw(3);
+    check_ocean_marker_counts(repeated, 1, 0);
+
+    method(0x0100, BW_DRAW_MARKER_OCEAN_DRAW);
+    flip();
+    draw(3);
+    check_ocean_marker_counts(repeated + 1, 1, 1);
+
+    method(0x0100, BW_DRAW_MARKER_MAKE(BW_DRAW_MARKER_OP_OCEAN_DRAW, 2));
+    draw(3);
+    check_ocean_marker_counts(repeated + 2, 1, 2);
+
+    method(0x0100, BW_DRAW_MARKER_OCEAN_DRAW);
+    method(0x0100, BW_DRAW_MARKER_MAKE(BW_DRAW_MARKER_OP_OCEAN_DRAW, 2));
+    draw(3);
+    check_ocean_marker_counts(repeated + 4, 1, 3);
+
+    method(0x0100, BW_DRAW_MARKER_MAKE(BW_DRAW_MARKER_OP_OCEAN_DRAW, 2));
     method(0x0100, BW_DRAW_MARKER_OCEAN_DRAW);
     draw(3);
+    check_ocean_marker_counts(repeated + 6, 1, 5);
+
+    method(0x17FC, 5);
+    method(0x0100, BW_DRAW_MARKER_OCEAN_DRAW);
+    method(0x1810, 2u << 24);
+    method(0x17FC, 0);
+    check_ocean_marker_counts(repeated + 7, 1, 6);
+
+    method(0x0100, BW_DRAW_MARKER_OCEAN_DRAW);
+    method(0x17FC, 0);
     draw(3);
+    check_ocean_marker_counts(repeated + 8, 1, 7);
 
     method(0x0100, BW_DRAW_MARKER_OCEAN_DRAW);
     method(0x17FC, 5);
     method(0x17FC, 0);
     draw(3);
+    check_ocean_marker_counts(repeated + 9, 2, 8);
 
     method(0x0100, BW_DRAW_MARKER_OCEAN_DRAW);
-    method(0x0100, BW_DRAW_MARKER_OCEAN_DRAW);
     draw(3);
-
-    method(0x0100, BW_DRAW_MARKER_MAKE(BW_DRAW_MARKER_OP_OCEAN_DRAW, 2));
     draw(3);
+    check_ocean_marker_counts(repeated + 10, 3, 8);
 
-    CHECK(s_ocean_marker_seen_count == 6);
+    CHECK(s_ocean_marker_seen_count == 12);
     CHECK(s_ocean_marker_seen[0] == BW_X_DRAW_MARKER_NONE);
     CHECK(s_ocean_marker_seen[1] == BW_X_DRAW_MARKER_OCEAN);
     CHECK(s_ocean_marker_seen[2] == BW_X_DRAW_MARKER_NONE);
     CHECK(s_ocean_marker_seen[3] == BW_X_DRAW_MARKER_NONE);
     CHECK(s_ocean_marker_seen[4] == BW_X_DRAW_MARKER_NONE);
     CHECK(s_ocean_marker_seen[5] == BW_X_DRAW_MARKER_NONE);
+    CHECK(s_ocean_marker_seen[6] == BW_X_DRAW_MARKER_NONE);
+    CHECK(s_ocean_marker_seen[7] == BW_X_DRAW_MARKER_NONE);
+    CHECK(s_ocean_marker_seen[8] == BW_X_DRAW_MARKER_NONE);
+    CHECK(s_ocean_marker_seen[9] == BW_X_DRAW_MARKER_NONE);
+    CHECK(s_ocean_marker_seen[10] == BW_X_DRAW_MARKER_OCEAN);
+    CHECK(s_ocean_marker_seen[11] == BW_X_DRAW_MARKER_NONE);
     bw_backend_ext_register(NULL);
 }
 
@@ -2130,6 +2183,7 @@ static void ocean_marker_retail_test(void)
     Nv2aCombiner rc = synthetic_combiner();
     const uint32_t source = 0x8064C832u;
     uint32_t unmarked, marked;
+    uint32_t after_marked;
 
     setup_dxt1_texture(0xF800u, 0x001Fu, 0);
     setup_combiner(&rc);
@@ -2141,12 +2195,20 @@ static void ocean_marker_retail_test(void)
     unmarked = pixel(4, 3);
 
     clear(0xFF102030u);
-    method(0x0100, BW_DRAW_MARKER_OCEAN_DRAW);
+    for (unsigned i = 0; i < OCEAN_MARKER_REPEAT_COUNT; i++)
+        method(0x0100, BW_DRAW_MARKER_OCEAN_DRAW);
     draw(3);
     flip();
     expect_no_error();
     marked = pixel(4, 3);
+
+    clear(0xFF102030u);
+    draw(3);
+    flip();
+    expect_no_error();
+    after_marked = pixel(4, 3);
     CHECK(marked == unmarked);
+    CHECK(after_marked == unmarked);
 }
 
 static void extended_texture_cache_test(void)

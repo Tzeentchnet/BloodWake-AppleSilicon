@@ -5182,9 +5182,13 @@ static void bw_ocean_marker_nop(uint32_t param)
     } else if (param != BW_DRAW_MARKER_OCEAN_DRAW) {
         s_bw_ocean_marker_pending = BW_OCEAN_MARKER_INVALID;
         bw_ocean_marker_reject("unknown version", param);
+    } else if (s_bw_ocean_marker_pending == BW_OCEAN_MARKER_ARMED) {
+        /* Ocean_FillVertices can reach the same boundary repeatedly while
+         * building one later submission. Identical current-version markers
+         * still describe that one next scope. */
     } else if (s_bw_ocean_marker_pending != BW_OCEAN_MARKER_IDLE) {
         s_bw_ocean_marker_pending = BW_OCEAN_MARKER_INVALID;
-        bw_ocean_marker_reject("more than one marker before a draw", param);
+        bw_ocean_marker_reject("conflicting markers before a draw", param);
     } else {
         s_bw_ocean_marker_pending = BW_OCEAN_MARKER_ARMED;
     }
@@ -5219,6 +5223,19 @@ static void bw_ocean_marker_frame_end(void)
         s_gpu.draw_marker_copies = 0;
     }
 }
+
+#if defined(BW_METAL_TESTING)
+void bw_ocean_marker_test_counts(unsigned long *received, unsigned long *scopes,
+                                 unsigned long *rejected)
+{
+    if (received)
+        *received = s_bw_ocean_markers;
+    if (scopes)
+        *scopes = s_bw_ocean_marker_batches;
+    if (rejected)
+        *rejected = s_bw_ocean_marker_rejected;
+}
+#endif
 
 /* Blood Wake carried patch: the least presentation interval a swap gets.
  * Blood Wake asks for interval ONE, steps its game clock (and, inferred, its

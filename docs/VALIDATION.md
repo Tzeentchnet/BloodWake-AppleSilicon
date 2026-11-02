@@ -97,11 +97,18 @@ wall-clock performance evidence.
   concurrent polling.
 - The hook-portability suite passes 9/9 tests, including the validated ocean
   marker boundary and retail fallback. Metal backend coverage verifies
-  marked/unmarked batches, one-shot scope, duplicate/unknown rejection, no
-  carry-over, and byte-identical retail output.
+  marked/unmarked batches, 4,096-marker coalescing into one scope,
+  conflicting/unknown rejection, no carry-over, and byte-identical retail
+  output.
 - The MSAA evidence harness passes 9/9 Python tests covering 2x/4x/8x memory
   costs, strict schemas, non-finite and overflow rejection, missing evidence,
   and exact decision-threshold boundaries.
+- The Metal MSAA capability target passes 2/2 tests. The recorded Apple M5
+  reports 2x, 4x, and 8x support; the probe explicitly retains the unsupported
+  project policy.
+- The focused macOS diagnostic suite passes 33/33 tests, including strict
+  edition selection, bounded marker-summary parsing, typed relaunch outcomes,
+  integrity-failure precedence, and boot-cap reporting.
 - Nine LOD cases cover Original passthrough, defaults, disable/fix override,
   custom/clamped values, live changes, invalid rejection, and concurrent
   readers/writers.
@@ -124,8 +131,8 @@ wall-clock performance evidence.
   production retirement is safe.
 - The DMA ownership suite passed 13 tests normally and under focused TSan and
   ASan/UBSan runs.
-- The guest-memory inventory passed 21 synthetic tests, and the broader Python
-  suite passed 66/66 at the recorded checkpoint.
+- The guest-memory inventory passed 21 synthetic tests, and the complete
+  Python suite now passes 102/102.
 - The synthetic GPU capture suite passed 11 tests normally and under
   ASan/UBSan, with four focused TSan cases.
 - Windows and x86 execution were not validated on the Apple Silicon host.
@@ -153,6 +160,13 @@ Original-edition retail boot:
 That bounded boot did not interact with F1, enable Remastered LOD/anisotropy,
 capture the mouse, judge rendered output, or confirm audible sound. Those
 remain hands-on validation items.
+
+A later private four-boot Remastered diagnostic followed validated relaunches
+until the configured boot cap. Prepared-tree, toolkit, and executable integrity
+were unchanged. It aggregated 41,348 ocean markers into 512 scoped batches
+with zero rejections. This validates the coalescing and one-shot executor
+lifetime in the exercised boot flow; representative calm/storm, day/night,
+shore, split-screen, reflection, and wake coverage remains outstanding.
 
 ## Integrity and privacy
 

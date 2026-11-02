@@ -40,6 +40,7 @@ static uint32_t ack_regs, ack_user, expected_put;
 static int expect_queued;
 static int relaunch_fail, relaunch_stage;
 static int ocean_eval_calls, ocean_gen_calls;
+static unsigned ocean_marker_calls;
 static uint32_t ocean_marker_param;
 
 bw_edition_t bw_edition(void) { return edition; }
@@ -84,6 +85,7 @@ static void voice_idle_guest(void)
 static void marker_guest(void)
 {
     assert(g_ecx == BW_DRAW_MARKER_NOP_HEADER);
+    ocean_marker_calls++;
     ocean_marker_param = g_edx;
     g_esp += 4;
 }
@@ -419,6 +421,7 @@ static void test_display(void)
 static void test_ocean_marker_boundary(void)
 {
     const uint32_t sp = 0x20000u, ww = 0x001D77F8u, base = 0x22000u;
+    const unsigned repeats = 512;
 
     G32(ww + 0xCCB8u) = base + 8u;
     G32(ww + 0xCCBCu) = base;
@@ -430,24 +433,36 @@ static void test_ocean_marker_boundary(void)
     edition = BW_ED_ORIGINAL;
     g_ecx = ww; g_esp = sp;
     sub_00098130();
-    assert(ocean_eval_calls == 1 && ocean_gen_calls == 0 && !ocean_marker_param);
+    assert(ocean_eval_calls == 1 && ocean_gen_calls == 0 &&
+           ocean_marker_calls == 0 && !ocean_marker_param);
 
     edition = BW_ED_REMASTERED;
-    g_ecx = ww; g_esp = sp;
-    sub_00098130();
-    assert(ocean_eval_calls == 2 && ocean_marker_param == BW_DRAW_MARKER_OCEAN_DRAW);
+    for (unsigned i = 0; i < repeats; i++) {
+        G32(sp) = 0x00037CC2u;
+        G32(sp + 4u) = 0x1Du;
+        G32(sp + 8u) = 25u;
+        g_ecx = ww; g_esp = sp;
+        sub_00098130();
+    }
+    assert(ocean_eval_calls == (int)repeats + 1 &&
+           ocean_marker_calls == repeats &&
+           ocean_marker_param == BW_DRAW_MARKER_OCEAN_DRAW);
 
     ocean_marker_param = 0;
+    G32(sp) = 0x00037CC2u;
     G32(sp + 4u) = 0x1Cu;
+    G32(sp + 8u) = 25u;
     g_ecx = ww; g_esp = sp;
     sub_00098130();
-    assert(ocean_eval_calls == 3 && !ocean_marker_param);
+    assert(ocean_eval_calls == (int)repeats + 2 &&
+           ocean_marker_calls == repeats && !ocean_marker_param);
 
     G32(sp + 4u) = 0x1Du;
     G32(sp) = 0x00000000u;
     g_ecx = ww; g_esp = sp;
     sub_00098130();
-    assert(ocean_gen_calls == 1 && !ocean_marker_param);
+    assert(ocean_gen_calls == 1 && ocean_marker_calls == repeats &&
+           !ocean_marker_param);
 }
 
 int main(int argc, char **argv)
