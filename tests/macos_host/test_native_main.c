@@ -12,6 +12,15 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+#if defined(__has_feature)
+#if __has_feature(thread_sanitizer)
+#define BW_NATIVE_TEST_TSAN 1
+#endif
+#endif
+#ifndef BW_NATIVE_TEST_TSAN
+#define BW_NATIVE_TEST_TSAN 0
+#endif
+
 int bw_native_main(int argc, char **argv);
 
 RECOMP_TLS uint32_t g_esp;
@@ -22,16 +31,21 @@ MCPXAPUState *g_apu_state;
 static uint8_t *memory;
 static pthread_t ui_thread, guest_thread_id;
 static int step, fl_initialized, marked_guest, did_cleanup;
+static int apu_started, apu_dispatch_enabled;
 static unsigned pb_methods;
 static int metal_expected;
 static BwMetalFramebufferCallback metal_framebuffer_callback;
 static _Atomic int metal_error;
 
-static void check(int ok)
+static void check_at(int ok, int line)
 {
-    if (!ok)
+    if (!ok) {
+        fprintf(stderr, "native fixture check failed at line %d\n", line);
         _exit(70);
+    }
 }
+
+#define check(ok) check_at((ok), __LINE__)
 
 #ifdef BW_EXPERIMENTAL_SYNTHETIC_INPUT
 void bw_macos_input_bridge_configure(int enabled) { (void)enabled; }
@@ -60,8 +74,25 @@ unsigned bw_hifps_boot(int gameplay) { check(gameplay); return 0; }
 void bw_set_min_flip_interval(unsigned n) { check(n == 2); }
 
 int bw_posix_fault_install(void) { check(step == 1 && marked_guest); return 0; }
-void bw_posix_fault_set_base(uintptr_t base) { (void)base; }
-void bw_posix_fault_uninstall(void) { did_cleanup |= 8; }
+void bw_posix_fault_set_base(uintptr_t base)
+{
+    if (!base)
+        check(!apu_dispatch_enabled);
+}
+void bw_posix_fault_enable_apu(int enabled)
+{
+    if (enabled) {
+        check(!apu_dispatch_enabled && apu_started && g_apu_state);
+        apu_dispatch_enabled = 1;
+    } else {
+        apu_dispatch_enabled = 0;
+    }
+}
+void bw_posix_fault_uninstall(void)
+{
+    check(!apu_dispatch_enabled && !g_apu_state);
+    did_cleanup |= 8;
+}
 void xbox_SetMapSize(size_t n) { check(n == 128u * 1024 * 1024); }
 BOOL xbox_MemoryLayoutInit(const void *p, size_t n)
 {
@@ -102,6 +133,8 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
 uint32_t xbox_HeapAlloc(uint32_t size, uint32_t alignment)
 {
     check(size == 4096 && alignment == 4096);
+    if (getenv("BW_TEST_LAUNCH_ALLOC_FAIL"))
+        return 0;
     return 0x3000;
 }
 int bw_metal_backend_start(void)
@@ -113,7 +146,7 @@ int bw_metal_backend_start(void)
 }
 void bw_sdl_framebuffer_expect_metal(void)
 {
-    check(step == 3 && !metal_expected && !metal_framebuffer_callback);
+    check(step == 0 && !metal_expected && !metal_framebuffer_callback);
     metal_expected = 1;
 }
 int bw_sdl_framebuffer_prepare_metal(const BwMetalFramebuffer *frame)
@@ -132,9 +165,36 @@ const char *bw_metal_backend_error(void)
            ? "synthetic failure" : NULL;
 }
 void bw_metal_backend_stop(void) { did_cleanup |= 2; }
-MCPXAPUState *mcpx_apu_init_standalone(uint8_t *p) { (void)p; _exit(71); }
-void mcpx_apu_shutdown(MCPXAPUState *d) { (void)d; _exit(71); }
-void xbox_OhciInit(void) { check(step == 4); step = 5; }
+MCPXAPUState *mcpx_apu_init_standalone(uint8_t *p)
+{
+    const char *ready = getenv("RECOMP_AC97_READY");
+    check(step == 4 && p == memory && !apu_started &&
+          ready && !strcmp(ready, "1"));
+    if (getenv("BW_TEST_APU_START_FAIL"))
+        return NULL;
+    apu_started = 1;
+    return (MCPXAPUState *)(uintptr_t)1;
+}
+void mcpx_apu_shutdown(MCPXAPUState *d)
+{
+    check(d == (MCPXAPUState *)(uintptr_t)1 && apu_started &&
+          !apu_dispatch_enabled && (did_cleanup & 1));
+    apu_started = 0;
+    did_cleanup |= 32;
+}
+void xbox_OhciInit(void)
+{
+    const char *audio = getenv("BW_MACOS_AUDIO");
+    const char *ready = getenv("RECOMP_AC97_READY");
+    check(step == 4);
+    if (!audio || strcmp(audio, "0"))
+        check(apu_started && g_apu_state && apu_dispatch_enabled &&
+              ready && !strcmp(ready, "1"));
+    else
+        check(!apu_started && !g_apu_state && !apu_dispatch_enabled &&
+              !getenv("RECOMP_AC97_READY"));
+    step = 5;
+}
 void xbox_kernel_init(void) { check(step == 5); step = 6; }
 void xbox_kernel_shutdown(void) { did_cleanup |= 16; }
 void xbox_path_init(const char *game, const char *save)
@@ -173,6 +233,10 @@ void xbe_entry_point(void)
           !pthread_equal(pthread_self(), ui_thread));
     check(!strcmp(getenv("BW_GPU"), "metal") &&
           !strcmp(getenv("RECOMP_FB_WINDOW"), "1"));
+    if (!getenv("BW_MACOS_AUDIO") || strcmp(getenv("BW_MACOS_AUDIO"), "0"))
+        check(apu_started && g_apu_state && apu_dispatch_enabled);
+    else
+        check(!apu_started && !g_apu_state && !apu_dispatch_enabled);
     if (mode && (!strcmp(mode, "overrides") ||
                  !strcmp(mode, "overrides-empty")))
         check(!strcmp(getenv("RECOMP_KEYBOARD"), "0") &&
@@ -269,6 +333,13 @@ int main(int argc, char **argv)
         if (getenv("BW_TEST_METAL_START_FAIL") && !stop_fails)
             check((did_cleanup & (1 | 4 | 8)) == (1 | 4 | 8) &&
                   !(did_cleanup & (2 | 16)));
+        if (getenv("BW_TEST_APU_START_FAIL") && !stop_fails)
+            check((did_cleanup & (1 | 2 | 4 | 8)) == (1 | 2 | 4 | 8) &&
+                  !(did_cleanup & (16 | 32)) && !apu_dispatch_enabled);
+        if (getenv("BW_TEST_LAUNCH_ALLOC_FAIL") && !stop_fails)
+            check((did_cleanup & (1 | 2 | 4 | 8 | 16 | 32)) ==
+                  (1 | 2 | 4 | 8 | 16 | 32) &&
+                  !apu_started && !apu_dispatch_enabled && !g_apu_state);
         return rc;
     }
     unsetenv("RECOMP_USB");
@@ -283,6 +354,7 @@ int main(int argc, char **argv)
     unsetenv("BW_LAUNCH_DATA_FILE");
     unsetenv("BW_RUN_SECONDS");
     unsetenv("BW_MACOS_KEYBOARD_HOOK");
+    unsetenv("BW_MACOS_AUDIO");
     unsetenv("BW_SYNTHETIC_INPUT_DIAGNOSTIC");
     unsetenv("RECOMP_HEADLESS");
     check_scanner_requires_execution_switch();
@@ -328,12 +400,29 @@ int main(int argc, char **argv)
         return 12;
     unsetenv("BW_TEST_EARLY_WINDOW_RETURN");
     unsetenv("BW_TEST_NV2A_STOP_FAIL");
-    if (invoke(argc, argv, "metal-runtime") == 0)
-        return 4;
-    setenv("BW_RUN_SECONDS", "1", 1);
-    if (invoke(argc, argv, "run-limit") != 124)
-        return 5;
-    unsetenv("BW_RUN_SECONDS");
+    if (!BW_NATIVE_TEST_TSAN) {
+        if (invoke(argc, argv, "metal-runtime") == 0)
+            return 4;
+        setenv("BW_RUN_SECONDS", "1", 1);
+        if (invoke(argc, argv, "run-limit") != 124)
+            return 5;
+        unsetenv("BW_RUN_SECONDS");
+    }
+    setenv("BW_MACOS_AUDIO", "0", 1);
+    if (invoke(argc, argv, "normal") != 0)
+        return 21;
+    setenv("BW_MACOS_AUDIO", "invalid", 1);
+    if (invoke(argc, argv, "normal") == 0)
+        return 22;
+    unsetenv("BW_MACOS_AUDIO");
+    setenv("BW_TEST_APU_START_FAIL", "1", 1);
+    if (invoke(argc, argv, "normal") == 0)
+        return 23;
+    unsetenv("BW_TEST_APU_START_FAIL");
+    setenv("BW_TEST_LAUNCH_ALLOC_FAIL", "1", 1);
+    if (invoke(argc, argv, "normal") == 0)
+        return 24;
+    unsetenv("BW_TEST_LAUNCH_ALLOC_FAIL");
     setenv("RECOMP_USB", "0", 1);
     if (invoke(argc, argv, "normal") == 0)
         return 6;

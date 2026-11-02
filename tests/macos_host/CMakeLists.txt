@@ -9,7 +9,7 @@ set(XBOXRECOMP_DIR "${CMAKE_CURRENT_LIST_DIR}/../../build/xboxrecomp" CACHE PATH
 find_package(Threads REQUIRED)
 add_executable(bw_fault_test test_fault.c ../../src/bw_posix_fault.c)
 target_include_directories(bw_fault_test PRIVATE
-    ../../src "${XBOXRECOMP_DIR}/src/platform")
+    ../../src "${XBOXRECOMP_DIR}/src" "${XBOXRECOMP_DIR}/src/platform")
 target_link_libraries(bw_fault_test PRIVATE Threads::Threads)
 target_compile_options(bw_fault_test PRIVATE -Wall -Wextra -Werror
     -Wno-deprecated-declarations)

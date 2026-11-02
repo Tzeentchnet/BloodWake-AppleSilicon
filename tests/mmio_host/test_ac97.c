@@ -20,6 +20,31 @@ static int test_mprotect(void *addr, size_t size, int prot)
 #undef mprotect
 #include "../../src/bw_posix_fault.h"
 
+MCPXAPUState *g_apu_state;
+
+bool apu_hook_handle_mmio_posix(void *ucv, uintptr_t fault_addr,
+                                uint32_t fault_xbox_va, int is_write)
+{
+    (void)ucv;
+    (void)fault_addr;
+    (void)fault_xbox_va;
+    (void)is_write;
+    return false;
+}
+
+int xbox_OhciOwnsAddress(uint32_t xbox_va)
+{
+    (void)xbox_va;
+    return 0;
+}
+
+int xbox_OhciHandleMmio(void *ctx, uint32_t xbox_va)
+{
+    (void)ctx;
+    (void)xbox_va;
+    return 0;
+}
+
 #define CHECK(expr) do {                                                      \
     if (!(expr)) {                                                            \
         fprintf(stderr, "FAIL %s:%d: %s\n", __FILE__, __LINE__, #expr);        \

@@ -94,12 +94,14 @@ class MacosDiagnosticTests(unittest.TestCase):
 
     def test_guest_environment_is_allowlisted_and_opt_in(self):
         with mock.patch.dict(os.environ, {"RECOMP_USB": "1", "RECOMP_AC97_READY": "0",
+                                         "BW_MACOS_AUDIO": "0",
                                          "BW_SETTINGS": "unsafe",
                                          "BW_MACOS_KEYBOARD_HOOK": "1",
                                          "BW_SYNTHETIC_INPUT_DIAGNOSTIC": "1"}, clear=True):
             env = diagnostic.diagnostic_env(self.root, self.prepared, 15, False, False, 4, 5)
         self.assertNotIn("RECOMP_USB", env)
         self.assertNotIn("RECOMP_AC97_READY", env)
+        self.assertNotIn("BW_MACOS_AUDIO", env)
         self.assertNotIn("BW_METAL_QUINCUNX_APPROX", env)
         self.assertNotIn("BW_GPU_AUDIT", env)
         self.assertNotIn("BW_MACOS_KEYBOARD_HOOK", env)

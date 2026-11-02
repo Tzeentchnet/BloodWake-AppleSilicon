@@ -5,6 +5,7 @@
 #include <errno.h>
 #include <pthread.h>
 #include <signal.h>
+#include <stdatomic.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
@@ -18,6 +19,9 @@
 static uint8_t *s_guest;
 static volatile uint32_t *s_mmio;
 static uint8_t s_registers[0x4000];
+static uint8_t s_apu_registers[0x30000];
+static pthread_mutex_t s_apu_lock;
+static _Atomic unsigned s_apu_calls;
 static volatile sig_atomic_t s_decline, s_nested, s_forwarded;
 static _Thread_local int s_tls_count;
 
@@ -81,6 +85,42 @@ int xbox_Ac97PosixFault(void *ucv, uintptr_t fault)
     return mmio_emulate_a64((ucontext_t *)ucv,
                             (uint32_t)(fault - (uintptr_t)s_mmio),
                             s_registers, read_register, write_register);
+}
+
+static uint64_t read_apu_register(void *dev, uint32_t off, int size)
+{
+    uint64_t value = 0;
+    const uint8_t *registers = dev;
+    if (off <= sizeof(s_apu_registers) &&
+        (size_t)size <= sizeof(s_apu_registers) - off)
+        memcpy(&value, registers + off, (size_t)size);
+    return value;
+}
+
+static void write_apu_register(void *dev, uint32_t off, uint64_t value, int size)
+{
+    uint8_t *registers = dev;
+    if (off <= sizeof(s_apu_registers) &&
+        (size_t)size <= sizeof(s_apu_registers) - off)
+        memcpy(registers + off, &value, (size_t)size);
+}
+
+int xbox_PosixMmioFault(void *ucv, uintptr_t access)
+{
+    uintptr_t start = (uintptr_t)s_guest + 0xfe800000u;
+    int handled;
+    if (!ucv || access < start || access - start >= sizeof(s_apu_registers))
+        return 0;
+    if (pthread_mutex_lock(&s_apu_lock) != 0)
+        _exit(91);
+    errno = ENOTTY;
+    handled = mmio_emulate_a64((ucontext_t *)ucv, (uint32_t)(access - start),
+                               s_apu_registers,
+                               read_apu_register, write_apu_register);
+    atomic_fetch_add_explicit(&s_apu_calls, 1, memory_order_relaxed);
+    if (pthread_mutex_unlock(&s_apu_lock) != 0)
+        _exit(91);
+    return handled;
 }
 
 static void previous_handler(int sig, siginfo_t *si, void *ucv)
@@ -207,6 +247,118 @@ static void *fault_thread(void *arg)
     return s_tls_count == 200 ? NULL : (void *)1;
 }
 
+static void *apu_fault_thread(void *arg)
+{
+    uintptr_t n = (uintptr_t)arg;
+    volatile uint32_t *p =
+        (volatile uint32_t *)(s_guest + 0xfe800100u + n * sizeof(uint32_t));
+    for (unsigned i = 0; i < 100; i++) {
+        *p = (uint32_t)(n * 1000 + i);
+        if (*p != n * 1000 + i)
+            return (void *)1;
+    }
+    return NULL;
+}
+
+static int apu_failure(const char *reason)
+{
+    fprintf(stderr, "deferred APU fault: %s\n", reason);
+    return 0;
+}
+
+static int test_deferred_apu(void)
+{
+    volatile uint32_t *reg =
+        (volatile uint32_t *)(s_guest + 0xfe800100u);
+    uint64_t expected[2] = {
+        UINT64_C(0x0123456789abcdef), UINT64_C(0xfedcba9876543210)
+    };
+    uint64_t got[2] = {0, 0};
+    uint32_t value = 0, flags = 0;
+    sigset_t blocked, before, after;
+    unsigned calls;
+    int fault_errno;
+    sig_atomic_t forwarded;
+
+    bw_posix_fault_enable_apu(1);
+    sigemptyset(&blocked);
+    sigaddset(&blocked, SIGUSR1);
+    if (pthread_sigmask(SIG_BLOCK, &blocked, &before) != 0)
+        return apu_failure("cannot block SIGUSR1");
+    errno = EDOM;
+    if (pthread_mutex_lock(&s_apu_lock) != 0)
+        return apu_failure("cannot lock recursive model mutex");
+    __asm__ volatile(
+        "ldr q31, [%[expected]]\n\t"
+        "cmp wzr, wzr\n\t"
+        "str %w[input], [%[reg]]\n\t"
+        "ldr %w[value], [%[reg]]\n\t"
+        "cset %w[flags], eq\n\t"
+        "str q31, [%[got]]"
+        : [value] "=&r"(value), [flags] "=&r"(flags)
+        : [reg] "r"(reg), [input] "r"(UINT32_C(0x12345678)),
+          [expected] "r"(expected), [got] "r"(got)
+        : "v31", "cc", "memory");
+    fault_errno = errno;
+    if (pthread_mutex_unlock(&s_apu_lock) != 0 ||
+        pthread_sigmask(SIG_SETMASK, NULL, &after) != 0 ||
+        value != UINT32_C(0x12345678) || flags != 1 ||
+        memcmp(expected, got, sizeof(got)) != 0 ||
+        (!BW_FAULT_TEST_TSAN && fault_errno != EDOM) ||
+        sigismember(&after, SIGUSR1) != 1) {
+        fprintf(stderr,
+                "deferred APU state: value=%08x flags=%u vector=%d errno=%d mask=%d\n",
+                value, flags, memcmp(expected, got, sizeof(got)), fault_errno,
+                sigismember(&after, SIGUSR1));
+        pthread_sigmask(SIG_SETMASK, &before, NULL);
+        return apu_failure("machine state was not preserved");
+    }
+    if (pthread_sigmask(SIG_SETMASK, &before, NULL) != 0)
+        return apu_failure("cannot restore signal mask");
+    calls = atomic_load_explicit(&s_apu_calls, memory_order_relaxed);
+    if (calls != 2)
+        return apu_failure("dispatcher call count is not two");
+
+    forwarded = s_forwarded;
+    bw_posix_fault_enable_apu(0);
+    *reg = 0xdeadbeefu;
+    if (s_forwarded != forwarded + 1 ||
+        atomic_load_explicit(&s_apu_calls, memory_order_relaxed) != calls)
+        return apu_failure("disabled APU fault was not forwarded");
+    bw_posix_fault_enable_apu(1);
+    return 1;
+}
+
+static int test_concurrent_apu(void)
+{
+    pthread_t threads[8];
+    unsigned before =
+        atomic_load_explicit(&s_apu_calls, memory_order_relaxed);
+    int created = 0, failures = 0;
+
+    bw_posix_fault_enable_apu(1);
+    for (; created < 8; created++)
+        if (pthread_create(&threads[created], NULL, apu_fault_thread,
+                           (void *)(uintptr_t)created)) {
+            failures++;
+            break;
+        }
+    for (int i = 0; i < created; i++) {
+        void *rc;
+        if (pthread_join(threads[i], &rc) != 0 || rc)
+            failures++;
+    }
+    if (atomic_load_explicit(&s_apu_calls, memory_order_relaxed) !=
+        before + (unsigned)created * 200) {
+        fprintf(stderr,
+                "deferred APU fault: concurrent call count is %u, expected %u\n",
+                atomic_load_explicit(&s_apu_calls, memory_order_relaxed),
+                before + (unsigned)created * 200);
+        failures++;
+    }
+    return failures == 0;
+}
+
 int main(int argc, char **argv)
 {
     struct sigaction sa;
@@ -214,13 +366,20 @@ int main(int argc, char **argv)
     uint64_t got[2] = { 0, 0 }, flags = 0;
     uint32_t value = 0;
     pthread_t threads[8];
+    pthread_mutexattr_t recursive;
     int failures = 0;
     sigset_t mask, after, fault_mask, previous_mask;
     int nested_only = argc == 2 && !strcmp(argv[1], "--nested-only");
     int non_nested_only = argc == 2 && !strcmp(argv[1], "--non-nested");
+    int apu_only = argc == 2 && !strcmp(argv[1], "--apu-only");
+    int apu_stress_only =
+        argc == 2 && !strcmp(argv[1], "--apu-stress-only");
 
-    if (argc != 1 && !nested_only && !non_nested_only) {
-        fprintf(stderr, "usage: %s [--nested-only|--non-nested]\n", argv[0]);
+    if (argc != 1 && !nested_only && !non_nested_only && !apu_only &&
+        !apu_stress_only) {
+        fprintf(stderr,
+                "usage: %s [--nested-only|--non-nested|--apu-only|"
+                "--apu-stress-only]\n", argv[0]);
         return 1;
     }
 
@@ -231,17 +390,30 @@ int main(int argc, char **argv)
         return 1;
     }
     s_mmio = (volatile uint32_t *)(s_guest + 0xfec00000u);
+    if (pthread_mutexattr_init(&recursive) != 0 ||
+        pthread_mutexattr_settype(&recursive, PTHREAD_MUTEX_RECURSIVE) != 0 ||
+        pthread_mutex_init(&s_apu_lock, &recursive) != 0)
+        return 1;
+    pthread_mutexattr_destroy(&recursive);
 
     memset(&sa, 0, sizeof(sa));
     sa.sa_sigaction = previous_handler;
     sa.sa_flags = SA_SIGINFO;
     sigemptyset(&sa.sa_mask);
-    if (sigaction(SIGSEGV, &sa, NULL) || sigaction(SIGBUS, &sa, NULL) ||
-        bw_posix_fault_install()) {
+    if (sigaction(SIGSEGV, &sa, NULL) || sigaction(SIGBUS, &sa, NULL))
+        return 1;
+    if (bw_posix_fault_install()) {
         perror("install");
         return 1;
     }
     bw_posix_fault_set_base((uintptr_t)s_guest);
+    if (apu_only || apu_stress_only) {
+        int result = apu_only ? test_deferred_apu() : test_concurrent_apu();
+        bw_posix_fault_uninstall();
+        pthread_mutex_destroy(&s_apu_lock);
+        munmap(s_guest, 0x100000000ull);
+        return result ? 0 : 1;
+    }
     if (nested_only) {
         int result = child_fails_closed(1);
         bw_posix_fault_uninstall();
@@ -299,6 +471,8 @@ int main(int argc, char **argv)
     s_decline = 0;
     if (s_forwarded != 3)
         failures++;
+    if (!test_deferred_apu())
+        failures++;
 
     if (!child_fails_closed(0) ||
         (!non_nested_only && child_fails_closed(1) != 1))
@@ -315,8 +489,11 @@ int main(int argc, char **argv)
         if (rc)
             failures++;
     }
+    if (!test_concurrent_apu())
+        failures++;
 
     bw_posix_fault_uninstall();
+    pthread_mutex_destroy(&s_apu_lock);
     sa.sa_flags = SA_SIGINFO | SA_ONSTACK;
     if (sigaction(SIGSEGV, &sa, NULL) != 0 ||
         bw_posix_fault_install() == 0 || errno != ENOTSUP)

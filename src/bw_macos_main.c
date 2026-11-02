@@ -47,6 +47,8 @@ typedef struct {
     int memory_ready;
     int backend_ready;
     int kernel_ready;
+    int audio_enabled;
+    int apu_dispatch_enabled;
     int guest_entered;
     int diagnostics_started;
 } BwNativeBoot;
@@ -96,6 +98,7 @@ static int configure_native(void)
     const char *watch = getenv("RECOMP_WATCH");
     const char *keyboard_hook = getenv("BW_MACOS_KEYBOARD_HOOK");
     const char *synthetic_input = getenv("BW_SYNTHETIC_INPUT_DIAGNOSTIC");
+    const char *audio = getenv("BW_MACOS_AUDIO");
 
     if (keyboard_hook && strcmp(keyboard_hook, "0") && strcmp(keyboard_hook, "1")) {
         fprintf(stderr, "[BW] BW_MACOS_KEYBOARD_HOOK must be 0 or 1\n");
@@ -105,6 +108,11 @@ static int configure_native(void)
         fprintf(stderr, "[BW] BW_SYNTHETIC_INPUT_DIAGNOSTIC must be 0 or 1\n");
         return -1;
     }
+    if (audio && strcmp(audio, "0") && strcmp(audio, "1")) {
+        fprintf(stderr, "[BW] BW_MACOS_AUDIO must be 0 or 1\n");
+        return -1;
+    }
+    s_boot.audio_enabled = !audio || !strcmp(audio, "1");
 #ifdef BW_EXPERIMENTAL_SYNTHETIC_INPUT
     if (synthetic_input && !strcmp(synthetic_input, "1")) {
         if (!keyboard_hook || strcmp(keyboard_hook, "1")) {
@@ -140,13 +148,20 @@ static int configure_native(void)
         fprintf(stderr, "[BW] RECOMP_WATCH is not safe on POSIX and is unavailable\n");
         return -1;
     }
-    /* These switches are presence-based in the toolkit, including "=0".
-     * The APU and OHCI callbacks acquire host locks and cannot run in a
-     * POSIX signal handler. A safe origin/lock-ownership protocol is not
-     * available yet; refusing is preferable to deadlock or fake devices. */
-    if (getenv("RECOMP_AC97_READY") || getenv("RECOMP_USB")) {
-        fprintf(stderr, "[BW] audio/USB guest MMIO is unavailable on macOS: "
-                        "lock-safe dispatch is not implemented\n");
+    /* These toolkit switches are presence-based, including "=0". Keep them
+     * under host control so audio cannot be half-enabled and USB cannot enter
+     * the signal bridge intended only for the APU. */
+    if (getenv("RECOMP_AC97_READY")) {
+        fprintf(stderr, "[BW] RECOMP_AC97_READY is managed by BW_MACOS_AUDIO "
+                        "on the native macOS host\n");
+        return -1;
+    }
+    if (getenv("RECOMP_USB")) {
+        fprintf(stderr, "[BW] guest USB MMIO is unavailable on macOS\n");
+        return -1;
+    }
+    if (s_boot.audio_enabled && setenv("RECOMP_AC97_READY", "1", 0) != 0) {
+        fprintf(stderr, "[BW] cannot enable native audio\n");
         return -1;
     }
     if (env_default("BW_GPU", "metal") ||
@@ -179,8 +194,10 @@ static int configure_native(void)
         }
     }
 #endif
-    fprintf(stderr, "[BW] audio and guest USB are disabled: safe trapped-MMIO "
-                    "dispatch is not available\n");
+    fprintf(stderr, s_boot.audio_enabled
+            ? "[BW] native audio enabled with deferred APU MMIO dispatch; "
+              "guest USB is disabled\n"
+            : "[BW] native audio and guest USB are disabled\n");
     return 0;
 }
 
@@ -288,7 +305,7 @@ static int guest_main(void)
         return 1;
     }
     if (bw_posix_fault_install() != 0) {
-        fprintf(stderr, "[BW] cannot install the safe AC'97 fault handler\n");
+        fprintf(stderr, "[BW] cannot install the native MMIO fault handler\n");
         free(xbe_data);
         return 1;
     }
@@ -311,14 +328,14 @@ static int guest_main(void)
     }
     s_boot.backend_ready = 1;
 
-    /* These are the real device constructors. configure_native refuses the
-     * switches that would require unsafe APU/OHCI fault dispatch today. */
-    if (getenv("RECOMP_AC97_READY")) {
+    if (s_boot.audio_enabled) {
         g_apu_state = mcpx_apu_init_standalone((uint8_t *)xbox_GetMemoryBase());
         if (!g_apu_state) {
             fprintf(stderr, "[BW] cannot initialize the emulated APU\n");
             return 1;
         }
+        bw_posix_fault_enable_apu(1);
+        s_boot.apu_dispatch_enabled = 1;
     }
     xbox_OhciInit();
     xbox_kernel_init();
@@ -371,6 +388,10 @@ static int cleanup_before_guest(void)
 {
     if (s_boot.guest_entered)
         return 0;
+    if (s_boot.apu_dispatch_enabled) {
+        bw_posix_fault_enable_apu(0);
+        s_boot.apu_dispatch_enabled = 0;
+    }
     if (bw_xbox_ohci_stop() != 0 || bw_xbox_nv2a_stop() != 0) {
         static const char message[] =
             "[BW] device worker did not stop; leaving resources to process exit\n";
