@@ -163,6 +163,14 @@ static const BwSetting s_set[] = {
         { "4", "4x", "fix:+VFX_ANISO;env:BW_VFX_AF=4" },
         { "8", "8x", "fix:+VFX_ANISO;env:BW_VFX_AF=8" },
         { "16", "16x", "fix:+VFX_ANISO;env:BW_VFX_AF=16" } } },
+    { "Graphics", "graphics", "water_rendering", "Water rendering",
+      "Retail keeps the existing ocean shader exactly. Realistic is an optional "
+      "experimental Metal preset that adds restrained reflection shaping only to "
+      "explicitly identified ocean draws; unsupported passes stay retail.",
+      "retail", "remastered",
+      { { "retail", "Retail (original shader)", "" },
+        { "realistic", "Realistic (experimental)",
+          "env:BW_METAL_WATER=realistic" } } },
     { "Graphics", "graphics", "draw_distance", "Detail distance",
       "How far away boats and buildings keep their full detail. Farther looks better "
       "and costs a little speed.",
@@ -392,6 +400,7 @@ static const BwSettingMeta s_meta[] = {
     { "graphics", "antialiasing", "windows-d3d11", "restart",
       "Metal MSAA is not implemented; use render scaling while it is evaluated." },
     { "graphics", "texture_filtering", "all", "frame", "" },
+    { "graphics", "water_rendering", "macos-metal", "frame", "" },
     { "graphics", "draw_distance", "all", "live", "" },
     { "controls", "mouse", "macos-metal", "live", "" },
     { "controls", "mouse_sensitivity", "macos-metal", "live", "" },

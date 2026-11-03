@@ -18,7 +18,7 @@ locally exported definition data remain private and must not be committed.
 | Metal filtering | Implemented | Collect oblique water/cliff comparisons and GPU timings for 1x/4x/8x/16x. |
 | Metal MSAA | No-go; synthetic smoke complete | Apple M5 passes 2x/4x/8x synthetic color/depth/resolve, but game-scene attachment ownership and the controlled visual/GPU-time/memory matrix are still required. |
 | Upstream fixes | Verified | Re-run the offline parity checker whenever upstream changes. |
-| Realistic water | Runtime identification proven; representative visual coverage blocked | Expand the clean scripted marker/fingerprint evidence to calm/storm, lighting, shore, split-screen, reflection, and wake captures before adding a shader variant. |
+| Realistic water | Experimental optional preset implemented and runtime-activated | Compare Retail/Realistic across calm/storm, lighting, shore, split-screen, reflection, and wake scenes; measure GPU cost before tuning or promoting it. |
 
 ## F1 runtime settings
 
@@ -43,8 +43,9 @@ synthesizing Start is safe, so the panel explicitly says the game continues.
 The presenter integration target exercises F1 down/repeat/up through the real
 presenter path, main-thread AppKit panel/controller lifecycle, guest-input and
 relative-mouse release, capability reasons, live LOD, frame-boundary
-anisotropy, restart-pending state, isolated atomic save, and visible apply/save
-errors. The real-window case skips only when WindowServer is unavailable.
+anisotropy and water-preset selection, restart-pending state, isolated atomic
+save, and visible apply/save errors. The real-window case skips only when
+WindowServer is unavailable.
 
 ## Mouse
 
@@ -80,6 +81,12 @@ mode. It keeps guest APU/DSP timing active when CoreAudio is unavailable,
 retains no samples, rejects every sample-data writer, and reports only
 aggregate signal/queue/cadence metrics. It is never an automatic fallback and
 does not establish that sound is audible.
+
+The runner also owns strict `--water-preset retail|realistic` selection.
+Realistic requires Remastered, inherited `BW_METAL_WATER` values are discarded,
+and a requested realistic run fails validation if no guest boot reports actual
+shader activation. It reports activation and unsupported-pass fallback by boot
+without exposing private render-state data.
 
 ## Ship and weapon mod profiles
 
@@ -143,13 +150,12 @@ policy.
 ## Realistic water
 
 The current Metal path reproduces the retail register-combiner ocean and cube
-reflection programs. A validated native ocean boundary now appends a versioned
-NOP through the title's push buffer. The executor scopes it to the next
-BEGIN/END draw, copies the classification synchronously into each extended
-batch, clears it at END/frame boundaries, coalesces repeated identical markers
-while the next scope is armed, and rejects conflicting, unknown, inside-draw,
-or unconsumed markers. Marked and unmarked draws still select the same retail
-Metal path.
+reflection programs. A validated native ocean boundary appends a versioned NOP
+through the title's push buffer. The executor scopes it to the next BEGIN/END
+draw, copies the classification synchronously into each extended batch, clears
+it at END/frame boundaries, coalesces repeated identical markers while the
+next scope is armed, and rejects conflicting, unknown, inside-draw, or
+unconsumed markers.
 
 A bounded four-boot Remastered diagnostic followed validated relaunches and
 recorded 41,348 received markers, 512 batch scopes, and zero rejected markers.
@@ -157,8 +163,8 @@ This validates command ordering and lifetime in the exercised boot flow, not
 all water passes or visual classification across representative gameplay.
 
 A combiner/texture fingerprint alone may match non-water reflective geometry,
-so it remains only a consistency check. Missing or mismatched marker evidence
-must select retail rendering and report the unknown state rather than guess.
+so it remains only a consistency check. Missing marker evidence always selects
+retail rendering rather than guessing.
 
 Marked batches now produce a versioned FNV-1a-64 fingerprint from stable,
 copied render/program/combiner/texture metadata only. Private GPU audits keep a
@@ -171,13 +177,36 @@ A deterministic three-boot, two-relaunch Remastered run with headless audio
 timing reached gameplay and produced 12,670 markers, 154 clean scopes, and 297
 fingerprinted batches across 10 aggregate hashes. Marker rejection,
 fingerprint-table overflow, and within-scope mismatch were all zero. This
-completes runtime identification for the exercised automated flow without
-publishing the private hash values. It does not cover every water scene or
-provide the representative visual comparison required for a shader change.
+completed runtime identification for the exercised automated flow without
+publishing the private hash values.
 
-After marker coverage is proven across calm/storm, day/night, shore,
-split-screen, reflection, and wake passes, the first optional preset may add
-restrained Fresnel-weighted reflection and roughness/specular shaping using
-existing inputs. Retail remains the exact default. Depth absorption,
-refraction, foam, and shoreline effects wait for separate depth/material
-ownership.
+Remastered now exposes `graphics.water_rendering=retail|realistic` in F1 and
+the strict `BW_METAL_WATER` startup switch. Retail is the default and continues
+to use the existing `extended_fragment` pipeline. Realistic has a separate
+pipeline cache key and fragment entry, activates only at a flip boundary, and
+requires both the explicit ocean marker and the validated stage-0 texture plus
+passthrough water-basis shape. Unsupported marked batches fall back
+individually to retail. A realistic pipeline-creation failure explicitly
+returns the requested/active preset to retail before retrying the retail
+pipeline.
+
+The optional shader decodes the existing interpolated water normal and
+view-direction basis, applies a restrained Schlick-style Fresnel weight to the
+existing reflection and fog-atmosphere colors, and preserves the retail alpha.
+It adds no replacement assets, depth reads, refraction, absorption, foam, or
+shoreline logic. The setting is deliberately absent from quality presets.
+
+Synthetic coverage proves default Retail behavior, frame-boundary activation,
+Original rejection, strict environment parsing, deterministic marked-pixel
+change, exact return to Retail on the next unmarked draw, and unsupported-state
+fallback. A later private four-boot Remastered run reached 40,790 markers in
+499 clean scopes and 602 fingerprinted batches across 16 aggregate hashes.
+The realistic pipeline activated in the two boots that reached supported
+marked passes; no unsupported-pass fallback, marker rejection, fingerprint
+overflow/mismatch, or Metal runtime error was observed.
+
+That is runtime evidence, not a visual-quality or performance approval.
+Retail/Realistic comparisons across calm/storm, day/night, shore,
+split-screen, reflection, and wake scenes remain open. Depth absorption,
+refraction, replacement foam, and shoreline effects still require separate
+depth/material ownership.

@@ -95,6 +95,8 @@ set_tests_properties(metal_shared-backing-unprotected-alias-counterexample PROPE
 
 foreach(case semaphore-release semaphore-concurrent visual
              anisotropy anisotropy-original anisotropy-invalid
+             water-preset water-preset-original water-preset-invalid
+             water-preset-original-env
              render-scale render-scale-aa render-scale-partial render-scale-box
              render-scale-depth render-scale-auto render-scale-invalid render-scale-ssaa-min
              seed-order command-batching perspective blend color-mask alpha-test pipeline-cache cull full-rect depth-clear
@@ -115,6 +117,7 @@ foreach(case semaphore-release semaphore-concurrent visual
              xrgb-single-reject-incomplete-rect xrgb-single-reject-depth
              extended-basic extended-texture-cache
              ocean-marker-batches ocean-fingerprint ocean-marker-retail
+             ocean-realistic ocean-realistic-fallback
              extended-combiner extended-multistage extended-combiner-mappings
              extended-combiner-operations extended-combiner-constants
              extended-combiner-secondary extended-fog extended-passthrough-stage

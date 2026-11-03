@@ -100,6 +100,7 @@ class MacosDiagnosticTests(unittest.TestCase):
                                          "BW_MACOS_KEYBOARD_HOOK": "1",
                                          "BW_SYNTHETIC_INPUT_DIAGNOSTIC": "1",
                                          "BW_SYNTHETIC_INPUT_SCRIPT": "unsafe",
+                                         "BW_METAL_WATER": "realistic",
                                          "BW_HEADLESS_AUDIO_AUDIT": "1",
                                          "BW_NATIVE_DIAGNOSTIC": "unsafe",
                                          "RECOMP_AUDIO_HEADLESS_AUDIT": "1"}, clear=True):
@@ -114,6 +115,7 @@ class MacosDiagnosticTests(unittest.TestCase):
         self.assertNotIn("BW_SYNTHETIC_INPUT_SCRIPT", env)
         self.assertNotIn("BW_HEADLESS_AUDIO_AUDIT", env)
         self.assertNotIn("RECOMP_AUDIO_HEADLESS_AUDIT", env)
+        self.assertNotIn("BW_METAL_WATER", env)
         self.assertEqual(env["BW_SETTINGS"], "none")
         self.assertEqual(env["BW_EDITION"], "original")
         self.assertEqual(env["BW_RUN_SECONDS"], "15")
@@ -139,6 +141,10 @@ class MacosDiagnosticTests(unittest.TestCase):
         remastered = diagnostic.diagnostic_env(
             self.root, self.prepared, 15, False, False, 4, 5, edition="remastered")
         self.assertEqual(remastered["BW_EDITION"], "remastered")
+        realistic = diagnostic.diagnostic_env(
+            self.root, self.prepared, 15, False, False, 4, 5,
+            edition="remastered", water_preset="realistic")
+        self.assertEqual(realistic["BW_METAL_WATER"], "realistic")
         audio_disabled = diagnostic.diagnostic_env(
             self.root, self.prepared, 15, False, False, 4, 5,
             disable_audio=True)
@@ -423,6 +429,25 @@ class MacosDiagnosticTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "missing or out of sequence"):
             diagnostic.guest_log_paths(self.root, True, 2, 4)
 
+    def test_realistic_water_coverage_is_boot_bounded(self):
+        first = self.root / "guest-001.log"
+        second = self.root / "guest-002.log"
+        first.write_bytes(diagnostic.REALISTIC_WATER_ACTIVE + b"\n")
+        second.write_bytes(
+            diagnostic.REALISTIC_WATER_ACTIVE + b"\n" +
+            diagnostic.REALISTIC_WATER_FALLBACK_PREFIX + b"(synthetic)\n"
+        )
+        self.assertEqual(
+            diagnostic.extract_realistic_water_coverage([first, second]), (2, 1))
+        with self.assertRaisesRegex(RuntimeError, "retail preset"):
+            diagnostic.report_realistic_water_coverage([first], "retail")
+
+    def test_realistic_water_coverage_requires_activation(self):
+        log = self.root / "guest.log"
+        log.write_bytes(diagnostic.REALISTIC_WATER_FALLBACK_PREFIX + b"(synthetic)\n")
+        with self.assertRaisesRegex(RuntimeError, "did not activate"):
+            diagnostic.report_realistic_water_coverage([log], "realistic")
+
     def main_arguments(self):
         executable = self.root / "binary"
         executable.write_bytes(b"synthetic executable")
@@ -454,6 +479,15 @@ class MacosDiagnosticTests(unittest.TestCase):
             diagnostic.main(arguments)
         self.assertEqual(failure.exception.code, 2)
         self.assertIn("mutually exclusive", errors.getvalue())
+
+    def test_realistic_water_cli_requires_remastered(self):
+        arguments = self.main_arguments() + ["--water-preset", "realistic"]
+        errors = io.StringIO()
+        with mock.patch.object(diagnostic.sys, "platform", "darwin"), \
+             contextlib.redirect_stderr(errors), self.assertRaises(SystemExit) as failure:
+            diagnostic.main(arguments)
+        self.assertEqual(failure.exception.code, 2)
+        self.assertIn("requires --edition remastered", errors.getvalue())
 
     def test_script_cli_requires_hook_remastered_and_known_name(self):
         script = "remastered-boot-menu-to-gameplay-v1"

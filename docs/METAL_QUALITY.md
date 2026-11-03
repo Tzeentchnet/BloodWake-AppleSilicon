@@ -20,6 +20,38 @@ Invalid `BW_VFX_AF` values stop Metal startup with an explicit error. Original
 ignores the Remastered setting and stays at 1x. The settings UI exposes the
 existing Off, 4x, 8x, and 16x choices.
 
+## Optional realistic water
+
+`graphics.water_rendering` is a Remastered-only macOS Metal frame-boundary
+setting with `retail` and `realistic` choices. Retail is the default and keeps
+the existing fragment entry and output path. `BW_METAL_WATER` strictly accepts
+the same two values; invalid input fails startup, and Realistic is rejected in
+Original.
+
+Realistic uses a distinct pipeline key and fragment entry. Selection requires
+the explicit in-stream ocean marker, a valid stage-0 water/reflection texture,
+and the validated passthrough normal/view basis. Every unmarked draw and every
+unsupported marked state uses Retail. Pipeline creation failure is reported,
+returns the active/requested setting to Retail, and retries the retail
+pipeline instead of dropping the draw.
+
+The shader uses only existing game inputs. It decodes the interpolated water
+normal and view basis, computes a restrained Schlick-style Fresnel term,
+desaturates the existing reflection slightly as a roughness proxy, and blends
+it with the current fog-atmosphere color. The additional weight is bounded by
+the existing fog visibility and retail alpha is preserved. There are no new
+textures, art, depth reads, refraction, depth absorption, foam, or shoreline
+effects.
+
+The complete 320-case Metal suite includes exact default-Retail output,
+marked-only enhancement, unmarked recovery, unsupported-state fallback,
+frame-boundary activation, edition gating, and strict startup parsing. A
+private four-boot scripted Remastered diagnostic activated the shader on real
+marked ocean batches with no observed fallback or Metal error. Hands-on A/B
+visual review and controlled GPU-time/memory measurements remain required;
+the preset is therefore experimental, default-off, and excluded from quality
+presets.
+
 ## Metal MSAA decision
 
 The DX11 `BW_VFX_MSAA` setting is not implemented by the Metal backend and is

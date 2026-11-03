@@ -89,21 +89,25 @@ wall-clock performance evidence.
 
 ## Current regression coverage
 
-- The Metal backend suite passes 314/314 tests, including texture-stage masks,
+- The Metal backend suite passes 320/320 tests, including texture-stage masks,
   combiner operations, cube reflection, mip selection, command-buffer and
   render-encoder batching, texture caching, upload-arena reuse, anisotropy
-  selection/lifecycle, and invalid filtering rejection.
+  selection/lifecycle, optional-water frame-boundary selection, exact default
+  Retail output, marked-only enhancement, per-pass fallback, edition gating,
+  and invalid startup rejection.
 - Eight dedicated scaling cases cover forced 2x private targets, guest-AA
   collapse, exact guest seeding, weighted box-filter readback, scaled colour
   and depth scissors, invalid scale rejection, SSAA minimum handling, and a
   live 1x-to-2x resize with depth/stencil preservation.
-- The macOS presenter suite has 62 CTest entries. In the current non-
-  WindowServer test context, 61 pass and the real-window AppKit integration
-  case skips explicitly. Coverage includes direct Metal attachment, resize
+- The macOS presenter suite has 62 CTest entries, all of which pass in the
+  current WindowServer session. The real-window AppKit integration case skips
+  explicitly where WindowServer is unavailable. Coverage includes direct
+  Metal attachment, resize
   propagation, confirmation that direct mode skips CPU gamma and SDL texture
   upload, F1 down/repeat/up consumption, guest-input and relative-mouse
   release, main-thread panel/controller lifecycle, live LOD, frame-boundary
-  filtering, restart-pending state, atomic save, and visible apply/save errors.
+  filtering and water selection, restart-pending state, atomic save, and
+  visible apply/save errors.
 - The input integration suite passes 11/11 tests, including gameplay mouse
   capture, one-shot delta consumption, sensitivity/inversion/stick mapping,
   focus-loss clearing, keyboard/controller coexistence, hotplug, slots,
@@ -123,11 +127,12 @@ wall-clock performance evidence.
 - The standalone Metal MSAA smoke target passes 2/2 tests. The recorded Apple
   M5 passes synthetic 2x/4x/8x color, depth/stencil, resolve, readback, and
   explicit error checks; this is not game-renderer or visual evidence.
-- The focused macOS diagnostic suite passes 40/40 tests, including strict
+- The focused macOS diagnostic suite passes 43/43 tests, including strict
   edition and built-in script selection, bounded marker/fingerprint summary
   parsing, typed relaunch outcomes, integrity-failure precedence, boot-cap
   reporting, explicit audio isolation, and strict headless-audit authorization
-  with default audio preserved.
+  with default audio preserved. It also covers strict water-preset propagation,
+  inherited-value removal, edition gating, and activation/fallback reporting.
 - Nine LOD cases cover Original passthrough, defaults, disable/fix override,
   custom/clamped values, live changes, invalid rejection, and concurrent
   readers/writers.
@@ -150,7 +155,7 @@ wall-clock performance evidence.
 - The DMA ownership suite passed 13 tests normally and under focused TSan and
   ASan/UBSan runs.
 - The guest-memory inventory passed 21 synthetic tests, and the complete
-  Python suite now passes 109/109.
+  Python suite now passes 112/112.
 - The synthetic GPU capture suite passed 11 tests normally and under
   ASan/UBSan, with four focused TSan cases.
 - Windows and x86 execution were not validated on the Apple Silicon host.
@@ -207,6 +212,26 @@ This demonstrates marker ordering and fingerprint consistency in the
 automated boot-to-gameplay path. It does not establish visual correctness
 across calm/storm, day/night, shore, split-screen, reflection, wakes, or every
 mission. Actual hash values and all private logs remain uncommitted.
+
+After adding the optional realistic-water pipeline, a fresh private
+Remastered run explicitly selected it through the bounded runner:
+
+- Four sandboxed boots completed and three validated same-title relaunches
+  were followed before the configured boot cap.
+- The aggregate contained 40,790 ocean markers, 499 clean scopes, and zero
+  rejected markers.
+- It contained 602 fingerprinted batches across 16 aggregate hashes, with
+  zero table-overflow batches and zero within-scope mismatches.
+- The separate realistic fragment pipeline activated in the two boots that
+  reached supported marked passes.
+- No unsupported-marked-pass fallback, realistic-pipeline failure, or Metal
+  runtime error was observed.
+- Prepared-tree, toolkit, and executable integrity remained unchanged.
+
+This proves that the optional pipeline is not a synthetic-only or silent
+no-op in the exercised runtime flow. It does not judge whether the treatment
+looks better, establish representative scene coverage, or measure GPU cost.
+Private hashes, logs, saves, and retail data remain uncommitted.
 
 ## Integrity and privacy
 

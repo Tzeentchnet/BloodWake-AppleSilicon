@@ -44,6 +44,12 @@ OCEAN_FINGERPRINT_PATTERN = re.compile(
 OCEAN_FINGERPRINT_HASH_PATTERN = re.compile(
     rb"  ([0-9A-F]{16}) +([0-9]{1,20}) batches"
 )
+REALISTIC_WATER_ACTIVE = (
+    b"[GPU-METAL] optional realistic water shader active for explicitly marked ocean passes"
+)
+REALISTIC_WATER_FALLBACK_PREFIX = (
+    b"[GPU-METAL] realistic water encountered an unsupported marked pass "
+)
 
 
 @dataclass(frozen=True)
@@ -241,7 +247,7 @@ def verify_sandbox(profile, output, protected):
 def diagnostic_env(output, game_dir, seconds, quincunx, audit, input_fd, output_fd,
                    audit_name="gpu-audit.txt", keyboard_hook=False, synthetic_input=False,
                    edition="original", disable_audio=False, synthetic_input_script=None,
-                   audio_audit=False):
+                   audio_audit=False, water_preset="retail"):
     if (synthetic_input or synthetic_input_script) and not keyboard_hook:
         raise ValueError("synthetic input requires the experimental keyboard hook")
     if synthetic_input and synthetic_input_script:
@@ -250,6 +256,10 @@ def diagnostic_env(output, game_dir, seconds, quincunx, audit, input_fd, output_
         raise ValueError("unknown synthetic input script")
     if edition not in EDITIONS:
         raise ValueError("edition must be original or remastered")
+    if water_preset not in ("retail", "realistic"):
+        raise ValueError("water preset must be retail or realistic")
+    if water_preset == "realistic" and edition != "remastered":
+        raise ValueError("realistic water requires the remastered edition")
     if synthetic_input_script and edition != "remastered":
         raise ValueError("the synthetic input script requires the remastered edition")
     if disable_audio and audio_audit:
@@ -282,6 +292,8 @@ def diagnostic_env(output, game_dir, seconds, quincunx, audit, input_fd, output_
         env["BW_MACOS_AUDIO"] = "0"
     if audio_audit:
         env["BW_HEADLESS_AUDIO_AUDIT"] = "1"
+    if water_preset == "realistic":
+        env["BW_METAL_WATER"] = "realistic"
     if audit:
         env["BW_GPU_AUDIT"] = "1"
         env["BW_GPU_AUDIT_EVERY"] = "5"
@@ -357,7 +369,7 @@ def run_guest_once(executable, output, game_dir, profile, seconds, quincunx, aud
                    launch=b"", log_name="guest.log", audit_name="gpu-audit.txt",
                    timeout=None, log_limit=None, keyboard_hook=False, synthetic_input=False,
                    edition="original", disable_audio=False, synthetic_input_script=None,
-                   audio_audit=False):
+                   audio_audit=False, water_preset="retail"):
     input_read = input_write = output_read = output_write = -1
     child = None
     try:
@@ -379,7 +391,7 @@ def run_guest_once(executable, output, game_dir, profile, seconds, quincunx, aud
         input_write = -1
         env = diagnostic_env(output, game_dir, seconds, quincunx, audit, input_read, output_write,
                              audit_name, keyboard_hook, synthetic_input, edition, disable_audio,
-                             synthetic_input_script, audio_audit)
+                             synthetic_input_script, audio_audit, water_preset)
         with open(output / log_name, "xb") as log:
             child = subprocess.Popen(
                 [SANDBOX, "-p", profile, str(executable), "--bw-native-child"],
@@ -410,13 +422,15 @@ def run_guest_once(executable, output, game_dir, profile, seconds, quincunx, aud
 
 def run_guest(executable, output, game_dir, profile, seconds, quincunx, audit,
               keyboard_hook=False, synthetic_input=False, edition="original",
-              disable_audio=False, synthetic_input_script=None, audio_audit=False):
+              disable_audio=False, synthetic_input_script=None, audio_audit=False,
+              water_preset="retail"):
     result, relaunch, _ = run_guest_once(executable, output, game_dir, profile,
                                          seconds, quincunx, audit, keyboard_hook=keyboard_hook,
                                          synthetic_input=synthetic_input, edition=edition,
                                          disable_audio=disable_audio,
                                          synthetic_input_script=synthetic_input_script,
-                                         audio_audit=audio_audit)
+                                         audio_audit=audio_audit,
+                                         water_preset=water_preset)
     if relaunch:
         (output / "relaunch.bin").write_bytes(relaunch)
         print("Guest requested a relaunch; request saved privately, not executed")
@@ -426,7 +440,8 @@ def run_guest(executable, output, game_dir, profile, seconds, quincunx, audit,
 def run_guest_relaunches(executable, output, game_dir, profile, seconds, quincunx,
                          audit, max_boots, total_seconds, keyboard_hook=False,
                          synthetic_input=False, edition="original", disable_audio=False,
-                         synthetic_input_script=None, audio_audit=False):
+                         synthetic_input_script=None, audio_audit=False,
+                         water_preset="retail"):
     deadline = time.monotonic() + total_seconds
     log_remaining = MAX_LOG_BYTES
     launch = b""
@@ -442,7 +457,7 @@ def run_guest_relaunches(executable, output, game_dir, profile, seconds, quincun
             timeout=min(seconds + 15, remaining), log_limit=log_remaining,
             keyboard_hook=keyboard_hook, synthetic_input=synthetic_input, edition=edition,
             disable_audio=disable_audio, synthetic_input_script=synthetic_input_script,
-            audio_audit=audio_audit)
+            audio_audit=audio_audit, water_preset=water_preset)
         completed_boots = boot
         log_remaining -= log_size
         if relaunch:
@@ -513,6 +528,38 @@ def report_ocean_marker_counts(log_paths):
     print(f"Ocean markers: {received} received, {batches} batch scopes, "
           f"{rejected} rejected{suffix}")
     return counts
+
+
+def extract_realistic_water_coverage(log_paths):
+    active_boots = fallback_boots = 0
+    for path in log_paths:
+        active = fallback = False
+        with open(path, "rb") as stream:
+            for line in stream:
+                line = line.rstrip(b"\r\n")
+                if line == REALISTIC_WATER_ACTIVE:
+                    if active:
+                        raise RuntimeError("guest log contains duplicate realistic-water activation")
+                    active = True
+                elif line.startswith(REALISTIC_WATER_FALLBACK_PREFIX):
+                    if fallback:
+                        raise RuntimeError("guest log contains duplicate realistic-water fallback")
+                    fallback = True
+        active_boots += active
+        fallback_boots += fallback
+    return active_boots, fallback_boots
+
+
+def report_realistic_water_coverage(log_paths, water_preset):
+    active_boots, fallback_boots = extract_realistic_water_coverage(log_paths)
+    if water_preset == "realistic":
+        if not active_boots:
+            raise RuntimeError("realistic water did not activate in any guest boot")
+        print(f"Realistic water: active in {active_boots} boots; unsupported-pass "
+              f"fallback observed in {fallback_boots} boots")
+    elif active_boots or fallback_boots:
+        raise RuntimeError("realistic-water activity was observed under the retail preset")
+    return active_boots, fallback_boots
 
 
 def gpu_audit_paths(output, follow_relaunches, completed_boots, max_boots):
@@ -607,6 +654,8 @@ def main(argv=None):
                         help="guest edition (default: original)")
     parser.add_argument("--quincunx-approx", action="store_true", help="opt into the unverified approximation")
     parser.add_argument("--gpu-audit", action="store_true", help="write the private GPU usage summary")
+    parser.add_argument("--water-preset", choices=("retail", "realistic"), default="retail",
+                        help="Metal ocean preset (default: retail; realistic requires Remastered)")
     parser.add_argument("--disable-audio", action="store_true",
                         help="disable native audio for an isolated non-audio diagnostic")
     parser.add_argument("--headless-audio-audit", action="store_true",
@@ -638,6 +687,8 @@ def main(argv=None):
         parser.error("--disable-audio and --headless-audio-audit are mutually exclusive")
     if args.synthetic_input_script and args.edition != "remastered":
         parser.error("--synthetic-input-script requires --edition remastered")
+    if args.water_preset == "realistic" and args.edition != "remastered":
+        parser.error("--water-preset realistic requires --edition remastered")
     if not args.follow_relaunches and (args.max_boots is not None or args.total_seconds is not None):
         parser.error("--max-boots and --total-seconds require --follow-relaunches")
     if args.max_boots is not None and not 1 <= args.max_boots <= MAX_RELAUNCH_BOOTS:
@@ -667,6 +718,7 @@ def main(argv=None):
         executable_hash = digest_file(executable)
         print("Executable SHA-256:", executable_hash)
         print("Diagnostic edition:", args.edition.capitalize())
+        print("Diagnostic water preset:", args.water_preset)
         if args.headless_audio_audit:
             print("Diagnostic audio: silent headless audit (not audible)")
         else:
@@ -687,7 +739,8 @@ def main(argv=None):
                     synthetic_input=args.synthetic_input, edition=args.edition,
                     disable_audio=args.disable_audio,
                     synthetic_input_script=args.synthetic_input_script,
-                    audio_audit=args.headless_audio_audit)
+                    audio_audit=args.headless_audio_audit,
+                    water_preset=args.water_preset)
                 result = relaunch_result.guest_status
                 completed_boots = relaunch_result.completed_boots
                 boot_limit_reached = relaunch_result.boot_limit_reached
@@ -698,7 +751,8 @@ def main(argv=None):
                                    synthetic_input=args.synthetic_input, edition=args.edition,
                                    disable_audio=args.disable_audio,
                                    synthetic_input_script=args.synthetic_input_script,
-                                   audio_audit=args.headless_audio_audit)
+                                   audio_audit=args.headless_audio_audit,
+                                   water_preset=args.water_preset)
                 completed_boots = 1
         finally:
             changed = snapshot_tree(prepared) != baseline
@@ -707,8 +761,9 @@ def main(argv=None):
             if changed:
                 raise RuntimeError("prepared tree changed during the diagnostic")
         print("Prepared-tree, toolkit and executable integrity unchanged")
-        report_ocean_marker_counts(
-            guest_log_paths(output, args.follow_relaunches, completed_boots, max_boots))
+        logs = guest_log_paths(output, args.follow_relaunches, completed_boots, max_boots)
+        report_ocean_marker_counts(logs)
+        report_realistic_water_coverage(logs, args.water_preset)
         if args.gpu_audit:
             report_ocean_fingerprint_counts(
                 gpu_audit_paths(output, args.follow_relaunches, completed_boots, max_boots))

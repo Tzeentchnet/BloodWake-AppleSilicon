@@ -27,9 +27,9 @@ This is still a development build:
 - The game-specific keyboard bridge and Metal quincunx approximation require
   explicit build or runtime opt-ins.
 - F1 now opens a native settings panel. It applies proven-live LOD, Metal
-  filtering, and mouse controls through subsystem-owned callbacks, labels
-  restart-required choices, and disables unsupported Metal settings with a
-  reason.
+  filtering, the optional realistic-water preset, and mouse controls through
+  subsystem-owned callbacks, labels restart-required choices, and disables
+  unsupported Metal settings with a reason.
 - A versioned in-stream marker now identifies validated ocean submissions and
   is copied into executor batches without changing retail rendering. A
   four-boot Remastered diagnostic observed 41,348 markers, 512 scoped ocean
@@ -38,8 +38,15 @@ This is still a development build:
   and 297 fingerprinted batches across 10 aggregate hashes, with no marker
   rejection, table overflow, or within-scope mismatch. Representative
   calm/storm, lighting, shore, split-screen, reflection, and wake coverage
-  remains outstanding. A fail-closed MSAA evidence tool records memory,
-  timing, correctness, and visual-review gates. This Apple M5 reports
+  remains outstanding. Remastered now also has an experimental, default-off
+  realistic-water preset. It selects a separate Metal fragment pipeline only
+  for supported marked ocean batches, preserves retail alpha, and falls back
+  per batch; Retail remains the exact default for every unmarked or
+  unsupported draw. A private four-boot scripted run activated the preset on
+  real ocean batches with no observed fallback or Metal error. Hands-on
+  visual comparison and controlled performance measurements are still
+  required. A fail-closed MSAA evidence tool records memory, timing,
+  correctness, and visual-review gates. This Apple M5 reports
   2x/4x/8x capability and passes the standalone color/depth/resolve smoke
   path, but Metal MSAA remains unsupported.
 - Optional gameplay mouse input supports sensitivity, inversion, response,
@@ -57,12 +64,12 @@ This is still a development build:
   audible.
 - USB gamepads, physical-controller support, and broad mission, save, FMV,
   and edition coverage are incomplete.
-- Current regression results include 314/314 Metal backend tests, all 62
-  presenter CTest entries (61 passed and the real-window AppKit case skipped
-  without WindowServer), 35/35 MMIO host tests, 8/8 normal and ASan/UBSan
+- Current regression results include 320/320 Metal backend tests, all 62
+  presenter CTest entries (including the real-window AppKit case in the
+  current WindowServer session), 35/35 MMIO host tests, 8/8 normal and ASan/UBSan
   macOS host tests, 11/11 input integration tests, 6/6 APU/audio tests,
   13/13 support tests, and 100/100 concurrent APU restore stress runs. The
-  complete Python suite passes 109/109.
+  complete Python suite passes 112/112.
 - A post-roadmap 30-second isolated retail boot reached its configured limit
   with direct Metal at 2560x1920, native audio/DSP activity, 1,490 audited
   flips, 4,503 draws, 1,252,771 vertices, unchanged input trees/executable,

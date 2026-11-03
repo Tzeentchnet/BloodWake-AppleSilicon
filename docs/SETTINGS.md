@@ -170,6 +170,28 @@ Applies to: Remastered. Default: **16x**.
 On Metal this applies at an executor flip boundary only to linear, mipmapped
 textures. Point-sampled and unmipped textures remain 1x.
 
+### Water rendering
+
+Chooses between the existing retail ocean shader and an optional experimental
+Metal treatment. Retail is unchanged and remains the default.
+
+Applies to: Remastered on macOS Metal. Default: **Retail (original shader)**.
+
+| Choice | Under the hood |
+|---|---|
+| Retail (original shader) (default) | (no switch) |
+| Realistic (experimental) | `env:BW_METAL_WATER=realistic` |
+
+The realistic choice takes effect at an executor flip boundary. It uses a
+separate fragment pipeline only for explicitly marked ocean batches with the
+validated stage shape. Unmarked draws, unsupported marked passes, Original,
+and pipeline-creation failure use the retail shader. The optional path
+reweights the game's existing reflection and atmosphere with a restrained
+Fresnel response from the existing water normal/view basis, preserves retail
+alpha, and adds no replacement textures, refraction, depth absorption, or
+shoreline foam. Representative hands-on visual and performance comparison is
+still required.
+
 ### Detail distance
 
 How far away boats and buildings keep their full detail. Farther looks better and costs a little speed.

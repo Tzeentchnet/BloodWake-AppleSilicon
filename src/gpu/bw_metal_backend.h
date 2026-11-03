@@ -17,6 +17,11 @@ typedef struct {
     uint32_t guest_va, pitch, width, height, pixel_format, aa_sx, aa_sy;
 } BwMetalFramebuffer;
 
+typedef enum {
+    BW_METAL_WATER_RETAIL = 0,
+    BW_METAL_WATER_REALISTIC = 1,
+} BwMetalWaterPreset;
+
 /* Register only while the executor is idle, before start or after stop.
  * The callback runs synchronously on the executor thread after readback and
  * before the snapshot. Copy the descriptor during the call; its dimensions
@@ -42,6 +47,12 @@ int bw_metal_backend_resize_presenter(uint32_t drawable_width,
  * next executor flip; point-sampled and unmipped textures remain 1x. */
 int bw_metal_backend_set_anisotropy(unsigned anisotropy);
 unsigned bw_metal_backend_anisotropy(void);
+
+/* Request the optional marked-ocean fragment pipeline. Retail is the exact
+ * default and fallback. Realistic is Remastered-only and activates at the next
+ * executor flip; unmarked and unsupported marked batches always use retail. */
+int bw_metal_backend_set_water_preset(BwMetalWaterPreset preset);
+BwMetalWaterPreset bw_metal_backend_water_preset(void);
 
 /* Start after the toolkit has mapped guest memory and before the guest submits
  * GPU work. The host must set RECOMP_PB_EXEC before the toolkit starts its

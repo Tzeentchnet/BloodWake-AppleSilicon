@@ -135,7 +135,7 @@ static int test_settings(const char *cwd)
     char expected[512], err[256];
     bw_setting_info_t info;
     bw_setting_option_info_t option;
-    int found_aa = 0, found_af = 0, found_lod = 0;
+    int found_aa = 0, found_af = 0, found_water = 0, found_lod = 0;
     CHECK(setenv("HOME", cwd, 1) == 0);
     snprintf(expected, sizeof expected, "%s/.config/BloodWake/settings.ini", cwd);
     CHECK(!strcmp(bw_settings_path(), expected));
@@ -174,7 +174,7 @@ static int test_settings(const char *cwd)
     CHECK(file_contains("schema.json", "\"settings\""));
     CHECK(file_contains("schema.json", "\"availability\""));
     CHECK(file_contains("schema.json", "\"apply\": \"unsupported\""));
-    CHECK(bw_settings_count() == 52);
+    CHECK(bw_settings_count() == 53);
     CHECK(bw_settings_get_info(0, &info) == 0);
     CHECK(!strcmp(info.section, "edition") && !strcmp(info.key, "edition"));
     CHECK(info.option_count == 2 && info.supported);
@@ -190,13 +190,19 @@ static int test_settings(const char *cwd)
             CHECK(info.supported && !strcmp(info.apply_mode, "frame"));
             found_af = 1;
         } else if (!strcmp(info.section, "graphics") &&
+                   !strcmp(info.key, "water_rendering")) {
+            CHECK(info.supported && !strcmp(info.availability, "macos-metal") &&
+                  !strcmp(info.apply_mode, "frame"));
+            CHECK(info.option_count == 2);
+            found_water = 1;
+        } else if (!strcmp(info.section, "graphics") &&
                    !strcmp(info.key, "draw_distance")) {
             CHECK(info.supported && !strcmp(info.apply_mode, "live"));
             CHECK(info.option_count == 8);
             found_lod = 1;
         }
     }
-    CHECK(found_aa && found_af && found_lod);
+    CHECK(found_aa && found_af && found_water && found_lod);
     CHECK(bw_settings_validate_value("display", "mode", "window", err, sizeof err) == 0);
     CHECK(bw_settings_validate_value("display", "mode", "invalid", err, sizeof err) != 0);
     CHECK(strstr(err, "not one of its choices") != NULL);

@@ -177,6 +177,8 @@ extern void bw_metal_test_set_present_size(uint32_t width, uint32_t height);
 extern int bw_metal_test_write_surface_pixel(uint32_t x, uint32_t y, uint32_t argb);
 extern unsigned bw_metal_test_sampler_anisotropy(int min_linear, unsigned mip_mode);
 extern void bw_metal_test_apply_pending_render_settings(void);
+extern unsigned bw_metal_test_active_water_preset(void);
+extern void bw_metal_test_realistic_water_counts(uint64_t *enhanced, uint64_t *fallback);
 extern void bw_ocean_marker_test_counts(unsigned long *received, unsigned long *scopes,
                                         unsigned long *rejected);
 extern uint64_t bw_ocean_fingerprint_test_hash(const BwXBatch *batch,
@@ -214,6 +216,32 @@ static void anisotropy_test(unsigned expected)
     CHECK(bw_metal_test_sampler_anisotropy(1, 2) == 4);
     CHECK(!bw_metal_backend_set_anisotropy(3));
     CHECK(bw_metal_backend_anisotropy() == 4);
+}
+
+static void water_preset_test(void)
+{
+    CHECK(bw_metal_backend_water_preset() == BW_METAL_WATER_REALISTIC);
+    CHECK(bw_metal_test_active_water_preset() == BW_METAL_WATER_REALISTIC);
+    CHECK(bw_metal_backend_set_water_preset(BW_METAL_WATER_RETAIL));
+    CHECK(bw_metal_backend_water_preset() == BW_METAL_WATER_RETAIL);
+    CHECK(bw_metal_test_active_water_preset() == BW_METAL_WATER_REALISTIC);
+    bw_metal_test_apply_pending_render_settings();
+    CHECK(bw_metal_test_active_water_preset() == BW_METAL_WATER_RETAIL);
+    CHECK(bw_metal_backend_set_water_preset(BW_METAL_WATER_REALISTIC));
+    CHECK(bw_metal_backend_water_preset() == BW_METAL_WATER_REALISTIC);
+    CHECK(bw_metal_test_active_water_preset() == BW_METAL_WATER_RETAIL);
+    bw_metal_test_apply_pending_render_settings();
+    CHECK(bw_metal_test_active_water_preset() == BW_METAL_WATER_REALISTIC);
+    CHECK(!bw_metal_backend_set_water_preset((BwMetalWaterPreset)2));
+    CHECK(bw_metal_backend_water_preset() == BW_METAL_WATER_REALISTIC);
+}
+
+static void water_preset_original_test(void)
+{
+    CHECK(bw_metal_backend_water_preset() == BW_METAL_WATER_RETAIL);
+    CHECK(bw_metal_test_active_water_preset() == BW_METAL_WATER_RETAIL);
+    CHECK(!bw_metal_backend_set_water_preset(BW_METAL_WATER_REALISTIC));
+    CHECK(bw_metal_backend_water_preset() == BW_METAL_WATER_RETAIL);
 }
 
 static void method_float(uint32_t method_number, float value)
@@ -3123,6 +3151,92 @@ static void extended_dot_reflection_test(void)
     check_pixel_near(0xFFFF00FFu, 1, "retail specular dot state", 0);
 }
 
+static void setup_realistic_water_scene(void)
+{
+    Nv2aCombiner rc = synthetic_combiner();
+    rc.stage_program = 1u | (4u << 5) | (4u << 10) | (4u << 15);
+    rc.final0 = RC_WORD(0, 0, 0, 8);
+    rc.final1 = RC_WORD(0, 0, 0x18, 0x80);
+
+    setup_dxt1_texture_stage(0, TEX_AT, 0xF800u, 0, 0);
+    setup_combiner(&rc);
+    triangle(0xFFFFFFFFu);
+
+    const float coordinates[3][4] = {
+        {0.5f, 1.0f, 0.5f, 1.0f},
+        {0.35f, 0.70f, 0.80f, 1.0f},
+        {0.0f, 0.0f, 0.0f, 0.0f},
+    };
+    for (unsigned stage = 1; stage < 4; stage++) {
+        uint32_t address = UV_AT + stage * 0x100u;
+        method(0x1744 + stage * 4u, address);
+        method(0x1784 + stage * 4u, 2 | (4 << 4) | (16 << 8));
+        for (unsigned vertex_index = 0; vertex_index < 3; vertex_index++)
+            for (unsigned component = 0; component < 4; component++)
+                put_float(address + vertex_index * 16u + component * 4u,
+                          coordinates[stage - 1u][component]);
+    }
+}
+
+static void realistic_water_test(void)
+{
+    uint64_t enhanced = 0, fallback = 0;
+    uint32_t retail, realistic, after;
+    setup_realistic_water_scene();
+
+    clear(0xFF102030u);
+    draw(3);
+    flip();
+    expect_no_error();
+    retail = pixel(4, 3);
+    CHECK(color_near(retail, 0xFFFF0000u, 1));
+
+    clear(0xFF102030u);
+    method(0x0100, BW_DRAW_MARKER_OCEAN_DRAW);
+    draw(3);
+    flip();
+    expect_no_error();
+    realistic = pixel(4, 3);
+    check_pixel_near(0xFFFC0000u, 1, "realistic marked water", 0);
+    CHECK(realistic != retail);
+
+    clear(0xFF102030u);
+    draw(3);
+    flip();
+    expect_no_error();
+    after = pixel(4, 3);
+    CHECK(after == retail);
+    bw_metal_test_realistic_water_counts(&enhanced, &fallback);
+    CHECK(enhanced == 1 && fallback == 0);
+}
+
+static void realistic_water_fallback_test(void)
+{
+    Nv2aCombiner rc = synthetic_combiner();
+    const uint32_t source = 0x8064C832u;
+    uint64_t enhanced = 0, fallback = 0;
+    uint32_t retail, marked;
+
+    setup_dxt1_texture(0xF800u, 0x001Fu, 0);
+    setup_combiner(&rc);
+    triangle(source);
+    clear(0xFF102030u);
+    draw(3);
+    flip();
+    expect_no_error();
+    retail = pixel(4, 3);
+
+    clear(0xFF102030u);
+    method(0x0100, BW_DRAW_MARKER_OCEAN_DRAW);
+    draw(3);
+    flip();
+    expect_no_error();
+    marked = pixel(4, 3);
+    CHECK(marked == retail);
+    bw_metal_test_realistic_water_counts(&enhanced, &fallback);
+    CHECK(enhanced == 0 && fallback == 1);
+}
+
 static void extended_swizzled_test(void)
 {
     const uint32_t formats[3] = {0x05u, 0x06u, 0x07u};
@@ -5572,6 +5686,7 @@ int main(int argc, char **argv)
     unsetenv("BW_VFX_SSAA");
     unsetenv("BW_VFX");
     unsetenv("BW_VFX_AF");
+    unsetenv("BW_METAL_WATER");
     unsetenv("RECOMP_WINDOW_SCALE");
     if (!strcmp(argv[1], "render-scale-auto")) {
         setenv("BW_METAL_RENDER_SCALE", "auto", 1);
@@ -5595,6 +5710,16 @@ int main(int argc, char **argv)
         s_edition = BW_ED_REMASTERED;
         g_bw_fix_on[BW_FIX_VFX_ANISO] = 1;
         setenv("BW_VFX_AF", "3", 1);
+    } else if (!strcmp(argv[1], "water-preset") ||
+               !strcmp(argv[1], "ocean-realistic") ||
+               !strcmp(argv[1], "ocean-realistic-fallback")) {
+        s_edition = BW_ED_REMASTERED;
+        setenv("BW_METAL_WATER", "realistic", 1);
+    } else if (!strcmp(argv[1], "water-preset-invalid")) {
+        s_edition = BW_ED_REMASTERED;
+        setenv("BW_METAL_WATER", "cinematic", 1);
+    } else if (!strcmp(argv[1], "water-preset-original-env")) {
+        setenv("BW_METAL_WATER", "realistic", 1);
     }
     setenv("BW_IMMEDIATE_PRESENT", "1", 1);
     memset(s_mem, 0, sizeof s_mem);
@@ -5629,6 +5754,16 @@ int main(int argc, char **argv)
         bw_metal_backend_stop();
         return s_failed ? 1 : 0;
     }
+    if (!strcmp(argv[1], "water-preset-invalid") ||
+        !strcmp(argv[1], "water-preset-original-env")) {
+        CHECK(!bw_metal_backend_start_for_test(s_mem, sizeof s_mem));
+        CHECK(bw_metal_backend_error() &&
+              strstr(bw_metal_backend_error(),
+                     !strcmp(argv[1], "water-preset-invalid")
+                         ? "BW_METAL_WATER must be" : "requires Remastered"));
+        bw_metal_backend_stop();
+        return s_failed ? 1 : 0;
+    }
     if (!strncmp(argv[1], "framebuffer-info-", 17) ||
         !strncmp(argv[1], "extended-reject-", 16) ||
         !strncmp(argv[1], "extended-bc1-inactive-kernel-",
@@ -5648,6 +5783,10 @@ int main(int argc, char **argv)
         anisotropy_test(8);
     else if (!strcmp(argv[1], "anisotropy-original"))
         anisotropy_test(1);
+    else if (!strcmp(argv[1], "water-preset"))
+        water_preset_test();
+    else if (!strcmp(argv[1], "water-preset-original"))
+        water_preset_original_test();
     else if (!strcmp(argv[1], "render-scale"))
         render_scale_test();
     else if (!strcmp(argv[1], "render-scale-aa"))
@@ -5766,6 +5905,10 @@ int main(int argc, char **argv)
         ocean_fingerprint_test();
     else if (!strcmp(argv[1], "ocean-marker-retail"))
         ocean_marker_retail_test();
+    else if (!strcmp(argv[1], "ocean-realistic"))
+        realistic_water_test();
+    else if (!strcmp(argv[1], "ocean-realistic-fallback"))
+        realistic_water_fallback_test();
     else if (!strcmp(argv[1], "extended-texture-cache"))
         extended_texture_cache_test();
     else if (!strcmp(argv[1], "extended-combiner"))

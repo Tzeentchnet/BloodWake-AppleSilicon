@@ -65,6 +65,13 @@ rejection enabled. Other unsupported texture states still fail explicitly.
 Synthetic tests cover the approximation, and the measured retail gameplay run
 exercised it. It has not been validated against NV2A hardware.
 
+Remastered macOS Metal also accepts `BW_METAL_WATER=retail|realistic`.
+`retail` is the default and keeps the existing ocean fragment path.
+`realistic` is an experimental, frame-boundary preset selected only for
+explicitly marked supported ocean batches; all other draws stay Retail.
+Invalid values and Realistic in Original fail explicitly. The same choice is
+available in F1 as **Water rendering**.
+
 For a complete build from your disc, use a **new** install directory:
 
 ```sh
@@ -213,7 +220,8 @@ build/venv/bin/python tools/macos_diagnostic.py \
   --prepared-tree "$PWD/game/prepare" \
   --toolkit "$PWD/build/xboxrecomp" \
   --output-dir "$HOME/bw-private-diagnostics/scripted-remastered-001" \
-  --edition remastered --experimental-keyboard-hook \
+  --edition remastered --water-preset realistic --quincunx-approx \
+  --experimental-keyboard-hook \
   --synthetic-input-script remastered-boot-menu-to-gameplay-v1 \
   --headless-audio-audit --gpu-audit \
   --follow-relaunches --max-boots 3 --total-seconds 300 --seconds 90
@@ -224,6 +232,12 @@ press/release packets on guest polling epochs, rejects unknown names, and
 releases state on completion, focus loss, and shutdown. Reaching `--max-boots`
 is intentionally reported as a non-success outcome even though aggregate
 marker/fingerprint evidence is still printed.
+
+`--water-preset` strictly accepts `retail` or `realistic`, defaults to Retail,
+and discards inherited `BW_METAL_WATER` values. Realistic requires
+`--edition remastered`. After the run, the runner reports how many boots
+actually activated the optional shader and observed unsupported-pass fallback;
+a requested Realistic run with no activation fails closed.
 
 ### Isolated native diagnostic
 
@@ -280,6 +294,8 @@ remastered-boot-menu-to-gameplay-v1` with
 `--experimental-keyboard-hook --edition remastered` for deterministic
 poll-epoch navigation; the legacy and scripted modes are mutually exclusive.
 Inherited synthetic-input and headless-audio settings are discarded.
+Inherited water-preset settings are also discarded; use `--water-preset
+realistic --edition remastered` for an explicit optional-water diagnostic.
 Keep the output directory, including logs, saves and any
 guest data, private. A missing sandbox or failed isolation check aborts before
 guest execution.

@@ -41,6 +41,7 @@ static _Atomic int metal_error;
 static unsigned runtime_registrations;
 static float lod_scale = 2.0f;
 static unsigned metal_anisotropy = 16;
+static BwMetalWaterPreset metal_water_preset = BW_METAL_WATER_RETAIL;
 static BwMouseConfig mouse_config = {
     .sensitivity = 1.0f,
     .stick = BW_MOUSE_STICK_STEERING,
@@ -83,6 +84,10 @@ int bw_settings_runtime_register(const char *section, const char *key,
         check(!strcmp(section, "graphics") &&
               get_current(value, sizeof value, context, err, errlen) == 0 &&
               !strcmp(value, "16"));
+    else if (!strcmp(key, "water_rendering"))
+        check(!strcmp(section, "graphics") &&
+              get_current(value, sizeof value, context, err, errlen) == 0 &&
+              !strcmp(value, "retail"));
     else {
         check(!strcmp(section, "controls"));
         check(get_current(value, sizeof value, context, err, errlen) == 0 && value[0]);
@@ -117,6 +122,12 @@ unsigned bw_metal_backend_anisotropy(void) { return metal_anisotropy; }
 int bw_metal_backend_set_anisotropy(unsigned value)
 {
     metal_anisotropy = value;
+    return 1;
+}
+BwMetalWaterPreset bw_metal_backend_water_preset(void) { return metal_water_preset; }
+int bw_metal_backend_set_water_preset(BwMetalWaterPreset preset)
+{
+    metal_water_preset = preset;
     return 1;
 }
 int bw_edition_init(char *err, size_t n) { (void)err; (void)n; step = 1; return 0; }
@@ -235,7 +246,7 @@ MCPXAPUState *mcpx_apu_init_standalone(uint8_t *p)
     const char *ready = getenv("RECOMP_AC97_READY");
     const char *audit = getenv("BW_HEADLESS_AUDIO_AUDIT");
     const char *backend_audit = getenv("RECOMP_AUDIO_HEADLESS_AUDIT");
-    check(step == 4 && runtime_registrations == 8 && p == memory && !apu_started &&
+    check(step == 4 && runtime_registrations == 9 && p == memory && !apu_started &&
           ready && !strcmp(ready, "1"));
     if (audit)
         check(!strcmp(audit, "1") && backend_audit &&

@@ -97,6 +97,20 @@ test coverage are in [VALIDATION.md](VALIDATION.md).
   private three-boot/two-relaunch Remastered flow. It produced 12,670 markers,
   154 clean scopes, and 297 fingerprinted batches across 10 aggregate hashes,
   with zero marker rejection, table overflow, or within-scope mismatch.
+- Added a default-off Remastered `Retail`/`Realistic` water setting for macOS
+  Metal. It owns a separate fragment pipeline, applies only at a flip boundary
+  to explicitly marked batches with the validated water stage shape, preserves
+  retail alpha, and falls back per pass. Unmarked draws and Retail continue to
+  use the existing fragment entry.
+- Added restrained Fresnel reflection shaping from the game's existing
+  interpolated water normal/view basis, stage-0 reflection input, fog
+  atmosphere, and visibility. It adds no replacement textures, refraction,
+  absorption, foam, shoreline logic, or depth dependency.
+- Added synthetic coverage for default Retail equivalence, marked-only
+  enhancement, unmarked recovery, unsupported-state fallback, frame-boundary
+  activation, strict environment parsing, and Original rejection. A private
+  four-boot run activated the shader on real marked ocean batches with no
+  observed fallback or Metal error.
 
 ## Renderer performance
 
@@ -159,6 +173,9 @@ test coverage are in [VALIDATION.md](VALIDATION.md).
 - Added explicit sticky errors for unsupported renderer states, invalid spans,
   allocation failures, and Metal command failures rather than silently
   dropping work.
+- Added strict diagnostic `--water-preset retail|realistic` selection,
+  Remastered gating, inherited-setting removal, and fail-closed reporting when
+  a requested realistic run never activates the shader.
 - Added an offline Blood Wake upstream parity manifest/checker covering the
   42-entry fix registry, settings fix references, native source wiring, branch
   divergence, and the two classified DX11 warm-up commits.
@@ -202,11 +219,10 @@ test coverage are in [VALIDATION.md](VALIDATION.md).
   aggregate signal/timing only and is not an audible-output fallback.
 - Gameplay mouse input is implemented, but point-and-click menu hitboxes need
   validated title UI state and geometry. Ship/weapon profiles need proven
-  definition fields/ownership. Realistic water now has runtime-validated
-  explicit markers and consistent metadata fingerprints in the automated
-  boot-to-gameplay flow, but still needs representative pass-coverage and
-  visual captures before any shader change; none is represented by a
-  placeholder or silent no-op.
+  definition fields/ownership. The optional realistic-water shader is
+  implemented and runtime-activated, but remains experimental and default-off
+  until representative pass coverage, hands-on Retail/Realistic visual
+  comparisons, and controlled performance measurements are complete.
 - Metal MSAA remains deliberately unsupported until the controlled
   visual/GPU-time/memory gate in `METAL_QUALITY.md` justifies it.
 - Unsupported states continue to fail explicitly instead of being guessed or

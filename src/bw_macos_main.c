@@ -132,6 +132,46 @@ static int anisotropy_apply(const char *value, void *context, char *err, size_t 
     return -1;
 }
 
+static int water_preset_current(char *value, size_t value_len, void *context,
+                                char *err, size_t errlen)
+{
+    const char *text = bw_metal_backend_water_preset() == BW_METAL_WATER_REALISTIC
+                     ? "realistic" : "retail";
+    int n;
+    (void)context;
+    n = snprintf(value, value_len, "%s", text);
+    if (!value || !value_len || n < 0 || (size_t)n >= value_len) {
+        if (err && errlen) {
+            snprintf(err, errlen, "water-rendering setting output buffer is too small");
+            err[errlen - 1] = 0;
+        }
+        return -1;
+    }
+    return 0;
+}
+
+static int water_preset_apply(const char *value, void *context, char *err, size_t errlen)
+{
+    BwMetalWaterPreset preset;
+    (void)context;
+    if (!strcmp(value, "retail"))
+        preset = BW_METAL_WATER_RETAIL;
+    else if (!strcmp(value, "realistic"))
+        preset = BW_METAL_WATER_REALISTIC;
+    else
+        goto invalid;
+    if (bw_metal_backend_set_water_preset(preset))
+        return 0;
+invalid:
+    if (err && errlen) {
+        snprintf(err, errlen,
+                 "Metal water rendering must be retail or realistic; "
+                 "realistic requires Remastered");
+        err[errlen - 1] = 0;
+    }
+    return -1;
+}
+
 enum {
     MOUSE_ENABLED,
     MOUSE_SENSITIVITY,
@@ -236,6 +276,10 @@ static int register_runtime_settings(char *err, size_t errlen)
         return -1;
     if (bw_settings_runtime_register("graphics", "texture_filtering",
                                      anisotropy_current, anisotropy_apply,
+                                     NULL, err, errlen) != 0)
+        return -1;
+    if (bw_settings_runtime_register("graphics", "water_rendering",
+                                     water_preset_current, water_preset_apply,
                                      NULL, err, errlen) != 0)
         return -1;
     for (size_t i = 0; i < sizeof mouse_settings / sizeof mouse_settings[0]; i++)

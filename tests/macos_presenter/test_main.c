@@ -138,6 +138,7 @@ typedef struct {
 
 static PanelRuntimeSetting s_panel_lod = {"far", "", 0, 0};
 static PanelRuntimeSetting s_panel_af = {"16", "", 0, 0};
+static PanelRuntimeSetting s_panel_water = {"retail", "", 0, 0};
 static char s_panel_root[PATH_MAX];
 static char s_panel_settings[PATH_MAX];
 static char s_panel_bad_settings[PATH_MAX];
@@ -284,6 +285,23 @@ static void panel_check_first_open(void)
           strstr(row.status, "queued for the next frame"),
           "frame-boundary request is visibly queued");
 
+    check(bw_macos_settings_panel_test_row("graphics", "water_rendering", &row) == 0 &&
+          row.enabled && row.apply_kind == BW_MACOS_SETTINGS_FRAME &&
+          !strcmp(row.value, "retail") &&
+          strstr(row.status, "next frame"),
+          "optional water control defaults to the retail frame-boundary path");
+    check(bw_macos_settings_panel_test_select("graphics", "water_rendering",
+                                              "realistic") == 0,
+          "realistic water choice uses the actual AppKit control action");
+    check(s_panel_water.apply_calls == 1 &&
+          !strcmp(s_panel_water.pending, "realistic") &&
+          !strcmp(s_panel_water.current, "retail"),
+          "water callback queues the optional preset without mutating active retail");
+    check(bw_macos_settings_panel_test_row("graphics", "water_rendering", &row) == 0 &&
+          strstr(row.status, "queued for the next frame") &&
+          panel_file_contains(s_panel_settings, "water_rendering=realistic"),
+          "optional water request is visibly queued and saved");
+
     check(bw_macos_settings_panel_test_row("display", "mode", &row) == 0 &&
           row.enabled && row.apply_kind == BW_MACOS_SETTINGS_RESTART &&
           strstr(row.status, "Restart required"),
@@ -362,6 +380,9 @@ static void panel_lifecycle_changed(int open, void *context)
             check(bw_macos_settings_panel_test_row("graphics", "texture_filtering", &row) == 0 &&
                   !strcmp(row.value, "16"),
                   "reopened frame control reflects active AF before frame activation");
+            check(bw_macos_settings_panel_test_row("graphics", "water_rendering", &row) == 0 &&
+                  !strcmp(row.value, "retail"),
+                  "reopened water control reflects active retail before frame activation");
         } else {
             check(0, "unexpected extra panel open");
         }
@@ -441,7 +462,10 @@ static int panel_integration_setup(void)
                                      &s_panel_lod, error, sizeof error) != 0 ||
         bw_settings_runtime_register("graphics", "texture_filtering",
                                      panel_runtime_get, panel_af_request,
-                                     &s_panel_af, error, sizeof error) != 0)
+                                     &s_panel_af, error, sizeof error) != 0 ||
+        bw_settings_runtime_register("graphics", "water_rendering",
+                                     panel_runtime_get, panel_af_request,
+                                     &s_panel_water, error, sizeof error) != 0)
         return 0;
     bw_macos_settings_panel_test_set_lifecycle_callback(
         panel_lifecycle_changed, NULL);

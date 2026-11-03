@@ -78,6 +78,13 @@ typedef struct {
     uint32_t depth_attachment;
 } MetalPipelineKey;
 
+enum {
+    METAL_SHADER_COLOR,
+    METAL_SHADER_TEXTURE,
+    METAL_SHADER_EXTENDED,
+    METAL_SHADER_REALISTIC_WATER,
+};
+
 typedef struct {
     uint32_t depth_test, depth_func, depth_write, stencil_enable;
     uint32_t stencil_func, stencil_func_mask, stencil_write_mask;
@@ -160,6 +167,7 @@ static id<MTLFunction> s_color_function;
 static id<MTLFunction> s_texture_function;
 static id<MTLFunction> s_extended_vertex_function;
 static id<MTLFunction> s_extended_fragment_function;
+static id<MTLFunction> s_realistic_water_fragment_function;
 static id<MTLFunction> s_clear_vertex_function;
 static id<MTLFunction> s_clear_color_function;
 static id<MTLFunction> s_clear_depth_function;
@@ -193,6 +201,12 @@ static id<MTLSamplerState> s_sampler;
 static id<MTLSamplerState> s_samplers[5][3][3][2][2][3];
 static atomic_uint s_requested_anisotropy;
 static unsigned s_active_anisotropy = 1;
+static atomic_uint s_requested_water_preset;
+static unsigned s_active_water_preset;
+static uint64_t s_realistic_water_batches;
+static uint64_t s_realistic_water_fallback_batches;
+static int s_realistic_water_reported;
+static int s_realistic_water_fallback_reported;
 static id<MTLTexture> s_surface;
 static id<MTLTexture> s_inactive_texture;
 static id<MTLTexture> s_inactive_cube_texture;
@@ -231,6 +245,8 @@ static void apply_pending_render_settings(void)
 {
     s_active_anisotropy =
         atomic_load_explicit(&s_requested_anisotropy, memory_order_acquire);
+    s_active_water_preset =
+        atomic_load_explicit(&s_requested_water_preset, memory_order_acquire);
 }
 
 int bw_metal_backend_set_anisotropy(unsigned anisotropy)
@@ -246,6 +262,27 @@ unsigned bw_metal_backend_anisotropy(void)
     unsigned value =
         atomic_load_explicit(&s_requested_anisotropy, memory_order_acquire);
     return valid_anisotropy(value) ? value : 1u;
+}
+
+int bw_metal_backend_set_water_preset(BwMetalWaterPreset preset)
+{
+    if (preset != BW_METAL_WATER_RETAIL &&
+        preset != BW_METAL_WATER_REALISTIC)
+        return 0;
+    if (preset == BW_METAL_WATER_REALISTIC &&
+        !bw_edition_at_least(BW_ED_REMASTERED))
+        return 0;
+    atomic_store_explicit(&s_requested_water_preset, (unsigned)preset,
+                          memory_order_release);
+    return 1;
+}
+
+BwMetalWaterPreset bw_metal_backend_water_preset(void)
+{
+    unsigned value =
+        atomic_load_explicit(&s_requested_water_preset, memory_order_acquire);
+    return value == BW_METAL_WATER_REALISTIC
+         ? BW_METAL_WATER_REALISTIC : BW_METAL_WATER_RETAIL;
 }
 
 static void end_draw_encoder(void)
@@ -398,14 +435,13 @@ static const char s_shader[] =
     "  return (a * (1.0 - f.x) + b * f.x) * (1.0 - f.y)\n"
     "       + (c * (1.0 - f.x) + d * f.x) * f.y;\n"
     "}\n"
-    "fragment float4 extended_fragment(XVarying in [[stage_in]],\n"
-    "    constant XUniforms &u [[buffer(1)]],\n"
-    "    texture2d<float> tex [[texture(0)]], texture2d<float> tex1 [[texture(1)]],\n"
-    "    texture2d<float> tex2 [[texture(2)]], texture2d<float> tex3 [[texture(3)]],\n"
-    "    texture2d_array<float> cube0 [[texture(4)]], texture2d_array<float> cube1 [[texture(5)]],\n"
-    "    texture2d_array<float> cube2 [[texture(6)]], texture2d_array<float> cube3 [[texture(7)]],\n"
-    "    sampler samp [[sampler(0)]], sampler samp1 [[sampler(1)]],\n"
-    "    sampler samp2 [[sampler(2)]], sampler samp3 [[sampler(3)]]) {\n"
+    "float4 extended_shade(XVarying in, constant XUniforms &u,\n"
+    "    texture2d<float> tex, texture2d<float> tex1,\n"
+    "    texture2d<float> tex2, texture2d<float> tex3,\n"
+    "    texture2d_array<float> cube0, texture2d_array<float> cube1,\n"
+    "    texture2d_array<float> cube2, texture2d_array<float> cube3,\n"
+    "    sampler samp, sampler samp1, sampler samp2, sampler samp3,\n"
+    "    bool realistic) {\n"
     "  float4 r[16]; for (uint i = 0; i < 16; ++i) r[i] = 0.0;\n"
     "  r[3] = float4(u.fog_color.rgb, saturate(in.fogp));\n"
     "  r[4] = in.d0; r[5] = in.d1;\n"
@@ -510,7 +546,49 @@ static const char s_shader[] =
     "    if (!ok) discard_fragment();\n"
     "  }\n"
     "  if (u.texture.x) o.rgb = floor(o.rgb * 255.0 + 0.5) / 255.0;\n"
+    "  if (realistic) {\n"
+    "    float3 n = tc[1].rgb * 2.0 - 1.0;\n"
+    "    float3 e = tc[2].rgb * 2.0 - 1.0;\n"
+    "    float nl = length(n), el = length(e);\n"
+    "    if (isfinite(nl) && isfinite(el) && nl > 0.0001 && el > 0.0001) {\n"
+    "      float ndv = saturate(abs(dot(n / nl, e / el)));\n"
+    "      float edge = 1.0 - ndv, edge2 = edge * edge;\n"
+    "      float fresnel = 0.02 + 0.98 * edge2 * edge2 * edge;\n"
+    "      float3 existing_reflection = saturate(r[8].rgb);\n"
+    "      float reflection_luma = dot(existing_reflection, float3(0.2126, 0.7152, 0.0722));\n"
+    "      float3 restrained_reflection = mix(float3(reflection_luma), existing_reflection, 0.72);\n"
+    "      float3 atmosphere = saturate(u.fog_color.rgb);\n"
+    "      float3 reflection = mix(restrained_reflection, atmosphere,\n"
+    "                              0.16 + 0.30 * fresnel);\n"
+    "      float strength = saturate((0.025 + 0.18 * fresnel) * saturate(in.fogp));\n"
+    "      o.rgb = saturate(mix(o.rgb, reflection, strength));\n"
+    "    }\n"
+    "  }\n"
     "  return o;\n"
+    "}\n"
+    "fragment float4 extended_fragment(XVarying in [[stage_in]],\n"
+    "    constant XUniforms &u [[buffer(1)]],\n"
+    "    texture2d<float> tex [[texture(0)]], texture2d<float> tex1 [[texture(1)]],\n"
+    "    texture2d<float> tex2 [[texture(2)]], texture2d<float> tex3 [[texture(3)]],\n"
+    "    texture2d_array<float> cube0 [[texture(4)]], texture2d_array<float> cube1 [[texture(5)]],\n"
+    "    texture2d_array<float> cube2 [[texture(6)]], texture2d_array<float> cube3 [[texture(7)]],\n"
+    "    sampler samp [[sampler(0)]], sampler samp1 [[sampler(1)]],\n"
+    "    sampler samp2 [[sampler(2)]], sampler samp3 [[sampler(3)]]) {\n"
+    "  return extended_shade(in, u, tex, tex1, tex2, tex3,\n"
+    "                        cube0, cube1, cube2, cube3,\n"
+    "                        samp, samp1, samp2, samp3, false);\n"
+    "}\n"
+    "fragment float4 realistic_water_fragment(XVarying in [[stage_in]],\n"
+    "    constant XUniforms &u [[buffer(1)]],\n"
+    "    texture2d<float> tex [[texture(0)]], texture2d<float> tex1 [[texture(1)]],\n"
+    "    texture2d<float> tex2 [[texture(2)]], texture2d<float> tex3 [[texture(3)]],\n"
+    "    texture2d_array<float> cube0 [[texture(4)]], texture2d_array<float> cube1 [[texture(5)]],\n"
+    "    texture2d_array<float> cube2 [[texture(6)]], texture2d_array<float> cube3 [[texture(7)]],\n"
+    "    sampler samp [[sampler(0)]], sampler samp1 [[sampler(1)]],\n"
+    "    sampler samp2 [[sampler(2)]], sampler samp3 [[sampler(3)]]) {\n"
+    "  return extended_shade(in, u, tex, tex1, tex2, tex3,\n"
+    "                        cube0, cube1, cube2, cube3,\n"
+    "                        samp, samp1, samp2, samp3, true);\n"
     "}\n"
     "struct PresentVarying { float4 position [[position]]; float2 uv; };\n"
     "struct ResolveUniforms { uint width, height, aa_sx, aa_sy; };\n"
@@ -1715,9 +1793,14 @@ static id<MTLRenderPipelineState> draw_pipeline(int shader_kind, const Nv2aRende
     if (state)
         return state;
     MTLRenderPipelineDescriptor *pipeline = [MTLRenderPipelineDescriptor new];
-    pipeline.vertexFunction = shader_kind == 2 ? s_extended_vertex_function : s_vertex_function;
-    pipeline.fragmentFunction = shader_kind == 2 ? s_extended_fragment_function
-                               : shader_kind == 1 ? s_texture_function : s_color_function;
+    pipeline.vertexFunction = shader_kind >= METAL_SHADER_EXTENDED
+                            ? s_extended_vertex_function : s_vertex_function;
+    pipeline.fragmentFunction =
+        shader_kind == METAL_SHADER_REALISTIC_WATER ? s_realistic_water_fragment_function
+      : shader_kind == METAL_SHADER_EXTENDED ? s_extended_fragment_function
+      : shader_kind == METAL_SHADER_TEXTURE ? s_texture_function : s_color_function;
+    if (!pipeline.fragmentFunction)
+        return nil;
     MTLRenderPipelineColorAttachmentDescriptor *attachment = pipeline.colorAttachments[0];
     attachment.pixelFormat = MTLPixelFormatBGRA8Unorm;
     if (key.depth_attachment) {
@@ -1740,6 +1823,12 @@ static id<MTLRenderPipelineState> draw_pipeline(int shader_kind, const Nv2aRende
     }
     NSError *error = nil;
     state = [s_device newRenderPipelineStateWithDescriptor:pipeline error:&error];
+    if (!state && shader_kind == METAL_SHADER_REALISTIC_WATER) {
+        fprintf(stderr,
+                "[GPU-METAL] realistic water pipeline creation failed: %s; "
+                "using retail water\n", metal_error_text(error));
+        return nil;
+    }
     if (!state)
         return metal_fail("draw pipeline creation failed: %s", metal_error_text(error)), nil;
     if (s_pipelines.count >= METAL_MAX_PIPELINES)
@@ -2658,6 +2747,21 @@ static id<MTLTexture> inactive_cube_texture(void)
     return s_inactive_cube_texture;
 }
 
+/* The marked ocean path binds its sampled water/reflection input at stage 0
+ * and carries the encoded normal and eye basis through stages 1 and 2. */
+static int realistic_water_supported(const BwXBatch *batch, uint32_t stage_mask,
+                                     uint32_t cube_mask)
+{
+    uint32_t program = batch->rc->stage_program;
+    (void)cube_mask;
+    return batch->draw_marker == BW_X_DRAW_MARKER_OCEAN &&
+           (stage_mask & 1u) &&
+           (program & 31u) == 1u &&
+           ((program >> 5) & 31u) == 4u &&
+           ((program >> 10) & 31u) == 4u &&
+           ((program >> 15) & 31u) == 4u;
+}
+
 static void metal_draw_extended(const Nv2aSurface *surface, const BwXBatch *batch)
 {
     @autoreleasepool {
@@ -2688,6 +2792,26 @@ static void metal_draw_extended(const Nv2aSurface *surface, const BwXBatch *batc
                 cube_mask |= 1u << stage;
             else if (mode == 4u)
                 passthrough_mask |= 1u << stage;
+        }
+        int realistic_water = 0;
+        if (s_active_water_preset == BW_METAL_WATER_REALISTIC &&
+            batch->draw_marker == BW_X_DRAW_MARKER_OCEAN) {
+            realistic_water =
+                realistic_water_supported(batch, stage_mask, cube_mask);
+            if (!realistic_water) {
+                s_realistic_water_fallback_batches++;
+                if (!s_realistic_water_fallback_reported) {
+                    uint32_t program = batch->rc->stage_program;
+                    fprintf(stderr,
+                            "[GPU-METAL] realistic water encountered an unsupported "
+                            "marked pass (stages %u/%u/%u/%u, 2D mask %X, cube mask %X); "
+                            "using the retail shader for that pass\n",
+                            program & 0x1Fu, (program >> 5) & 0x1Fu,
+                            (program >> 10) & 0x1Fu, (program >> 15) & 0x1Fu,
+                            stage_mask, cube_mask);
+                    s_realistic_water_fallback_reported = 1;
+                }
+            }
         }
         for (uint32_t i = 0; i < batch->count; i++) {
             const BwXVertex *v = &batch->vertices[i];
@@ -2742,11 +2866,31 @@ static void metal_draw_extended(const Nv2aSurface *surface, const BwXBatch *batc
         if (batch->state->zeta_va && !depth)
             return;
         id<MTLRenderPipelineState> pipeline =
-            draw_pipeline(2, batch->state, depth != nil);
+            draw_pipeline(realistic_water ? METAL_SHADER_REALISTIC_WATER
+                                          : METAL_SHADER_EXTENDED,
+                          batch->state, depth != nil);
+        if (!pipeline && realistic_water && !bw_metal_backend_error()) {
+            realistic_water = 0;
+            s_active_water_preset = BW_METAL_WATER_RETAIL;
+            atomic_store_explicit(&s_requested_water_preset,
+                                  BW_METAL_WATER_RETAIL, memory_order_release);
+            s_realistic_water_fallback_batches++;
+            pipeline = draw_pipeline(METAL_SHADER_EXTENDED,
+                                     batch->state, depth != nil);
+        }
         id<MTLDepthStencilState> depth_state =
             draw_depth_state(batch->state, depth != nil);
         if (!pipeline || !depth_state)
             return;
+        if (realistic_water) {
+            s_realistic_water_batches++;
+            if (!s_realistic_water_reported) {
+                fprintf(stderr,
+                        "[GPU-METAL] optional realistic water shader active for "
+                        "explicitly marked ocean passes\n");
+                s_realistic_water_reported = 1;
+            }
+        }
         int quincunx_approx = 0;
         id<MTLTexture> textures[4] = {nil, nil, nil, nil};
         id<MTLTexture> cube_textures[4] = {nil, nil, nil, nil};
@@ -3236,6 +3380,8 @@ static int initialize_metal(void)
     s_texture_function = [library newFunctionWithName:@"texture_main"];
     s_extended_vertex_function = [library newFunctionWithName:@"extended_vertex"];
     s_extended_fragment_function = [library newFunctionWithName:@"extended_fragment"];
+    s_realistic_water_fragment_function =
+        [library newFunctionWithName:@"realistic_water_fragment"];
     s_clear_vertex_function = [library newFunctionWithName:@"clear_vertex"];
     s_clear_color_function = [library newFunctionWithName:@"clear_color"];
     s_clear_depth_function = [library newFunctionWithName:@"clear_depth"];
@@ -3250,6 +3396,14 @@ static int initialize_metal(void)
         !s_present_vertex_function || !s_present_resolve_function ||
         !s_present_fragment_function || !s_scale_function || !s_box_function)
         return metal_fail("Metal shader entry point missing");
+    if (!s_realistic_water_fragment_function &&
+        s_active_water_preset == BW_METAL_WATER_REALISTIC) {
+        fprintf(stderr,
+                "[GPU-METAL] realistic water shader is unavailable; using retail water\n");
+        s_active_water_preset = BW_METAL_WATER_RETAIL;
+        atomic_store_explicit(&s_requested_water_preset,
+                              BW_METAL_WATER_RETAIL, memory_order_release);
+    }
     MTLRenderPipelineDescriptor *present_pipeline = [MTLRenderPipelineDescriptor new];
     if (!present_pipeline)
         return metal_fail("could not create presentation pipeline descriptor");
@@ -3376,6 +3530,23 @@ static int start_with_regions(void *guest_memory, size_t low_size,
         atomic_store_explicit(&s_requested_anisotropy, anisotropy, memory_order_release);
         s_active_anisotropy = anisotropy;
     }
+    {
+        const char *water = getenv("BW_METAL_WATER");
+        BwMetalWaterPreset preset = BW_METAL_WATER_RETAIL;
+        if (water) {
+            if (!strcasecmp(water, "retail"))
+                preset = BW_METAL_WATER_RETAIL;
+            else if (!strcasecmp(water, "realistic"))
+                preset = BW_METAL_WATER_REALISTIC;
+            else
+                return metal_fail("BW_METAL_WATER must be retail or realistic");
+        }
+        if (preset == BW_METAL_WATER_REALISTIC &&
+            !bw_edition_at_least(BW_ED_REMASTERED))
+            return metal_fail("BW_METAL_WATER=realistic requires Remastered");
+        atomic_store_explicit(&s_requested_water_preset, preset, memory_order_release);
+        s_active_water_preset = preset;
+    }
     s_pending_command = nil;
     s_draw_encoder = nil;
     s_draw_color = nil;
@@ -3387,6 +3558,10 @@ static int start_with_regions(void *guest_memory, size_t low_size,
     s_vertex_upload_offset = 0;
     s_vertex_upload_allocations = 0;
     s_texture_uploads = 0;
+    s_realistic_water_batches = 0;
+    s_realistic_water_fallback_batches = 0;
+    s_realistic_water_reported = 0;
+    s_realistic_water_fallback_reported = 0;
     s_present_surface = nil;
     memset(&s_present_framebuffer, 0, sizeof s_present_framebuffer);
     s_surface_upload = nil;
@@ -3468,6 +3643,12 @@ void bw_metal_backend_stop(void)
     if (s_frame_timing_enabled && trailing && trailing != s_frame_time_count)
         report_frame_times("trailing 300",
                            s_frame_times + s_frame_time_count - trailing, trailing);
+    if (s_realistic_water_batches || s_realistic_water_fallback_batches)
+        fprintf(stderr,
+                "[GPU-METAL] realistic water summary: %llu enhanced batches, "
+                "%llu retail fallbacks\n",
+                (unsigned long long)s_realistic_water_batches,
+                (unsigned long long)s_realistic_water_fallback_batches);
     if (s_registered) {
         bw_backend_ext_unregister_if_current(&s_extended_backend);
         bw_backend_unregister_if_current(&s_backend);
@@ -3476,6 +3657,10 @@ void bw_metal_backend_stop(void)
     s_dirty = 0;
     s_quincunx_approx = 0;
     s_quincunx_reported = 0;
+    s_realistic_water_batches = 0;
+    s_realistic_water_fallback_batches = 0;
+    s_realistic_water_reported = 0;
+    s_realistic_water_fallback_reported = 0;
     s_current_format = 0;
     s_framebuffer_callback = NULL;
     s_surface = nil;
@@ -3511,6 +3696,9 @@ void bw_metal_backend_stop(void)
                             s_samplers[a][u][v][min_linear][mag_linear][mip_mode] = nil;
     s_active_anisotropy = 1;
     atomic_store_explicit(&s_requested_anisotropy, 1, memory_order_release);
+    s_active_water_preset = BW_METAL_WATER_RETAIL;
+    atomic_store_explicit(&s_requested_water_preset,
+                          BW_METAL_WATER_RETAIL, memory_order_release);
     s_pipelines = nil;
     s_clear_pipelines = nil;
     s_color_surfaces = nil;
@@ -3524,6 +3712,7 @@ void bw_metal_backend_stop(void)
     s_texture_function = nil;
     s_extended_vertex_function = nil;
     s_extended_fragment_function = nil;
+    s_realistic_water_fragment_function = nil;
     s_clear_vertex_function = nil;
     s_clear_color_function = nil;
     s_clear_depth_function = nil;
@@ -3551,5 +3740,18 @@ unsigned bw_metal_test_sampler_anisotropy(int min_linear, unsigned mip_mode)
 void bw_metal_test_apply_pending_render_settings(void)
 {
     apply_pending_render_settings();
+}
+
+unsigned bw_metal_test_active_water_preset(void)
+{
+    return s_active_water_preset;
+}
+
+void bw_metal_test_realistic_water_counts(uint64_t *enhanced, uint64_t *fallback)
+{
+    if (enhanced)
+        *enhanced = s_realistic_water_batches;
+    if (fallback)
+        *fallback = s_realistic_water_fallback_batches;
 }
 #endif
