@@ -43,14 +43,45 @@ the existing fog visibility and retail alpha is preserved. There are no new
 textures, art, depth reads, refraction, depth absorption, foam, or shoreline
 effects.
 
-The complete 320-case Metal suite includes exact default-Retail output,
+The complete 322-case Metal suite includes exact default-Retail output,
 marked-only enhancement, unmarked recovery, unsupported-state fallback,
-frame-boundary activation, edition gating, and strict startup parsing. A
-private four-boot scripted Remastered diagnostic activated the shader on real
-marked ocean batches with no observed fallback or Metal error. Hands-on A/B
-visual review and controlled GPU-time/memory measurements remain required;
-the preset is therefore experimental, default-off, and excluded from quality
-presets.
+frame-boundary activation, edition gating, strict startup parsing, and the
+diagnostic benchmark state machine. A private four-boot scripted Remastered
+diagnostic activated the shader on real marked ocean batches with no observed
+fallback or Metal error.
+
+### Controlled water GPU benchmark
+
+`BW_METAL_WATER_BENCHMARK=1` is accepted only by the private diagnostic
+runner in Remastered with GPU audit enabled and Retail selected initially. It
+waits for a successfully encoded supported marked-ocean frame, then measures
+four blocks in Retail/Realistic/Realistic/Retail order. Each block discards 10
+supported-water warm-up frames and records 50 supported-water frames, yielding
+100 samples per preset. Frames without a supported marked-ocean draw do not
+advance the protocol. External preset requests cannot change the active mode
+during measurement, and completion restores Retail.
+
+Each sample sums Metal's completed-command-buffer GPU duration for command
+buffers containing an encoded supported-ocean draw. It therefore includes
+other work sharing those command buffers and is not an isolated fragment
+shader timer. Missing timestamps, command failures, state changes, sample
+overflow, incomplete runs, malformed summaries, or inconsistent deltas fail
+explicitly.
+
+A private four-boot run completed independent ABBA samples in two boots:
+
+| Sample | Retail mean / median / p95 | Realistic mean / median / p95 | Mean / median / p95 delta |
+| --- | --- | --- | --- |
+| 1 | 51.126104 / 51.121375 / 54.506500 ms | 53.591635 / 52.075000 / 60.007250 ms | +4.822451% / +1.865413% / +10.091916% |
+| 2 | 52.924863 / 53.103750 / 56.421125 ms | 55.331963 / 54.999625 / 60.814792 ms | +4.548148% / +3.570134% / +7.787273% |
+
+Across the two completed samples, the Realistic delta ranges were
++4.548%-+4.822% mean, +1.865%-+3.570% median, and +7.787%-+10.092% p95.
+No unsupported-pass fallback or Metal runtime error was observed. No
+automatic acceptance threshold is inferred from these measurements. Hands-on
+A/B visual review, representative scene coverage, and any desired
+process/driver memory measurement remain open; the preset is therefore still
+experimental, default-off, and excluded from quality presets.
 
 ## Metal MSAA decision
 

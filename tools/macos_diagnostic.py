@@ -5,6 +5,7 @@ from dataclasses import dataclass
 import hashlib
 import importlib.util
 import json
+import math
 import os
 from pathlib import Path
 import re
@@ -33,6 +34,7 @@ OCEAN_MARKER_PATTERN = re.compile(
 )
 MAX_OCEAN_MARKER_COUNT = (1 << 64) - 1
 MAX_OCEAN_MARKER_SUMMARIES = 4096
+WATER_BENCHMARK_SAMPLES_PER_PRESET = 100
 OCEAN_FINGERPRINT_HEADER = (
     b"== Marked ocean batch fingerprints (v1 FNV-1a-64; stable metadata only)"
 )
@@ -49,6 +51,17 @@ REALISTIC_WATER_ACTIVE = (
 )
 REALISTIC_WATER_FALLBACK_PREFIX = (
     b"[GPU-METAL] realistic water encountered an unsupported marked pass "
+)
+WATER_BENCHMARK_PREFIX = b"[GPU-METAL] water benchmark v1 "
+WATER_BENCHMARK_PATTERN = re.compile(
+    rb"(?m)^\[GPU-METAL\] water benchmark v1 "
+    rb"retail_samples=([0-9]{1,5}) retail_mean_ms=([0-9]+\.[0-9]{6}) "
+    rb"retail_median_ms=([0-9]+\.[0-9]{6}) retail_p95_ms=([0-9]+\.[0-9]{6}) "
+    rb"realistic_samples=([0-9]{1,5}) realistic_mean_ms=([0-9]+\.[0-9]{6}) "
+    rb"realistic_median_ms=([0-9]+\.[0-9]{6}) realistic_p95_ms=([0-9]+\.[0-9]{6}) "
+    rb"mean_delta_percent=([+-][0-9]+\.[0-9]{6}) "
+    rb"median_delta_percent=([+-][0-9]+\.[0-9]{6}) "
+    rb"p95_delta_percent=([+-][0-9]+\.[0-9]{6})\r?$"
 )
 
 
@@ -247,7 +260,8 @@ def verify_sandbox(profile, output, protected):
 def diagnostic_env(output, game_dir, seconds, quincunx, audit, input_fd, output_fd,
                    audit_name="gpu-audit.txt", keyboard_hook=False, synthetic_input=False,
                    edition="original", disable_audio=False, synthetic_input_script=None,
-                   audio_audit=False, water_preset="retail"):
+                   audio_audit=False, water_preset="retail",
+                   water_benchmark=False):
     if (synthetic_input or synthetic_input_script) and not keyboard_hook:
         raise ValueError("synthetic input requires the experimental keyboard hook")
     if synthetic_input and synthetic_input_script:
@@ -260,6 +274,12 @@ def diagnostic_env(output, game_dir, seconds, quincunx, audit, input_fd, output_
         raise ValueError("water preset must be retail or realistic")
     if water_preset == "realistic" and edition != "remastered":
         raise ValueError("realistic water requires the remastered edition")
+    if water_benchmark and edition != "remastered":
+        raise ValueError("water benchmark requires the remastered edition")
+    if water_benchmark and water_preset != "retail":
+        raise ValueError("water benchmark requires the retail water preset")
+    if water_benchmark and not audit:
+        raise ValueError("water benchmark requires GPU audit")
     if synthetic_input_script and edition != "remastered":
         raise ValueError("the synthetic input script requires the remastered edition")
     if disable_audio and audio_audit:
@@ -294,6 +314,8 @@ def diagnostic_env(output, game_dir, seconds, quincunx, audit, input_fd, output_
         env["BW_HEADLESS_AUDIO_AUDIT"] = "1"
     if water_preset == "realistic":
         env["BW_METAL_WATER"] = "realistic"
+    if water_benchmark:
+        env["BW_METAL_WATER_BENCHMARK"] = "1"
     if audit:
         env["BW_GPU_AUDIT"] = "1"
         env["BW_GPU_AUDIT_EVERY"] = "5"
@@ -369,7 +391,8 @@ def run_guest_once(executable, output, game_dir, profile, seconds, quincunx, aud
                    launch=b"", log_name="guest.log", audit_name="gpu-audit.txt",
                    timeout=None, log_limit=None, keyboard_hook=False, synthetic_input=False,
                    edition="original", disable_audio=False, synthetic_input_script=None,
-                   audio_audit=False, water_preset="retail"):
+                   audio_audit=False, water_preset="retail",
+                   water_benchmark=False):
     input_read = input_write = output_read = output_write = -1
     child = None
     try:
@@ -391,7 +414,8 @@ def run_guest_once(executable, output, game_dir, profile, seconds, quincunx, aud
         input_write = -1
         env = diagnostic_env(output, game_dir, seconds, quincunx, audit, input_read, output_write,
                              audit_name, keyboard_hook, synthetic_input, edition, disable_audio,
-                             synthetic_input_script, audio_audit, water_preset)
+                             synthetic_input_script, audio_audit, water_preset,
+                             water_benchmark)
         with open(output / log_name, "xb") as log:
             child = subprocess.Popen(
                 [SANDBOX, "-p", profile, str(executable), "--bw-native-child"],
@@ -423,14 +447,15 @@ def run_guest_once(executable, output, game_dir, profile, seconds, quincunx, aud
 def run_guest(executable, output, game_dir, profile, seconds, quincunx, audit,
               keyboard_hook=False, synthetic_input=False, edition="original",
               disable_audio=False, synthetic_input_script=None, audio_audit=False,
-              water_preset="retail"):
+              water_preset="retail", water_benchmark=False):
     result, relaunch, _ = run_guest_once(executable, output, game_dir, profile,
                                          seconds, quincunx, audit, keyboard_hook=keyboard_hook,
                                          synthetic_input=synthetic_input, edition=edition,
                                          disable_audio=disable_audio,
                                          synthetic_input_script=synthetic_input_script,
                                          audio_audit=audio_audit,
-                                         water_preset=water_preset)
+                                         water_preset=water_preset,
+                                         water_benchmark=water_benchmark)
     if relaunch:
         (output / "relaunch.bin").write_bytes(relaunch)
         print("Guest requested a relaunch; request saved privately, not executed")
@@ -441,7 +466,7 @@ def run_guest_relaunches(executable, output, game_dir, profile, seconds, quincun
                          audit, max_boots, total_seconds, keyboard_hook=False,
                          synthetic_input=False, edition="original", disable_audio=False,
                          synthetic_input_script=None, audio_audit=False,
-                         water_preset="retail"):
+                         water_preset="retail", water_benchmark=False):
     deadline = time.monotonic() + total_seconds
     log_remaining = MAX_LOG_BYTES
     launch = b""
@@ -457,7 +482,8 @@ def run_guest_relaunches(executable, output, game_dir, profile, seconds, quincun
             timeout=min(seconds + 15, remaining), log_limit=log_remaining,
             keyboard_hook=keyboard_hook, synthetic_input=synthetic_input, edition=edition,
             disable_audio=disable_audio, synthetic_input_script=synthetic_input_script,
-            audio_audit=audio_audit, water_preset=water_preset)
+            audio_audit=audio_audit, water_preset=water_preset,
+            water_benchmark=water_benchmark)
         completed_boots = boot
         log_remaining -= log_size
         if relaunch:
@@ -550,9 +576,21 @@ def extract_realistic_water_coverage(log_paths):
     return active_boots, fallback_boots
 
 
-def report_realistic_water_coverage(log_paths, water_preset):
+def report_realistic_water_coverage(log_paths, water_preset,
+                                    water_benchmark=False):
     active_boots, fallback_boots = extract_realistic_water_coverage(log_paths)
-    if water_preset == "realistic":
+    if water_benchmark:
+        if not active_boots:
+            raise RuntimeError(
+                "water benchmark did not activate realistic water in any "
+                "guest boot"
+            )
+        print(
+            "Realistic water benchmark: shader path active in "
+            f"{active_boots} boots; unsupported-pass fallback observed in "
+            f"{fallback_boots} boots"
+        )
+    elif water_preset == "realistic":
         if not active_boots:
             raise RuntimeError("realistic water did not activate in any guest boot")
         print(f"Realistic water: active in {active_boots} boots; unsupported-pass "
@@ -560,6 +598,101 @@ def report_realistic_water_coverage(log_paths, water_preset):
     elif active_boots or fallback_boots:
         raise RuntimeError("realistic-water activity was observed under the retail preset")
     return active_boots, fallback_boots
+
+
+def read_water_benchmarks(log_paths):
+    benchmarks = []
+    for path in log_paths:
+        data = path.read_bytes()
+        matches = list(WATER_BENCHMARK_PATTERN.finditer(data))
+        prefixes = data.count(WATER_BENCHMARK_PREFIX)
+        if prefixes != len(matches):
+            raise RuntimeError(
+                f"malformed water benchmark summary in {path.name}"
+            )
+        if len(matches) > 1:
+            raise RuntimeError(
+                f"duplicate water benchmark summaries in {path.name}"
+            )
+        if not matches:
+            continue
+
+        groups = matches[0].groups()
+        retail_samples = int(groups[0])
+        realistic_samples = int(groups[4])
+        retail = tuple(float(value) for value in groups[1:4])
+        realistic = tuple(float(value) for value in groups[5:8])
+        reported_delta = tuple(float(value) for value in groups[8:11])
+        values = retail + realistic + reported_delta
+        if (retail_samples != realistic_samples or
+                retail_samples != WATER_BENCHMARK_SAMPLES_PER_PRESET):
+            raise RuntimeError(
+                f"inconsistent water benchmark sample counts in {path.name}"
+            )
+        if not all(math.isfinite(value) for value in values):
+            raise RuntimeError(
+                f"non-finite water benchmark value in {path.name}"
+            )
+        if any(value <= 0.0 for value in retail + realistic):
+            raise RuntimeError(
+                f"non-positive water benchmark timing in {path.name}"
+            )
+
+        calculated_delta = tuple(
+            (realistic[index] - retail[index]) * 100.0 / retail[index]
+            for index in range(3)
+        )
+        if any(
+            abs(calculated_delta[index] - reported_delta[index]) > 0.01
+            for index in range(3)
+        ):
+            raise RuntimeError(
+                f"inconsistent water benchmark deltas in {path.name}"
+            )
+        benchmarks.append(
+            {
+                "retail_samples": retail_samples,
+                "realistic_samples": realistic_samples,
+                "retail": retail,
+                "realistic": realistic,
+                "delta": reported_delta,
+            }
+        )
+    return benchmarks
+
+
+def report_water_benchmarks(log_paths, requested):
+    benchmarks = read_water_benchmarks(log_paths)
+    if not requested:
+        if benchmarks:
+            raise RuntimeError(
+                "water benchmark summary appeared without --water-benchmark"
+            )
+        return
+    if not benchmarks:
+        raise RuntimeError(
+            "water benchmark requested, but no boot completed the ABBA sample"
+        )
+
+    def delta_range(index):
+        values = [benchmark["delta"][index] for benchmark in benchmarks]
+        if len(values) == 1:
+            return f"{values[0]:+.3f}%"
+        return f"{min(values):+.3f}% to {max(values):+.3f}%"
+
+    total_samples = sum(
+        benchmark["retail_samples"] + benchmark["realistic_samples"]
+        for benchmark in benchmarks
+    )
+    print(
+        f"Water benchmark: {len(benchmarks)} completed boot(s), "
+        f"{total_samples} measured supported-water frames"
+    )
+    print(
+        "  Same-scene command-buffer GPU deltas "
+        f"(realistic versus retail): mean {delta_range(0)}, "
+        f"median {delta_range(1)}, p95 {delta_range(2)}"
+    )
 
 
 def gpu_audit_paths(output, follow_relaunches, completed_boots, max_boots):
@@ -656,6 +789,10 @@ def main(argv=None):
     parser.add_argument("--gpu-audit", action="store_true", help="write the private GPU usage summary")
     parser.add_argument("--water-preset", choices=("retail", "realistic"), default="retail",
                         help="Metal ocean preset (default: retail; realistic requires Remastered)")
+    parser.add_argument(
+        "--water-benchmark", action="store_true",
+        help="run the diagnostic-only same-scene Retail/Realistic ABBA GPU sample"
+    )
     parser.add_argument("--disable-audio", action="store_true",
                         help="disable native audio for an isolated non-audio diagnostic")
     parser.add_argument("--headless-audio-audit", action="store_true",
@@ -689,6 +826,12 @@ def main(argv=None):
         parser.error("--synthetic-input-script requires --edition remastered")
     if args.water_preset == "realistic" and args.edition != "remastered":
         parser.error("--water-preset realistic requires --edition remastered")
+    if args.water_benchmark and args.edition != "remastered":
+        parser.error("--water-benchmark requires --edition remastered")
+    if args.water_benchmark and args.water_preset != "retail":
+        parser.error("--water-benchmark requires --water-preset retail")
+    if args.water_benchmark and not args.gpu_audit:
+        parser.error("--water-benchmark requires --gpu-audit")
     if not args.follow_relaunches and (args.max_boots is not None or args.total_seconds is not None):
         parser.error("--max-boots and --total-seconds require --follow-relaunches")
     if args.max_boots is not None and not 1 <= args.max_boots <= MAX_RELAUNCH_BOOTS:
@@ -719,6 +862,8 @@ def main(argv=None):
         print("Executable SHA-256:", executable_hash)
         print("Diagnostic edition:", args.edition.capitalize())
         print("Diagnostic water preset:", args.water_preset)
+        if args.water_benchmark:
+            print("Diagnostic water benchmark: Retail/Realistic/Realistic/Retail")
         if args.headless_audio_audit:
             print("Diagnostic audio: silent headless audit (not audible)")
         else:
@@ -740,7 +885,8 @@ def main(argv=None):
                     disable_audio=args.disable_audio,
                     synthetic_input_script=args.synthetic_input_script,
                     audio_audit=args.headless_audio_audit,
-                    water_preset=args.water_preset)
+                    water_preset=args.water_preset,
+                    water_benchmark=args.water_benchmark)
                 result = relaunch_result.guest_status
                 completed_boots = relaunch_result.completed_boots
                 boot_limit_reached = relaunch_result.boot_limit_reached
@@ -752,7 +898,8 @@ def main(argv=None):
                                    disable_audio=args.disable_audio,
                                    synthetic_input_script=args.synthetic_input_script,
                                    audio_audit=args.headless_audio_audit,
-                                   water_preset=args.water_preset)
+                                   water_preset=args.water_preset,
+                                   water_benchmark=args.water_benchmark)
                 completed_boots = 1
         finally:
             changed = snapshot_tree(prepared) != baseline
@@ -763,7 +910,10 @@ def main(argv=None):
         print("Prepared-tree, toolkit and executable integrity unchanged")
         logs = guest_log_paths(output, args.follow_relaunches, completed_boots, max_boots)
         report_ocean_marker_counts(logs)
-        report_realistic_water_coverage(logs, args.water_preset)
+        report_realistic_water_coverage(
+            logs, args.water_preset, args.water_benchmark
+        )
+        report_water_benchmarks(logs, args.water_benchmark)
         if args.gpu_audit:
             report_ocean_fingerprint_counts(
                 gpu_audit_paths(output, args.follow_relaunches, completed_boots, max_boots))

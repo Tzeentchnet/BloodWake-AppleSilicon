@@ -18,7 +18,7 @@ locally exported definition data remain private and must not be committed.
 | Metal filtering | Implemented | Collect oblique water/cliff comparisons and GPU timings for 1x/4x/8x/16x. |
 | Metal MSAA | No-go; synthetic smoke complete | Apple M5 passes 2x/4x/8x synthetic color/depth/resolve, but game-scene attachment ownership and the controlled visual/GPU-time/memory matrix are still required. |
 | Upstream fixes | Verified | Re-run the offline parity checker whenever upstream changes. |
-| Realistic water | Experimental optional preset implemented and runtime-activated | Compare Retail/Realistic across calm/storm, lighting, shore, split-screen, reflection, and wake scenes; measure GPU cost before tuning or promoting it. |
+| Realistic water | Optional preset implemented; runtime activation and same-scene GPU benchmark complete | Compare Retail/Realistic across calm/storm, lighting, shore, split-screen, reflection, and wake scenes before tuning or promoting it. |
 
 ## F1 runtime settings
 
@@ -87,6 +87,14 @@ Realistic requires Remastered, inherited `BW_METAL_WATER` values are discarded,
 and a requested realistic run fails validation if no guest boot reports actual
 shader activation. It reports activation and unsupported-pass fallback by boot
 without exposing private render-state data.
+
+`--water-benchmark` is a separate diagnostic-only mode. It requires
+Remastered, the Retail starting preset, and `--gpu-audit`; the clean child
+environment alone receives `BW_METAL_WATER_BENCHMARK=1`. The backend runs
+10 warm-up plus 50 measured supported-water frames in each of four
+Retail/Realistic/Realistic/Retail blocks. The runner rejects missing,
+duplicate, malformed, non-finite, or internally inconsistent summaries and
+rejects benchmark output when the mode was not requested.
 
 ## Ship and weapon mod profiles
 
@@ -205,8 +213,17 @@ The realistic pipeline activated in the two boots that reached supported
 marked passes; no unsupported-pass fallback, marker rejection, fingerprint
 overflow/mismatch, or Metal runtime error was observed.
 
-That is runtime evidence, not a visual-quality or performance approval.
-Retail/Realistic comparisons across calm/storm, day/night, shore,
-split-screen, reflection, and wake scenes remain open. Depth absorption,
-refraction, replacement foam, and shoreline effects still require separate
-depth/material ownership.
+A later private four-boot diagnostic completed the same-scene ABBA benchmark
+in two independent boots, each with 100 Retail and 100 Realistic measured
+supported-water frames. Realistic increased water-containing command-buffer
+GPU duration by 4.548%-4.822% for mean, 1.865%-3.570% for median, and
+7.787%-10.092% for p95. The command-buffer timer includes non-water work
+sharing those buffers, so these ranges are not isolated fragment-shader cost.
+No automatic acceptance threshold or visual-quality conclusion is inferred.
+
+Runtime activation and controlled performance evidence are complete for the
+exercised automated scene. Retail/Realistic visual comparisons across
+calm/storm, day/night, shore, split-screen, reflection, and wake scenes remain
+open. The preset stays experimental, default-off, and absent from quality
+presets. Depth absorption, refraction, replacement foam, and shoreline
+effects still require separate depth/material ownership.

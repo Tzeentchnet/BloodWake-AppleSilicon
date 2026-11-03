@@ -1,6 +1,6 @@
 # Apple Silicon validation
 
-Updated 2026-11-02. This document records measured behavior and regression
+Updated 2026-11-03. This document records measured behavior and regression
 coverage. Implementation history is in
 [WORK_COMPLETED.md](WORK_COMPLETED.md), and current priorities are in
 [APPLE_SILICON_HANDOFF.md](APPLE_SILICON_HANDOFF.md).
@@ -89,12 +89,13 @@ wall-clock performance evidence.
 
 ## Current regression coverage
 
-- The Metal backend suite passes 320/320 tests, including texture-stage masks,
+- The Metal backend suite passes 322/322 tests, including texture-stage masks,
   combiner operations, cube reflection, mip selection, command-buffer and
   render-encoder batching, texture caching, upload-arena reuse, anisotropy
   selection/lifecycle, optional-water frame-boundary selection, exact default
   Retail output, marked-only enhancement, per-pass fallback, edition gating,
-  and invalid startup rejection.
+  invalid startup rejection, strict benchmark authorization, and the
+  Retail/Realistic/Realistic/Retail benchmark state machine.
 - Eight dedicated scaling cases cover forced 2x private targets, guest-AA
   collapse, exact guest seeding, weighted box-filter readback, scaled colour
   and depth scissors, invalid scale rejection, SSAA minimum handling, and a
@@ -127,12 +128,15 @@ wall-clock performance evidence.
 - The standalone Metal MSAA smoke target passes 2/2 tests. The recorded Apple
   M5 passes synthetic 2x/4x/8x color, depth/stencil, resolve, readback, and
   explicit error checks; this is not game-renderer or visual evidence.
-- The focused macOS diagnostic suite passes 43/43 tests, including strict
+- The focused macOS diagnostic suite passes 48/48 tests, including strict
   edition and built-in script selection, bounded marker/fingerprint summary
   parsing, typed relaunch outcomes, integrity-failure precedence, boot-cap
   reporting, explicit audio isolation, and strict headless-audit authorization
   with default audio preserved. It also covers strict water-preset propagation,
-  inherited-value removal, edition gating, and activation/fallback reporting.
+  inherited-value removal, edition gating, activation/fallback reporting,
+  benchmark CLI authorization and propagation, clean-environment isolation,
+  and malformed, duplicate, inconsistent, missing, or unexpected benchmark
+  summary rejection.
 - Nine LOD cases cover Original passthrough, defaults, disable/fix override,
   custom/clamped values, live changes, invalid rejection, and concurrent
   readers/writers.
@@ -155,7 +159,7 @@ wall-clock performance evidence.
 - The DMA ownership suite passed 13 tests normally and under focused TSan and
   ASan/UBSan runs.
 - The guest-memory inventory passed 21 synthetic tests, and the complete
-  Python suite now passes 112/112.
+  Python suite now passes 117/117.
 - The synthetic GPU capture suite passed 11 tests normally and under
   ASan/UBSan, with four focused TSan cases.
 - Windows and x86 execution were not validated on the Apple Silicon host.
@@ -232,6 +236,34 @@ This proves that the optional pipeline is not a synthetic-only or silent
 no-op in the exercised runtime flow. It does not judge whether the treatment
 looks better, establish representative scene coverage, or measure GPU cost.
 Private hashes, logs, saves, and retail data remain uncommitted.
+
+The next private four-boot Remastered run selected Retail initially and
+authorized the diagnostic-only water benchmark. The backend waited for
+supported marked-ocean rendering, then ran four same-scene blocks in
+Retail/Realistic/Realistic/Retail order. Each block used 10 supported-water
+warm-up frames and 50 measured frames. Two boots independently completed the
+full 100-Retail/100-Realistic sample:
+
+| Completed sample | Retail mean / median / p95 | Realistic mean / median / p95 | Mean / median / p95 delta |
+| --- | --- | --- | --- |
+| 1 | 51.126104 / 51.121375 / 54.506500 ms | 53.591635 / 52.075000 / 60.007250 ms | +4.822451% / +1.865413% / +10.091916% |
+| 2 | 52.924863 / 53.103750 / 56.421125 ms | 55.331963 / 54.999625 / 60.814792 ms | +4.548148% / +3.570134% / +7.787273% |
+
+The four-boot aggregate contained 38,330 markers, 467 clean scopes, and 604
+fingerprinted batches across 17 aggregate hashes, with zero marker rejection,
+fingerprint overflow, or within-scope mismatch. The shader activated in the
+two benchmark boots, with no unsupported-pass fallback, malformed completed
+summary, or Metal runtime error. Both completed summaries contained the exact
+100/100 sample counts. The configured boot cap was reached while another
+validated relaunch was requested, so the runner returned its documented
+non-success cap status after preserving and reporting the two complete
+samples.
+
+These timings are completed Metal command-buffer durations for command buffers
+that contained supported marked-ocean draws. They include other commands in
+the same buffers and do not claim isolated shader cost, a performance
+acceptance threshold, representative scene coverage, or improved visual
+quality. Private logs, hashes, saves, and retail data remain uncommitted.
 
 ## Integrity and privacy
 

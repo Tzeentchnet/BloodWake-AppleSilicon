@@ -96,7 +96,7 @@ set_tests_properties(metal_shared-backing-unprotected-alias-counterexample PROPE
 foreach(case semaphore-release semaphore-concurrent visual
              anisotropy anisotropy-original anisotropy-invalid
              water-preset water-preset-original water-preset-invalid
-             water-preset-original-env
+             water-preset-original-env water-benchmark water-benchmark-validation
              render-scale render-scale-aa render-scale-partial render-scale-box
              render-scale-depth render-scale-auto render-scale-invalid render-scale-ssaa-min
              seed-order command-batching perspective blend color-mask alpha-test pipeline-cache cull full-rect depth-clear

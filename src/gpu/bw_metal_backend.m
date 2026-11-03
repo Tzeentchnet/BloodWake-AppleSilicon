@@ -36,6 +36,16 @@ extern uint64_t xbox_HostNowNs(void);
 #define METAL_INITIAL_VERTEX_UPLOAD (16u * 1024u * 1024u)
 #define METAL_COLOR_XRGB_ZERO 0x4u
 #define METAL_COLOR_ARGB8 0x8u
+#if defined(BW_METAL_TESTING)
+#define METAL_WATER_BENCHMARK_WARMUP_FRAMES 1u
+#define METAL_WATER_BENCHMARK_SAMPLE_FRAMES 2u
+#else
+#define METAL_WATER_BENCHMARK_WARMUP_FRAMES 10u
+#define METAL_WATER_BENCHMARK_SAMPLE_FRAMES 50u
+#endif
+#define METAL_WATER_BENCHMARK_BLOCKS 4u
+#define METAL_WATER_BENCHMARK_SAMPLES_PER_PRESET \
+    (METAL_WATER_BENCHMARK_SAMPLE_FRAMES * 2u)
 
 typedef struct {
     float position[4];
@@ -215,6 +225,20 @@ static uint64_t s_frame_times[METAL_MAX_FRAME_SAMPLES];
 static size_t s_frame_time_count;
 static uint64_t s_last_flip_ns;
 static int s_frame_timing_enabled;
+static int s_water_benchmark_enabled;
+static int s_water_benchmark_started;
+static int s_water_benchmark_complete;
+static int s_water_benchmark_failed;
+static unsigned s_water_benchmark_block;
+static unsigned s_water_benchmark_frames;
+static int s_water_benchmark_sampling;
+static uint64_t s_water_benchmark_samples[2][METAL_WATER_BENCHMARK_SAMPLES_PER_PRESET];
+static size_t s_water_benchmark_sample_count[2];
+static unsigned s_frame_supported_water_batches;
+static uint64_t s_frame_water_gpu_ns;
+static int s_frame_water_gpu_valid;
+static int s_frame_water_gpu_invalid;
+static int s_pending_supported_water;
 
 static int flush_commands(void);
 static id<MTLCommandBuffer> pending_command(void);
@@ -245,8 +269,10 @@ static void apply_pending_render_settings(void)
 {
     s_active_anisotropy =
         atomic_load_explicit(&s_requested_anisotropy, memory_order_acquire);
-    s_active_water_preset =
-        atomic_load_explicit(&s_requested_water_preset, memory_order_acquire);
+    if (!s_water_benchmark_enabled || s_water_benchmark_complete ||
+        s_water_benchmark_failed)
+        s_active_water_preset =
+            atomic_load_explicit(&s_requested_water_preset, memory_order_acquire);
 }
 
 int bw_metal_backend_set_anisotropy(unsigned anisotropy)
@@ -268,6 +294,9 @@ int bw_metal_backend_set_water_preset(BwMetalWaterPreset preset)
 {
     if (preset != BW_METAL_WATER_RETAIL &&
         preset != BW_METAL_WATER_REALISTIC)
+        return 0;
+    if (s_water_benchmark_enabled && !s_water_benchmark_complete &&
+        !s_water_benchmark_failed)
         return 0;
     if (preset == BW_METAL_WATER_REALISTIC &&
         !bw_edition_at_least(BW_ED_REMASTERED))
@@ -325,6 +354,157 @@ static void report_frame_times(const char *label, const uint64_t *samples, size_
             label, count, sum ? (double)count * 1e9 / (double)sum : 0.0,
             (double)median / 1e6, (double)p95 / 1e6, (double)maximum / 1e6);
     free(sorted);
+}
+
+typedef struct {
+    double mean_ms, median_ms, p95_ms;
+} MetalWaterBenchmarkStats;
+
+static MetalWaterBenchmarkStats water_benchmark_stats(const uint64_t *samples,
+                                                       size_t count)
+{
+    uint64_t sorted[METAL_WATER_BENCHMARK_SAMPLES_PER_PRESET];
+    long double sum = 0.0;
+    MetalWaterBenchmarkStats stats = {0};
+    if (!count || count > METAL_WATER_BENCHMARK_SAMPLES_PER_PRESET)
+        return stats;
+    for (size_t i = 0; i < count; i++) {
+        sorted[i] = samples[i];
+        sum += samples[i];
+    }
+    qsort(sorted, count, sizeof *sorted, compare_u64);
+    stats.mean_ms = (double)(sum / count / 1.0e6L);
+    stats.median_ms = (double)sorted[count / 2u] / 1.0e6;
+    stats.p95_ms =
+        (double)sorted[((count * 95u + 99u) / 100u) - 1u] / 1.0e6;
+    return stats;
+}
+
+static void water_benchmark_set_preset(BwMetalWaterPreset preset)
+{
+    s_active_water_preset = preset;
+    atomic_store_explicit(&s_requested_water_preset, (unsigned)preset,
+                          memory_order_release);
+}
+
+static void water_benchmark_fail(const char *reason)
+{
+    if (!s_water_benchmark_failed)
+        fprintf(stderr, "[GPU-METAL] water benchmark unavailable: %s\n", reason);
+    s_water_benchmark_failed = 1;
+    water_benchmark_set_preset(BW_METAL_WATER_RETAIL);
+}
+
+static void water_benchmark_report(void)
+{
+    MetalWaterBenchmarkStats retail =
+        water_benchmark_stats(s_water_benchmark_samples[BW_METAL_WATER_RETAIL],
+                              s_water_benchmark_sample_count[BW_METAL_WATER_RETAIL]);
+    MetalWaterBenchmarkStats realistic =
+        water_benchmark_stats(s_water_benchmark_samples[BW_METAL_WATER_REALISTIC],
+                              s_water_benchmark_sample_count[BW_METAL_WATER_REALISTIC]);
+    double mean_delta = retail.mean_ms > 0.0
+                      ? (realistic.mean_ms / retail.mean_ms - 1.0) * 100.0 : 0.0;
+    double median_delta = retail.median_ms > 0.0
+                        ? (realistic.median_ms / retail.median_ms - 1.0) * 100.0 : 0.0;
+    double p95_delta = retail.p95_ms > 0.0
+                     ? (realistic.p95_ms / retail.p95_ms - 1.0) * 100.0 : 0.0;
+    fprintf(stderr,
+            "[GPU-METAL] water benchmark v1 "
+            "retail_samples=%zu retail_mean_ms=%.6f retail_median_ms=%.6f "
+            "retail_p95_ms=%.6f realistic_samples=%zu realistic_mean_ms=%.6f "
+            "realistic_median_ms=%.6f realistic_p95_ms=%.6f "
+            "mean_delta_percent=%+.6f median_delta_percent=%+.6f "
+            "p95_delta_percent=%+.6f\n",
+            s_water_benchmark_sample_count[BW_METAL_WATER_RETAIL],
+            retail.mean_ms, retail.median_ms, retail.p95_ms,
+            s_water_benchmark_sample_count[BW_METAL_WATER_REALISTIC],
+            realistic.mean_ms, realistic.median_ms, realistic.p95_ms,
+            mean_delta, median_delta, p95_delta);
+}
+
+static BwMetalWaterPreset water_benchmark_block_preset(unsigned block)
+{
+    static const BwMetalWaterPreset presets[METAL_WATER_BENCHMARK_BLOCKS] = {
+        BW_METAL_WATER_RETAIL, BW_METAL_WATER_REALISTIC,
+        BW_METAL_WATER_REALISTIC, BW_METAL_WATER_RETAIL,
+    };
+    return presets[block];
+}
+
+static void water_benchmark_frame(void)
+{
+    if (!s_water_benchmark_enabled || s_water_benchmark_complete ||
+        s_water_benchmark_failed)
+        goto reset;
+    if (!s_frame_supported_water_batches)
+        goto reset;
+    if (!s_frame_water_gpu_valid || s_frame_water_gpu_invalid ||
+        !s_frame_water_gpu_ns) {
+        water_benchmark_fail("Metal GPU timestamps were unavailable");
+        goto reset;
+    }
+    if (!s_water_benchmark_started) {
+        s_water_benchmark_started = 1;
+        s_water_benchmark_block = 0;
+        s_water_benchmark_frames = 0;
+        s_water_benchmark_sampling = 0;
+        water_benchmark_set_preset(water_benchmark_block_preset(0));
+        fprintf(stderr,
+                "[GPU-METAL] water benchmark started: same-scene ABBA, "
+                "%u warm-up and %u measured water frames per block\n",
+                METAL_WATER_BENCHMARK_WARMUP_FRAMES,
+                METAL_WATER_BENCHMARK_SAMPLE_FRAMES);
+    }
+    BwMetalWaterPreset expected =
+        water_benchmark_block_preset(s_water_benchmark_block);
+    if (s_active_water_preset != (unsigned)expected) {
+        water_benchmark_fail("the active preset changed during measurement");
+        goto reset;
+    }
+    if (s_water_benchmark_sampling) {
+        size_t index = s_water_benchmark_sample_count[expected];
+        if (index >= METAL_WATER_BENCHMARK_SAMPLES_PER_PRESET) {
+            water_benchmark_fail("the sample table overflowed");
+            goto reset;
+        }
+        s_water_benchmark_samples[expected][index] = s_frame_water_gpu_ns;
+        s_water_benchmark_sample_count[expected] = index + 1u;
+    }
+    s_water_benchmark_frames++;
+    unsigned target = s_water_benchmark_sampling
+                    ? METAL_WATER_BENCHMARK_SAMPLE_FRAMES
+                    : METAL_WATER_BENCHMARK_WARMUP_FRAMES;
+    if (s_water_benchmark_frames < target)
+        goto reset;
+    s_water_benchmark_frames = 0;
+    if (!s_water_benchmark_sampling) {
+        s_water_benchmark_sampling = 1;
+        goto reset;
+    }
+    s_water_benchmark_sampling = 0;
+    s_water_benchmark_block++;
+    if (s_water_benchmark_block == METAL_WATER_BENCHMARK_BLOCKS) {
+        if (s_water_benchmark_sample_count[BW_METAL_WATER_RETAIL] !=
+                METAL_WATER_BENCHMARK_SAMPLES_PER_PRESET ||
+            s_water_benchmark_sample_count[BW_METAL_WATER_REALISTIC] !=
+                METAL_WATER_BENCHMARK_SAMPLES_PER_PRESET) {
+            water_benchmark_fail("the ABBA sample counts are inconsistent");
+            goto reset;
+        }
+        water_benchmark_report();
+        s_water_benchmark_complete = 1;
+        water_benchmark_set_preset(BW_METAL_WATER_RETAIL);
+        goto reset;
+    }
+    water_benchmark_set_preset(
+        water_benchmark_block_preset(s_water_benchmark_block));
+
+reset:
+    s_frame_supported_water_batches = 0;
+    s_frame_water_gpu_ns = 0;
+    s_frame_water_gpu_valid = 0;
+    s_frame_water_gpu_invalid = 0;
 }
 
 static const char s_shader[] =
@@ -1364,7 +1544,23 @@ static int flush_commands(void)
         return 1;
     id<MTLCommandBuffer> command = s_pending_command;
     s_pending_command = nil;
+    int water_command = s_pending_supported_water;
+    s_pending_supported_water = 0;
     int result = finish_command(command);
+    if (result && water_command && s_water_benchmark_enabled &&
+        !s_water_benchmark_complete && !s_water_benchmark_failed) {
+        CFTimeInterval start = command.GPUStartTime;
+        CFTimeInterval end = command.GPUEndTime;
+        double duration = (end - start) * 1.0e9;
+        if (!isfinite(start) || !isfinite(end) || end <= start ||
+            !isfinite(duration) || duration <= 0.0 ||
+            duration > (double)(UINT64_MAX - s_frame_water_gpu_ns)) {
+            s_frame_water_gpu_invalid = 1;
+        } else {
+            s_frame_water_gpu_ns += (uint64_t)llround(duration);
+            s_frame_water_gpu_valid = 1;
+        }
+    }
     s_vertex_upload_offset = 0;
     return result;
 }
@@ -2793,12 +2989,13 @@ static void metal_draw_extended(const Nv2aSurface *surface, const BwXBatch *batc
             else if (mode == 4u)
                 passthrough_mask |= 1u << stage;
         }
-        int realistic_water = 0;
+        int supported_water =
+            realistic_water_supported(batch, stage_mask, cube_mask);
+        int realistic_water =
+            s_active_water_preset == BW_METAL_WATER_REALISTIC && supported_water;
         if (s_active_water_preset == BW_METAL_WATER_REALISTIC &&
             batch->draw_marker == BW_X_DRAW_MARKER_OCEAN) {
-            realistic_water =
-                realistic_water_supported(batch, stage_mask, cube_mask);
-            if (!realistic_water) {
+            if (!supported_water) {
                 s_realistic_water_fallback_batches++;
                 if (!s_realistic_water_fallback_reported) {
                     uint32_t program = batch->rc->stage_program;
@@ -2992,6 +3189,10 @@ static void metal_draw_extended(const Nv2aSurface *surface, const BwXBatch *batc
         [encoder setStencilReferenceValue:batch->state->stencil_ref & 0xFFu];
         set_draw_state(encoder, batch->state);
         [encoder drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:batch->count];
+        if (supported_water) {
+            s_frame_supported_water_batches++;
+            s_pending_supported_water = 1;
+        }
         s_dirty = 1;
         if (quincunx_approx && !s_quincunx_reported) {
             fprintf(stderr, "[GPU-METAL] quincunx approximation used: legacy Gaussian; "
@@ -3310,6 +3511,7 @@ static void metal_flip(void)
             metal_fail("flip occurred without a successful surface readback");
             return;
         }
+        water_benchmark_frame();
         apply_pending_render_settings();
         uint64_t now = xbox_HostNowNs();
         if (now && s_last_flip_ns && now > s_last_flip_ns &&
@@ -3547,6 +3749,25 @@ static int start_with_regions(void *guest_memory, size_t low_size,
         atomic_store_explicit(&s_requested_water_preset, preset, memory_order_release);
         s_active_water_preset = preset;
     }
+    {
+        const char *benchmark = getenv("BW_METAL_WATER_BENCHMARK");
+        s_water_benchmark_enabled = 0;
+        if (benchmark) {
+            if (strcmp(benchmark, "1"))
+                return metal_fail("BW_METAL_WATER_BENCHMARK must be 1 when set");
+            if (!bw_edition_at_least(BW_ED_REMASTERED))
+                return metal_fail("BW_METAL_WATER_BENCHMARK requires Remastered");
+            const char *diagnostic = getenv("BW_NATIVE_DIAGNOSTIC");
+            if (!diagnostic || strcmp(diagnostic, "1"))
+                return metal_fail("BW_METAL_WATER_BENCHMARK requires the private diagnostic runner");
+            const char *audit = getenv("BW_GPU_AUDIT");
+            if (!audit || strcmp(audit, "1"))
+                return metal_fail("BW_METAL_WATER_BENCHMARK requires BW_GPU_AUDIT=1");
+            if (s_active_water_preset != BW_METAL_WATER_RETAIL)
+                return metal_fail("BW_METAL_WATER_BENCHMARK requires the retail starting preset");
+            s_water_benchmark_enabled = 1;
+        }
+    }
     s_pending_command = nil;
     s_draw_encoder = nil;
     s_draw_color = nil;
@@ -3562,6 +3783,19 @@ static int start_with_regions(void *guest_memory, size_t low_size,
     s_realistic_water_fallback_batches = 0;
     s_realistic_water_reported = 0;
     s_realistic_water_fallback_reported = 0;
+    s_water_benchmark_started = 0;
+    s_water_benchmark_complete = 0;
+    s_water_benchmark_failed = 0;
+    s_water_benchmark_block = 0;
+    s_water_benchmark_frames = 0;
+    s_water_benchmark_sampling = 0;
+    memset(s_water_benchmark_samples, 0, sizeof s_water_benchmark_samples);
+    memset(s_water_benchmark_sample_count, 0, sizeof s_water_benchmark_sample_count);
+    s_frame_supported_water_batches = 0;
+    s_frame_water_gpu_ns = 0;
+    s_frame_water_gpu_valid = 0;
+    s_frame_water_gpu_invalid = 0;
+    s_pending_supported_water = 0;
     s_present_surface = nil;
     memset(&s_present_framebuffer, 0, sizeof s_present_framebuffer);
     s_surface_upload = nil;
@@ -3594,6 +3828,10 @@ static int start_with_regions(void *guest_memory, size_t low_size,
     if (s_quincunx_approx)
         fprintf(stderr, "[GPU-METAL] WARNING: BW_METAL_QUINCUNX_APPROX=1 uses a legacy "
                         "Gaussian approximation, not verified NV2A quincunx filtering\n");
+    if (s_water_benchmark_enabled)
+        fprintf(stderr,
+                "[GPU-METAL] diagnostic water benchmark armed; Retail remains active "
+                "until a supported marked ocean frame arrives\n");
     return 1;
 }
 
@@ -3649,6 +3887,16 @@ void bw_metal_backend_stop(void)
                 "%llu retail fallbacks\n",
                 (unsigned long long)s_realistic_water_batches,
                 (unsigned long long)s_realistic_water_fallback_batches);
+    if (s_registered && s_water_benchmark_enabled &&
+        !s_water_benchmark_complete && !s_water_benchmark_failed)
+        fprintf(stderr,
+                "[GPU-METAL] water benchmark incomplete: block %u, %s frame %u; "
+                "retail samples %zu, realistic samples %zu\n",
+                s_water_benchmark_block + 1u,
+                s_water_benchmark_sampling ? "measured" : "warm-up",
+                s_water_benchmark_frames,
+                s_water_benchmark_sample_count[BW_METAL_WATER_RETAIL],
+                s_water_benchmark_sample_count[BW_METAL_WATER_REALISTIC]);
     if (s_registered) {
         bw_backend_ext_unregister_if_current(&s_extended_backend);
         bw_backend_unregister_if_current(&s_backend);
@@ -3661,6 +3909,20 @@ void bw_metal_backend_stop(void)
     s_realistic_water_fallback_batches = 0;
     s_realistic_water_reported = 0;
     s_realistic_water_fallback_reported = 0;
+    s_water_benchmark_enabled = 0;
+    s_water_benchmark_started = 0;
+    s_water_benchmark_complete = 0;
+    s_water_benchmark_failed = 0;
+    s_water_benchmark_block = 0;
+    s_water_benchmark_frames = 0;
+    s_water_benchmark_sampling = 0;
+    memset(s_water_benchmark_samples, 0, sizeof s_water_benchmark_samples);
+    memset(s_water_benchmark_sample_count, 0, sizeof s_water_benchmark_sample_count);
+    s_frame_supported_water_batches = 0;
+    s_frame_water_gpu_ns = 0;
+    s_frame_water_gpu_valid = 0;
+    s_frame_water_gpu_invalid = 0;
+    s_pending_supported_water = 0;
     s_current_format = 0;
     s_framebuffer_callback = NULL;
     s_surface = nil;
@@ -3753,5 +4015,18 @@ void bw_metal_test_realistic_water_counts(uint64_t *enhanced, uint64_t *fallback
         *enhanced = s_realistic_water_batches;
     if (fallback)
         *fallback = s_realistic_water_fallback_batches;
+}
+
+void bw_metal_test_water_benchmark(int *complete, size_t *retail_samples,
+                                   size_t *realistic_samples)
+{
+    if (complete)
+        *complete = s_water_benchmark_complete;
+    if (retail_samples)
+        *retail_samples =
+            s_water_benchmark_sample_count[BW_METAL_WATER_RETAIL];
+    if (realistic_samples)
+        *realistic_samples =
+            s_water_benchmark_sample_count[BW_METAL_WATER_REALISTIC];
 }
 #endif

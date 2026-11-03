@@ -239,6 +239,17 @@ and discards inherited `BW_METAL_WATER` values. Realistic requires
 actually activated the optional shader and observed unsupported-pass fallback;
 a requested Realistic run with no activation fails closed.
 
+Use `--water-benchmark` only for the diagnostic same-scene GPU comparison. It
+requires `--edition remastered --water-preset retail --gpu-audit`; inherited
+`BW_METAL_WATER_BENCHMARK` is never propagated. The backend waits for
+supported marked-ocean rendering and runs four
+Retail/Realistic/Realistic/Retail blocks, each with 10 warm-up and 50 measured
+supported-water frames. It restores Retail afterward. The runner requires a
+strict machine-readable 100-Retail/100-Realistic summary from at least one
+boot and rejects malformed, duplicate, inconsistent, missing, or unexpected
+summaries. Reported GPU duration covers complete command buffers containing
+supported-ocean draws, not the water fragment shader in isolation.
+
 ### Isolated native diagnostic
 
 By default, the diagnostic runner performs one boot, not a playability test.

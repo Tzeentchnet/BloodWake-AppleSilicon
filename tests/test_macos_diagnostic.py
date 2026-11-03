@@ -101,6 +101,7 @@ class MacosDiagnosticTests(unittest.TestCase):
                                          "BW_SYNTHETIC_INPUT_DIAGNOSTIC": "1",
                                          "BW_SYNTHETIC_INPUT_SCRIPT": "unsafe",
                                          "BW_METAL_WATER": "realistic",
+                                         "BW_METAL_WATER_BENCHMARK": "1",
                                          "BW_HEADLESS_AUDIO_AUDIT": "1",
                                          "BW_NATIVE_DIAGNOSTIC": "unsafe",
                                          "RECOMP_AUDIO_HEADLESS_AUDIT": "1"}, clear=True):
@@ -116,6 +117,7 @@ class MacosDiagnosticTests(unittest.TestCase):
         self.assertNotIn("BW_HEADLESS_AUDIO_AUDIT", env)
         self.assertNotIn("RECOMP_AUDIO_HEADLESS_AUDIT", env)
         self.assertNotIn("BW_METAL_WATER", env)
+        self.assertNotIn("BW_METAL_WATER_BENCHMARK", env)
         self.assertEqual(env["BW_SETTINGS"], "none")
         self.assertEqual(env["BW_EDITION"], "original")
         self.assertEqual(env["BW_RUN_SECONDS"], "15")
@@ -145,6 +147,11 @@ class MacosDiagnosticTests(unittest.TestCase):
             self.root, self.prepared, 15, False, False, 4, 5,
             edition="remastered", water_preset="realistic")
         self.assertEqual(realistic["BW_METAL_WATER"], "realistic")
+        benchmark = diagnostic.diagnostic_env(
+            self.root, self.prepared, 15, False, True, 4, 5,
+            edition="remastered", water_benchmark=True)
+        self.assertEqual(benchmark["BW_METAL_WATER_BENCHMARK"], "1")
+        self.assertNotIn("BW_METAL_WATER", benchmark)
         audio_disabled = diagnostic.diagnostic_env(
             self.root, self.prepared, 15, False, False, 4, 5,
             disable_audio=True)
@@ -181,6 +188,19 @@ class MacosDiagnosticTests(unittest.TestCase):
                 self.root, self.prepared, 15, False, False, 4, 5,
                 keyboard_hook=True, synthetic_input=True, edition="remastered",
                 synthetic_input_script="remastered-boot-menu-to-gameplay-v1")
+        with self.assertRaisesRegex(ValueError, "requires the remastered edition"):
+            diagnostic.diagnostic_env(
+                self.root, self.prepared, 15, False, True, 4, 5,
+                water_benchmark=True)
+        with self.assertRaisesRegex(ValueError, "requires the retail water preset"):
+            diagnostic.diagnostic_env(
+                self.root, self.prepared, 15, False, True, 4, 5,
+                edition="remastered", water_preset="realistic",
+                water_benchmark=True)
+        with self.assertRaisesRegex(ValueError, "requires GPU audit"):
+            diagnostic.diagnostic_env(
+                self.root, self.prepared, 15, False, False, 4, 5,
+                edition="remastered", water_benchmark=True)
 
     def test_sandbox_preflight_fails_closed(self):
         failure = subprocess.CompletedProcess([], 1, "", "sandbox denied setup")
@@ -448,6 +468,71 @@ class MacosDiagnosticTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "did not activate"):
             diagnostic.report_realistic_water_coverage([log], "realistic")
 
+    @staticmethod
+    def water_benchmark_summary():
+        return (
+            b"[GPU-METAL] water benchmark v1 "
+            b"retail_samples=100 retail_mean_ms=1.000000 "
+            b"retail_median_ms=1.000000 retail_p95_ms=1.000000 "
+            b"realistic_samples=100 realistic_mean_ms=1.100000 "
+            b"realistic_median_ms=1.200000 realistic_p95_ms=1.300000 "
+            b"mean_delta_percent=+10.000000 "
+            b"median_delta_percent=+20.000000 "
+            b"p95_delta_percent=+30.000000"
+        )
+
+    def test_water_benchmark_summary_is_strict_and_reported(self):
+        log = self.root / "guest.log"
+        log.write_bytes(self.water_benchmark_summary() + b"\n")
+        benchmarks = diagnostic.read_water_benchmarks([log])
+        self.assertEqual(len(benchmarks), 1)
+        self.assertEqual(benchmarks[0]["retail_samples"], 100)
+        self.assertEqual(benchmarks[0]["delta"], (10.0, 20.0, 30.0))
+
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            diagnostic.report_water_benchmarks([log], True)
+        self.assertIn("1 completed boot(s), 200 measured", output.getvalue())
+        self.assertIn("mean +10.000%, median +20.000%, p95 +30.000%",
+                      output.getvalue())
+        with self.assertRaisesRegex(RuntimeError, "without --water-benchmark"):
+            diagnostic.report_water_benchmarks([log], False)
+
+    def test_water_benchmark_summary_rejects_invalid_evidence(self):
+        log = self.root / "guest.log"
+        valid = self.water_benchmark_summary()
+        invalid = (
+            diagnostic.WATER_BENCHMARK_PREFIX + b"malformed\n",
+            valid + b" trailing-data\n",
+            valid.replace(b"retail_samples=100", b"retail_samples=99") + b"\n",
+            valid.replace(b"retail_mean_ms=1.000000",
+                          b"retail_mean_ms=nan") + b"\n",
+            valid.replace(b"mean_delta_percent=+10.000000",
+                          b"mean_delta_percent=+11.000000") + b"\n",
+            valid + b"\n" + valid + b"\n",
+        )
+        for evidence in invalid:
+            with self.subTest(evidence=evidence):
+                log.write_bytes(evidence)
+                with self.assertRaisesRegex(
+                    RuntimeError, "water benchmark"
+                ):
+                    diagnostic.read_water_benchmarks([log])
+        log.write_bytes(b"no water benchmark\n")
+        with self.assertRaisesRegex(RuntimeError, "no boot completed"):
+            diagnostic.report_water_benchmarks([log], True)
+
+    def test_water_benchmark_coverage_accepts_controlled_activation(self):
+        log = self.root / "guest.log"
+        log.write_bytes(diagnostic.REALISTIC_WATER_ACTIVE + b"\n")
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            result = diagnostic.report_realistic_water_coverage(
+                [log], "retail", True
+            )
+        self.assertEqual(result, (1, 0))
+        self.assertIn("benchmark", output.getvalue())
+
     def main_arguments(self):
         executable = self.root / "binary"
         executable.write_bytes(b"synthetic executable")
@@ -488,6 +573,27 @@ class MacosDiagnosticTests(unittest.TestCase):
             diagnostic.main(arguments)
         self.assertEqual(failure.exception.code, 2)
         self.assertIn("requires --edition remastered", errors.getvalue())
+
+    def test_water_benchmark_cli_requires_controlled_mode(self):
+        arguments = self.main_arguments()
+        cases = (
+            (["--water-benchmark"],
+             "--water-benchmark requires --edition remastered"),
+            (["--water-benchmark", "--edition", "remastered"],
+             "--water-benchmark requires --gpu-audit"),
+            (["--water-benchmark", "--edition", "remastered", "--gpu-audit",
+              "--water-preset", "realistic"],
+             "--water-benchmark requires --water-preset retail"),
+        )
+        for extra, expected in cases:
+            errors = io.StringIO()
+            with self.subTest(extra=extra), \
+                 mock.patch.object(diagnostic.sys, "platform", "darwin"), \
+                 contextlib.redirect_stderr(errors), \
+                 self.assertRaises(SystemExit) as failure:
+                diagnostic.main(arguments + extra)
+            self.assertEqual(failure.exception.code, 2)
+            self.assertIn(expected, errors.getvalue())
 
     def test_script_cli_requires_hook_remastered_and_known_name(self):
         script = "remastered-boot-menu-to-gameplay-v1"
@@ -587,6 +693,7 @@ class MacosDiagnosticTests(unittest.TestCase):
             self.assertEqual(kwargs["edition"], "original")
             self.assertFalse(kwargs["disable_audio"])
             self.assertFalse(kwargs["audio_audit"])
+            self.assertFalse(kwargs["water_benchmark"])
             return 0
 
         output = io.StringIO()
@@ -603,6 +710,41 @@ class MacosDiagnosticTests(unittest.TestCase):
         self.assertIn("Diagnostic audio: enabled", output.getvalue())
         self.assertIn("0 received, 0 batch scopes, 0 rejected", output.getvalue())
         self.assertIn("zero observed ocean coverage", output.getvalue())
+
+    def test_water_benchmark_cli_propagates_and_reports(self):
+        arguments = self.main_arguments() + [
+            "--water-benchmark", "--edition", "remastered", "--gpu-audit",
+        ]
+
+        def guest(_executable, output, _game_dir, _profile, _seconds,
+                  _quincunx, _audit, **kwargs):
+            self.assertTrue(kwargs["water_benchmark"])
+            self.assertEqual(kwargs["water_preset"], "retail")
+            (output / "guest.log").write_bytes(
+                b"[GPU] ocean draw markers: 100 received, 100 batch scopes, "
+                b"0 rejected\n" +
+                diagnostic.REALISTIC_WATER_ACTIVE + b"\n" +
+                self.water_benchmark_summary() + b"\n"
+            )
+            (output / "gpu-audit.txt").write_bytes(
+                diagnostic.OCEAN_FINGERPRINT_HEADER + b"\n"
+                b"  batches 0, hashes 0/32, table-overflow batches 0, "
+                b"within-scope mismatches 0\n"
+            )
+            return 0
+
+        output = io.StringIO()
+        with mock.patch.object(diagnostic.sys, "platform", "darwin"), \
+             mock.patch.object(diagnostic, "ROOT", self.repository), \
+             mock.patch.object(diagnostic, "verify_prepared"), \
+             mock.patch.object(diagnostic, "toolkit_revision", return_value="pinned"), \
+             mock.patch.object(diagnostic, "verify_sandbox"), \
+             mock.patch.object(diagnostic, "run_guest", side_effect=guest), \
+             contextlib.redirect_stdout(output):
+            result = diagnostic.main(arguments)
+        self.assertEqual(result, 0)
+        self.assertIn("Retail/Realistic/Realistic/Retail", output.getvalue())
+        self.assertIn("Water benchmark: 1 completed boot(s)", output.getvalue())
 
     def test_cli_audio_disable_is_explicit_and_propagated(self):
         arguments = self.main_arguments() + ["--disable-audio"]

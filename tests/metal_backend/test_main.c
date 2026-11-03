@@ -179,6 +179,8 @@ extern unsigned bw_metal_test_sampler_anisotropy(int min_linear, unsigned mip_mo
 extern void bw_metal_test_apply_pending_render_settings(void);
 extern unsigned bw_metal_test_active_water_preset(void);
 extern void bw_metal_test_realistic_water_counts(uint64_t *enhanced, uint64_t *fallback);
+extern void bw_metal_test_water_benchmark(int *complete, size_t *retail_samples,
+                                          size_t *realistic_samples);
 extern void bw_ocean_marker_test_counts(unsigned long *received, unsigned long *scopes,
                                         unsigned long *rejected);
 extern uint64_t bw_ocean_fingerprint_test_hash(const BwXBatch *batch,
@@ -242,6 +244,46 @@ static void water_preset_original_test(void)
     CHECK(bw_metal_test_active_water_preset() == BW_METAL_WATER_RETAIL);
     CHECK(!bw_metal_backend_set_water_preset(BW_METAL_WATER_REALISTIC));
     CHECK(bw_metal_backend_water_preset() == BW_METAL_WATER_RETAIL);
+}
+
+static void water_benchmark_validation_test(void)
+{
+    struct {
+        const char *value;
+        bw_edition_t edition;
+        int diagnostic, audit, realistic;
+        const char *error;
+    } cases[] = {
+        {"yes", BW_ED_REMASTERED, 1, 1, 0, "must be 1"},
+        {"1", BW_ED_ORIGINAL, 1, 1, 0, "requires Remastered"},
+        {"1", BW_ED_REMASTERED, 0, 1, 0, "private diagnostic runner"},
+        {"1", BW_ED_REMASTERED, 1, 0, 0, "requires BW_GPU_AUDIT=1"},
+        {"1", BW_ED_REMASTERED, 1, 1, 1, "retail starting preset"},
+    };
+    for (size_t i = 0; i < sizeof cases / sizeof cases[0]; i++) {
+        s_edition = cases[i].edition;
+        setenv("BW_METAL_WATER_BENCHMARK", cases[i].value, 1);
+        if (cases[i].diagnostic)
+            setenv("BW_NATIVE_DIAGNOSTIC", "1", 1);
+        else
+            unsetenv("BW_NATIVE_DIAGNOSTIC");
+        if (cases[i].audit)
+            setenv("BW_GPU_AUDIT", "1", 1);
+        else
+            unsetenv("BW_GPU_AUDIT");
+        if (cases[i].realistic)
+            setenv("BW_METAL_WATER", "realistic", 1);
+        else
+            unsetenv("BW_METAL_WATER");
+        CHECK(!bw_metal_backend_start_for_test(s_mem, sizeof s_mem));
+        CHECK(bw_metal_backend_error() &&
+              strstr(bw_metal_backend_error(), cases[i].error));
+        bw_metal_backend_stop();
+    }
+    unsetenv("BW_METAL_WATER_BENCHMARK");
+    unsetenv("BW_NATIVE_DIAGNOSTIC");
+    unsetenv("BW_GPU_AUDIT");
+    unsetenv("BW_METAL_WATER");
 }
 
 static void method_float(uint32_t method_number, float value)
@@ -3237,6 +3279,29 @@ static void realistic_water_fallback_test(void)
     CHECK(enhanced == 0 && fallback == 1);
 }
 
+static void water_benchmark_test(void)
+{
+    int complete = 0;
+    size_t retail_samples = 0, realistic_samples = 0;
+    setup_realistic_water_scene();
+    CHECK(!bw_metal_backend_set_water_preset(BW_METAL_WATER_REALISTIC));
+    CHECK(bw_metal_backend_water_preset() == BW_METAL_WATER_RETAIL);
+    for (unsigned frame = 0; frame < 20u && !complete; frame++) {
+        clear(0xFF102030u);
+        method(0x0100, BW_DRAW_MARKER_OCEAN_DRAW);
+        draw(3);
+        flip();
+        expect_no_error();
+        bw_metal_test_water_benchmark(&complete, &retail_samples,
+                                      &realistic_samples);
+    }
+    CHECK(complete);
+    CHECK(retail_samples == 4u);
+    CHECK(realistic_samples == 4u);
+    CHECK(bw_metal_backend_water_preset() == BW_METAL_WATER_RETAIL);
+    CHECK(bw_metal_test_active_water_preset() == BW_METAL_WATER_RETAIL);
+}
+
 static void extended_swizzled_test(void)
 {
     const uint32_t formats[3] = {0x05u, 0x06u, 0x07u};
@@ -5687,6 +5752,9 @@ int main(int argc, char **argv)
     unsetenv("BW_VFX");
     unsetenv("BW_VFX_AF");
     unsetenv("BW_METAL_WATER");
+    unsetenv("BW_METAL_WATER_BENCHMARK");
+    unsetenv("BW_NATIVE_DIAGNOSTIC");
+    unsetenv("BW_GPU_AUDIT");
     unsetenv("RECOMP_WINDOW_SCALE");
     if (!strcmp(argv[1], "render-scale-auto")) {
         setenv("BW_METAL_RENDER_SCALE", "auto", 1);
@@ -5710,6 +5778,11 @@ int main(int argc, char **argv)
         s_edition = BW_ED_REMASTERED;
         g_bw_fix_on[BW_FIX_VFX_ANISO] = 1;
         setenv("BW_VFX_AF", "3", 1);
+    } else if (!strcmp(argv[1], "water-benchmark")) {
+        s_edition = BW_ED_REMASTERED;
+        setenv("BW_METAL_WATER_BENCHMARK", "1", 1);
+        setenv("BW_NATIVE_DIAGNOSTIC", "1", 1);
+        setenv("BW_GPU_AUDIT", "1", 1);
     } else if (!strcmp(argv[1], "water-preset") ||
                !strcmp(argv[1], "ocean-realistic") ||
                !strcmp(argv[1], "ocean-realistic-fallback")) {
@@ -5734,6 +5807,10 @@ int main(int argc, char **argv)
     }
     if (!strcmp(argv[1], "production-memory")) {
         production_memory_test();
+        return s_failed ? 1 : 0;
+    }
+    if (!strcmp(argv[1], "water-benchmark-validation")) {
+        water_benchmark_validation_test();
         return s_failed ? 1 : 0;
     }
     if (!strcmp(argv[1], "invalid-base")) {
@@ -5783,6 +5860,8 @@ int main(int argc, char **argv)
         anisotropy_test(8);
     else if (!strcmp(argv[1], "anisotropy-original"))
         anisotropy_test(1);
+    else if (!strcmp(argv[1], "water-benchmark"))
+        water_benchmark_test();
     else if (!strcmp(argv[1], "water-preset"))
         water_preset_test();
     else if (!strcmp(argv[1], "water-preset-original"))

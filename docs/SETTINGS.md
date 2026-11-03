@@ -189,8 +189,9 @@ and pipeline-creation failure use the retail shader. The optional path
 reweights the game's existing reflection and atmosphere with a restrained
 Fresnel response from the existing water normal/view basis, preserves retail
 alpha, and adds no replacement textures, refraction, depth absorption, or
-shoreline foam. Representative hands-on visual and performance comparison is
-still required.
+shoreline foam. A same-scene diagnostic benchmark is recorded in
+[METAL_QUALITY.md](METAL_QUALITY.md); representative hands-on visual
+comparison is still required, so this remains experimental and default-off.
 
 ### Detail distance
 

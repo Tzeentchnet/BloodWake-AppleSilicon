@@ -43,9 +43,14 @@ This is still a development build:
   for supported marked ocean batches, preserves retail alpha, and falls back
   per batch; Retail remains the exact default for every unmarked or
   unsupported draw. A private four-boot scripted run activated the preset on
-  real ocean batches with no observed fallback or Metal error. Hands-on
-  visual comparison and controlled performance measurements are still
-  required. A fail-closed MSAA evidence tool records memory, timing,
+  real ocean batches with no observed fallback or Metal error. A later
+  diagnostic-only same-scene ABBA capture completed two independent
+  100-Retail/100-Realistic GPU samples. Realistic increased water-containing
+  command-buffer mean time by 4.548%-4.822%, median by 1.865%-3.570%, and p95
+  by 7.787%-10.092% in that exercised scene. This is not isolated shader cost
+  or a visual-quality judgment; hands-on representative A/B review is still
+  required, so the preset remains experimental and default-off. A fail-closed
+  MSAA evidence tool records memory, timing,
   correctness, and visual-review gates. This Apple M5 reports
   2x/4x/8x capability and passes the standalone color/depth/resolve smoke
   path, but Metal MSAA remains unsupported.
@@ -64,12 +69,12 @@ This is still a development build:
   audible.
 - USB gamepads, physical-controller support, and broad mission, save, FMV,
   and edition coverage are incomplete.
-- Current regression results include 320/320 Metal backend tests, all 62
+- Current regression results include 322/322 Metal backend tests, all 62
   presenter CTest entries (including the real-window AppKit case in the
   current WindowServer session), 35/35 MMIO host tests, 8/8 normal and ASan/UBSan
   macOS host tests, 11/11 input integration tests, 6/6 APU/audio tests,
   13/13 support tests, and 100/100 concurrent APU restore stress runs. The
-  complete Python suite passes 112/112.
+  complete Python suite passes 117/117.
 - A post-roadmap 30-second isolated retail boot reached its configured limit
   with direct Metal at 2560x1920, native audio/DSP activity, 1,490 audited
   flips, 4,503 draws, 1,252,771 vertices, unchanged input trees/executable,
@@ -163,8 +168,8 @@ are in [BUILDING.md](docs/BUILDING.md).
 - [UPSTREAM_ISSUES.md](docs/UPSTREAM_ISSUES.md) - portability findings
 - [NATIVE_FEATURE_ROADMAP.md](docs/NATIVE_FEATURE_ROADMAP.md) - F1, mouse,
   modding, quality, upstream, and water work plan
-- [METAL_QUALITY.md](docs/METAL_QUALITY.md) - LOD/filtering behavior and the
-  Metal MSAA go/no-go gate
+- [METAL_QUALITY.md](docs/METAL_QUALITY.md) - LOD/filtering behavior, the
+  realistic-water GPU benchmark, and the Metal MSAA go/no-go gate
 - [GPU_CAPTURE.md](docs/GPU_CAPTURE.md) - synthetic capture fixture
 - [GUEST_MEMORY_INVENTORY.md](docs/GUEST_MEMORY_INVENTORY.md) - memory-access
   inventory

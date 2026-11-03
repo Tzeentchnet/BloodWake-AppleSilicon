@@ -1,9 +1,9 @@
 # Apple Silicon handoff
 
-Status updated 2026-11-02 after the native F1 settings integration, gameplay
+Status updated 2026-11-03 after the native F1 settings integration, gameplay
 mouse input, live LOD, Metal anisotropic filtering, optional realistic-water
-pipeline, upstream parity audit, deterministic menu-to-gameplay diagnostics,
-and bounded audio validation.
+pipeline and same-scene GPU benchmark, upstream parity audit, deterministic
+menu-to-gameplay diagnostics, and bounded audio validation.
 
 ## Current status
 
@@ -100,6 +100,18 @@ overflow/mismatch, realistic-pipeline failure, or Metal runtime error was
 observed. This proves runtime activation, not improved visual quality or
 acceptable performance. All private evidence remains uncommitted.
 
+A subsequent diagnostic-only run started in Retail and measured four
+Retail/Realistic/Realistic/Retail blocks after reaching supported marked-ocean
+rendering. Each block discarded 10 warm-up frames and recorded 50 frames. Two
+of four boots independently completed 100 Retail and 100 Realistic samples.
+Across those completions, Realistic increased water-containing Metal
+command-buffer GPU duration by 4.548%-4.822% mean, 1.865%-3.570% median, and
+7.787%-10.092% p95. The four-boot aggregate recorded 38,330 markers, 467 clean
+scopes, and 604 fingerprinted batches across 17 aggregate hashes, with no
+marker rejection, fingerprint overflow/mismatch, unsupported-pass fallback,
+or Metal runtime error. These are whole command-buffer timings in the
+exercised scene, not isolated shader cost or a visual-quality approval.
+
 ## Required opt-ins
 
 The currently verified path requires:
@@ -115,6 +127,11 @@ Realistic water is also optional. Select it in Remastered through F1 or set
 `BW_METAL_WATER=realistic`; `retail` is the strict default. Other values and
 Realistic in Original are rejected. The diagnostic runner exposes the same
 choice through `--water-preset`.
+
+The runner's `--water-benchmark` mode is diagnostic-only and additionally
+requires Remastered, `--water-preset retail`, and `--gpu-audit`. It temporarily
+owns the active preset, restores Retail on completion or failure, and rejects
+missing or malformed aggregate results.
 
 The quincunx path is a narrowly scoped legacy Gaussian approximation, not
 verified NV2A filtering. Unsupported renderer states continue to fail
@@ -136,8 +153,8 @@ rejected even when set to `0`.
   instructions.
 - [NATIVE_FEATURE_ROADMAP.md](NATIVE_FEATURE_ROADMAP.md) records the F1,
   mouse-menu, mod-editor, quality, upstream, and realistic-water work plan.
-- [METAL_QUALITY.md](METAL_QUALITY.md) records native LOD/filtering behavior
-  and the current MSAA no-go gate.
+- [METAL_QUALITY.md](METAL_QUALITY.md) records native LOD/filtering behavior,
+  the realistic-water GPU benchmark, and the current MSAA no-go gate.
 - [UPSTREAM_BASELINE.md](UPSTREAM_BASELINE.md) records the 42-fix baseline and
   the classified DX11-only upstream commits.
 
@@ -163,8 +180,10 @@ rejected even when set to `0`.
 - Ocean draws carry an explicit, false-positive-safe game-to-executor marker,
   and the default-off realistic preset is implemented and runtime-activated.
   Retail water remains the exact default/fallback. Representative calm/storm,
-  lighting, shore, split-screen, reflection, and wake A/B review plus GPU
-  timing remain open, so the preset is still experimental.
+  lighting, shore, split-screen, reflection, and wake A/B review remains open.
+  The current automated scene has a completed same-scene GPU benchmark, but no
+  promotion threshold or visual conclusion, so the preset is still
+  experimental.
 - Physical controllers, guest USB, audible/sustained native audio, saves, FMV,
   other editions, and broad mission coverage are not validated Apple Silicon
   features.
@@ -211,8 +230,8 @@ rejected even when set to `0`.
   private.
 - Compare Retail and Realistic water across calm/storm, day/night, shore,
   split-screen, reflection, and wake scenes. Record fixed private crops and
-  controlled GPU timing before tuning the shader or changing its
-  experimental/default-off status.
+  repeat the controlled GPU benchmark after any shader tuning before changing
+  its experimental/default-off status.
 - Run the MSAA matrix in [METAL_QUALITY.md](METAL_QUALITY.md); keep the setting
   unavailable if the measured benefit does not justify it.
 

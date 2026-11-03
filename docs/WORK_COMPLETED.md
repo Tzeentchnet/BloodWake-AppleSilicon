@@ -176,6 +176,12 @@ test coverage are in [VALIDATION.md](VALIDATION.md).
 - Added strict diagnostic `--water-preset retail|realistic` selection,
   Remastered gating, inherited-setting removal, and fail-closed reporting when
   a requested realistic run never activates the shader.
+- Added a diagnostic-only same-scene water benchmark with strict private-runner
+  authorization, Retail/Realistic/Realistic/Retail ordering, supported-frame
+  warm-up and sampling, completed-command-buffer GPU timing, Retail restore,
+  and fail-closed aggregate parsing. Two private boots completed independent
+  100-Retail/100-Realistic samples; Realistic command-buffer deltas were
+  +4.548%-+4.822% mean, +1.865%-+3.570% median, and +7.787%-+10.092% p95.
 - Added an offline Blood Wake upstream parity manifest/checker covering the
   42-entry fix registry, settings fix references, native source wiring, branch
   divergence, and the two classified DX11 warm-up commits.
@@ -222,7 +228,9 @@ test coverage are in [VALIDATION.md](VALIDATION.md).
   definition fields/ownership. The optional realistic-water shader is
   implemented and runtime-activated, but remains experimental and default-off
   until representative pass coverage, hands-on Retail/Realistic visual
-  comparisons, and controlled performance measurements are complete.
+  comparisons, and a project acceptance decision are complete. Same-scene GPU
+  timing is recorded for the current automated scene; it is whole
+  water-containing command-buffer cost, not isolated shader timing.
 - Metal MSAA remains deliberately unsupported until the controlled
   visual/GPU-time/memory gate in `METAL_QUALITY.md` justifies it.
 - Unsupported states continue to fail explicitly instead of being guessed or
