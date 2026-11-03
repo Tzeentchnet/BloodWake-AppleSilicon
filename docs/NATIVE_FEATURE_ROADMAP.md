@@ -17,8 +17,8 @@ locally exported definition data remain private and must not be committed.
 | Adjustable LOD | Implemented | Validate 1x-8x visually in both editions; Original remains fixed at 1x. |
 | Metal filtering | Implemented | Collect oblique water/cliff comparisons and GPU timings for 1x/4x/8x/16x. |
 | Metal MSAA | No-go; synthetic smoke complete | Apple M5 passes 2x/4x/8x synthetic color/depth/resolve, but game-scene attachment ownership and the controlled visual/GPU-time/memory matrix are still required. |
-| Upstream fixes | Verified | Re-run the offline parity checker whenever upstream changes. |
-| Realistic water | Optional preset implemented; runtime activation and same-scene GPU benchmark complete | Compare Retail/Realistic across calm/storm, lighting, shore, split-screen, reflection, and wake scenes before tuning or promoting it. |
+| Upstream fixes | Registry/source parity verified; one Metal water-backend gap identified | Re-run the offline parity checker whenever upstream changes, and port or explicitly disable the DX11-only distant-water-line fix on Metal. |
+| Realistic water | Optional preset, runtime activation, GPU benchmark, and system research complete; hands-on result is near-Retail | Mark and isolate all three ocean passes, build same-execution A/B capture, then decide whether pass-1 or pass-2 shader work is worthwhile. |
 
 ## F1 runtime settings
 
@@ -141,6 +141,31 @@ checks, or visual review are missing. A standalone real-Metal smoke target now
 passes 2x/4x/8x synthetic color, depth/stencil, resolve, and readback on the
 Apple M5, but it is deliberately separate from the game renderer.
 
+## Water-system research
+
+[WATER_RENDERING.md](WATER_RENDERING.md) is now the authoritative map of the
+water path. It separates the title's simulation and ocean geometry from the
+three Retail material passes, traces the versioned lit-pass marker into Metal,
+inventories verified and unavailable shader inputs, and defines the
+mechanics-preservation boundary.
+
+The research explains the current near-Retail result: the optional fragment
+entry applies a deliberately small RGB-only treatment to the marked lit/base
+pass, while the later cube-reflection and wake-foam passes remain Retail. It
+also identifies a parity gap: `OCEAN_REFLECT_SINGLE` is present in the shared
+fix registry but its implementation is currently DX11-only.
+
+The next safe water work is:
+
+1. explicitly mark all three ocean passes at validated title boundaries;
+2. replace separate-run comparisons with same-execution aligned A/B capture;
+3. port or explicitly report the distant-water-line fix as unsupported on
+   Metal;
+4. isolate pass 1 and pass 2 before tuning either shader; and
+5. keep scene color, sampled depth, refraction, absorption, shoreline foam,
+   and replacement art out of scope until a new resource/material contract is
+   designed and justified.
+
 ## Upstream parity
 
 The local registry is byte-identical to recorded upstream commit `e631edd` and
@@ -200,8 +225,9 @@ pipeline.
 
 The optional shader decodes the existing interpolated water normal and
 view-direction basis, applies a restrained Schlick-style Fresnel weight to the
-existing reflection and fog-atmosphere colors, and preserves the retail alpha.
-It adds no replacement assets, depth reads, refraction, absorption, foam, or
+stage-0 water sample and fog-atmosphere colors, and preserves the Retail
+alpha. The later Retail cube-reflection and wake-foam passes are unchanged. It
+adds no replacement assets, depth reads, refraction, absorption, foam, or
 shoreline logic. The setting is deliberately absent from quality presets.
 
 Synthetic coverage proves default Retail behavior, frame-boundary activation,

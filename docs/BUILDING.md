@@ -70,7 +70,9 @@ Remastered macOS Metal also accepts `BW_METAL_WATER=retail|realistic`.
 `realistic` is an experimental, frame-boundary preset selected only for
 explicitly marked supported ocean batches; all other draws stay Retail.
 Invalid values and Realistic in Original fail explicitly. The same choice is
-available in F1 as **Water rendering**.
+available in F1 as **Water rendering**. Its pass coverage, verified inputs,
+mechanics boundary, and evidence limits are documented in
+[WATER_RENDERING.md](WATER_RENDERING.md).
 
 For a complete build from your disc, use a **new** install directory:
 

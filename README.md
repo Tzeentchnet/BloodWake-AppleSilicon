@@ -48,9 +48,14 @@ This is still a development build:
   100-Retail/100-Realistic GPU samples. Realistic increased water-containing
   command-buffer mean time by 4.548%-4.822%, median by 1.865%-3.570%, and p95
   by 7.787%-10.092% in that exercised scene. This is not isolated shader cost
-  or a visual-quality judgment; hands-on representative A/B review is still
-  required, so the preset remains experimental and default-off. A fail-closed
-  MSAA evidence tool records memory, timing,
+  or a visual-quality judgment. Initial hands-on review found the treatment
+  almost identical to Retail, and separate bounded captures were not
+  sufficiently phase-aligned for pixel A/B evidence. The dedicated
+  [water-rendering dossier](docs/WATER_RENDERING.md) explains why the current
+  pass-1-only treatment is subtle, maps the title's later Retail reflection
+  and foam passes, and defines mechanics-safe next steps. The preset remains
+  experimental and default-off. A fail-closed MSAA evidence tool records
+  memory, timing,
   correctness, and visual-review gates. This Apple M5 reports
   2x/4x/8x capability and passes the standalone color/depth/resolve smoke
   path, but Metal MSAA remains unsupported.
@@ -170,6 +175,9 @@ are in [BUILDING.md](docs/BUILDING.md).
   modding, quality, upstream, and water work plan
 - [METAL_QUALITY.md](docs/METAL_QUALITY.md) - LOD/filtering behavior, the
   realistic-water GPU benchmark, and the Metal MSAA go/no-go gate
+- [WATER_RENDERING.md](docs/WATER_RENDERING.md) - Blood Wake water simulation
+  boundaries, three-pass Retail renderer, Metal shader inputs, and safe future
+  work
 - [GPU_CAPTURE.md](docs/GPU_CAPTURE.md) - synthetic capture fixture
 - [GUEST_MEMORY_INVENTORY.md](docs/GUEST_MEMORY_INVENTORY.md) - memory-access
   inventory

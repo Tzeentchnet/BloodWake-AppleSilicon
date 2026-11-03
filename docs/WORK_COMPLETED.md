@@ -1,6 +1,6 @@
 # Apple Silicon work completed
 
-Updated 2026-11-02. This document records implemented Apple Silicon work.
+Updated 2026-11-03. This document records implemented Apple Silicon work.
 Current status and remaining work are in
 [APPLE_SILICON_HANDOFF.md](APPLE_SILICON_HANDOFF.md); measured results and
 test coverage are in [VALIDATION.md](VALIDATION.md).
@@ -102,15 +102,22 @@ test coverage are in [VALIDATION.md](VALIDATION.md).
   to explicitly marked batches with the validated water stage shape, preserves
   retail alpha, and falls back per pass. Unmarked draws and Retail continue to
   use the existing fragment entry.
-- Added restrained Fresnel reflection shaping from the game's existing
-  interpolated water normal/view basis, stage-0 reflection input, fog
-  atmosphere, and visibility. It adds no replacement textures, refraction,
-  absorption, foam, shoreline logic, or depth dependency.
+- Added restrained Fresnel shaping from the game's existing interpolated water
+  normal/view basis, stage-0 water sample, fog atmosphere, and visibility.
+  The later Retail cube-reflection and wake-foam passes remain unchanged. It
+  adds no replacement textures, refraction, absorption, foam, shoreline
+  logic, or depth dependency.
 - Added synthetic coverage for default Retail equivalence, marked-only
   enhancement, unmarked recovery, unsupported-state fallback, frame-boundary
   activation, strict environment parsing, and Original rejection. A private
   four-boot run activated the shader on real marked ocean batches with no
   observed fallback or Metal error.
+- Added the source-grounded
+  [water-rendering dossier](WATER_RENDERING.md), separating simulation,
+  render geometry, the three Retail ocean passes, the lit-pass marker, Metal
+  shader inputs, optional-preset limits, mechanics-safe opportunities, and
+  open evidence questions. It records that the current treatment is
+  intentionally subtle and that the distant-water-line fix remains DX11-only.
 
 ## Renderer performance
 

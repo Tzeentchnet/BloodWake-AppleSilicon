@@ -183,15 +183,18 @@ Applies to: Remastered on macOS Metal. Default: **Retail (original shader)**.
 | Realistic (experimental) | `env:BW_METAL_WATER=realistic` |
 
 The realistic choice takes effect at an executor flip boundary. It uses a
-separate fragment pipeline only for explicitly marked ocean batches with the
-validated stage shape. Unmarked draws, unsupported marked passes, Original,
-and pipeline-creation failure use the retail shader. The optional path
-reweights the game's existing reflection and atmosphere with a restrained
-Fresnel response from the existing water normal/view basis, preserves retail
-alpha, and adds no replacement textures, refraction, depth absorption, or
+separate fragment pipeline only for explicitly marked lit/base ocean batches
+with the validated stage shape. Unmarked draws, unsupported marked passes,
+Original, and pipeline-creation failure use the Retail shader. The optional
+path reweights the pass's stage-0 water sample and atmosphere with a restrained
+Fresnel response from the existing water normal/view basis, preserves Retail
+alpha, and leaves the title's later cube-reflection and wake-foam passes
+unchanged. It adds no replacement textures, refraction, depth absorption, or
 shoreline foam. A same-scene diagnostic benchmark is recorded in
-[METAL_QUALITY.md](METAL_QUALITY.md); representative hands-on visual
-comparison is still required, so this remains experimental and default-off.
+[METAL_QUALITY.md](METAL_QUALITY.md). Initial hands-on review found the result
+almost identical to Retail, so it remains experimental and default-off. The
+complete system and shader boundary is in
+[WATER_RENDERING.md](WATER_RENDERING.md).
 
 ### Detail distance
 
@@ -587,6 +590,11 @@ Applies to: Remastered. Default: **On**.
 |---|---|
 | On (default) | `fix:+OCEAN_REFLECT_SINGLE` |
 | As shipped | `fix:-OCEAN_REFLECT_SINGLE` |
+
+Current Apple Silicon limitation: the private-depth implementation of this
+fix exists only in the DX11 backend. The registry choice is present on macOS,
+but Metal does not yet apply the fix. This parity gap is tracked in
+[WATER_RENDERING.md](WATER_RENDERING.md).
 
 ## Controls
 

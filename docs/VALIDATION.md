@@ -265,6 +265,21 @@ the same buffers and do not claim isolated shader cost, a performance
 acceptance threshold, representative scene coverage, or improved visual
 quality. Private logs, hashes, saves, and retail data remain uncommitted.
 
+### Water visual-review boundary
+
+The user's hands-on assessment is that the current optional treatment looks
+almost identical to Retail. Separate bounded Retail and Realistic runs each
+completed four private captures at fixed supported-water offsets, but camera
+and scene phase drift between processes prevents pixel alignment. Those images
+are excluded as formal A/B evidence and remain private.
+
+This near-Retail result is consistent with the implementation rather than
+proof of full-scene equivalence: the optional shader changes only the
+explicitly marked lit/base pass, with deliberately low strength, while the
+later Retail cube-reflection and wake-foam passes remain unchanged. Future
+visual evidence must use same-execution aligned pairs and isolate all three
+passes. See [WATER_RENDERING.md](WATER_RENDERING.md).
+
 ## Integrity and privacy
 
 - The coordinated diagnostic verified all 37 generated files against the

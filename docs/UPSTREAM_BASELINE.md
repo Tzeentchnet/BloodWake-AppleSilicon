@@ -45,6 +45,12 @@ evidence and Metal pipeline-cache design. The generic rule that an optional
 cache/install-record rewrite must not invalidate a successful installation
 should be retained by any future native installer.
 
+Registry/source parity is not the same as backend behavioral parity. The
+`OCEAN_REFLECT_SINGLE` entry is present and therefore covered by the 42-fix
+registry check, but its private-depth implementation currently exists only in
+the DX11 backend. The Metal gap and safe porting boundary are documented in
+[WATER_RENDERING.md](WATER_RENDERING.md).
+
 When upstream changes, update the manifest only after reviewing the commit
 range, matching every registry/settings/build-wiring change, running the
 parity and support-port tests, and documenting any deliberately unported

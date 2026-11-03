@@ -22,6 +22,11 @@ existing Off, 4x, 8x, and 16x choices.
 
 ## Optional realistic water
 
+The authoritative system and shader research is in
+[WATER_RENDERING.md](WATER_RENDERING.md). In particular, the current marker
+and optional shader cover the lit/base ocean pass; the later Retail
+dot-product cube-reflection and wake-foam passes remain unchanged.
+
 `graphics.water_rendering` is a Remastered-only macOS Metal frame-boundary
 setting with `retail` and `realistic` choices. Retail is the default and keeps
 the existing fragment entry and output path. `BW_METAL_WATER` strictly accepts
@@ -29,17 +34,18 @@ the same two values; invalid input fails startup, and Realistic is rejected in
 Original.
 
 Realistic uses a distinct pipeline key and fragment entry. Selection requires
-the explicit in-stream ocean marker, a valid stage-0 water/reflection texture,
-and the validated passthrough normal/view basis. Every unmarked draw and every
+the explicit in-stream ocean marker, a valid stage-0 water sample, and the
+validated passthrough normal/view basis. Every unmarked draw and every
 unsupported marked state uses Retail. Pipeline creation failure is reported,
 returns the active/requested setting to Retail, and retries the retail
 pipeline instead of dropping the draw.
 
 The shader uses only existing game inputs. It decodes the interpolated water
 normal and view basis, computes a restrained Schlick-style Fresnel term,
-desaturates the existing reflection slightly as a roughness proxy, and blends
-it with the current fog-atmosphere color. The additional weight is bounded by
-the existing fog visibility and retail alpha is preserved. There are no new
+desaturates the stage-0 sample slightly as a roughness/reflection proxy, and
+blends it with the current fog-atmosphere color. The title's actual later cube
+reflection pass is not modified. The additional weight is bounded by the
+existing fog visibility and Retail alpha is preserved. There are no new
 textures, art, depth reads, refraction, depth absorption, foam, or shoreline
 effects.
 
@@ -79,9 +85,12 @@ Across the two completed samples, the Realistic delta ranges were
 +4.548%-+4.822% mean, +1.865%-+3.570% median, and +7.787%-+10.092% p95.
 No unsupported-pass fallback or Metal runtime error was observed. No
 automatic acceptance threshold is inferred from these measurements. Hands-on
-A/B visual review, representative scene coverage, and any desired
-process/driver memory measurement remain open; the preset is therefore still
-experimental, default-off, and excluded from quality presets.
+review found the current result almost identical to Retail. Separate bounded
+Retail and Realistic capture runs completed, but scene/camera phase drift
+prevents treating them as pixel-aligned A/B evidence. Representative
+same-execution visual coverage and any desired process/driver memory
+measurement remain open; the preset is therefore still experimental,
+default-off, and excluded from quality presets.
 
 ## Metal MSAA decision
 

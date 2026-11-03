@@ -2,8 +2,9 @@
 
 Status updated 2026-11-03 after the native F1 settings integration, gameplay
 mouse input, live LOD, Metal anisotropic filtering, optional realistic-water
-pipeline and same-scene GPU benchmark, upstream parity audit, deterministic
-menu-to-gameplay diagnostics, and bounded audio validation.
+pipeline and same-scene GPU benchmark, dedicated water-system research,
+upstream parity audit, deterministic menu-to-gameplay diagnostics, and bounded
+audio validation.
 
 ## Current status
 
@@ -112,6 +113,14 @@ marker rejection, fingerprint overflow/mismatch, unsupported-pass fallback,
 or Metal runtime error. These are whole command-buffer timings in the
 exercised scene, not isolated shader cost or a visual-quality approval.
 
+Initial hands-on review found the optional treatment almost identical to
+Retail. That is consistent with its intentionally low-strength, pass-1-only
+design: the title's later cube-reflection and wake-foam passes remain Retail.
+Separate bounded capture runs completed for both presets, but scene/camera
+phase drift means they are not pixel-aligned A/B evidence. The complete
+simulation/render/pass/input analysis and mechanics-safe follow-up plan is in
+[WATER_RENDERING.md](WATER_RENDERING.md).
+
 ## Required opt-ins
 
 The currently verified path requires:
@@ -179,11 +188,16 @@ rejected even when set to `0`.
   no-op.
 - Ocean draws carry an explicit, false-positive-safe game-to-executor marker,
   and the default-off realistic preset is implemented and runtime-activated.
-  Retail water remains the exact default/fallback. Representative calm/storm,
-  lighting, shore, split-screen, reflection, and wake A/B review remains open.
-  The current automated scene has a completed same-scene GPU benchmark, but no
-  promotion threshold or visual conclusion, so the preset is still
-  experimental.
+  Retail water remains the exact default/fallback. The current marker and
+  optional pipeline cover the lit/base pass only; later reflection and foam
+  remain Retail. Representative calm/storm, lighting, shore, split-screen,
+  reflection, and wake A/B review remains open. The current automated scene
+  has a completed same-scene GPU benchmark and a near-Retail hands-on
+  assessment, but no aligned visual evidence or promotion threshold, so the
+  preset is still experimental.
+- The shared registry includes the distant-water-line fix, but its
+  private-depth implementation is currently DX11-only. Metal must port it or
+  report it as unavailable before behavioral parity can be claimed.
 - Physical controllers, guest USB, audible/sustained native audio, saves, FMV,
   other editions, and broad mission coverage are not validated Apple Silicon
   features.
@@ -228,10 +242,12 @@ rejected even when set to `0`.
 - Inventory ship/weapon definition construction and ownership locally before
   defining a profile schema or editor. Keep every retail-derived export
   private.
-- Compare Retail and Realistic water across calm/storm, day/night, shore,
-  split-screen, reflection, and wake scenes. Record fixed private crops and
-  repeat the controlled GPU benchmark after any shader tuning before changing
-  its experimental/default-off status.
+- Follow [WATER_RENDERING.md](WATER_RENDERING.md): explicitly mark all three
+  ocean passes, use same-execution aligned A/B capture, and isolate lit,
+  reflection, and foam contributions before tuning. Port or explicitly
+  disable the DX11-only distant-water-line fix on Metal. Repeat the controlled
+  GPU benchmark after any shader change before reconsidering the
+  experimental/default-off status.
 - Run the MSAA matrix in [METAL_QUALITY.md](METAL_QUALITY.md); keep the setting
   unavailable if the measured benefit does not justify it.
 
