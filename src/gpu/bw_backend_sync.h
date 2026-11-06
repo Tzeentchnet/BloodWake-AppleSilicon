@@ -6,13 +6,16 @@
 #include "nv2a_backend.h"
 #include "../toolkit_patches/kernel/bw_backend_ext.h"
 
-/* The callback runs synchronously on the executor thread before either the
- * window snapshot or framebuffer dump. It must finish GPU work and copy the
- * selected surface into guest memory; return zero on failure to suppress both
- * consumers. The backend must report the error itself. As with the toolkit
- * registration API, change registrations only while the executor is idle. */
-void bw_backend_register_with_present_sync(
-    const Nv2aBackend *backend, int (*present_sync)(uint32_t color_va, uint32_t pitch));
+/* The callbacks run on the executor thread. prepare_present selects and
+ * validates the private generation used by the window; publish_snapshot
+ * additionally makes that generation CPU-visible in guest memory for dumps
+ * and other explicit snapshot consumers. Either callback may be NULL.
+ * Return zero on failure and report the backend error before returning.
+ * Change registrations only while the executor is idle. */
+void bw_backend_register_with_present_ops(
+    const Nv2aBackend *backend,
+    int (*prepare_present)(uint32_t color_va, uint32_t pitch),
+    int (*publish_snapshot)(uint32_t color_va, uint32_t pitch));
 
 /* Remove only registrations still owned by the caller. */
 void bw_backend_unregister_if_current(const Nv2aBackend *backend);

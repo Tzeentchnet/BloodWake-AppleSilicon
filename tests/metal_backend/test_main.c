@@ -65,7 +65,13 @@ int bw_xbox_contiguous_memory_region(void **host, uint32_t *guest_va, size_t *by
     return 1;
 }
 
-enum { EVENT_SYNC = 1, EVENT_PRESENT, EVENT_FLIP, EVENT_DESCRIPTOR };
+enum {
+    EVENT_SYNC = 1,
+    EVENT_PRESENT,
+    EVENT_FLIP,
+    EVENT_DESCRIPTOR,
+    EVENT_PUBLISH,
+};
 static int s_events[32], s_event_count, s_capture_present;
 static uint32_t s_present_va, s_present_pitch, s_present_pixel, s_present_aa;
 static uint32_t s_present_probe_pixel, s_framebuffer_probe_pixel;
@@ -175,6 +181,14 @@ extern uint64_t bw_metal_test_draw_encoder_creation_count(void);
 extern uint64_t bw_metal_test_vertex_upload_allocation_count(void);
 extern uint64_t bw_metal_test_texture_upload_count(void);
 extern uint64_t bw_metal_test_surface_seed_count(void);
+extern void bw_metal_test_set_async_display(int enabled, int defer_retirement);
+extern void bw_metal_test_fail_next_submission(void);
+extern void bw_metal_test_async_counts(size_t *depth, unsigned *high_water,
+                                       uint64_t *saturation_waits,
+                                       uint64_t *publications,
+                                       uint64_t *display_frames);
+extern int bw_metal_test_publish_snapshot(uint32_t color_va, uint32_t pitch);
+extern int bw_metal_test_drain_submissions(void);
 extern int bw_metal_test_prepare_surface(const Nv2aSurface *surface);
 extern int bw_metal_test_prepare_present_surface(const Nv2aSurface *surface,
                                                  uint32_t format);
@@ -662,6 +676,90 @@ static void command_batching_test(void)
     expect_no_error();
     CHECK(bw_metal_test_command_submission_count() == submissions + 1u);
     CHECK(pixel(4, 3) == 0xFF11CC44u);
+}
+
+static void async_submission_ownership_test(void)
+{
+    uint64_t uploads = bw_metal_test_vertex_upload_allocation_count();
+    size_t depth = 0;
+    unsigned high_water = 0;
+    uint64_t waits = 0, publications = 0, display_frames = 0;
+    const uint32_t colors[] = {0xFF204060u, 0xFF406080u, 0xFF6080A0u};
+
+    bw_metal_test_set_async_display(1, 1);
+    for (unsigned i = 0; i < 2; i++) {
+        triangle(colors[i]);
+        draw(3);
+        flip();
+        expect_no_error();
+    }
+    bw_metal_test_async_counts(&depth, &high_water, &waits,
+                               &publications, &display_frames);
+    CHECK(depth == 2u && high_water == 2u && waits == 0u);
+    CHECK(display_frames == 2u && publications == 0u);
+    CHECK(bw_metal_test_vertex_upload_allocation_count() == uploads + 2u);
+    CHECK(pixel(4, 3) == 0xA5A5A5A5u);
+
+    triangle(colors[2]);
+    draw(3);
+    flip();
+    expect_no_error();
+    bw_metal_test_async_counts(&depth, &high_water, &waits,
+                               &publications, &display_frames);
+    CHECK(depth == 2u && high_water == 2u && waits == 1u);
+    CHECK(display_frames == 3u && publications == 0u);
+    CHECK(bw_metal_test_vertex_upload_allocation_count() == uploads + 2u);
+
+    CHECK(bw_metal_test_publish_snapshot(COLOR_AT, PITCH));
+    expect_no_error();
+    CHECK(pixel(4, 3) == colors[2]);
+    bw_metal_test_async_counts(&depth, &high_water, &waits,
+                               &publications, &display_frames);
+    CHECK(depth == 0u && publications == 1u);
+    bw_metal_test_set_async_display(0, 0);
+    CHECK(bw_metal_test_drain_submissions());
+}
+
+static void async_cpu_write_merge_test(void)
+{
+    const Nv2aSurface surface = {COLOR_AT, WIDTH, HEIGHT, PITCH, 4, 1, 1};
+    const uint32_t gpu_color = 0xFF214365u;
+    const uint32_t cpu_color = 0xFFABCDEFu;
+    const uint32_t draw_color = 0xFF6080A0u;
+
+    bw_metal_test_set_async_display(1, 0);
+    clear(gpu_color);
+    flip();
+    expect_no_error();
+    CHECK(pixel(0, 0) == 0xA5A5A5A5u);
+
+    put32(COLOR_AT, cpu_color);
+    CHECK(bw_metal_test_prepare_surface(&surface));
+    expect_no_error();
+    CHECK(pixel(0, 0) == cpu_color);
+    CHECK(pixel(1, 0) == gpu_color);
+
+    triangle(draw_color);
+    draw(3);
+    flip();
+    CHECK(bw_metal_test_publish_snapshot(COLOR_AT, PITCH));
+    expect_no_error();
+    CHECK(pixel(0, 0) == cpu_color);
+    CHECK(pixel(4, 3) == draw_color);
+    bw_metal_test_set_async_display(0, 0);
+    CHECK(bw_metal_test_drain_submissions());
+}
+
+static void async_command_failure_test(void)
+{
+    bw_metal_test_set_async_display(1, 0);
+    bw_metal_test_fail_next_submission();
+    triangle(0xFF204060u);
+    draw(3);
+    flip();
+    CHECK(!bw_metal_test_drain_submissions());
+    const char *error = bw_metal_backend_error();
+    CHECK(error && strstr(error, "synthetic test failure"));
 }
 
 static void vertex4(unsigned n, float x, float y, float w, uint32_t color)
@@ -5616,6 +5714,23 @@ static int mock_sync(uint32_t color_va, uint32_t pitch)
     return 1;
 }
 
+static int mock_prepare(uint32_t color_va, uint32_t pitch)
+{
+    event(EVENT_SYNC);
+    s_mock_sync_va = color_va;
+    s_mock_sync_pitch = pitch;
+    return color_va == COLOR_AT && pitch == PITCH;
+}
+
+static int mock_publish(uint32_t color_va, uint32_t pitch)
+{
+    event(EVENT_PUBLISH);
+    if (color_va != COLOR_AT || pitch != PITCH)
+        return 0;
+    put32(color_va, s_sync_pixel);
+    return 1;
+}
+
 static const Nv2aBackend s_mock_backend = {mock_clear, NULL, mock_flip};
 static const Nv2aBackend s_other_backend = {mock_clear, NULL, mock_flip};
 
@@ -5651,9 +5766,9 @@ static void mock_order_test(const char *which)
     s_mock_sync_fails = failure;
     s_mock_remap = strstr(which, "remap") != NULL;
     if (checked)
-        bw_backend_register_with_present_sync(&s_mock_backend, mock_sync);
+        bw_backend_register_with_present_ops(&s_mock_backend, mock_sync, NULL);
     else {
-        bw_backend_register_with_present_sync(&s_mock_backend, mock_sync);
+        bw_backend_register_with_present_ops(&s_mock_backend, mock_sync, NULL);
         nv2a_backend_register(&s_mock_backend);
     }
     clear(0);
@@ -5703,9 +5818,36 @@ static void mock_order_test(const char *which)
     remove(path);
 }
 
+static void split_publication_order_test(void)
+{
+    const char *prefix = "metal-split-publication-";
+    const char *path = "metal-split-publication-00000.bmp";
+    const uint32_t old_pixel = 0xFFA0B0C0u;
+
+    remove(path);
+    setenv("RECOMP_FB_DUMP", prefix, 1);
+    setenv("RECOMP_FB_DUMP_FLIPS", "1", 1);
+    put32(COLOR_AT, old_pixel);
+    bw_backend_register_with_present_ops(&s_mock_backend,
+                                         mock_prepare, mock_publish);
+    clear(0);
+    reset_capture();
+    flip();
+
+    CHECK(s_event_count == 4);
+    CHECK(s_events[0] == EVENT_SYNC);
+    CHECK(s_events[1] == EVENT_PRESENT);
+    CHECK(s_events[2] == EVENT_PUBLISH);
+    CHECK(s_events[3] == EVENT_FLIP);
+    CHECK(s_present_count == 1 && s_present_pixel == old_pixel);
+    CHECK(dumped_first_pixel(path) == (s_sync_pixel & 0xFFFFFFu));
+    CHECK(pixel(0, 0) == s_flip_pixel);
+    remove(path);
+}
+
 static void registration_test(void)
 {
-    bw_backend_register_with_present_sync(&s_mock_backend, mock_sync);
+    bw_backend_register_with_present_ops(&s_mock_backend, mock_sync, NULL);
     clear(0);
     bw_metal_backend_stop();
     reset_capture();
@@ -5729,17 +5871,17 @@ static void registration_test(void)
     flip();
     CHECK(s_event_count == 1 && s_events[0] == EVENT_PRESENT);
 
-    bw_backend_register_with_present_sync(NULL, mock_sync);
+    bw_backend_register_with_present_ops(NULL, mock_sync, NULL);
     reset_capture();
     flip();
     CHECK(s_event_count == 1 && s_events[0] == EVENT_PRESENT);
 
-    bw_backend_register_with_present_sync(&s_mock_backend, NULL);
+    bw_backend_register_with_present_ops(&s_mock_backend, NULL, NULL);
     reset_capture();
     flip();
     CHECK(s_event_count == 2 && s_events[0] == EVENT_PRESENT && s_events[1] == EVENT_FLIP);
 
-    bw_backend_register_with_present_sync(&s_mock_backend, mock_sync);
+    bw_backend_register_with_present_ops(&s_mock_backend, mock_sync, NULL);
     nv2a_backend_register(NULL);
     reset_capture();
     flip();
@@ -5955,6 +6097,7 @@ static void failure_test(const char *which)
 static void surface_switch_test(void)
 {
     const uint32_t next_at = COLOR_AT + 0x2000u;
+    const Nv2aSurface next_surface = {next_at, WIDTH, HEIGHT, AA_PITCH, 4, 2, 1};
     const uint32_t first = 0xFF214365u;
     const uint32_t second = 0xFF102030u;
     const uint32_t cpu_seed = 0xFFABCDEFu;
@@ -5965,7 +6108,7 @@ static void surface_switch_test(void)
     setup_color_mode(SURFACE_XRGB_AA, next_at);
     clear(second);
     expect_no_error();
-    CHECK(pixel(0, 0) == first);
+    CHECK(pixel(0, 0) == 0xA5A5A5A5u);
     CHECK(surface_pixel(next_at, AA_PITCH, 0, 0) == 0x6B6B6B6Bu);
     CHECK(bw_metal_test_color_surface_count() == 2u);
 
@@ -5974,9 +6117,13 @@ static void surface_switch_test(void)
     triangle(draw_color);
     draw(3);
     expect_no_error();
-    CHECK(surface_pixel(next_at, AA_PITCH, 0, 0) == (second & 0x00FFFFFFu));
+    CHECK(surface_pixel(next_at, AA_PITCH, 0, 0) == 0x6B6B6B6Bu);
     CHECK(bw_metal_test_color_surface_count() == 2u);
 
+    setup_color_mode(SURFACE_XRGB_AA, next_at);
+    CHECK(bw_metal_test_publish_snapshot(next_surface.color_va, next_surface.pitch));
+    CHECK(surface_pixel(next_at, AA_PITCH, 0, 0) == (second & 0x00FFFFFFu));
+    setup_surface(1);
     flip();
     expect_no_error();
     CHECK(pixel(0, 0) == cpu_seed);
@@ -6001,12 +6148,12 @@ static void present_surface_reuse_test(void)
 
     put32(COLOR_AT, cpu_color);
     CHECK(bw_metal_test_prepare_present_surface(&first_surface, 8u));
-    CHECK(bw_metal_test_command_submission_count() == submissions + 2u);
+    CHECK(bw_metal_test_command_submission_count() == submissions + 3u);
     CHECK(bw_metal_test_surface_seed_count() == seeds + 1u);
     CHECK(pixel(0, 0) == cpu_color);
 
     CHECK(bw_metal_test_prepare_present_surface(&first_surface, 8u));
-    CHECK(bw_metal_test_command_submission_count() == submissions + 2u);
+    CHECK(bw_metal_test_command_submission_count() == submissions + 3u);
     CHECK(bw_metal_test_surface_seed_count() == seeds + 1u);
 
     CHECK(bw_metal_test_prepare_surface(&first_surface));
@@ -6398,6 +6545,12 @@ int main(int argc, char **argv)
         seed_order_test();
     else if (!strcmp(argv[1], "command-batching"))
         command_batching_test();
+    else if (!strcmp(argv[1], "async-submission-ownership"))
+        async_submission_ownership_test();
+    else if (!strcmp(argv[1], "async-cpu-write-merge"))
+        async_cpu_write_merge_test();
+    else if (!strcmp(argv[1], "async-command-failure"))
+        async_command_failure_test();
     else if (!strcmp(argv[1], "present-surface-reuse"))
         present_surface_reuse_test();
     else if (!strcmp(argv[1], "perspective"))
@@ -6630,6 +6783,8 @@ int main(int argc, char **argv)
         registration_test();
     else if (!strncmp(argv[1], "mock-", 5))
         mock_order_test(argv[1]);
+    else if (!strcmp(argv[1], "split-publication-order"))
+        split_publication_order_test();
     else if (!strncmp(argv[1], "basic-feedback-", 15))
         basic_feedback_test(argv[1]);
     else if (!strcmp(argv[1], "cpu-write-counterexample"))

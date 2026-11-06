@@ -40,7 +40,7 @@ This is still a development build:
   the title body without markers. A post-fix one-player Battle run recorded
   186,893 scopes for each pass, 2,915 balanced view-0 pairs, zero rejection,
   and clean fingerprints. Metal private reflection depth also activated with
-  no fallback, and the 333-test Metal suite passes. Split-screen/view-1
+  no fallback, and the 337-test Metal suite passes. Split-screen/view-1
   validation is deferred. Earlier lit-only diagnostics observed
   41,348 markers and 512 clean scopes in one four-boot run; a later
   deterministic run observed 12,670 markers, 154 clean scopes, and 297
@@ -83,7 +83,7 @@ This is still a development build:
   audible.
 - USB gamepads, physical-controller support, and broad mission, save, FMV,
   and edition coverage are incomplete.
-- Current regression results include 333/333 Metal backend tests, all 62
+- Current regression results include 337/337 Metal backend tests, all 62
   presenter CTest entries (including the real-window AppKit case in the
   current WindowServer session), 35/35 MMIO host tests, 8/8 normal and ASan/UBSan
   macOS host tests, 11/11 input integration tests, 6/6 APU/audio tests,
@@ -99,21 +99,19 @@ This is still a development build:
   with the headless audio sink, it completed three private boots and two
   validated relaunches, reached ocean rendering, and stopped at the configured
   boot limit. Default physical input and CoreAudio behavior are unchanged.
-- Clean seeded Battle runs now establish the base-performance envelope without
-  GPU audit or BMP capture. Fixed 1x reaches about 31-32 FPS with a 17.2 ms
-  median GPU command; 2.25x reaches about 28-30 FPS with a 20.1-20.4 ms
-  median; and 4x reaches about 15.8 FPS with a 48.25 ms median. Native
-  sampling shows the guest blocked in `bw_flush_wait` and the Metal worker
-  blocked in `finish_command`, so lower scales lose substantial time to
-  serialized CPU/GPU execution. The measured 4x GPU work alone cannot fit a
-  60 FPS budget. The first ownership-safe optimization now reuses cached
-  private color targets only after an exact guest-memory comparison. Clean
-  repeats recorded thousands of target reuses and one forced guest reseed per
-  run; the first 4x median improved to 43.38 ms GPU / 56.75 ms wall, although
-  later sustained windows reached 50.27 ms / 65.24 ms. Correct bounded
-  asynchronous ownership remains the renderer priority; render-scale and
-  frame-cap defaults have not been changed.
-  Precise power/thermal and formal visual-reference measurements remain open.
+- Bounded Metal ownership now keeps at most two submissions in flight, gives
+  mutable upload/readback resources to their submission, presents private
+  color generations without routine guest readback, and retains explicit
+  publication for snapshots, dumps, feedback, captures, and scale changes.
+  Immutable NV2A texture-stage and combiner routing is specialized with Metal
+  function constants while material values remain dynamic. In two seeded
+  Battle runs, every explicit 4x 300-frame window averaged 32.08-36.14 FPS
+  with 27.90-29.34 ms wall medians. An exact Native/auto, match-display run
+  selected 2560x1920 and averaged 31.89-34.65 FPS with 28.75-29.92 ms
+  medians. The 30 FPS default-quality target is met without changing render
+  scale, filtering, LOD, or Retail-water defaults. Native 4x/60 is not
+  claimed. Direct package-power/temperature and formal visual-reference
+  measurements remain open.
 
 See [Apple Silicon status](docs/APPLE_SILICON_HANDOFF.md),
 [work completed](docs/WORK_COMPLETED.md), and

@@ -309,11 +309,11 @@ validated relaunch and reached its configured time limit:
 - Realistic water active with no unsupported-pass fallback; and
 - Metal private reflection depth active with no logged fallback.
 
-The complete Metal suite passes 333/333, all eight focused private-depth
-sanitizer cases pass, and the hook suite passes 10/10. This closes NW-007 and
-NW-100 for representative single-player gameplay. Split-screen/view-1
-evidence remains deferred. Private frames, input timings, saves, logs,
-fingerprints, and retail data remain uncommitted.
+At this checkpoint, the then-current Metal suite passed completely, all eight
+focused private-depth sanitizer cases passed, and the hook suite passed
+10/10. This closed NW-007 and NW-100 for representative single-player
+gameplay. Split-screen/view-1 evidence remains deferred. Private frames,
+input timings, saves, logs, fingerprints, and retail data remain uncommitted.
 
 ### Guided 4x performance observation
 
@@ -380,11 +380,11 @@ the snapshot. This keeps target switches, framebuffer descriptors, the
 CPU-write counterexample, and shutdown synchronous while avoiding an
 unnecessary upload/scale operation.
 
-The complete Metal suite passes 333/333 with a new ownership case covering
-unchanged reactivation, CPU mutation, and subsequent reuse. Clean seeded
-Battle runs reached the time limit with zero marker rejection or Metal error.
-At each scale the first 300-frame report recorded 599 target reuses and only
-one present-time guest reseed:
+The then-current Metal suite passed completely with a new ownership case
+covering unchanged reactivation, CPU mutation, and subsequent reuse. Clean
+seeded Battle runs reached the time limit with zero marker rejection or Metal
+error. At each scale the first 300-frame report recorded 599 target reuses and
+only one present-time guest reseed:
 
 | Fixed scale | Earlier baseline median | First optimized median | Later optimized range |
 | --- | --- | --- | --- |
@@ -396,11 +396,52 @@ The early 4x window suggests a useful reduction in redundant scaled-surface
 work, and 1x wall time improves modestly. The later 2.25x and 4x windows also
 show that scene progression and sustained load can outweigh that gain. These
 were repeat runs, not interleaved process-level A/B samples with controlled
-power and temperature, so no precise percentage is claimed. Most
-importantly, GPU duration and host wait remain nearly identical: exact cache
-reuse does not remove the per-frame `waitUntilCompleted` serialization and
-does not change the conclusion that bounded asynchronous ownership is the
-next major optimization.
+power and temperature, so no precise percentage is claimed. Most importantly, GPU duration and host wait remained nearly identical:
+exact cache reuse did not remove the per-frame `waitUntilCompleted`
+serialization. This identified bounded asynchronous ownership as the next
+major optimization; the completed follow-up is documented below.
+
+#### Bounded ownership and function specialization
+
+The follow-up implementation separates direct display preparation from
+explicit guest publication, bounds the queue at two submissions, and assigns
+vertex, surface-upload, and surface-readback resources to their owning
+submission. Ordinary target switches commit private generations
+asynchronously. Snapshots, dumps, feedback, captures, scale transitions, and
+other CPU-visible consumers still wait and publish in order. Detected guest
+CPU changes are merged over the newest private generation before reseeding.
+
+The first representative ownership-only 4x run remained GPU-bound at
+16.50 FPS with a 59.42 ms wall median. Command-role timing attributed the
+remaining cost across the selected AA target, an alternate target, and
+presentation. Metal function constants now specialize immutable texture-stage
+programs, register-combiner routing, final-combiner routing, and alpha-test
+mode while preserving dynamic material constants and references.
+
+Two independent fixed-4x Battle runs produced the following range across all
+reported rolling 300-frame windows:
+
+- 32.08-36.14 FPS average;
+- 27.90-29.34 ms wall median and 33.26-35.63 ms wall p95;
+- 15.66-20.75 ms combined render/present GPU median;
+- 9.36-12.45 ms command-wait median; and
+- 12.33-15.89 ms submission-latency p95.
+
+Both runs retained the expected lit, reflection, and foam scopes with zero
+marker rejection. The exact Native/auto, match-display run selected 4x
+(2560x1920); every window averaged 31.89-34.65 FPS with a
+28.75-29.92 ms wall median and 32.73-35.89 ms p95. This clears the 30 FPS and
+33.3 ms median gate without a quality-setting change.
+
+The final two-run matrix measured 38.50-45.30 FPS at 1x,
+37.95-47.62 FPS at 2.25x, and 32.08-36.14 FPS at 4x. The complete Metal suite
+passes 337/337, seven focused ownership/publication cases pass under
+ASan/UBSan, and the macOS presenter suite passes 62/62. The measured
+executable SHA-256 is
+`fee23401f7c42a13744b5c1bd6521bbc22ea93cbffe8c17e091337f693496891`.
+Post-matrix `pmset -g therm` reported no thermal or performance warning, but
+direct package-power and temperature telemetry was not available, so no
+energy-per-frame conclusion is drawn.
 
 ### Water visual-review boundary
 

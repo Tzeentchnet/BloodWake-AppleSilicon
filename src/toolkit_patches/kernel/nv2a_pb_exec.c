@@ -383,7 +383,10 @@ static struct {
     uint32_t batches_ffp;
 } s_gpu;
 
-static int (*s_backend_present_sync)(uint32_t color_va, uint32_t pitch);
+static int (*s_backend_present_prepare)(uint32_t color_va, uint32_t pitch);
+static int (*s_backend_snapshot_publish)(uint32_t color_va, uint32_t pitch);
+static int backend_prepare_snapshot(uint32_t *resolved, uint32_t *pitch, uint32_t *aa_sy);
+static int backend_publish_snapshot(uint32_t resolved, uint32_t pitch);
 
 /* The last value written to every Kelvin method, as the GPU's register file
  * would hold it. State the executor does not model explicitly (lights,
@@ -768,7 +771,7 @@ static void note_drawn_at(uint32_t resolved)
 
 static void note_drawn(void)
 {
-    note_drawn_at(s_backend_present_sync ? dma_resolve(s_gpu.color_offset) : 0);
+    note_drawn_at(s_backend_present_prepare ? dma_resolve(s_gpu.color_offset) : 0);
 }
 
 static uint32_t surface_bpp(void)
@@ -894,7 +897,14 @@ static void dump_surface_bmp_at(uint32_t resolved)
 
 static void dump_surface_bmp(void)
 {
-    dump_surface_bmp_at(0);
+    uint32_t resolved, pitch, aa_sy;
+    if (!s_backend_present_prepare) {
+        dump_surface_bmp_at(0);
+        return;
+    }
+    if (backend_prepare_snapshot(&resolved, &pitch, &aa_sy) &&
+        backend_publish_snapshot(resolved, pitch))
+        dump_surface_bmp_at(resolved);
 }
 
 /* Defined below, next to the rest of the rasteriser; the clear path uses it
@@ -930,16 +940,19 @@ static void surface_apply_clip(void)
 
 static const Nv2aBackend *s_backend;
 
-void bw_backend_register_with_present_sync(
-    const Nv2aBackend *backend, int (*present_sync)(uint32_t, uint32_t))
+void bw_backend_register_with_present_ops(
+    const Nv2aBackend *backend,
+    int (*prepare_present)(uint32_t, uint32_t),
+    int (*publish_snapshot)(uint32_t, uint32_t))
 {
     s_backend = backend;
-    s_backend_present_sync = backend ? present_sync : NULL;
+    s_backend_present_prepare = backend ? prepare_present : NULL;
+    s_backend_snapshot_publish = backend ? publish_snapshot : NULL;
 }
 
 void nv2a_backend_register(const Nv2aBackend *backend)
 {
-    bw_backend_register_with_present_sync(backend, NULL);
+    bw_backend_register_with_present_ops(backend, NULL, NULL);
 }
 
 void bw_backend_unregister_if_current(const Nv2aBackend *backend)
@@ -954,7 +967,7 @@ static int backend_prepare_snapshot(uint32_t *resolved, uint32_t *pitch, uint32_
     *resolved = 0;
     *pitch = 0;
     *aa_sy = s_gpu.aa_sy > 1.5f ? 2 : 1;
-    if (!s_backend_present_sync)
+    if (!s_backend_present_prepare)
         return 1;
     done = s_gpu.drawn_offset ? s_gpu.drawn_offset : s_gpu.color_offset;
     *pitch = s_gpu.drawn_offset ? s_gpu.drawn_pitch : s_gpu.pitch;
@@ -962,7 +975,13 @@ static int backend_prepare_snapshot(uint32_t *resolved, uint32_t *pitch, uint32_
         *aa_sy = s_gpu.drawn_aa_sy;
     *resolved = s_gpu.drawn_offset ? s_gpu.drawn_resolved
                 : done ? dma_resolve(done) : 0;
-    return s_backend_present_sync(*resolved, *pitch);
+    return s_backend_present_prepare(*resolved, *pitch);
+}
+
+static int backend_publish_snapshot(uint32_t resolved, uint32_t pitch)
+{
+    return !s_backend_snapshot_publish ||
+           s_backend_snapshot_publish(resolved, pitch);
 }
 
 static int backend_draws(void)
@@ -1154,7 +1173,7 @@ static void clear_surface(uint32_t param)
         /* An opt-in readback backend must snapshot the surface it cleared,
          * even when a frame contains no triangles or the title rebinds before
          * flipping. Keep legacy backends' selection unchanged. */
-        if (s_backend_present_sync && (param & NV097_CLEAR_COLOR_MASK))
+        if (s_backend_present_prepare && (param & NV097_CLEAR_COLOR_MASK))
             note_drawn_at(surf.color_va);
         s_gpu.clears++;
         return;
@@ -5888,17 +5907,17 @@ static void bw_present_immediate(void)
     }
     s_bw_flipno++;
     snapshot_ok = backend_prepare_snapshot(&snapshot_va, &snapshot_pitch, &snapshot_aa_sy);
-    if (snapshot_ok && (s_gpu.pitch || (s_backend_present_sync &&
+    if (snapshot_ok && (s_gpu.pitch || (s_backend_present_prepare &&
                                        s_gpu.drawn_offset && s_gpu.drawn_pitch))) {
         extern void xbox_FramebufferWindowPresent(uint32_t, uint32_t);
         uint32_t done = s_gpu.drawn_offset ? s_gpu.drawn_offset : s_gpu.color_offset;
-        uint32_t pitch = s_backend_present_sync ? snapshot_pitch
+        uint32_t pitch = s_backend_present_prepare ? snapshot_pitch
                          : s_gpu.drawn_offset ? s_gpu.drawn_pitch : s_gpu.pitch;
         if (done) {
-            xbox_FramebufferWindowSet(s_backend_present_sync ? snapshot_va : dma_resolve(done), pitch);
-            xbox_FramebufferWindowSetAA(s_backend_present_sync ? snapshot_aa_sy
+            xbox_FramebufferWindowSet(s_backend_present_prepare ? snapshot_va : dma_resolve(done), pitch);
+            xbox_FramebufferWindowSetAA(s_backend_present_prepare ? snapshot_aa_sy
                                                                : (s_gpu.aa_sy > 1.5f ? 2 : 1));
-            xbox_FramebufferWindowPresent(s_backend_present_sync ? snapshot_va : dma_resolve(done), pitch);
+            xbox_FramebufferWindowPresent(s_backend_present_prepare ? snapshot_va : dma_resolve(done), pitch);
         }
     }
     {
@@ -5913,8 +5932,10 @@ static void bw_present_immediate(void)
             }
             s_flip_dumping = dump;
             if (dump && snapshot_ok) {
-                if (s_backend_present_sync)
-                    dump_surface_bmp_at(snapshot_va);
+                if (s_backend_present_prepare) {
+                    if (backend_publish_snapshot(snapshot_va, snapshot_pitch))
+                        dump_surface_bmp_at(snapshot_va);
+                }
                 else
                     dump_surface_bmp();
             }
@@ -6326,7 +6347,7 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
          * counter counts -- see xbox_Nv2aFrameCounterFlip. */
         xbox_Nv2aFrameCounterFlip();
         s_bw_flipno++;
-        synchronized = s_backend_present_sync != NULL;
+        synchronized = s_backend_present_prepare != NULL;
         snapshot_ok = backend_prepare_snapshot(&snapshot_va, &snapshot_pitch, &snapshot_aa_sy);
         /* Hand the window a copy of the frame just finished.
          *
@@ -6385,8 +6406,10 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
                 dump_now = on;
                 if (on && snapshot_ok &&
                     (synchronized || !(dump_after && s_backend && s_backend->flip))) {
-                    if (synchronized)
-                        dump_surface_bmp_at(snapshot_va);
+                    if (synchronized) {
+                        if (backend_publish_snapshot(snapshot_va, snapshot_pitch))
+                            dump_surface_bmp_at(snapshot_va);
+                    }
                     else
                         dump_surface_bmp();
                 }

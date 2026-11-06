@@ -100,7 +100,8 @@ foreach(case semaphore-release semaphore-concurrent visual
              water-capture water-capture-validation
              render-scale render-scale-aa render-scale-partial render-scale-box
              render-scale-depth render-scale-auto render-scale-invalid render-scale-ssaa-min
-             seed-order command-batching present-surface-reuse
+             seed-order command-batching async-submission-ownership
+             async-cpu-write-merge async-command-failure present-surface-reuse
              perspective blend color-mask alpha-test pipeline-cache cull full-rect depth-clear
              depth-draw stencil-draw polygon-offset polygon-offset-disabled polygon-offset-zero
              partial-color partial-color-masks partial-color-default-rect partial-clip partial-empty
@@ -197,6 +198,7 @@ foreach(case semaphore-release semaphore-concurrent visual
              mock-checked-rebind-aa-normal mock-checked-rebind-aa-immediate
              mock-legacy-normal mock-legacy-pre mock-legacy-immediate
              mock-legacy-rebind-aa-normal mock-legacy-rebind-aa-immediate
+             split-publication-order
              unsupported-state invalid-blend-src invalid-blend-dst invalid-blend-equation invalid-alpha-func
              invalid-cull-face invalid-cull-winding
              unsupported-fog invalid-polygon-offset-factor invalid-polygon-offset-units

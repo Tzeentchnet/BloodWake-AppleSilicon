@@ -23,10 +23,13 @@ typedef enum {
 } BwMetalWaterPreset;
 
 /* Register only while the executor is idle, before start or after stop.
- * The callback runs synchronously on the executor thread after readback and
- * before the snapshot. Copy the descriptor during the call; its dimensions
- * are physical samples and its pitch is in bytes. Return zero to reject the
- * snapshot. A NULL callback or backend stop removes the registration. */
+ * The callback runs synchronously on the executor thread while preparing a
+ * presentation descriptor; direct presentation does not first publish private
+ * pixels to guest memory. Copy only the descriptor during the call; its
+ * dimensions are physical samples and its pitch is in bytes. CPU-visible
+ * snapshots and dumps use a separate explicit publication boundary. Return
+ * zero to reject the descriptor. A NULL callback or backend stop removes the
+ * registration. */
 typedef int (*BwMetalFramebufferCallback)(const BwMetalFramebuffer *framebuffer);
 void bw_metal_backend_set_framebuffer_callback(BwMetalFramebufferCallback callback);
 
@@ -101,21 +104,27 @@ BwMetalWaterPreset bw_metal_backend_water_preset(void);
  * Exact hardware sample positions and reconstruction filtering are unverified;
  * the framebuffer consumer chooses the resolve filter.
  * Draws and clears are recorded into one pending command buffer until a
- * presentation, readback or surface-ownership boundary. Draws with matching
- * colour and depth attachments also share a render encoder. Vertex data is
- * suballocated from a shared upload arena that is reused only after the
- * pending command buffer completes.
+ * presentation, readback or surface-ownership boundary. Full clears can share
+ * the first draw encoder when the attachments match. Mutable vertex, upload,
+ * and readback resources belong to one of at most two in-flight submissions
+ * and are reused only after their command completes.
  * Up to 1024 decoded textures are cached by guest span and layout. Guest
  * contents are checked at most once per frame; stable entries use distributed
  * samples with staggered full verification. Render-target writeback
  * invalidates overlapping entries.
- * With BW_GPU_AUDIT=1, the backend reports monotonic wall-clock statistics for
- * a rolling 300-frame window every 100 flips.
- * Up to 32 exact colour-surface descriptions are cached. Switching targets
- * after GPU writes synchronously copies the completed old target to guest
- * memory, then reseeds the cached new target from guest memory. This permits
- * ordered render-target sampling, including the title's AA resolve, without
- * assuming that an inactive cached texture still owns authoritative data.
+ * With BW_METAL_FRAME_TIMING=1, the backend reports monotonic wall-clock,
+ * completed-command, wait, submission-latency, and command-role statistics
+ * for rolling 300-frame windows.
+ * Up to 32 exact colour-surface descriptions are cached. Ordinary target
+ * switches commit the old private generation in queue order without
+ * publishing it to guest memory. Reactivation reuses that texture only while
+ * guest bytes still match its exact synchronization snapshot; a detected CPU
+ * change waits for the private generation, merges changed 32-bit pixels, and
+ * reseeds it. Texture feedback, snapshots, dumps, scale changes, captures,
+ * and other CPU-visible paths explicitly wait and publish.
+ * Extended fragment pipelines specialize immutable texture-stage, combiner,
+ * final-combiner, and alpha-test routing with Metal function constants while
+ * retaining dynamic material constants and reference values.
  * Depth-tested and stencil-tested draws use pitch-layout Z24S8 surfaces,
  * including all NV2A comparison functions, depth writes, stencil masks and
  * keep, zero, replace, clamp, invert and wrap operations.

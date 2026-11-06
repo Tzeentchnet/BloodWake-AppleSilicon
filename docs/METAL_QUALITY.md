@@ -22,6 +22,35 @@ existing Off, 4x, 8x, and 16x choices.
 
 ## Current base-performance envelope
 
+The bounded ownership path keeps at most two Metal submissions in flight,
+assigns mutable upload/readback resources to their submission, and separates
+direct display from explicit guest publication. Ordinary target switches stay
+private and asynchronous; snapshots, dumps, feedback, captures, and scale
+changes retain ordered publication. Immutable NV2A texture-stage, combiner,
+final-combiner, and alpha-test routing is specialized through Metal function
+constants without changing dynamic materials or quality settings.
+
+Two independent final Battle runs per fixed scale produced:
+
+| Fixed scale | Internal target | Completed-game FPS | GPU median | Command-wait median | Wall median | Wall p95 |
+| --- | --- | --- | --- | --- | --- | --- |
+| 1x | 640x480 | 38.50-45.30 | 7.52-8.21 ms | 7.12-7.78 ms | 21.84-26.07 ms | 24.76-28.03 ms |
+| 2.25x | 1440x1080 | 37.95-47.62 | 10.61-11.57 ms | 7.40-8.00 ms | 21.17-25.04 ms | 23.94-28.45 ms |
+| 4x | 2560x1920 | 32.08-36.14 | 15.66-20.75 ms | 9.36-12.45 ms | 27.90-29.34 ms | 33.26-35.63 ms |
+
+The exact Native/auto, match-display run selected 4x and reported
+31.89-34.65 FPS with 28.75-29.92 ms wall medians in every rolling 300-frame
+window. Current Native/auto, LOD, filtering, and Retail-water defaults
+therefore remain unchanged. The target is 30 FPS; 4x/60 is not claimed.
+The GPU metric now includes direct presentation and is not directly
+comparable to the older render-only command metric.
+The final code passes 337/337 Metal backend tests, seven focused
+ownership/publication cases under ASan/UBSan, and 62/62 macOS presenter tests.
+Direct package-power and temperature evidence remains blocked on approved
+privileged instrumentation.
+
+### Historical synchronized baseline
+
 A clean, seeded one-player Battle matrix disabled GPU audit and screenshot
 capture while holding render scale fixed. Lightweight Metal timing produced
 these representative rolling 300-frame windows:

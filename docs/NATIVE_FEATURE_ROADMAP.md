@@ -18,10 +18,10 @@ private and must not be committed.
 | Adjustable LOD | Implemented | Validate 1x-8x visually in both editions; Original remains fixed at 1x. |
 | Metal filtering | Implemented | Collect oblique water/cliff comparisons and GPU timings for 1x/4x/8x/16x. |
 | Metal MSAA | No-go; synthetic smoke complete | Apple M5 passes 2x/4x/8x synthetic color/depth/resolve, but game-scene attachment ownership and the controlled visual/GPU-time/memory matrix are still required. |
-| Base Metal performance | Clean scale matrix complete; exact private-surface reuse implemented and measured | Replace the remaining per-flip completion wait with bounded, correctness-safe upload/readback ownership, then repeat the 1x/2.25x/4x Battle matrix before changing defaults. |
+| Base Metal performance | Bounded two-submission ownership, explicit publication, and combiner specialization validated; Native/auto 4x clears 30 FPS | Retain current quality defaults; collect direct package-power/temperature evidence and charge future renderer work against the measured envelope. |
 | Lighting and renderer modernization | Current path and options mapped | Inventory representative fixed-function, vertex-program, light, material, and shadow use; then pilot an explicitly marked opaque fixed-function family with a semantic Metal lighting contract. |
 | Upstream fixes | Registry/source parity verified; Metal distant-water reflection depth ported | Re-run the offline parity checker whenever upstream changes and retain explicit fallback coverage for the Metal private-depth path. |
-| Realistic water | Three pass boundaries and private reflection depth validated in representative gameplay; later visual phases paused | Resume refraction, absorption, SSR, foam, and modern composition only after the base-performance ownership work is measured. |
+| Realistic water | Three pass boundaries and private reflection depth validated in representative gameplay; base-performance budget now measured | Resume refraction, absorption, SSR, foam, and modern composition through the separate visual plan with per-phase performance gates. |
 
 ## F1 runtime settings
 
