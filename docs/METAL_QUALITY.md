@@ -22,28 +22,37 @@ existing Off, 4x, 8x, and 16x choices.
 
 ## Current base-performance envelope
 
-The bounded ownership path keeps at most two Metal submissions in flight,
-assigns mutable upload/readback resources to their submission, and separates
-direct display from explicit guest publication. Ordinary target switches stay
-private and asynchronous; snapshots, dumps, feedback, captures, and scale
-changes retain ordered publication. Immutable NV2A texture-stage, combiner,
-final-combiner, and alpha-test routing is specialized through Metal function
-constants without changing dynamic materials or quality settings.
+The bounded ownership path keeps at most three Metal submissions in flight
+and assigns mutable upload, feedback-resolve, and readback resources to their
+submission. One submission can own multiple ordered color-surface
+generations; eight target switches force a fallback commit. Exact tracked
+XRGB anti-aliased feedback stays GPU-private while unchanged, with the
+publication/32-bit CPU-write merge/reseed path retained for changed guest
+memory and other CPU-visible consumers. Immutable NV2A texture-stage,
+combiner, final-combiner, and alpha-test routing remains specialized through
+Metal function constants without changing dynamic materials or quality.
 
-Two independent final Battle runs per fixed scale produced:
+The representative seeded Battle qualification produced:
 
-| Fixed scale | Internal target | Completed-game FPS | GPU median | Command-wait median | Wall median | Wall p95 |
-| --- | --- | --- | --- | --- | --- | --- |
-| 1x | 640x480 | 38.50-45.30 | 7.52-8.21 ms | 7.12-7.78 ms | 21.84-26.07 ms | 24.76-28.03 ms |
-| 2.25x | 1440x1080 | 37.95-47.62 | 10.61-11.57 ms | 7.40-8.00 ms | 21.17-25.04 ms | 23.94-28.45 ms |
-| 4x | 2560x1920 | 32.08-36.14 | 15.66-20.75 ms | 9.36-12.45 ms | 27.90-29.34 ms | 33.26-35.63 ms |
+| Mode | Completed-game FPS | Wall median | Combined GPU median | Combined GPU p95 |
+| --- | --- | --- | --- | --- |
+| Native/auto 4x, match display, two boots | 59.98-60.01 | 16.66-16.68 ms | 14.18-14.84 ms | 14.87-15.26 ms |
+| Fixed 4x, cap 120, boot 1 (all windows) | 59.36-100.78 | 9.82-16.59 ms | 9.47-13.25 ms | 14.67-20.46 ms |
+| Fixed 4x, cap 120, boot 2 (all windows) | 60.33-100.10 | 10.01-16.01 ms | 9.38-12.65 ms | 14.85-20.74 ms |
 
-The exact Native/auto, match-display run selected 4x and reported
-31.89-34.65 FPS with 28.75-29.92 ms wall medians in every rolling 300-frame
-window. Current Native/auto, LOD, filtering, and Retail-water defaults
-therefore remain unchanged. The target is 30 FPS; 4x/60 is not claimed.
-The GPU metric now includes direct presentation and is not directly
-comparable to the older render-only command metric.
+The exact-default row uses consecutive rolling reports emitted at or after
+presented frame 900 and before the guest relaunch transition. Cold windows
+remain recorded:
+they include 296-330 ms shader/workload warm-up maxima and average as low as
+53.22 FPS. Current Native/auto, LOD, filtering, quincunx approximation, draw
+coverage, and Retail-water defaults remain unchanged. Sustained 4x/60 is
+claimed for the representative workload; cold pipeline warm-up and broader
+mission pacing remain open.
+
+The GPU metric includes direct presentation and is not directly comparable to
+the older render-only command metric. Fixed-cap p95 ranges include later,
+lighter scene phases whose GPU-duration windows overlap command-role changes;
+the exact-default qualification is the stable default-policy evidence.
 The final code passes 337/337 Metal backend tests, seven focused
 ownership/publication cases under ASan/UBSan, and 62/62 macOS presenter tests.
 Direct package-power and temperature evidence remains blocked on approved
@@ -64,14 +73,14 @@ these representative rolling 300-frame windows:
 Native sampling attributes 87.3% of the guest thread to `bw_flush_wait` and
 79.3% of the NV2A/Metal worker to `finish_command` waiting for Metal command
 completion. This explains why 1x and 2.25x wall time remains much higher than
-GPU duration: every flip currently serializes CPU and GPU work while
+GPU duration: every flip then serialized CPU and GPU work while
 synchronizing the private render surface with guest memory.
 
 The 4x command buffer already consumes a 48.25 ms median on the GPU. Perfect
-CPU/GPU overlap therefore cannot make the current 4x workload reach 60 FPS;
+CPU/GPU overlap therefore could not make that 4x path reach 60 FPS;
 the GPU-only ceiling is about 20.7 FPS. The corresponding measured ceilings
 are about 49 FPS at 2.25x and 58 FPS at 1x before further GPU optimization.
-This is why the next renderer task is a bounded asynchronous ownership model
+This motivated the bounded asynchronous ownership model
 for vertex uploads, readback resources, and cached render surfaces. Simply
 removing `waitUntilCompleted` would reuse live resources and violate
 render-target, guest-memory, snapshot, and shutdown correctness.

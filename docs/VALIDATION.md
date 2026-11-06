@@ -91,9 +91,11 @@ wall-clocked completed-flip value as `Game FPS`.
 
 ## Current regression coverage
 
-- The Metal backend suite passes 324/324 tests, including texture-stage masks,
+- The Metal backend suite passes 337/337 tests, including texture-stage masks,
   combiner operations, cube reflection, mip selection, command-buffer and
-  render-encoder batching, texture caching, upload-arena reuse, anisotropy
+  render-encoder batching, three-submission ownership, bounded multi-surface
+  consolidation, private feedback with CPU-write fallback, exact quincunx
+  reference sweeps, texture caching, upload-arena reuse, anisotropy
   selection/lifecycle, optional-water frame-boundary selection, exact default
   Retail output, marked-only enhancement, typed lit/reflection/foam pass and
   view propagation, persistent multi-draw and empty pass runs, legacy marker
@@ -149,7 +151,8 @@ wall-clocked completed-flip value as `Game FPS`.
   readers/writers.
 - The standalone Metal smoke test passes, and the Release native `bloodwake`
   target builds successfully with the direct presenter and scaled-target path.
-- Focused Metal cases have also passed with ASan/UBSan and Metal validation.
+- Seven focused Metal ownership, feedback, failure, and target-switch cases
+  pass with ASan/UBSan; focused cases have also passed Metal validation.
 - The macOS host suite passed 8/8 normally and under ASan/UBSan. Under TSan,
   seven cases passed and the existing nested-signal case was skipped because
   the sanitizer blocks that delivery. The expanded APU/audio suite passed 6/6
@@ -403,8 +406,8 @@ major optimization; the completed follow-up is documented below.
 
 #### Bounded ownership and function specialization
 
-The follow-up implementation separates direct display preparation from
-explicit guest publication, bounds the queue at two submissions, and assigns
+The 30 FPS closure separated direct display preparation from explicit guest
+publication, bounded the queue at two submissions, and assigned
 vertex, surface-upload, and surface-readback resources to their owning
 submission. Ordinary target switches commit private generations
 asynchronously. Snapshots, dumps, feedback, captures, scale transitions, and
@@ -442,6 +445,53 @@ executable SHA-256 is
 Post-matrix `pmset -g therm` reported no thermal or performance warning, but
 direct package-power and temperature telemetry was not available, so no
 energy-per-frame conclusion is drawn.
+
+#### GPU-private feedback and sustained Native 4x/60
+
+The 4x/60 continuation added exact command reasons and feedback CPU counters.
+The original path performed one synchronous feedback readback per game frame:
+about 3.8-4.5 ms on the GPU and 13.46-14.26 ms of blocked CPU time. The
+retained exact-alias path resolves the newest private XRGB anti-aliased
+generation on the GPU when guest bytes are unchanged. A detected CPU write
+still waits, publishes, merges changed 32-bit pixels, and reseeds.
+Steady-state evidence records zero publications and 0.09-0.10 ms per feedback
+check.
+
+The final path uses three bounded submission-owned resource sets and lets one
+command own every color-surface generation touched in order. Safe target
+switches no longer force a commit; eight switches trigger a bounded fallback.
+The representative frame therefore produces one
+`render+target-switch+feedback+present+depth-copy` command instead of one
+presented and two offscreen commands.
+
+Two independent exact Native/auto boots selected 4x at 2560x1920. Across
+their consecutive post-warm-up 300-frame qualification windows:
+
+| Metric | Range |
+| --- | --- |
+| Completed-game FPS | 59.98-60.01 FPS |
+| Wall median / p95 | 16.66-16.68 / 17.06-17.46 ms |
+| Combined GPU median / p95 | 14.18-14.84 / 14.87-15.26 ms |
+| Submission-latency p95 | 15.23-15.50 ms |
+
+Two fixed-4x, cap-120 boots measured 59.36-100.78 FPS and
+60.33-100.10 FPS across all reported windows. Both included consecutive
+post-warm-up windows above 60 FPS; the second exceeded 60 FPS in every
+complete window. All four boots used Retail water and the accepted quincunx
+approximation, retained 4x scale/filtering/LOD/draw coverage, reported zero
+rejected ocean markers, and completed without a Metal command failure.
+
+Cold exact-default windows are not hidden: they averaged as low as 53.22 FPS
+and contained 296-330 ms shader/workload warm-up maxima. Qualification uses
+consecutive rolling reports emitted at or after presented frame 900 and
+before the guest relaunch transition. A 59.94 Hz cap cannot compensate for a
+cold stall with faster frames, so cold pipeline warm-up remains separate
+follow-up work.
+
+The measured executable SHA-256 is
+`3516f2e2906347880bcf20dd8f2966a0c32b46776e620923d694f097e4d37562`.
+The final source passes 337/337 Metal backend tests, seven focused
+ASan/UBSan ownership/feedback cases, and 62/62 macOS presenter tests.
 
 ### Water visual-review boundary
 

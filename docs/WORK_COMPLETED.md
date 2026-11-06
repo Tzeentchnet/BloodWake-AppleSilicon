@@ -1,6 +1,6 @@
 # Apple Silicon work completed
 
-Updated 2026-11-03. This document records implemented Apple Silicon work.
+Updated 2026-11-06. This document records implemented Apple Silicon work.
 Current status and remaining work are in
 [APPLE_SILICON_HANDOFF.md](APPLE_SILICON_HANDOFF.md); measured results and
 test coverage are in [VALIDATION.md](VALIDATION.md).
@@ -143,6 +143,45 @@ test coverage are in [VALIDATION.md](VALIDATION.md).
 - Removed the direct-present path's CPU gamma pass, second guest-memory read,
   and SDL streaming-texture upload. The executor's synchronous guest-sized
   writeback remains for snapshots and framebuffer dumps.
+- Split ordinary direct presentation from explicit guest publication.
+  Snapshots, dumps, captures, scale changes, unsupported feedback aliases, and
+  other CPU-visible consumers still publish in order.
+- Added exact command-reason GPU timing plus feedback/publication/quincunx CPU
+  timing and counters. This isolated a 13.46-14.26 ms per-frame synchronous
+  feedback wait from the 0.33-0.37 ms allocation/upload preparation cost.
+- Added an exact GPU-private XRGB anti-aliased feedback path. Unchanged guest
+  snapshots consume the newest private generation through a
+  submission-owned resolve texture; detected CPU writes retain ordered
+  publication, 32-bit merge, and private reseeding.
+- Added three bounded submission-owned resource sets for command buffers,
+  vertex arenas, surface uploads, feedback resolves, and surface readbacks.
+  Queue saturation retires only the oldest submission; completion, failure,
+  color generations, and publication remain ordered on the executor thread.
+- Let one submission own multiple touched color-surface generations, allowing
+  safe target switches to stay in one command buffer. Eight switches force a
+  bounded fallback commit. Detected guest CPU writes still merge over newer
+  private GPU generations, and full color clears stay in the first matching
+  draw render pass.
+- Specialized immutable texture-stage, register-combiner, final-combiner, and
+  alpha-test routing with Metal function constants while keeping material
+  colors, fog, factors, alpha reference, textures, and samplers dynamic.
+- Raised the representative exact-default Native/auto 4x workload to
+  31.89-34.65 FPS with 28.75-29.92 ms wall medians. Two fixed-4x runs measured
+  32.08-36.14 FPS without changing scale, filtering, LOD, draw coverage, or
+  Retail-water defaults.
+- Rejected four lower-read quincunx experiments after measurement: exact
+  16-read and 24-read shaders regressed runtime; grouped bilinear and
+  source-resolution prefilter variants failed byte-exact reference samples,
+  and the prefilter also regressed GPU timing. The exact measured-faster
+  36-read legacy loop remains.
+- Reached sustained Native 4x/60 without a quality reduction. Two exact
+  Native/auto boots produced post-warm-up windows at 59.98-60.01 FPS,
+  16.66-16.68 ms wall medians, 14.18-14.84 ms GPU medians, and
+  14.87-15.26 ms GPU p95. Two fixed-4x/cap-120 boots independently produced
+  consecutive windows above 60 FPS. Cold 296-330 ms startup stalls remain
+  documented as pipeline/workload warm-up.
+- Passed 337/337 Metal backend tests, seven focused ownership/publication
+  cases under ASan/UBSan, and 62/62 macOS presenter tests.
 
 ## Input
 
@@ -226,11 +265,13 @@ test coverage are in [VALIDATION.md](VALIDATION.md).
 
 - Exact NV2A quincunx weights, sample positions, edge behavior, and rounding
   remain unknown.
-- Direct presentation and 4x internal scaling have synthetic coverage and
-  hands-on retail visual confirmation. Formal reference comparison, frame
-  time, and memory measurements remain outstanding.
-- CPU/GPU ownership is coordinated only at the renderer's explicit surface
-  boundaries; general guest aliases and concurrent CPU access are not solved.
+- Direct presentation and 4x internal scaling have synthetic coverage,
+  hands-on retail visual confirmation, and repeated Battle frame-time
+  measurements. Formal reference comparison and a complete memory-budget
+  report remain outstanding.
+- CPU/GPU ownership is coordinated for tracked color surfaces and bounded
+  submission resources. General guest aliases and concurrent CPU access
+  outside those explicit boundaries are not solved.
 - Guest USB, physical gamepads, FMV, saves, other editions, and broad mission
   coverage are not complete Apple Silicon features. Native APU audio is
   implemented and regression-tested, but audible retail output, quality, and

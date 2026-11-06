@@ -36,7 +36,8 @@ extern uint64_t xbox_HostNowNs(void);
 #define METAL_MAX_COLOR_SURFACES 32u
 #define METAL_MAX_DEPTH_SURFACES 32u
 #define METAL_MAX_FRAME_SAMPLES 16384u
-#define METAL_MAX_IN_FLIGHT 2u
+#define METAL_MAX_IN_FLIGHT 3u
+#define METAL_MAX_TARGET_SWITCHES_PER_SUBMISSION 8u
 #define METAL_INITIAL_VERTEX_UPLOAD (16u * 1024u * 1024u)
 #define METAL_COLOR_XRGB_ZERO 0x4u
 #define METAL_COLOR_ARGB8 0x8u
@@ -51,6 +52,16 @@ extern uint64_t xbox_HostNowNs(void);
 #define METAL_WATER_BENCHMARK_SAMPLES_PER_PRESET \
     (METAL_WATER_BENCHMARK_SAMPLE_FRAMES * 2u)
 #define METAL_WATER_CAPTURE_IMAGES 4u
+
+enum {
+    METAL_COMMAND_REASON_RENDER = 1u << 0,
+    METAL_COMMAND_REASON_TARGET_SWITCH = 1u << 1,
+    METAL_COMMAND_REASON_SURFACE_UPLOAD = 1u << 2,
+    METAL_COMMAND_REASON_SURFACE_READBACK = 1u << 3,
+    METAL_COMMAND_REASON_FEEDBACK = 1u << 4,
+    METAL_COMMAND_REASON_PRESENT = 1u << 5,
+    METAL_COMMAND_REASON_DEPTH_COPY = 1u << 6,
+};
 
 typedef struct {
     float position[4];
@@ -176,10 +187,14 @@ typedef struct {
     size_t vertex_upload_offset;
     id<MTLTexture> surface_upload;
     id<MTLTexture> surface_readback;
-    BWMetalColorSurface *color_entry;
-    uint64_t color_generation;
+    id<MTLTexture> feedback_resolve;
+    BWMetalColorSurface *__strong color_entries[METAL_MAX_COLOR_SURFACES];
+    uint64_t color_generations[METAL_MAX_COLOR_SURFACES];
+    size_t color_entry_count;
+    unsigned target_switches;
     CFTimeInterval commit_time;
     uint32_t frame;
+    uint32_t reason_mask;
     int water_command;
     int presented;
 #if defined(BW_METAL_TESTING)
@@ -324,6 +339,20 @@ typedef struct {
     uint64_t nanoseconds, count;
 } MetalCommandRoleSurface;
 static MetalCommandRoleSurface s_command_role_surfaces[8];
+typedef struct {
+    uint32_t reason_mask;
+    uint64_t nanoseconds, count;
+} MetalCommandReasonTiming;
+static MetalCommandReasonTiming s_command_reason_timings[16];
+static uint64_t s_command_reason_timing_overflows;
+static uint64_t s_feedback_checks;
+static uint64_t s_gpu_private_feedback_resolves;
+static uint64_t s_feedback_fallbacks;
+static uint64_t s_feedback_publications;
+static uint64_t s_feedback_publication_ns;
+static uint64_t s_quincunx_preparations;
+static uint64_t s_quincunx_preparation_bytes;
+static uint64_t s_quincunx_preparation_ns;
 static uint64_t s_gpu_command_timestamp_failures;
 static uint64_t s_last_flip_ns;
 static int s_frame_timing_enabled;
@@ -501,6 +530,41 @@ static void report_duration_times(const char *kind, const char *label,
             kind, label, count, (double)sum / (double)count / 1e6,
             (double)median / 1e6, (double)p95 / 1e6, (double)maximum / 1e6);
     free(sorted);
+}
+
+static void command_reason_text(uint32_t reason_mask, char *text, size_t size)
+{
+    static const struct {
+        uint32_t flag;
+        const char *name;
+    } reasons[] = {
+        {METAL_COMMAND_REASON_RENDER, "render"},
+        {METAL_COMMAND_REASON_TARGET_SWITCH, "target-switch"},
+        {METAL_COMMAND_REASON_SURFACE_UPLOAD, "surface-upload"},
+        {METAL_COMMAND_REASON_SURFACE_READBACK, "surface-readback"},
+        {METAL_COMMAND_REASON_FEEDBACK, "feedback"},
+        {METAL_COMMAND_REASON_PRESENT, "present"},
+        {METAL_COMMAND_REASON_DEPTH_COPY, "depth-copy"},
+    };
+    size_t used = 0;
+    if (!size)
+        return;
+    text[0] = '\0';
+    for (size_t i = 0; i < sizeof reasons / sizeof reasons[0]; i++) {
+        if (!(reason_mask & reasons[i].flag) || used >= size - 1u)
+            continue;
+        int written = snprintf(text + used, size - used, "%s%s",
+                               used ? "+" : "", reasons[i].name);
+        if (written < 0)
+            break;
+        if ((size_t)written >= size - used) {
+            used = size - 1u;
+            break;
+        }
+        used += (size_t)written;
+    }
+    if (!used)
+        snprintf(text, size, "unspecified");
 }
 
 typedef struct {
@@ -876,6 +940,7 @@ static const char s_shader[] =
     "      r[8] += legacy_linear(tex, uv + float2(x, y))\n"
     "            * (float((2 - abs(x)) * (2 - abs(y))) / 16.0);\n"
     "  } else r[8] = tex.sample(samp, uv0);\n"
+    "  if (texture_state.x) r[8].a = 1.0;\n"
     "  if (m1 == 17u) {\n"
     "    r[9] = float4(0.0); dp1 = dot(tc[1].xyz, dot_map(r[8], dot_state.y & 15u));\n"
     "  } else if (m1 == 4u) r[9] = saturate(tc[1]);\n"
@@ -1543,6 +1608,27 @@ static int ensure_surface_readback(uint32_t width, uint32_t height)
     return 1;
 }
 
+static int ensure_feedback_resolve(uint32_t width, uint32_t height)
+{
+    if (!pending_command() || !s_encoding_submission)
+        return 0;
+    if (s_encoding_submission->feedback_resolve &&
+        s_encoding_submission->feedback_resolve.width == width &&
+        s_encoding_submission->feedback_resolve.height == height)
+        return 1;
+    MTLTextureDescriptor *desc =
+        [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
+                                                           width:width height:height mipmapped:NO];
+    if (!desc)
+        return metal_fail("could not create feedback resolve descriptor");
+    desc.storageMode = MTLStorageModePrivate;
+    desc.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
+    s_encoding_submission->feedback_resolve = [s_device newTextureWithDescriptor:desc];
+    if (!s_encoding_submission->feedback_resolve)
+        return metal_fail("could not create feedback resolve texture");
+    return 1;
+}
+
 static int encode_surface_copy(id<MTLTexture> source, id<MTLTexture> destination,
                                int box_filter)
 {
@@ -1586,11 +1672,20 @@ static int encode_surface_copy(id<MTLTexture> source, id<MTLTexture> destination
     return 1;
 }
 
+static int mark_pending_command_reason(uint32_t reason)
+{
+    if (!s_pending_command || !s_encoding_submission)
+        return metal_fail("Metal command reason has no pending submission");
+    s_encoding_submission->reason_mask |= reason;
+    return 1;
+}
+
 static int seed_color_surface(id<MTLTexture> destination,
                               const Nv2aSurface *surface,
                               const void *pixels, size_t row)
 {
-    if (!ensure_surface_upload(surface->width, surface->height))
+    if (!ensure_surface_upload(surface->width, surface->height) ||
+        !mark_pending_command_reason(METAL_COMMAND_REASON_SURFACE_UPLOAD))
         return 0;
     [s_encoding_submission->surface_upload
         replaceRegion:MTLRegionMake2D(0, 0, surface->width, surface->height)
@@ -1659,7 +1754,8 @@ static NSMutableData *copy_guest_surface(const Nv2aSurface *surface, size_t row)
 
 static int publish_cached_surface(BWMetalColorSurface *entry,
                                   const Nv2aSurface *surface,
-                                  uint32_t format, int merge_guest_changes)
+                                  uint32_t format, int merge_guest_changes,
+                                  uint32_t reason)
 {
     size_t row = (size_t)surface->width * 4u;
     if ((size_t)surface->height > SIZE_MAX / row)
@@ -1670,7 +1766,9 @@ static int publish_cached_surface(BWMetalColorSurface *entry,
     if (!guest_before || !pixels)
         return pixels ? 0 : metal_fail("could not allocate colour surface publication buffer");
     if (!ensure_surface_readback(surface->width, surface->height) ||
-        !s_encoding_submission)
+        !s_encoding_submission ||
+        !mark_pending_command_reason(METAL_COMMAND_REASON_SURFACE_READBACK |
+                                     reason))
         return 0;
     id<MTLTexture> readback = s_encoding_submission->surface_readback;
     if (!readback || !encode_surface_copy(entry->texture, readback, 1) ||
@@ -1730,7 +1828,7 @@ static int prepare_cached_surface(BWMetalColorSurface *entry,
     if (surface_matches_guest_sync(entry, surface, format))
         return 1;
     if (entry->private_dirty &&
-        !publish_cached_surface(entry, surface, format, 1))
+        !publish_cached_surface(entry, surface, format, 1, 0))
         return 0;
     if (surface_matches_guest_sync(entry, surface, format))
         return 1;
@@ -1755,7 +1853,8 @@ static int publish_overlapping_color_surfaces(uint32_t address, uint64_t end)
         if ((uint64_t)address < surface_end &&
             (uint64_t)entry->surface.color_va < end &&
             !publish_cached_surface(entry, &entry->surface,
-                                    entry->format, 1))
+                                    entry->format, 1,
+                                    METAL_COMMAND_REASON_FEEDBACK))
             return 0;
     }
     return 1;
@@ -1767,7 +1866,7 @@ static int publish_all_dirty_color_surfaces(void)
     for (BWMetalColorSurface *entry in entries)
         if (entry->private_dirty && entry->sync_valid &&
             !publish_cached_surface(entry, &entry->surface,
-                                    entry->format, 1))
+                                    entry->format, 1, 0))
             return 0;
     return wait_for_all_submissions();
 }
@@ -1781,6 +1880,7 @@ static int writeback(void)
         if (!ensure_surface_readback(s_current.width, s_current.height) ||
             !s_encoding_submission ||
             !(readback = s_encoding_submission->surface_readback) ||
+            !mark_pending_command_reason(METAL_COMMAND_REASON_SURFACE_READBACK) ||
             !encode_surface_copy(s_surface, readback, 1))
             return 0;
     }
@@ -1864,6 +1964,28 @@ static BWMetalColorSurface *cached_surface(const Nv2aSurface *s, uint32_t format
     return entry;
 }
 
+static int track_dirty_surface(BWMetalSubmission *submission)
+{
+    if (!s_dirty)
+        return 1;
+    if (!submission || !s_surface_entry)
+        return metal_fail("dirty colour surface has no submission owner");
+    for (size_t i = 0; i < submission->color_entry_count; i++)
+        if (submission->color_entries[i] == s_surface_entry)
+            return 1;
+    if (submission->color_entry_count >= METAL_MAX_COLOR_SURFACES)
+        return metal_fail("GPU submission touched too many colour surfaces");
+    uint64_t generation = ++s_surface_generation;
+    if (!generation)
+        return metal_fail("colour surface generation overflowed");
+    size_t index = submission->color_entry_count++;
+    submission->color_entries[index] = s_surface_entry;
+    submission->color_generations[index] = generation;
+    s_surface_entry->submitted_generation = generation;
+    s_surface_entry->private_dirty = 1;
+    return 1;
+}
+
 static int prepare_surface(const Nv2aSurface *s)
 {
     uint32_t format = bw_backend_reg(0x0208u) & 0xFu;
@@ -1875,12 +1997,18 @@ static int prepare_surface(const Nv2aSurface *s)
         return metal_fail("colour surface aliases a cleared depth/stencil surface");
     if (s_surface && same_surface(s, &s_current) && format == s_current_format)
         return 1;
-    if (s_surface && s_dirty) {
-        if (!commit_commands_async())
+    if (s_pending_command) {
+        end_draw_encoder();
+        BWMetalSubmission *submission = s_encoding_submission;
+        if (!submission ||
+            !mark_pending_command_reason(METAL_COMMAND_REASON_TARGET_SWITCH) ||
+            !track_dirty_surface(submission))
             return 0;
         s_dirty = 0;
-    } else if (s_pending_command) {
-        if (!commit_commands_async())
+        submission->target_switches++;
+        if (submission->target_switches >=
+                METAL_MAX_TARGET_SWITCHES_PER_SUBMISSION &&
+            !commit_commands_async())
             return 0;
     } else if (!retire_completed_submissions()) {
         return 0;
@@ -2025,8 +2153,29 @@ static void record_submission_timing(BWMetalSubmission *submission)
                 *total += nanoseconds;
                 (*count)++;
             }
-            if (submission->color_entry) {
-                BWMetalColorSurface *entry = submission->color_entry;
+            int recorded_reason = 0;
+            for (size_t i = 0;
+                 i < sizeof s_command_reason_timings /
+                         sizeof s_command_reason_timings[0];
+                 i++) {
+                MetalCommandReasonTiming *timing = &s_command_reason_timings[i];
+                if (!timing->count ||
+                    timing->reason_mask == submission->reason_mask) {
+                    if (!timing->count)
+                        timing->reason_mask = submission->reason_mask;
+                    if (UINT64_MAX - timing->nanoseconds >= nanoseconds) {
+                        timing->nanoseconds += nanoseconds;
+                        timing->count++;
+                        recorded_reason = 1;
+                    }
+                    break;
+                }
+            }
+            if (!recorded_reason)
+                s_command_reason_timing_overflows++;
+            if (submission->color_entry_count) {
+                BWMetalColorSurface *entry =
+                    submission->color_entries[submission->color_entry_count - 1u];
                 for (size_t i = 0;
                      i < sizeof s_command_role_surfaces /
                              sizeof s_command_role_surfaces[0];
@@ -2101,11 +2250,11 @@ static int retire_oldest_submission(int wait, int saturation_wait)
                                 ? metal_error_text(submission->command.error)
                                 : "synthetic test failure");
     } else {
-        if (submission->color_entry &&
-            submission->color_generation >
-                submission->color_entry->completed_generation)
-            submission->color_entry->completed_generation =
-                submission->color_generation;
+        for (size_t i = 0; i < submission->color_entry_count; i++)
+            if (submission->color_generations[i] >
+                submission->color_entries[i]->completed_generation)
+                submission->color_entries[i]->completed_generation =
+                    submission->color_generations[i];
         record_submission_timing(submission);
         CFTimeInterval completion_time = submission->command.GPUEndTime;
         double latency = (completion_time - submission->commit_time) * 1.0e9;
@@ -2129,8 +2278,12 @@ static int retire_oldest_submission(int wait, int saturation_wait)
     }
     [s_inflight_submissions removeObjectAtIndex:0];
     submission->command = nil;
-    submission->color_entry = nil;
-    submission->color_generation = 0;
+    for (size_t i = 0; i < submission->color_entry_count; i++) {
+        submission->color_entries[i] = nil;
+        submission->color_generations[i] = 0;
+    }
+    submission->color_entry_count = 0;
+    submission->target_switches = 0;
     submission->commit_time = 0.0;
     submission->frame = 0;
     submission->water_command = 0;
@@ -2189,6 +2342,7 @@ static id<MTLCommandBuffer> pending_command(void)
         submission->command = [s_queue commandBuffer];
         submission->frame = s_frame;
         submission->vertex_upload_offset = 0;
+        submission->reason_mask = 0;
         s_encoding_submission = submission;
         s_pending_command = submission->command;
     }
@@ -2204,21 +2358,14 @@ static int submit_commands(int wait)
         BWMetalSubmission *submission = s_encoding_submission;
         if (!submission || submission->command != s_pending_command)
             return metal_fail("pending GPU command has no submission owner");
+        if (!track_dirty_surface(submission))
+            return 0;
         submission->water_command = s_pending_supported_water;
         s_pending_supported_water = 0;
 #if defined(BW_METAL_TESTING)
         submission->test_failure = s_test_fail_next_submission;
         s_test_fail_next_submission = 0;
 #endif
-        if (s_dirty && s_surface_entry) {
-            uint64_t generation = ++s_surface_generation;
-            if (!generation)
-                return metal_fail("colour surface generation overflowed");
-            submission->color_entry = s_surface_entry;
-            submission->color_generation = generation;
-            s_surface_entry->submitted_generation = generation;
-            s_surface_entry->private_dirty = 1;
-        }
         submission->commit_time = CACurrentMediaTime();
         [submission->command commit];
         s_command_submissions++;
@@ -2865,6 +3012,9 @@ static id<MTLRenderCommandEncoder> draw_encoder(BWMetalDepthSurface *depth)
     pass.colorAttachments[0].storeAction = MTLStoreActionStore;
     configure_draw_depth(pass, depth);
     id<MTLCommandBuffer> command = pending_command();
+    if (command &&
+        !mark_pending_command_reason(METAL_COMMAND_REASON_RENDER))
+        return nil;
     s_draw_encoder = [command renderCommandEncoderWithDescriptor:pass];
     if (!command || !s_draw_encoder) {
         s_draw_encoder = nil;
@@ -2952,6 +3102,9 @@ static int water_reflect_copy_depth(BWMetalDepthSurface *source)
     }
     end_draw_encoder();
     id<MTLCommandBuffer> command = pending_command();
+    if (command &&
+        !mark_pending_command_reason(METAL_COMMAND_REASON_DEPTH_COPY))
+        return 0;
     id<MTLBlitCommandEncoder> blit = [command blitCommandEncoder];
     if (!command || !blit)
         return 0;
@@ -3196,6 +3349,22 @@ static int validate_extended_combiner(const BwXBatch *batch)
     return 1;
 }
 
+static BWMetalColorSurface *exact_feedback_surface(const Nv2aTexture *texture)
+{
+    for (BWMetalColorSurface *entry in s_color_surfaces.allValues)
+        if (entry->texture && entry->sync_valid &&
+            entry->format == METAL_COLOR_XRGB_ZERO &&
+            entry->surface.color_va == texture->offset &&
+            entry->surface.width == texture->width &&
+            entry->surface.height == texture->height &&
+            entry->surface.pitch == texture->pitch &&
+            entry->surface.bytes_per_pixel == 4u &&
+            entry->surface.aa_sx == 2u &&
+            entry->surface.aa_sy == 1u)
+            return entry;
+    return nil;
+}
+
 static id<MTLTexture> quincunx_approx_texture(const Nv2aSurface *surface,
                                               const BwXBatch *batch)
 {
@@ -3232,9 +3401,42 @@ static id<MTLTexture> quincunx_approx_texture(const Nv2aSurface *surface,
                                                    s_current.height, s_current.pitch) &&
         (uint64_t)s_current.color_va < end)
         return metal_fail("sampling a pending render target is unsupported"), nil;
-    if (!publish_overlapping_color_surfaces(tex->offset, end))
+    uint64_t feedback_start = s_frame_timing_enabled ? xbox_HostNowNs() : 0;
+    s_feedback_checks++;
+    BWMetalColorSurface *feedback = exact_feedback_surface(tex);
+    if (feedback &&
+        surface_matches_guest_sync(feedback, &feedback->surface,
+                                   feedback->format)) {
+        if (!ensure_feedback_resolve(tex->width, tex->height) ||
+            !mark_pending_command_reason(METAL_COMMAND_REASON_FEEDBACK) ||
+            !encode_surface_copy(feedback->texture,
+                                 s_encoding_submission->feedback_resolve, 1))
+            return nil;
+        id<MTLTexture> resolved = s_encoding_submission->feedback_resolve;
+        uint64_t feedback_end = s_frame_timing_enabled ? xbox_HostNowNs() : 0;
+        s_gpu_private_feedback_resolves++;
+        if (feedback_start && feedback_end > feedback_start &&
+            UINT64_MAX - s_feedback_publication_ns >=
+                feedback_end - feedback_start)
+            s_feedback_publication_ns += feedback_end - feedback_start;
+        return resolved;
+    }
+
+    s_feedback_fallbacks++;
+    uint64_t publications_before = s_guest_publications;
+    int published = publish_overlapping_color_surfaces(tex->offset, end);
+    uint64_t feedback_end = s_frame_timing_enabled ? xbox_HostNowNs() : 0;
+    if (s_guest_publications >= publications_before &&
+        UINT64_MAX - s_feedback_publications >=
+            s_guest_publications - publications_before)
+        s_feedback_publications += s_guest_publications - publications_before;
+    if (feedback_start && feedback_end > feedback_start &&
+        UINT64_MAX - s_feedback_publication_ns >= feedback_end - feedback_start)
+        s_feedback_publication_ns += feedback_end - feedback_start;
+    if (!published)
         return nil;
 
+    uint64_t preparation_start = s_frame_timing_enabled ? xbox_HostNowNs() : 0;
     size_t count = (size_t)tex->width * tex->height;
     uint32_t *pixels = malloc(count * sizeof *pixels);
     if (!pixels)
@@ -3264,6 +3466,14 @@ static id<MTLTexture> quincunx_approx_texture(const Nv2aSurface *surface,
     [texture replaceRegion:MTLRegionMake2D(0, 0, tex->width, tex->height)
                mipmapLevel:0 withBytes:pixels bytesPerRow:(size_t)tex->width * sizeof *pixels];
     free(pixels);
+    uint64_t preparation_end = s_frame_timing_enabled ? xbox_HostNowNs() : 0;
+    s_quincunx_preparations++;
+    if (UINT64_MAX - s_quincunx_preparation_bytes >= count * sizeof(uint32_t))
+        s_quincunx_preparation_bytes += count * sizeof(uint32_t);
+    if (preparation_start && preparation_end > preparation_start &&
+        UINT64_MAX - s_quincunx_preparation_ns >=
+            preparation_end - preparation_start)
+        s_quincunx_preparation_ns += preparation_end - preparation_start;
     return texture;
 }
 
@@ -3584,6 +3794,9 @@ static void metal_clear(const Nv2aSurface *s, const Nv2aRenderState *rs,
             pass.stencilAttachment.clearStencil = zstencil & 0xFFu;
         }
         id<MTLCommandBuffer> command = pending_command();
+        if (command &&
+            !mark_pending_command_reason(METAL_COMMAND_REASON_RENDER))
+            return;
         id<MTLRenderCommandEncoder> encoder = [command renderCommandEncoderWithDescriptor:pass];
         if (!command || !encoder) {
             metal_fail("could not create clear command");
@@ -4368,6 +4581,8 @@ static int direct_present(void)
     id<MTLCommandBuffer> command = pending_command();
     if (!command || !s_encoding_submission)
         return metal_fail("could not create presentation command buffer");
+    if (!mark_pending_command_reason(METAL_COMMAND_REASON_PRESENT))
+        return 0;
     id<MTLTexture> source = s_present_surface;
     uint32_t logical_width = s_present_framebuffer.width / s_present_framebuffer.aa_sx;
     uint32_t logical_height = s_present_framebuffer.height / s_present_framebuffer.aa_sy;
@@ -4534,7 +4749,7 @@ static int metal_publish_snapshot(uint32_t color_va, uint32_t pitch)
         if (!entry)
             return 0;
         if (entry->private_dirty)
-            return publish_cached_surface(entry, &selected.surface, format, 1);
+            return publish_cached_surface(entry, &selected.surface, format, 1, 0);
         return 1;
     }
 }
@@ -4635,12 +4850,68 @@ static void metal_flip(void)
                             (double)role->nanoseconds /
                                 (double)role->count / 1.0e6);
                 }
+                for (size_t i = 0;
+                     i < sizeof s_command_reason_timings /
+                             sizeof s_command_reason_timings[0];
+                     i++) {
+                    MetalCommandReasonTiming *timing =
+                        &s_command_reason_timings[i];
+                    if (!timing->count)
+                        continue;
+                    char reason[128];
+                    command_reason_text(timing->reason_mask,
+                                        reason, sizeof reason);
+                    fprintf(stderr,
+                            "[GPU-METAL] GPU command reason: %s, "
+                            "%llu commands, %.2f ms mean\n",
+                            reason, (unsigned long long)timing->count,
+                            (double)timing->nanoseconds /
+                                (double)timing->count / 1.0e6);
+                }
+                if (s_command_reason_timing_overflows)
+                    fprintf(stderr,
+                            "[GPU-METAL] GPU command reason timing omitted "
+                            "%llu commands because the role table was full\n",
+                            (unsigned long long)
+                                s_command_reason_timing_overflows);
+                if (s_feedback_checks || s_quincunx_preparations)
+                    fprintf(stderr,
+                            "[GPU-METAL] feedback/quincunx CPU: "
+                            "%llu checks, %llu GPU-private, %llu fallbacks, "
+                            "%llu publications, %.2f ms/check; "
+                            "%llu preparations, %.2f MiB, %.2f ms/preparation\n",
+                            (unsigned long long)s_feedback_checks,
+                            (unsigned long long)s_gpu_private_feedback_resolves,
+                            (unsigned long long)s_feedback_fallbacks,
+                            (unsigned long long)s_feedback_publications,
+                            s_feedback_checks
+                                ? (double)s_feedback_publication_ns /
+                                      (double)s_feedback_checks / 1.0e6
+                                : 0.0,
+                            (unsigned long long)s_quincunx_preparations,
+                            (double)s_quincunx_preparation_bytes /
+                                (1024.0 * 1024.0),
+                            s_quincunx_preparations
+                                ? (double)s_quincunx_preparation_ns /
+                                      (double)s_quincunx_preparations / 1.0e6
+                                : 0.0);
                 s_present_command_gpu_ns = 0;
                 s_offscreen_command_gpu_ns = 0;
                 s_present_command_count = 0;
                 s_offscreen_command_count = 0;
                 memset(s_command_role_surfaces, 0,
                        sizeof s_command_role_surfaces);
+                memset(s_command_reason_timings, 0,
+                       sizeof s_command_reason_timings);
+                s_command_reason_timing_overflows = 0;
+                s_feedback_checks = 0;
+                s_gpu_private_feedback_resolves = 0;
+                s_feedback_fallbacks = 0;
+                s_feedback_publications = 0;
+                s_feedback_publication_ns = 0;
+                s_quincunx_preparations = 0;
+                s_quincunx_preparation_bytes = 0;
+                s_quincunx_preparation_ns = 0;
             }
         }
         if (now)
@@ -5019,6 +5290,16 @@ static int start_with_regions(void *guest_memory, size_t low_size,
     s_present_command_count = 0;
     s_offscreen_command_count = 0;
     memset(s_command_role_surfaces, 0, sizeof s_command_role_surfaces);
+    memset(s_command_reason_timings, 0, sizeof s_command_reason_timings);
+    s_command_reason_timing_overflows = 0;
+    s_feedback_checks = 0;
+    s_gpu_private_feedback_resolves = 0;
+    s_feedback_fallbacks = 0;
+    s_feedback_publications = 0;
+    s_feedback_publication_ns = 0;
+    s_quincunx_preparations = 0;
+    s_quincunx_preparation_bytes = 0;
+    s_quincunx_preparation_ns = 0;
     s_gpu_command_timestamp_failures = 0;
     s_last_flip_ns = 0;
     const char *audit = getenv("BW_GPU_AUDIT");
@@ -5355,6 +5636,24 @@ int bw_metal_test_prepare_present_surface(const Nv2aSurface *surface, uint32_t f
 uint64_t bw_metal_test_surface_seed_count(void)
 {
     return s_surface_seed_count;
+}
+
+void bw_metal_test_feedback_counts(uint64_t *checks, uint64_t *gpu_private,
+                                   uint64_t *fallbacks, uint64_t *publications,
+                                   uint64_t *preparations, uint64_t *bytes)
+{
+    if (checks)
+        *checks = s_feedback_checks;
+    if (gpu_private)
+        *gpu_private = s_gpu_private_feedback_resolves;
+    if (fallbacks)
+        *fallbacks = s_feedback_fallbacks;
+    if (publications)
+        *publications = s_feedback_publications;
+    if (preparations)
+        *preparations = s_quincunx_preparations;
+    if (bytes)
+        *bytes = s_quincunx_preparation_bytes;
 }
 
 unsigned bw_metal_test_sampler_anisotropy(int min_linear, unsigned mip_mode)

@@ -4,8 +4,9 @@ Status: tracked performance tracker
 Last updated: 2026-11-06
 
 This tracker covers base-game frame rate, efficiency, and thermal work. The
-bounded ownership and 30 FPS default-quality target are complete; direct
-power/temperature telemetry remains open.
+bounded ownership, 30 FPS closure, and representative sustained Native 4x/60
+target are complete without a quality reduction. Broader mission coverage,
+cold pipeline warm-up, and direct power/temperature telemetry remain open.
 
 ## Status legend
 
@@ -16,10 +17,21 @@ power/temperature telemetry remains open.
 
 ## Current objective
 
-Retain Native/auto 4x quality while keeping every representative 300-frame
-Battle window at or above 30 FPS, below a 33.3 ms wall median, and free of
-material p95 or submission-latency regression. Continue collecting direct
-power and temperature evidence when privileged telemetry is available.
+Retain Native/auto 4x quality and the representative seeded Battle workload
+at a sustained 60 FPS. Fixed-4x, 120 FPS-cap qualification must produce two
+consecutive post-warm-up 300-frame windows at or above 60 FPS with combined
+render/present GPU median and p95 at or below 16.67 ms. Exact Native/auto,
+match-display qualification must produce two consecutive warm-qualified windows
+between 59.0 and 60.5 FPS, with wall median at or below 16.9 ms and the same
+GPU budget. Qualification starts with rolling reports emitted at or after
+presented frame 900; earlier reports and the guest relaunch transition remain
+reported cold-start/shutdown evidence, not steady-state qualification.
+This explicit boundary is necessary because the 59.94 Hz cap cannot average
+60.00 FPS after any cold compilation or loading stall.
+
+Render scale, filtering, LOD, Retail draw coverage, quincunx behavior, and
+Retail-water defaults remain fixed. Continue collecting direct power and
+temperature evidence when privileged telemetry is available.
 
 ## Dependency map
 
@@ -42,6 +54,16 @@ power and temperature evidence when privileged telemetry is available.
 | PERF-015 | Collect controlled power and thermal evidence | `[~]` | PERF-014 |
 | PERF-016 | Choose product defaults | `[x]` | PERF-014, PERF-015 |
 | PERF-017 | Resume modern-water visual phases | `[ ]` | PERF-014 |
+| PERF-018 | Freeze the Native 4x/60 contract and baseline | `[x]` | PERF-016 |
+| PERF-019 | Instrument render-target feedback and quincunx cost | `[x]` | PERF-018 |
+| PERF-020 | Keep render-target feedback GPU-private | `[x]` | PERF-019 |
+| PERF-021 | Evaluate exact lower-read quincunx resolves | `[x]` | PERF-020 |
+| PERF-022 | Consolidate multi-target submissions | `[x]` | PERF-020 |
+| PERF-023 | Re-evaluate the bounded in-flight depth | `[x]` | PERF-022 |
+| PERF-024 | Attribute remaining CPU vertex/draw cost if broader workloads miss | `[!]` | PERF-023 |
+| PERF-025 | Port justified NV2A vertex programs to Metal | `[!]` | PERF-024 |
+| PERF-026 | Repeat Native 4x/60 acceptance matrix | `[x]` | PERF-023 |
+| PERF-027 | Reconcile product documentation and defaults | `[x]` | PERF-026 |
 
 ## Completed investigation
 
@@ -244,7 +266,106 @@ Validation gates:
 Retain Native/auto 4x, match-display frame rate, filtering, LOD, and Retail
 water. Every exact-default 300-frame window averaged 31.89-34.65 FPS with a
 28.75-29.92 ms wall median, so no quality-policy change is needed for the
-30 FPS target. Native 4x/60 remains outside the demonstrated envelope.
+30 FPS target. At that checkpoint, Native 4x/60 remained outside the
+demonstrated envelope; PERF-018 through PERF-027 record its later closure.
+
+## Native 4x/60 continuation: PERF-018 through PERF-027
+
+### Frozen starting point and acceptance contract: PERF-018
+
+- [x] Retain the representative `relaunch-001.bin` one-player Battle seed.
+- [x] Retain Native/auto 4x, filtering, LOD, Retail draw coverage, quincunx
+  approximation, and Retail water.
+- [x] Use fixed 4x with a 120 FPS cap for uncapped qualification.
+- [x] Report cold-start and relaunch-transition windows separately; qualify
+  two consecutive rolling reports emitted at or after presented frame 900.
+- [x] Require fixed-4x qualification windows to average at least 60 FPS and
+  exact Native/auto windows to remain within 59.0-60.5 FPS.
+- [x] Require exact-default wall median at or below 16.9 ms and combined
+  render/present GPU median and p95 at or below 16.67 ms.
+- [x] Require exact Native/auto with match-display pacing to remain near the
+  59.94 Hz display limit rather than becoming renderer limited.
+- [x] Reject material p95, submission-latency, input-latency, marker, or
+  visual-regression increases.
+- [x] Do not count lower scale, filtering, LOD, draw coverage, or changed
+  Retail-water behavior as optimization.
+
+The exact-default continuation baseline reports 31.89-34.65 FPS,
+28.75-29.92 ms wall medians, 20.44-21.06 ms GPU medians, and
+12.21-12.56 ms command-wait medians. A representative 300-frame role window
+contains 100 presented and 200 offscreen commands. Presented work averages
+12.31 ms; the known 640x480 offscreen target averages 5.56 ms; the remaining
+unclassified offscreen command contributes roughly 4.1 ms per game frame.
+
+### GPU-private feedback and quincunx resolve: PERF-019 through PERF-021
+
+- [x] Add command reasons and CPU timing for feedback publication, quincunx
+  texture preparation, allocation/upload, and filter encoding.
+- [x] Count quincunx resolves and source generations per game frame.
+- [x] Prove whether the unclassified third command is feedback publication or
+  resolve preparation.
+- [x] Borrow the authoritative cached private color texture when a sampled
+  texture exactly aliases a tracked render-target generation.
+- [x] Preserve CPU-write detection, overlap handling, explicit snapshots,
+  dumps, captures, scale transitions, and error propagation.
+- [x] Keep feedback dependencies ordered on the GPU without routine guest
+  readback or CPU re-upload.
+- [x] Replace steady-state allocation and texture creation with a
+  submission-owned feedback-resolve texture.
+- [x] Evaluate exact lower-read variants before accepting one. Exact 16-read
+  and 24-read inline variants regressed the representative runtime; a grouped
+  bilinear variant mismatched 18/4096 samples; a source-resolution prefilter
+  mismatched 16/4096 samples and regressed GPU time. All were removed.
+- [x] Retain the measured-faster exact 36-read legacy loop rather than trading
+  correctness or representative performance for a lower theoretical read
+  count.
+- [x] Add edge, clamp, rounding, alias, CPU-write, generation, and failure
+  tests before accepting the optimized path.
+
+Instrumentation showed one synchronous feedback publication per game frame:
+about 3.8-4.5 ms of GPU readback and 13.46-14.26 ms of blocked CPU time,
+versus only about 0.33-0.37 ms for quincunx preparation. The retained private
+path records zero steady-state publications and about 0.09-0.10 ms per
+feedback check.
+
+### Submission and CPU continuation: PERF-022 through PERF-025
+
+- [x] Let one submission own an ordered set of color-surface generations so a
+  target switch can end one render pass and begin another without committing
+  solely to change ownership.
+- [x] Preserve ordered retirement, sticky failure propagation, publication,
+  and per-surface generation advancement.
+- [x] Bound a command at eight target switches, then force a fallback commit.
+- [x] Raise the in-flight bound from two to three only after feedback became
+  GPU-private.
+- [x] Reject a material submission/input-latency regression. Exact-default
+  steady-state submission-latency p95 remained 15.23-15.50 ms.
+- [!] Defer CPU vertex/draw attribution and a `draw_vsh` Metal port while the
+  representative target clears its budget. Resume only if broader mission
+  evidence identifies a CPU-bound miss.
+
+### Final acceptance: PERF-026 and PERF-027
+
+- [x] Pass focused ownership, feedback, quincunx, and failure tests.
+- [x] Pass the complete 337-case Metal suite and seven focused ASan/UBSan
+  cases.
+- [x] Pass the complete 62-case macOS presenter suite.
+- [x] Run two fixed-4x qualification boots and two exact-default Native/auto
+  boots.
+- [x] Record FPS, wall/GPU/wait percentiles, command reasons, submission
+  latency, marker coverage, executable hash, and direct telemetry caveats.
+- [x] Update tracked performance, validation, quality, roadmap, handoff, and
+  completion records only from retained evidence.
+
+The final exact-default boots selected 4x at 2560x1920. Their qualifying
+windows measured 59.98-60.01 FPS, 16.66-16.68 ms wall medians,
+14.18-14.84 ms GPU medians, and 14.87-15.26 ms GPU p95. Fixed-4x/cap-120
+boots reached 59.36-100.78 FPS and 60.33-100.10 FPS across all reported
+windows; both produced consecutive post-warm-up windows above 60 FPS. The
+steady-state command shape is one
+`render+target-switch+feedback+present+depth-copy` command per game frame.
+Cold windows still contain 296-330 ms shader/workload warm-up stalls and are
+retained as an explicit follow-up rather than silently discarded.
 
 ## Explicitly unsafe shortcuts
 

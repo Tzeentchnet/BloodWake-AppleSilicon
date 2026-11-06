@@ -181,6 +181,10 @@ extern uint64_t bw_metal_test_draw_encoder_creation_count(void);
 extern uint64_t bw_metal_test_vertex_upload_allocation_count(void);
 extern uint64_t bw_metal_test_texture_upload_count(void);
 extern uint64_t bw_metal_test_surface_seed_count(void);
+extern void bw_metal_test_feedback_counts(uint64_t *checks, uint64_t *gpu_private,
+                                          uint64_t *fallbacks,
+                                          uint64_t *publications,
+                                          uint64_t *preparations, uint64_t *bytes);
 extern void bw_metal_test_set_async_display(int enabled, int defer_retirement);
 extern void bw_metal_test_fail_next_submission(void);
 extern void bw_metal_test_async_counts(size_t *depth, unsigned *high_water,
@@ -661,6 +665,7 @@ static void seed_order_test(void)
 
 static void command_batching_test(void)
 {
+    const uint32_t next_at = COLOR_AT + 0x2000u;
     uint64_t submissions = bw_metal_test_command_submission_count();
     uint64_t encoders = bw_metal_test_draw_encoder_creation_count();
     uint64_t uploads = bw_metal_test_vertex_upload_allocation_count();
@@ -676,6 +681,27 @@ static void command_batching_test(void)
     expect_no_error();
     CHECK(bw_metal_test_command_submission_count() == submissions + 1u);
     CHECK(pixel(4, 3) == 0xFF11CC44u);
+
+    submissions = bw_metal_test_command_submission_count();
+    setup_xrgb_single_surface(next_at);
+    clear(0xFF214365u);
+    setup_surface(1);
+    clear(0xFFABCDEFu);
+    CHECK(bw_metal_test_command_submission_count() == submissions);
+    flip();
+    expect_no_error();
+    CHECK(bw_metal_test_command_submission_count() == submissions + 1u);
+    CHECK(pixel(0, 0) == 0xFFABCDEFu);
+
+    submissions = bw_metal_test_command_submission_count();
+    for (unsigned i = 0; i < 9; i++) {
+        setup_xrgb_single_surface((i & 1u) ? COLOR_AT : next_at);
+        clear(0xFF102030u + i);
+    }
+    CHECK(bw_metal_test_command_submission_count() == submissions + 1u);
+    flip();
+    expect_no_error();
+    CHECK(bw_metal_test_command_submission_count() == submissions + 2u);
 }
 
 static void async_submission_ownership_test(void)
@@ -684,10 +710,12 @@ static void async_submission_ownership_test(void)
     size_t depth = 0;
     unsigned high_water = 0;
     uint64_t waits = 0, publications = 0, display_frames = 0;
-    const uint32_t colors[] = {0xFF204060u, 0xFF406080u, 0xFF6080A0u};
+    const uint32_t colors[] = {
+        0xFF204060u, 0xFF406080u, 0xFF6080A0u, 0xFF80A0C0u,
+    };
 
     bw_metal_test_set_async_display(1, 1);
-    for (unsigned i = 0; i < 2; i++) {
+    for (unsigned i = 0; i < 3; i++) {
         triangle(colors[i]);
         draw(3);
         flip();
@@ -695,24 +723,24 @@ static void async_submission_ownership_test(void)
     }
     bw_metal_test_async_counts(&depth, &high_water, &waits,
                                &publications, &display_frames);
-    CHECK(depth == 2u && high_water == 2u && waits == 0u);
-    CHECK(display_frames == 2u && publications == 0u);
-    CHECK(bw_metal_test_vertex_upload_allocation_count() == uploads + 2u);
+    CHECK(depth == 3u && high_water == 3u && waits == 0u);
+    CHECK(display_frames == 3u && publications == 0u);
+    CHECK(bw_metal_test_vertex_upload_allocation_count() == uploads + 3u);
     CHECK(pixel(4, 3) == 0xA5A5A5A5u);
 
-    triangle(colors[2]);
+    triangle(colors[3]);
     draw(3);
     flip();
     expect_no_error();
     bw_metal_test_async_counts(&depth, &high_water, &waits,
                                &publications, &display_frames);
-    CHECK(depth == 2u && high_water == 2u && waits == 1u);
-    CHECK(display_frames == 3u && publications == 0u);
-    CHECK(bw_metal_test_vertex_upload_allocation_count() == uploads + 2u);
+    CHECK(depth == 3u && high_water == 3u && waits == 1u);
+    CHECK(display_frames == 4u && publications == 0u);
+    CHECK(bw_metal_test_vertex_upload_allocation_count() == uploads + 3u);
 
     CHECK(bw_metal_test_publish_snapshot(COLOR_AT, PITCH));
     expect_no_error();
-    CHECK(pixel(4, 3) == colors[2]);
+    CHECK(pixel(4, 3) == colors[3]);
     bw_metal_test_async_counts(&depth, &high_water, &waits,
                                &publications, &display_frames);
     CHECK(depth == 0u && publications == 1u);
@@ -6187,8 +6215,12 @@ static void quincunx_approx_render_target_resolve_test(void)
 {
     const uint32_t destination = COLOR_AT + 0x2000u;
     Nv2aCombiner rc = synthetic_combiner();
+    uint64_t checks, gpu_private, fallbacks, publications, preparations, bytes;
 
     memset(s_mem + destination, 0x6B, PITCH * HEIGHT);
+    uint32_t source_guest_before = aa_pixel(0, 0);
+    bw_metal_test_feedback_counts(&checks, &gpu_private, &fallbacks,
+                                  &publications, &preparations, &bytes);
     setup_xrgb_aa_surface();
     clear(0xFF214365u);
     setup_xrgb_single_surface(destination);
@@ -6208,13 +6240,55 @@ static void quincunx_approx_render_target_resolve_test(void)
     draw(3);
     flip();
     expect_no_error();
-    CHECK(aa_pixel(0, 0) == 0x00214365u);
+    CHECK(aa_pixel(0, 0) == source_guest_before);
     CHECK(surface_pixel(destination, PITCH, 0, 0) == 0x6B6B6B6Bu);
     CHECK(surface_pixel(destination, PITCH, 4, 3) == 0x00214365u);
+    uint64_t checks_after, gpu_private_after, fallbacks_after;
+    uint64_t publications_after, preparations_after, bytes_after;
+    bw_metal_test_feedback_counts(&checks_after, &gpu_private_after,
+                                  &fallbacks_after, &publications_after,
+                                  &preparations_after, &bytes_after);
+    CHECK(checks_after == checks + 1u);
+    CHECK(gpu_private_after == gpu_private + 1u);
+    CHECK(fallbacks_after == fallbacks);
+    CHECK(publications_after == publications);
+    CHECK(preparations_after == preparations);
+    CHECK(bytes_after == bytes);
     float z;
     uint8_t stencil;
     CHECK(bw_metal_test_read_depth(ZETA_AT, 4, 3, &z, &stencil));
     CHECK(fabsf(z - 0.5f) < 0.000001f && stencil == 0);
+
+    const uint32_t cpu_color = 0x00123456u;
+    method(0x0214, 0);
+    method(0x030C, 0);
+    setup_xrgb_aa_surface();
+    clear(0xFFABCDEFu);
+    for (unsigned y = 0; y < HEIGHT; y++)
+        for (unsigned x = 0; x < AA_WIDTH; x++)
+            put32(COLOR_AT + y * AA_PITCH + x * 4u, cpu_color);
+    setup_xrgb_single_surface(destination);
+    setup_xrgb_convolution_texture(COLOR_AT, (4u << 24) | (7u << 16) | (1u << 13));
+    setup_combiner(&rc);
+    triangle(0xFFFFFFFFu);
+    set_triangle_uv(6.5f, 3.5f);
+    draw(3);
+    flip();
+    expect_no_error();
+    CHECK(surface_pixel(destination, PITCH, 4, 3) == cpu_color);
+
+    uint64_t checks_fallback, gpu_private_fallback, fallbacks_fallback;
+    uint64_t publications_fallback, preparations_fallback, bytes_fallback;
+    bw_metal_test_feedback_counts(&checks_fallback, &gpu_private_fallback,
+                                  &fallbacks_fallback, &publications_fallback,
+                                  &preparations_fallback, &bytes_fallback);
+    CHECK(checks_fallback == checks_after + 1u);
+    CHECK(gpu_private_fallback == gpu_private_after);
+    CHECK(fallbacks_fallback == fallbacks_after + 1u);
+    CHECK(publications_fallback == publications_after + 1u);
+    CHECK(preparations_fallback == preparations_after + 1u);
+    CHECK(bytes_fallback ==
+          bytes_after + (uint64_t)AA_WIDTH * HEIGHT * 4u);
 }
 
 static void basic_feedback_test(const char *which)

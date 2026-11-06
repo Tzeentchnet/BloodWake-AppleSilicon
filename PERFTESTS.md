@@ -4,10 +4,12 @@ Status: tracked performance record
 Last updated: 2026-11-06
 
 This document records the base-game frame-rate and efficiency investigation
-that temporarily takes priority over later modern-water visual work. It
-separates measured behavior from hypotheses and product-policy decisions.
-Retail-derived saves, launch records, profiles, logs, frames, and prepared
-game data remain private and must not be committed.
+that temporarily takes priority over later modern-water visual work. The
+Native 4x/30 closure and representative sustained Native 4x/60 continuation
+are complete at unchanged quality. It separates measured behavior from
+hypotheses and product-policy decisions. Retail-derived saves, launch records,
+profiles, logs, frames, and prepared game data remain private and must not be
+committed.
 
 ## Investigation goals
 
@@ -17,6 +19,8 @@ game data remain private and must not be committed.
 4. identify the highest-confidence optimization that preserves rendering,
    guest-memory, and gameplay behavior.
 5. Avoid silently reducing visual quality or changing frame-rate policy.
+6. Continue from the validated Native 4x/30 envelope to Native 4x/60 without
+   reducing scale, filtering, LOD, draw coverage, or Retail-water behavior.
 
 ## Workload and controls
 
@@ -200,12 +204,13 @@ guest publication. Normal direct presentation keeps the newest color
 generation private, while snapshots, dumps, feedback, captures, scale
 changes, and other CPU-visible paths wait and publish explicitly.
 
-Mutable vertex, surface-upload, and surface-readback resources now belong to
-one of two bounded submissions. Queue saturation retires only the oldest
-submission. Completion, failure, color generation, and guest publication are
+At the 30 FPS closure, mutable vertex, surface-upload, and surface-readback
+resources belonged to one of two bounded submissions. Queue saturation
+retired only the oldest
+submission. Completion, failure, color generation, and guest publication were
 processed in order on the executor thread. A CPU change detected while a
-private generation is newer is merged at 32-bit pixel granularity before the
-surface is reseeded.
+private generation was newer was merged at 32-bit pixel granularity before
+the surface was reseeded.
 
 Ordinary render-target switches no longer resolve, wait, and publish the old
 target. They commit its private generation asynchronously. Full attachment
@@ -278,6 +283,100 @@ old render-only baseline. Wall-frame throughput is the stable comparison.
 - The final measured executable had SHA-256:
   `fee23401f7c42a13744b5c1bd6521bbc22ea93cbffe8c17e091337f693496891`.
 
+## Native 4x/60 continuation
+
+The frozen exact-default starting point was 34.65 FPS, 28.75/32.73 ms
+wall median/p95, 21.00/25.71 ms combined GPU median/p95, and
+12.50/15.09 ms command-wait median/p95. Each game frame produced one
+presented and two offscreen commands.
+
+### Feedback attribution and GPU-private resolve
+
+Exact command-reason and CPU timing proved that the dominant feedback cost
+was not allocation alone:
+
+- one `surface-readback+feedback` command per game frame consumed about
+  3.8-4.5 ms of GPU time;
+- each feedback check blocked the CPU for 13.46-14.26 ms;
+- guest-derived quincunx allocation/upload cost only 0.33-0.37 ms; and
+- each 100 game frames produced 100 presented and 200 offscreen commands.
+
+The retained fast path recognizes an exact tracked XRGB anti-aliased
+render-target alias. If guest bytes still match the synchronization snapshot,
+it resolves the authoritative private generation directly into one
+submission-owned logical-size texture and samples it in queue order. If any
+guest pixel changed, the old wait/readback/32-bit merge/reseed path remains.
+Steady-state publications then fell to zero and feedback CPU time to
+0.09-0.10 ms per check.
+
+With the original two-submission bound, the private path reached 53.80 FPS,
+17.42 ms wall median, and 17.07 ms GPU median in its best 300-frame window.
+Raising the bounded depth to three removed measured command waits and produced
+later windows at 60.00-60.06 FPS with 16.63-16.64 ms wall medians and
+15.91-16.62 ms GPU medians.
+
+### Rejected lower-read quincunx experiments
+
+The retained shader still evaluates the exact legacy 3x3 Gaussian through
+nine explicit bilinear operations, up to 36 reads per output fragment. Four
+lower-read approaches were measured and removed:
+
+1. an exact 16-read cached-neighborhood shader passed the reference tests but
+   regressed representative runtime timing;
+2. four grouped bilinear operations mismatched 18/4096 reference samples by
+   one channel value;
+3. an exact 24-read row-blocked shader passed the reference tests but also
+   regressed runtime timing; and
+4. a padded source-resolution prefilter reduced the final shader to four
+   reads, but mismatched 16/4096 samples and raised combined GPU timing to
+   about 17.2-17.5 ms.
+
+The lower theoretical read count did not survive exact-output and runtime
+measurement, likely because of register pressure, scheduling, and the added
+pass. The original exact loop is therefore the accepted implementation.
+
+### Multi-target consolidation and final qualification
+
+One submission now owns every color-surface generation touched in order.
+Target switches end and begin render passes without a command-buffer commit;
+eight switches force a bounded fallback commit. Three submission-owned
+resource sets remain the global in-flight limit. The representative command
+shape fell from two commands per frame to one
+`render+target-switch+feedback+present+depth-copy` command.
+
+Two exact Native/auto boots selected 4x, 2560x1920, and a 59.94 Hz
+match-display cap. Their consecutive post-warm-up qualification windows were:
+
+| Metric | Two-boot range |
+| --- | --- |
+| Completed-game FPS | 59.98-60.01 FPS |
+| Wall-frame median | 16.66-16.68 ms |
+| Wall-frame p95 | 17.06-17.46 ms |
+| Combined GPU median | 14.18-14.84 ms |
+| Combined GPU p95 | 14.87-15.26 ms |
+| Submission-latency p95 | 15.23-15.50 ms |
+| Steady-state feedback | 100 GPU-private, 0 fallback/publication per 100 checks |
+
+Two fixed-4x, cap-120 boots measured 59.36-100.78 FPS and
+60.33-100.10 FPS across all reported windows. Both produced consecutive
+post-warm-up windows above 60 FPS; the second exceeded 60 FPS in every
+complete window despite a 306.86 ms cold-start maximum. No retained run
+reported a rejected ocean marker or Metal command failure.
+
+Cold exact-default windows are retained separately. They averaged as low as
+53.22 FPS and contained 296-330 ms startup maxima while specialized pipelines
+and the seeded workload warmed. The 59.94 Hz cap cannot compensate for such a
+stall with faster frames, so qualification uses consecutive rolling reports
+emitted at or after presented frame 900 and before the guest relaunch
+transition. Cold
+pipeline warm-up remains an honest follow-up; it is not silently counted as
+steady-state performance.
+
+The final executable SHA-256 is
+`3516f2e2906347880bcf20dd8f2966a0c32b46776e620923d694f097e4d37562`.
+The complete 337-case Metal suite, seven focused ASan/UBSan ownership and
+feedback cases, and all 62 macOS presenter cases pass.
+
 ## Private evidence index
 
 The following local artifact directory names identify the retained evidence.
@@ -301,6 +400,16 @@ They live outside the repository and must remain uncommitted:
 - `runtime-base-specialized-matrix-1x-002`
 - `runtime-base-specialized-matrix-225x-001`
 - `runtime-base-specialized-matrix-225x-002`
+- `runtime-native-4x60-feedback-instrument-001`
+- `runtime-native-4x60-gpu-feedback-001`
+- `runtime-native-4x60-quincunx16-001`
+- `runtime-native-4x60-quincunx24-001`
+- `runtime-native-4x60-inflight3-001`
+- `runtime-native-4x60-prefilter-experiment-001`
+- `runtime-native-4x60-consolidated-001`
+- `runtime-native-4x60-consolidated-002`
+- `runtime-native-4x60-consolidated-fixed4-001`
+- `runtime-native-4x60-consolidated-fixed4-002`
 
 ## Reproduction template
 
@@ -338,8 +447,20 @@ timing run. Run profiling separately.
    300-frame Battle window, with a wall median below 33.3 ms.
 5. Current Native/auto, match-display, filtering, LOD, and Retail-water
    defaults are retained; no quality reduction is counted as a speedup.
-6. Native 4x/60 remains outside the demonstrated envelope and is not claimed.
-7. Direct package-power and temperature telemetry remains the open efficiency
+6. Exact GPU-private quincunx feedback removes the per-frame guest round trip,
+   while CPU-write detection retains the publication/merge/reseed fallback.
+7. Three bounded submissions and multi-target command consolidation reduce
+   the steady-state command shape from three commands to one and leave
+   1.4-1.8 ms of p95 GPU headroom under the 16.67 ms budget.
+8. Native/auto 4x is display-cap limited at 59.98-60.01 FPS after the explicit
+   cold-start interval. Fixed-4x/cap-120 runs independently clear sustained
+   60 FPS without changing quality.
+9. Exact lower-read quincunx rewrites are measured no-go variants; the
+   original 36-read loop remains both exact and faster on the representative
+   Apple M5 workload.
+10. Cold pipeline/workload warm-up and broader mission pacing remain open;
+    the 296-330 ms startup maxima are recorded rather than hidden.
+11. Direct package-power and temperature telemetry remains the open efficiency
    evidence item.
 
 Related tracked documentation:

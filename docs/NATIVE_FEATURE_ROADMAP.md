@@ -18,7 +18,7 @@ private and must not be committed.
 | Adjustable LOD | Implemented | Validate 1x-8x visually in both editions; Original remains fixed at 1x. |
 | Metal filtering | Implemented | Collect oblique water/cliff comparisons and GPU timings for 1x/4x/8x/16x. |
 | Metal MSAA | No-go; synthetic smoke complete | Apple M5 passes 2x/4x/8x synthetic color/depth/resolve, but game-scene attachment ownership and the controlled visual/GPU-time/memory matrix are still required. |
-| Base Metal performance | Bounded two-submission ownership, explicit publication, and combiner specialization validated; Native/auto 4x clears 30 FPS | Retain current quality defaults; collect direct package-power/temperature evidence and charge future renderer work against the measured envelope. |
+| Base Metal performance | Three-submission ownership, GPU-private feedback, multi-target consolidation, and combiner specialization validated; representative Native/auto 4x is display-limited near 60 FPS after cold warm-up | Retain current quality defaults; broaden mission/pacing coverage, investigate cold pipeline warm-up, and collect direct package-power/temperature evidence. |
 | Lighting and renderer modernization | Current path and options mapped | Inventory representative fixed-function, vertex-program, light, material, and shadow use; then pilot an explicitly marked opaque fixed-function family with a semantic Metal lighting contract. |
 | Upstream fixes | Registry/source parity verified; Metal distant-water reflection depth ported | Re-run the offline parity checker whenever upstream changes and retain explicit fallback coverage for the Metal private-depth path. |
 | Realistic water | Three pass boundaries and private reflection depth validated in representative gameplay; base-performance budget now measured | Resume refraction, absorption, SSR, foam, and modern composition through the separate visual plan with per-phase performance gates. |
@@ -135,6 +135,15 @@ Remastered LOD now supports 1x through 8x as an atomic live value. Metal
 anisotropy prebuilds immutable sampler variants and changes the selected
 variant at a flip boundary. Only linear, mipmapped stages receive anisotropy;
 point-sampled and unmipped stages remain 1x.
+
+Base Metal performance now keeps exact tracked XRGB anti-aliased feedback on
+the GPU, owns mutable resources across three bounded submissions, and
+consolidates safe target switches into one ordered command. Two exact-default
+Native/auto boots selected 4x at 2560x1920 and produced post-warm-up windows
+at 59.98-60.01 FPS with 14.18-14.84 ms GPU medians and
+14.87-15.26 ms GPU p95. Earlier rolling reports remain separately reported
+cold shader/workload warm-up evidence; qualification starts with reports
+emitted at or after presented frame 900.
 
 Metal MSAA remains explicitly unsupported. The memory lower bounds, required
 surface/resolve ownership, and go/no-go measurements are in

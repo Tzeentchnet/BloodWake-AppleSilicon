@@ -1,11 +1,11 @@
 # Apple Silicon handoff
 
-Status updated 2026-11-05 after the native F1 settings integration, gameplay
+Status updated 2026-11-06 after the native F1 settings integration, gameplay
 mouse input, live LOD, Metal anisotropic filtering, optional realistic-water
 pipeline and same-scene GPU benchmark, dedicated water-system research,
 upstream parity audit, deterministic menu-to-gameplay diagnostics, and bounded
-audio validation, plus bounded Metal submission ownership and the final
-default-quality performance matrix.
+audio validation, plus GPU-private feedback, multi-target Metal submission
+ownership, and the Native 4x/60 default-quality performance matrix.
 
 ## Current status
 
@@ -40,15 +40,18 @@ scaled-rendering measurements.
 
 The later seeded Battle investigation now provides that timing evidence.
 Direct display and explicit guest publication are separate, mutable resources
-belong to one of two bounded submissions, ordinary target switches stay
-private, and immutable NV2A combiner routing is specialized with Metal
-function constants. Two independent fixed-4x runs measured 32.08-36.14 FPS
-and 27.90-29.34 ms wall medians across every rolling 300-frame window. An
-exact Native/auto, match-display run selected 2560x1920 and measured
-31.89-34.65 FPS with 28.75-29.92 ms medians. Current quality defaults are
-retained; 4x/60 is not claimed. Validation passes 337/337 Metal backend
-tests, seven focused ownership/publication cases under ASan/UBSan, and 62/62
-macOS presenter tests.
+belong to one of three bounded submissions, exact XRGB anti-aliased feedback
+stays GPU-private while guest bytes are unchanged, and safe target switches
+share one ordered command. Immutable NV2A combiner routing remains specialized
+with Metal function constants. Two exact Native/auto, match-display boots
+selected 2560x1920 and produced post-warm-up windows at 59.98-60.01 FPS,
+16.66-16.68 ms wall medians, and 14.18-14.84 ms GPU medians. Two fixed-4x,
+cap-120 boots independently produced consecutive windows above 60 FPS.
+Current quality defaults are retained; representative sustained 4x/60 is now
+claimed. Cold 296-330 ms shader/workload warm-up stalls and broader mission
+pacing remain explicit follow-up work. Validation passes 337/337 Metal
+backend tests, seven focused ownership/feedback cases under ASan/UBSan, and
+62/62 macOS presenter tests.
 
 That 4x run had no sound because it predated the native APU dispatch path; it
 was not a Metal presentation or scaling regression. Native audio is now
@@ -187,8 +190,10 @@ rejected even when set to `0`.
   confirmation and controlled Battle frame timing; formal reference imagery
   and a complete memory-budget report remain outstanding.
 - Quincunx filtering is approximate and not hardware-verified.
-- Every exact-default 300-frame window clears 30 FPS with 32.73-35.89 ms p95;
-  broader mission and long-duration pacing coverage remains outstanding.
+- Exact-default post-warm-up windows reach 59.98-60.01 FPS with
+  17.06-17.46 ms wall p95. Cold startup still contains 296-330 ms
+  shader/workload warm-up stalls; broader mission and long-duration pacing
+  coverage remains outstanding.
 - Keyboard feedback, reconnect, and the complete device lifecycle remain
   experimental. Synthetic focus-loss and mouse-capture release are covered.
 - Native point-and-click menu hitboxes are not implemented; directional
@@ -228,8 +233,10 @@ rejected even when set to `0`.
   its analytical queue observed scheduling underflows, so it is signal/timing
   instrumentation rather than a device-quality result.
 - Bounded renderer ownership is implemented for tracked Metal color surfaces
-  and submission resources. General guest aliases, DMA lifetime, and safe
-  in-process device shutdown outside that contract are not solved.
+  and three submission-owned resource sets. Exact tracked XRGB feedback and
+  up to eight target switches remain ordered within that contract. General
+  guest aliases, DMA lifetime, and safe in-process device shutdown outside
+  that contract are not solved.
 - Windows behavior after the Apple Silicon changes has not been revalidated.
 
 ## Next priorities
@@ -247,6 +254,9 @@ rejected even when set to `0`.
   cannot provide energy-per-frame data.
 - Investigate remaining cross-scene frame-pacing jitter without weakening
   correctness or silently skipping unsupported work.
+- Investigate asynchronous or trace-derived specialized-pipeline warm-up so
+  cold seeded launches no longer contain 296-330 ms compilation/loading
+  stalls; keep cold and steady-state evidence separate.
 
 ### 2. Validate the new runtime controls
 

@@ -106,22 +106,25 @@ BwMetalWaterPreset bw_metal_backend_water_preset(void);
  * Draws and clears are recorded into one pending command buffer until a
  * presentation, readback or surface-ownership boundary. Full clears can share
  * the first draw encoder when the attachments match. Mutable vertex, upload,
- * and readback resources belong to one of at most two in-flight submissions
- * and are reused only after their command completes.
+ * feedback-resolve, and readback resources belong to one of at most three
+ * in-flight submissions and are reused only after their command completes.
  * Up to 1024 decoded textures are cached by guest span and layout. Guest
  * contents are checked at most once per frame; stable entries use distributed
  * samples with staggered full verification. Render-target writeback
  * invalidates overlapping entries.
  * With BW_METAL_FRAME_TIMING=1, the backend reports monotonic wall-clock,
- * completed-command, wait, submission-latency, and command-role statistics
- * for rolling 300-frame windows.
+ * completed-command, exact command-reason, wait, submission-latency,
+ * command-role, and feedback CPU statistics for rolling 300-frame windows.
  * Up to 32 exact colour-surface descriptions are cached. Ordinary target
- * switches commit the old private generation in queue order without
- * publishing it to guest memory. Reactivation reuses that texture only while
- * guest bytes still match its exact synchronization snapshot; a detected CPU
- * change waits for the private generation, merges changed 32-bit pixels, and
- * reseeds it. Texture feedback, snapshots, dumps, scale changes, captures,
- * and other CPU-visible paths explicitly wait and publish.
+ * switches retain each touched private generation in the current submission;
+ * presentation commits them together in queue order, while eight switches
+ * force a bounded fallback commit. Reactivation reuses a texture only while
+ * guest bytes still match its exact synchronization snapshot. Exact tracked
+ * XRGB anti-aliased quincunx feedback resolves the newest private generation
+ * directly on the GPU. A detected CPU change waits, publishes, merges changed
+ * 32-bit pixels, and reseeds the private texture. Other texture feedback,
+ * snapshots, dumps, scale changes, captures, and CPU-visible paths explicitly
+ * wait and publish.
  * Extended fragment pipelines specialize immutable texture-stage, combiner,
  * final-combiner, and alpha-test routing with Metal function constants while
  * retaining dynamic material constants and reference values.
