@@ -94,30 +94,44 @@ class MacosDiagnosticTests(unittest.TestCase):
 
     def test_guest_environment_is_allowlisted_and_opt_in(self):
         with mock.patch.dict(os.environ, {"RECOMP_USB": "1", "RECOMP_AC97_READY": "0",
+                                         "RECOMP_USB_PADS": "4",
+                                         "RECOMP_PAD_LIVE": "/unsafe",
+                                         "RECOMP_PB_REPORT_MS": "1",
                                          "BW_MACOS_AUDIO": "0",
                                          "BW_EDITION": "remastered",
                                          "BW_SETTINGS": "unsafe",
                                          "BW_MACOS_KEYBOARD_HOOK": "1",
+                                         "BW_MACOS_GUIDED_INPUT": "/unsafe",
                                          "BW_SYNTHETIC_INPUT_DIAGNOSTIC": "1",
                                          "BW_SYNTHETIC_INPUT_SCRIPT": "unsafe",
                                          "BW_METAL_WATER": "realistic",
                                          "BW_METAL_WATER_BENCHMARK": "1",
+                                         "BW_METAL_WATER_CAPTURE_TRIGGER": "/unsafe",
+                                         "RECOMP_FB_DUMP": "/unsafe",
+                                         "RECOMP_FB_DUMP_FLIPS": "1",
                                          "BW_HEADLESS_AUDIO_AUDIT": "1",
                                          "BW_NATIVE_DIAGNOSTIC": "unsafe",
                                          "RECOMP_AUDIO_HEADLESS_AUDIT": "1"}, clear=True):
             env = diagnostic.diagnostic_env(self.root, self.prepared, 15, False, False, 4, 5)
         self.assertNotIn("RECOMP_USB", env)
+        self.assertNotIn("RECOMP_USB_PADS", env)
+        self.assertNotIn("RECOMP_PAD_LIVE", env)
+        self.assertNotIn("RECOMP_PB_REPORT_MS", env)
         self.assertNotIn("RECOMP_AC97_READY", env)
         self.assertNotIn("BW_MACOS_AUDIO", env)
         self.assertNotIn("BW_METAL_QUINCUNX_APPROX", env)
         self.assertNotIn("BW_GPU_AUDIT", env)
         self.assertNotIn("BW_MACOS_KEYBOARD_HOOK", env)
+        self.assertNotIn("BW_MACOS_GUIDED_INPUT", env)
         self.assertNotIn("BW_SYNTHETIC_INPUT_DIAGNOSTIC", env)
         self.assertNotIn("BW_SYNTHETIC_INPUT_SCRIPT", env)
         self.assertNotIn("BW_HEADLESS_AUDIO_AUDIT", env)
         self.assertNotIn("RECOMP_AUDIO_HEADLESS_AUDIT", env)
         self.assertNotIn("BW_METAL_WATER", env)
         self.assertNotIn("BW_METAL_WATER_BENCHMARK", env)
+        self.assertNotIn("BW_METAL_WATER_CAPTURE_TRIGGER", env)
+        self.assertNotIn("RECOMP_FB_DUMP", env)
+        self.assertNotIn("RECOMP_FB_DUMP_FLIPS", env)
         self.assertEqual(env["BW_SETTINGS"], "none")
         self.assertEqual(env["BW_EDITION"], "original")
         self.assertEqual(env["BW_RUN_SECONDS"], "15")
@@ -140,6 +154,12 @@ class MacosDiagnosticTests(unittest.TestCase):
         self.assertEqual(scripted["BW_SYNTHETIC_INPUT_SCRIPT"],
                          "remastered-boot-menu-to-gameplay-v1")
         self.assertNotIn("BW_SYNTHETIC_INPUT_DIAGNOSTIC", scripted)
+        split_scripted = diagnostic.diagnostic_env(
+            self.root, self.prepared, 15, False, False, 4, 5, keyboard_hook=True,
+            edition="remastered",
+            synthetic_input_script="remastered-boot-menu-to-gameplay-2p-v1")
+        self.assertEqual(split_scripted["BW_SYNTHETIC_INPUT_SCRIPT"],
+                         "remastered-boot-menu-to-gameplay-2p-v1")
         remastered = diagnostic.diagnostic_env(
             self.root, self.prepared, 15, False, False, 4, 5, edition="remastered")
         self.assertEqual(remastered["BW_EDITION"], "remastered")
@@ -152,6 +172,32 @@ class MacosDiagnosticTests(unittest.TestCase):
             edition="remastered", water_benchmark=True)
         self.assertEqual(benchmark["BW_METAL_WATER_BENCHMARK"], "1")
         self.assertNotIn("BW_METAL_WATER", benchmark)
+        capture = diagnostic.diagnostic_env(
+            self.root, self.prepared, 15, False, True, 4, 5,
+            keyboard_hook=True, edition="remastered",
+            synthetic_input_script="remastered-boot-menu-to-gameplay-v1",
+            water_capture=True, capture_stem="water-capture-002")
+        self.assertEqual(
+            capture["RECOMP_FB_DUMP"],
+            str(self.root / "water-capture-002-")
+        )
+        self.assertEqual(
+            capture["RECOMP_FB_DUMP_FLIPS"],
+            str(self.root / ".water-capture-002.trigger")
+        )
+        self.assertEqual(
+            capture["BW_METAL_WATER_CAPTURE_TRIGGER"],
+            capture["RECOMP_FB_DUMP_FLIPS"]
+        )
+        guided = diagnostic.diagnostic_env(
+            self.root, self.prepared, 15, False, False, 4, 5,
+            guided_input=True)
+        self.assertEqual(guided["BW_MACOS_KEYBOARD_HOOK"], "1")
+        self.assertEqual(guided["BW_MACOS_GUIDED_INPUT"],
+                         str(self.root / "guided-pad.txt"))
+        self.assertEqual(guided["RECOMP_FB_DUMP"],
+                         str(self.root / "guided-frame-"))
+        self.assertEqual(guided["RECOMP_PB_REPORT_MS"], "2000")
         audio_disabled = diagnostic.diagnostic_env(
             self.root, self.prepared, 15, False, False, 4, 5,
             disable_audio=True)
@@ -163,6 +209,19 @@ class MacosDiagnosticTests(unittest.TestCase):
         self.assertEqual(audio_audit["BW_NATIVE_DIAGNOSTIC"], "1")
         self.assertNotIn("BW_MACOS_AUDIO", audio_audit)
         self.assertNotIn("RECOMP_AUDIO_HEADLESS_AUDIT", audio_audit)
+        performance = diagnostic.diagnostic_env(
+            self.root, self.prepared, 15, False, False, 4, 5,
+            frame_timing=True, profile_name="profile-002.txt",
+            profile_from=20.0, profile_to=40.0, profile_callers=True,
+            render_scale="2.25", frame_cap=60)
+        self.assertEqual(performance["BW_METAL_FRAME_TIMING"], "1")
+        self.assertEqual(performance["BW_PROFILE"],
+                         str(self.root / "profile-002.txt"))
+        self.assertEqual(performance["BW_PROFILE_FROM"], "20.0")
+        self.assertEqual(performance["BW_PROFILE_TO"], "40.0")
+        self.assertEqual(performance["BW_PROFILE_CALLERS"], "1")
+        self.assertEqual(performance["BW_METAL_RENDER_SCALE"], "2.25")
+        self.assertEqual(performance["BW_HIFPS"], "60")
         with self.assertRaisesRegex(ValueError, "requires audio to remain enabled"):
             diagnostic.diagnostic_env(
                 self.root, self.prepared, 15, False, False, 4, 5,
@@ -201,6 +260,36 @@ class MacosDiagnosticTests(unittest.TestCase):
             diagnostic.diagnostic_env(
                 self.root, self.prepared, 15, False, False, 4, 5,
                 edition="remastered", water_benchmark=True)
+        with self.assertRaisesRegex(ValueError, "requires the remastered edition"):
+            diagnostic.diagnostic_env(
+                self.root, self.prepared, 15, False, True, 4, 5,
+                keyboard_hook=True,
+                synthetic_input_script="remastered-boot-menu-to-gameplay-v1",
+                water_capture=True)
+        with self.assertRaisesRegex(ValueError, "requires GPU audit"):
+            diagnostic.diagnostic_env(
+                self.root, self.prepared, 15, False, False, 4, 5,
+                keyboard_hook=True, edition="remastered",
+                synthetic_input_script="remastered-boot-menu-to-gameplay-v1",
+                water_capture=True)
+        with self.assertRaisesRegex(ValueError, "mutually exclusive"):
+            diagnostic.diagnostic_env(
+                self.root, self.prepared, 15, False, True, 4, 5,
+                keyboard_hook=True, edition="remastered",
+                synthetic_input_script="remastered-boot-menu-to-gameplay-v1",
+                water_benchmark=True, water_capture=True)
+        with self.assertRaisesRegex(ValueError, "deterministic synthetic input"):
+            diagnostic.diagnostic_env(
+                self.root, self.prepared, 15, False, True, 4, 5,
+                keyboard_hook=True, edition="remastered", water_capture=True)
+        with self.assertRaisesRegex(ValueError, "experimental keyboard input path"):
+            diagnostic.diagnostic_env(
+                self.root, self.prepared, 15, False, False, 4, 5,
+                keyboard_hook=True, guided_input=True)
+        with self.assertRaisesRegex(ValueError, "mutually exclusive"):
+            diagnostic.diagnostic_env(
+                self.root, self.prepared, 15, False, True, 4, 5,
+                edition="remastered", water_capture=True, guided_input=True)
 
     def test_sandbox_preflight_fails_closed(self):
         failure = subprocess.CompletedProcess([], 1, "", "sandbox denied setup")
@@ -399,6 +488,28 @@ class MacosDiagnosticTests(unittest.TestCase):
             self.assertTrue(call.kwargs["keyboard_hook"])
             self.assertEqual(call.kwargs["synthetic_input_script"], script)
 
+    def test_water_capture_uses_boot_scoped_private_prefixes(self):
+        request = self.launch_request()
+        script = "remastered-boot-menu-to-gameplay-v1"
+        with mock.patch.object(
+            diagnostic, "run_guest_once",
+            side_effect=[(0, request, 0), (0, b"", 0)]
+        ) as once, contextlib.redirect_stdout(io.StringIO()):
+            result = diagnostic.run_guest_relaunches(
+                Path("/native"), self.root, self.prepared, "profile", 20,
+                False, True, 4, 30, keyboard_hook=True,
+                edition="remastered", synthetic_input_script=script,
+                water_capture=True
+            )
+        self.assertEqual(result, diagnostic.RelaunchRunResult.guest_exit(0, 2))
+        self.assertEqual(
+            [call.kwargs["capture_stem"] for call in once.call_args_list],
+            ["water-capture-001", "water-capture-002"]
+        )
+        self.assertTrue(all(
+            call.kwargs["water_capture"] for call in once.call_args_list
+        ))
+
     def test_follow_relaunch_rejects_malformed_and_wrong_title_before_next_boot(self):
         for request in (b"bad", self.launch_request(b"D:\\other.xbe")):
             with self.subTest(request=request), \
@@ -481,6 +592,29 @@ class MacosDiagnosticTests(unittest.TestCase):
             b"p95_delta_percent=+30.000000"
         )
 
+    @staticmethod
+    def water_capture_summary(preset="retail", width=2, height=1):
+        return (
+            b"[GPU-METAL] water capture v1 preset=" +
+            preset.encode("ascii") +
+            b" images=4 supported_offsets=0,60,120,180 width=" +
+            str(width).encode("ascii") + b" height=" +
+            str(height).encode("ascii")
+        )
+
+    @staticmethod
+    def write_capture_bitmap(path, width=2, height=1):
+        row_bytes = (width * 3 + 3) & ~3
+        image_bytes = row_bytes * height
+        header = bytearray(54)
+        header[:2] = b"BM"
+        struct.pack_into("<I", header, 2, 54 + image_bytes)
+        struct.pack_into("<I", header, 10, 54)
+        struct.pack_into("<III", header, 14, 40, width, height)
+        struct.pack_into("<HH", header, 26, 1, 24)
+        struct.pack_into("<I", header, 34, image_bytes)
+        path.write_bytes(header + bytes(image_bytes))
+
     def test_water_benchmark_summary_is_strict_and_reported(self):
         log = self.root / "guest.log"
         log.write_bytes(self.water_benchmark_summary() + b"\n")
@@ -533,6 +667,112 @@ class MacosDiagnosticTests(unittest.TestCase):
         self.assertEqual(result, (1, 0))
         self.assertIn("benchmark", output.getvalue())
 
+    def test_water_capture_sequence_is_private_bounded_and_reported(self):
+        first = self.root / "guest-001.log"
+        second = self.root / "guest-002.log"
+        first.write_bytes(b"no supported water in this boot\n")
+        second.write_bytes(self.water_capture_summary() + b"\n")
+        for image in range(3):
+            self.write_capture_bitmap(
+                self.root / f"water-capture-001-{image:05d}.bmp"
+            )
+        for image in range(4):
+            self.write_capture_bitmap(
+                self.root / f"water-capture-002-{image:05d}.bmp"
+            )
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            captures = diagnostic.report_water_captures(
+                [first, second], self.root, True, "retail", True
+            )
+        self.assertEqual(len(captures), 1)
+        self.assertEqual(captures[0]["width"], 2)
+        self.assertIn("4 private retail frames each at 2x1", output.getvalue())
+        self.assertIn("1 partial boot sequence(s) validated and excluded",
+                      output.getvalue())
+        with self.assertRaisesRegex(RuntimeError, "without --water-capture"):
+            diagnostic.report_water_captures(
+                [first, second], self.root, False, "retail", True
+            )
+
+    def test_water_capture_parser_rejects_incomplete_or_malformed_evidence(self):
+        log = self.root / "guest.log"
+        log.write_bytes(self.water_capture_summary() + b"\n")
+        for image in range(3):
+            self.write_capture_bitmap(
+                self.root / f"water-capture-{image:05d}.bmp"
+            )
+        with self.assertRaisesRegex(RuntimeError, "sequence is incomplete"):
+            diagnostic.report_water_captures(
+                [log], self.root, True, "retail", False
+            )
+        self.write_capture_bitmap(self.root / "water-capture-00003.bmp")
+        (self.root / "water-capture-00002.bmp").write_bytes(b"not a bitmap")
+        with self.assertRaisesRegex(RuntimeError, "invalid BMP header"):
+            diagnostic.report_water_captures(
+                [log], self.root, True, "retail", False
+            )
+        log.write_bytes(
+            self.water_capture_summary() + b"\n" +
+            self.water_capture_summary() + b"\n"
+        )
+        with self.assertRaisesRegex(RuntimeError, "duplicate water capture"):
+            diagnostic.report_water_captures(
+                [log], self.root, True, "retail", False
+            )
+        log.write_bytes(diagnostic.WATER_CAPTURE_PREFIX + b"malformed\n")
+        with self.assertRaisesRegex(RuntimeError, "malformed water capture"):
+            diagnostic.report_water_captures(
+                [log], self.root, True, "retail", False
+            )
+
+    def test_water_capture_requires_a_completed_boot(self):
+        log = self.root / "guest.log"
+        log.write_bytes(b"no capture\n")
+        with self.assertRaisesRegex(RuntimeError, "no boot completed"):
+            diagnostic.report_water_captures(
+                [log], self.root, True, "realistic", False
+            )
+
+    def test_water_capture_rejects_mismatched_extra_or_unsafe_evidence(self):
+        log = self.root / "guest.log"
+        for image in range(4):
+            self.write_capture_bitmap(
+                self.root / f"water-capture-{image:05d}.bmp"
+            )
+        log.write_bytes(self.water_capture_summary("realistic") + b"\n")
+        with self.assertRaisesRegex(RuntimeError, "preset is inconsistent"):
+            diagnostic.report_water_captures(
+                [log], self.root, True, "retail", False
+            )
+        log.write_bytes(self.water_capture_summary(width=3) + b"\n")
+        with self.assertRaisesRegex(RuntimeError, "metadata is inconsistent"):
+            diagnostic.report_water_captures(
+                [log], self.root, True, "retail", False
+            )
+        log.write_bytes(self.water_capture_summary() + b"\n")
+        trigger = self.root / ".water-capture.trigger"
+        trigger.write_bytes(b"")
+        with self.assertRaisesRegex(RuntimeError, "trigger remained"):
+            diagnostic.report_water_captures(
+                [log], self.root, True, "retail", False
+            )
+        trigger.unlink()
+        extra = self.root / "water-capture-00004.bmp"
+        self.write_capture_bitmap(extra)
+        with self.assertRaisesRegex(RuntimeError, "sequence is incomplete"):
+            diagnostic.report_water_captures(
+                [log], self.root, True, "retail", False
+            )
+        extra.unlink()
+        last = self.root / "water-capture-00003.bmp"
+        last.unlink()
+        last.symlink_to(self.root / "water-capture-00000.bmp")
+        with self.assertRaisesRegex(RuntimeError, "regular file"):
+            diagnostic.report_water_captures(
+                [log], self.root, True, "retail", False
+            )
+
     def main_arguments(self):
         executable = self.root / "binary"
         executable.write_bytes(b"synthetic executable")
@@ -584,6 +824,31 @@ class MacosDiagnosticTests(unittest.TestCase):
             (["--water-benchmark", "--edition", "remastered", "--gpu-audit",
               "--water-preset", "realistic"],
              "--water-benchmark requires --water-preset retail"),
+        )
+        for extra, expected in cases:
+            errors = io.StringIO()
+            with self.subTest(extra=extra), \
+                 mock.patch.object(diagnostic.sys, "platform", "darwin"), \
+                 contextlib.redirect_stderr(errors), \
+                 self.assertRaises(SystemExit) as failure:
+                diagnostic.main(arguments + extra)
+            self.assertEqual(failure.exception.code, 2)
+            self.assertIn(expected, errors.getvalue())
+
+    def test_water_capture_cli_requires_controlled_mode(self):
+        script = "remastered-boot-menu-to-gameplay-v1"
+        arguments = self.main_arguments()
+        cases = (
+            (["--water-capture"],
+             "--water-capture requires --edition remastered"),
+            (["--water-capture", "--edition", "remastered"],
+             "--water-capture requires --gpu-audit"),
+            (["--water-capture", "--edition", "remastered", "--gpu-audit"],
+             "--water-capture requires the deterministic"),
+            (["--water-capture", "--water-benchmark", "--edition", "remastered",
+              "--gpu-audit", "--experimental-keyboard-hook",
+              "--synthetic-input-script", script],
+             "--water-capture and --water-benchmark are mutually exclusive"),
         )
         for extra, expected in cases:
             errors = io.StringIO()
@@ -694,6 +959,7 @@ class MacosDiagnosticTests(unittest.TestCase):
             self.assertFalse(kwargs["disable_audio"])
             self.assertFalse(kwargs["audio_audit"])
             self.assertFalse(kwargs["water_benchmark"])
+            self.assertFalse(kwargs["water_capture"])
             return 0
 
         output = io.StringIO()
@@ -746,6 +1012,45 @@ class MacosDiagnosticTests(unittest.TestCase):
         self.assertIn("Retail/Realistic/Realistic/Retail", output.getvalue())
         self.assertIn("Water benchmark: 1 completed boot(s)", output.getvalue())
 
+    def test_water_capture_cli_propagates_and_reports(self):
+        arguments = self.main_arguments() + [
+            "--water-capture", "--edition", "remastered", "--gpu-audit",
+            "--experimental-keyboard-hook", "--synthetic-input-script",
+            "remastered-boot-menu-to-gameplay-v1",
+        ]
+
+        def guest(_executable, output, _game_dir, _profile, _seconds,
+                  _quincunx, _audit, **kwargs):
+            self.assertTrue(kwargs["water_capture"])
+            self.assertEqual(kwargs["water_preset"], "retail")
+            (output / "guest.log").write_bytes(
+                b"[GPU] ocean draw markers: 4 received, 4 batch scopes, "
+                b"0 rejected\n" + self.water_capture_summary() + b"\n"
+            )
+            (output / "gpu-audit.txt").write_bytes(
+                diagnostic.OCEAN_FINGERPRINT_HEADER + b"\n"
+                b"  batches 0, hashes 0/32, table-overflow batches 0, "
+                b"within-scope mismatches 0\n"
+            )
+            for image in range(4):
+                self.write_capture_bitmap(
+                    output / f"water-capture-{image:05d}.bmp"
+                )
+            return 0
+
+        output = io.StringIO()
+        with mock.patch.object(diagnostic.sys, "platform", "darwin"), \
+             mock.patch.object(diagnostic, "ROOT", self.repository), \
+             mock.patch.object(diagnostic, "verify_prepared"), \
+             mock.patch.object(diagnostic, "toolkit_revision", return_value="pinned"), \
+             mock.patch.object(diagnostic, "verify_sandbox"), \
+             mock.patch.object(diagnostic, "run_guest", side_effect=guest), \
+             contextlib.redirect_stdout(output):
+            result = diagnostic.main(arguments)
+        self.assertEqual(result, 0)
+        self.assertIn("four private supported-frame BMPs", output.getvalue())
+        self.assertIn("4 private retail frames each at 2x1", output.getvalue())
+
     def test_cli_audio_disable_is_explicit_and_propagated(self):
         arguments = self.main_arguments() + ["--disable-audio"]
 
@@ -766,6 +1071,98 @@ class MacosDiagnosticTests(unittest.TestCase):
             result = diagnostic.main(arguments)
         self.assertEqual(result, 0)
         self.assertIn("Diagnostic audio: disabled", output.getvalue())
+
+    def test_guided_input_capture_cli_propagates_private_paths(self):
+        arguments = self.main_arguments() + ["--guided-input-capture"]
+
+        def guest(_executable, output, _game_dir, _profile, _seconds,
+                  _quincunx, _audit, **kwargs):
+            self.assertTrue(kwargs["guided_input"])
+            self.assertTrue((output / "guided-pad.txt").is_file())
+            (output / "guest.log").write_bytes(b"no marker summary\n")
+            return 0
+
+        output = io.StringIO()
+        with mock.patch.object(diagnostic.sys, "platform", "darwin"), \
+             mock.patch.object(diagnostic, "ROOT", self.repository), \
+             mock.patch.object(diagnostic, "verify_prepared"), \
+             mock.patch.object(diagnostic, "toolkit_revision", return_value="pinned"), \
+             mock.patch.object(diagnostic, "verify_sandbox"), \
+             mock.patch.object(diagnostic, "run_guest", side_effect=guest), \
+             contextlib.redirect_stdout(output):
+            result = diagnostic.main(arguments)
+        self.assertEqual(result, 0)
+        self.assertIn("guided-pad.txt", output.getvalue())
+        self.assertIn("guided-frame-NNNNN.bmp", output.getvalue())
+
+    def test_performance_diagnostic_cli_propagates_options(self):
+        arguments = self.main_arguments() + [
+            "--frame-timing", "--profile", "--profile-from", "5",
+            "--profile-to", "10", "--profile-callers", "--render-scale", "2.25",
+            "--frame-cap", "60",
+        ]
+
+        def guest(_executable, output, _game_dir, _profile, _seconds,
+                  _quincunx, _audit, **kwargs):
+            self.assertTrue(kwargs["frame_timing"])
+            self.assertTrue(kwargs["profile_enabled"])
+            self.assertEqual(kwargs["profile_from"], 5.0)
+            self.assertEqual(kwargs["profile_to"], 10.0)
+            self.assertTrue(kwargs["profile_callers"])
+            self.assertEqual(kwargs["render_scale"], "2.25")
+            self.assertEqual(kwargs["frame_cap"], 60)
+            (output / "guest.log").write_bytes(b"no marker summary\n")
+            return 0
+
+        output = io.StringIO()
+        with mock.patch.object(diagnostic.sys, "platform", "darwin"), \
+             mock.patch.object(diagnostic, "ROOT", self.repository), \
+             mock.patch.object(diagnostic, "verify_prepared"), \
+             mock.patch.object(diagnostic, "toolkit_revision", return_value="pinned"), \
+             mock.patch.object(diagnostic, "verify_sandbox"), \
+             mock.patch.object(diagnostic, "run_guest", side_effect=guest), \
+             contextlib.redirect_stdout(output):
+            result = diagnostic.main(arguments)
+        self.assertEqual(result, 0)
+        self.assertIn("frame timing: enabled", output.getvalue())
+        self.assertIn("sampling profile: enabled", output.getvalue())
+        self.assertIn("render scale: 2.25", output.getvalue())
+        self.assertIn("frame cap: 60", output.getvalue())
+
+    def test_private_save_and_launch_seed_cli(self):
+        save_seed = self.root / "save-seed"
+        save_file = save_seed / "editions/remastered/save.bin"
+        save_file.parent.mkdir(parents=True)
+        save_file.write_bytes(b"private save")
+        launch_seed = self.root / "launch.bin"
+        request = self.launch_request()
+        launch_seed.write_bytes(request)
+        arguments = self.main_arguments() + [
+            "--save-seed", str(save_seed), "--launch-seed", str(launch_seed),
+        ]
+
+        def guest(_executable, output, _game_dir, _profile, _seconds,
+                  _quincunx, _audit, **kwargs):
+            self.assertEqual(kwargs["initial_launch"], request)
+            self.assertEqual(
+                (output / "saves/editions/remastered/save.bin").read_bytes(),
+                b"private save",
+            )
+            (output / "guest.log").write_bytes(b"no marker summary\n")
+            return 0
+
+        output = io.StringIO()
+        with mock.patch.object(diagnostic.sys, "platform", "darwin"), \
+             mock.patch.object(diagnostic, "ROOT", self.repository), \
+             mock.patch.object(diagnostic, "verify_prepared"), \
+             mock.patch.object(diagnostic, "toolkit_revision", return_value="pinned"), \
+             mock.patch.object(diagnostic, "verify_sandbox"), \
+             mock.patch.object(diagnostic, "run_guest", side_effect=guest), \
+             contextlib.redirect_stdout(output):
+            result = diagnostic.main(arguments)
+        self.assertEqual(result, 0)
+        self.assertIn("private save seed: 1 files", output.getvalue())
+        self.assertIn("validated same-title launch seed", output.getvalue())
 
     def test_headless_audio_audit_is_explicit_and_propagated(self):
         arguments = self.main_arguments() + ["--headless-audio-audit"]
@@ -973,6 +1370,59 @@ class MacosDiagnosticTests(unittest.TestCase):
         with mock.patch.object(diagnostic, "MAX_OCEAN_MARKER_SUMMARIES", 2):
             with self.assertRaisesRegex(RuntimeError, "too many"):
                 diagnostic.extract_ocean_marker_counts([first, second])
+
+    def test_water_semantic_summaries_use_each_boots_final_bounded_counts(self):
+        first = self.root / "guest-001.log"
+        second = self.root / "guest-002.log"
+        first.write_bytes(
+            b"[GPU] water pass scopes: lit 2, reflection 3, foam 4\n"
+            b"[GPU] water views: begin 2/1/0/0, end 2/1/0/0\n"
+            b"[GPU] water pass scopes: lit 5, reflection 7, foam 9\r\n"
+            b"[GPU] water views: begin 4/2/0/0, end 4/2/0/0\r\n")
+        second.write_bytes(
+            b"[GPU] water pass scopes: lit 1, reflection 2, foam 3\n"
+            b"[GPU] water views: begin 3/0/0/0, end 3/0/0/0\n")
+        self.assertEqual(
+            diagnostic.extract_water_semantic_counts([first, second]),
+            (((6, 9, 12), (7, 2, 0, 0), (7, 2, 0, 0)), (3, 3)))
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            counts = diagnostic.report_water_semantic_counts([first, second])
+        self.assertEqual(counts, ((6, 9, 12), (7, 2, 0, 0), (7, 2, 0, 0)))
+        self.assertIn("Water passes: 6 lit, 9 reflection, 12 foam scopes",
+                      output.getvalue())
+        self.assertIn("Water views: begin 7/2/0/0, end 7/2/0/0",
+                      output.getvalue())
+
+    def test_water_semantic_summary_validation(self):
+        log = self.root / "guest.log"
+        malformed = (
+            b"[GPU] water pass scopes: lit 1, missing fields\n",
+            b"[GPU] water pass scopes: lit 18446744073709551616, "
+            b"reflection 1, foam 1\n",
+            b"[GPU] water pass scopes: lit 2, reflection 2, foam 2\n"
+            b"[GPU] water pass scopes: lit 1, reflection 2, foam 2\n",
+            b"[GPU] water views: begin 1/0/0/0, missing fields\n",
+            b"[GPU] water views: begin 1/0/0/0, end 2/0/0/0\n",
+            b"[GPU] water views: begin 2/0/0/0, end 1/0/0/0\n"
+            b"[GPU] water views: begin 1/0/0/0, end 1/0/0/0\n",
+        )
+        for contents in malformed:
+            with self.subTest(contents=contents):
+                log.write_bytes(contents)
+                with self.assertRaisesRegex(
+                        RuntimeError, "malformed|out-of-range|non-monotonic|inconsistent"):
+                    diagnostic.extract_water_semantic_counts([log])
+
+    def test_missing_water_semantic_summaries_report_zero_coverage(self):
+        log = self.root / "guest.log"
+        log.write_bytes(b"unrelated guest output\n")
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            counts = diagnostic.report_water_semantic_counts([log])
+        self.assertEqual(counts, ((0, 0, 0), (0, 0, 0, 0), (0, 0, 0, 0)))
+        self.assertIn("zero observed semantic coverage", output.getvalue())
+        self.assertIn("zero observed view coverage", output.getvalue())
 
     def test_preflight_failure_never_launches_guest_and_rechecks_integrity(self):
         arguments = self.main_arguments()

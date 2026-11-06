@@ -763,6 +763,8 @@ static void *run_limit_thread(void *arg)
         static const char message[] = "[BW] run limit reached\n";
         (void)write(STDERR_FILENO, message, sizeof(message) - 1);
     }
+    finish_diagnostics("run limit");
+    fflush(NULL);
     _exit(124);
 }
 

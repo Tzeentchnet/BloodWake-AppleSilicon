@@ -4,6 +4,7 @@
 
 #include <float.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <limits.h>
 #include <math.h>
 #include <stdatomic.h>
@@ -13,6 +14,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>
+#include <unistd.h>
 
 #include "bw_metal_backend.h"
 #include "bw_backend_sync.h"
@@ -24,6 +26,7 @@
 extern ptrdiff_t xbox_GetMemoryOffset(void);
 extern void *xbox_GetMemoryBase(void);
 extern size_t xbox_GetMappedSize(void);
+extern int bw_ab_off(const char *fix);
 extern void bw_ab_frame(uint32_t frame);
 extern uint64_t xbox_HostNowNs(void);
 
@@ -46,6 +49,7 @@ extern uint64_t xbox_HostNowNs(void);
 #define METAL_WATER_BENCHMARK_BLOCKS 4u
 #define METAL_WATER_BENCHMARK_SAMPLES_PER_PRESET \
     (METAL_WATER_BENCHMARK_SAMPLE_FRAMES * 2u)
+#define METAL_WATER_CAPTURE_IMAGES 4u
 
 typedef struct {
     float position[4];
@@ -93,6 +97,7 @@ enum {
     METAL_SHADER_TEXTURE,
     METAL_SHADER_EXTENDED,
     METAL_SHADER_REALISTIC_WATER,
+    METAL_SHADER_DEPTH_ONLY,
 };
 
 typedef struct {
@@ -110,6 +115,19 @@ typedef struct {
     uint32_t physical_width, physical_height;
     uint32_t format, bytes_per_pixel, aa_sx, aa_sy, scale_epoch;
 } MetalColorSurfaceKey;
+
+@interface BWMetalColorSurface : NSObject {
+@public
+    id<MTLTexture> texture;
+    NSMutableData *guest_sync;
+    Nv2aSurface surface;
+    uint32_t format;
+    size_t row;
+    int sync_valid;
+}
+@end
+@implementation BWMetalColorSurface
+@end
 
 @interface BWMetalDepthSurface : NSObject {
 @public
@@ -160,6 +178,7 @@ static atomic_uint s_present_width;
 static atomic_uint s_present_height;
 static id<MTLTexture> s_present_surface;
 static BwMetalFramebuffer s_present_framebuffer;
+static BWMetalColorSurface *s_surface_entry;
 static id<MTLDevice> s_device;
 static id<MTLCommandQueue> s_queue;
 static id<MTLCommandBuffer> s_pending_command;
@@ -193,6 +212,10 @@ static id<MTLRenderPipelineState> s_box_pipeline;
 static id<MTLSamplerState> s_present_sampler;
 static id<MTLTexture> s_surface_upload;
 static id<MTLTexture> s_surface_readback;
+static uint64_t s_surface_seed_count;
+static uint64_t s_surface_cache_reuses;
+static uint64_t s_present_cache_reuses;
+static uint64_t s_present_guest_reseeds;
 static id<MTLTexture> s_present_resolve;
 static id<MTLTexture> s_present_gamma;
 static id<MTLCommandBuffer> s_last_present_command;
@@ -202,7 +225,7 @@ static uint64_t s_presented_frames;
 static uint64_t s_dropped_drawables;
 static NSMutableDictionary<NSData *, id<MTLRenderPipelineState>> *s_pipelines;
 static NSMutableDictionary<NSNumber *, id<MTLRenderPipelineState>> *s_clear_pipelines;
-static NSMutableDictionary<NSData *, id<MTLTexture>> *s_color_surfaces;
+static NSMutableDictionary<NSData *, BWMetalColorSurface *> *s_color_surfaces;
 static NSMutableDictionary<NSData *, BWMetalTextureEntry *> *s_textures;
 static NSMutableDictionary<NSNumber *, BWMetalDepthSurface *> *s_depth_surfaces;
 static NSMutableDictionary<NSData *, id<MTLDepthStencilState>> *s_depth_states;
@@ -217,12 +240,36 @@ static uint64_t s_realistic_water_batches;
 static uint64_t s_realistic_water_fallback_batches;
 static int s_realistic_water_reported;
 static int s_realistic_water_fallback_reported;
+static int s_water_reflect_single_enabled;
+static int s_water_reflect_single_failed;
+static int s_water_reflect_single_reported;
+static int s_water_reflect_active;
+static int s_water_reflect_primed;
+static uint8_t s_water_reflect_view;
+static BWMetalDepthSurface *s_water_reflect_depth;
+static BWMetalDepthSurface *s_water_reflect_source;
+static id<MTLDepthStencilState> s_water_reflect_prime_state;
+static id<MTLDepthStencilState> s_water_reflect_test_state;
+static uint64_t s_water_reflect_copies;
+static uint64_t s_water_reflect_prime_draws;
+static uint64_t s_water_reflect_filtered_draws;
+#if defined(BW_METAL_TESTING)
+static int s_water_reflect_test_failure;
+#endif
 static id<MTLTexture> s_surface;
 static id<MTLTexture> s_inactive_texture;
 static id<MTLTexture> s_inactive_cube_texture;
 static uint64_t s_texture_uploads;
 static uint64_t s_frame_times[METAL_MAX_FRAME_SAMPLES];
 static size_t s_frame_time_count;
+static uint64_t s_gpu_command_times[METAL_MAX_FRAME_SAMPLES];
+static size_t s_gpu_command_time_count;
+static uint64_t s_command_wait_times[METAL_MAX_FRAME_SAMPLES];
+static size_t s_command_wait_time_count;
+static uint64_t s_frame_gpu_command_ns;
+static uint64_t s_frame_command_wait_ns;
+static int s_frame_gpu_command_valid;
+static uint64_t s_gpu_command_timestamp_failures;
 static uint64_t s_last_flip_ns;
 static int s_frame_timing_enabled;
 static int s_water_benchmark_enabled;
@@ -239,10 +286,20 @@ static uint64_t s_frame_water_gpu_ns;
 static int s_frame_water_gpu_valid;
 static int s_frame_water_gpu_invalid;
 static int s_pending_supported_water;
+static int s_water_capture_enabled;
+static int s_water_capture_complete;
+static int s_water_capture_trigger_active;
+static unsigned s_water_capture_supported_frames;
+static unsigned s_water_capture_images;
+static BwMetalWaterPreset s_water_capture_preset;
+static char s_water_capture_trigger[PATH_MAX];
 
 static int flush_commands(void);
 static id<MTLCommandBuffer> pending_command(void);
+static void set_draw_state(id<MTLRenderCommandEncoder> encoder,
+                           const Nv2aRenderState *state);
 static int preserve_depth_surfaces(void);
+static int metal_fail(const char *format, ...);
 
 static int valid_anisotropy(unsigned value)
 {
@@ -269,8 +326,9 @@ static void apply_pending_render_settings(void)
 {
     s_active_anisotropy =
         atomic_load_explicit(&s_requested_anisotropy, memory_order_acquire);
-    if (!s_water_benchmark_enabled || s_water_benchmark_complete ||
-        s_water_benchmark_failed)
+    if ((!s_water_benchmark_enabled || s_water_benchmark_complete ||
+         s_water_benchmark_failed) &&
+        (!s_water_capture_enabled || s_water_capture_complete))
         s_active_water_preset =
             atomic_load_explicit(&s_requested_water_preset, memory_order_acquire);
 }
@@ -297,6 +355,8 @@ int bw_metal_backend_set_water_preset(BwMetalWaterPreset preset)
         return 0;
     if (s_water_benchmark_enabled && !s_water_benchmark_complete &&
         !s_water_benchmark_failed)
+        return 0;
+    if (s_water_capture_enabled && !s_water_capture_complete)
         return 0;
     if (preset == BW_METAL_WATER_REALISTIC &&
         !bw_edition_at_least(BW_ED_REMASTERED))
@@ -352,6 +412,34 @@ static void report_frame_times(const char *label, const uint64_t *samples, size_
             "[GPU-METAL] frame timing %s: %zu intervals, %.2f fps average, "
             "%.2f ms median, %.2f ms p95, %.2f ms max\n",
             label, count, sum ? (double)count * 1e9 / (double)sum : 0.0,
+            (double)median / 1e6, (double)p95 / 1e6, (double)maximum / 1e6);
+    free(sorted);
+}
+
+static void report_duration_times(const char *kind, const char *label,
+                                  const uint64_t *samples, size_t count)
+{
+    if (!count)
+        return;
+    uint64_t *sorted = malloc(count * sizeof *sorted);
+    if (!sorted) {
+        fprintf(stderr, "[GPU-METAL] %s timing unavailable: allocation failed\n", kind);
+        return;
+    }
+    uint64_t sum = 0, maximum = 0;
+    for (size_t i = 0; i < count; i++) {
+        sorted[i] = samples[i];
+        sum += samples[i];
+        if (samples[i] > maximum)
+            maximum = samples[i];
+    }
+    qsort(sorted, count, sizeof *sorted, compare_u64);
+    uint64_t median = sorted[count / 2u];
+    uint64_t p95 = sorted[((count * 95u + 99u) / 100u) - 1u];
+    fprintf(stderr,
+            "[GPU-METAL] %s timing %s: %zu frames, %.2f ms mean, "
+            "%.2f ms median, %.2f ms p95, %.2f ms max\n",
+            kind, label, count, (double)sum / (double)count / 1e6,
             (double)median / 1e6, (double)p95 / 1e6, (double)maximum / 1e6);
     free(sorted);
 }
@@ -505,6 +593,68 @@ reset:
     s_frame_water_gpu_ns = 0;
     s_frame_water_gpu_valid = 0;
     s_frame_water_gpu_invalid = 0;
+}
+
+static unsigned water_capture_offset(unsigned image)
+{
+#if defined(BW_METAL_TESTING)
+    return image;
+#else
+    return image * 60u;
+#endif
+}
+
+static int water_capture_arm_frame(void)
+{
+    if (!s_water_capture_enabled || s_water_capture_complete ||
+        s_water_capture_trigger_active ||
+        s_water_capture_images >= METAL_WATER_CAPTURE_IMAGES ||
+        s_water_capture_supported_frames !=
+            water_capture_offset(s_water_capture_images))
+        return 1;
+    int fd = open(s_water_capture_trigger,
+                  O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
+    if (fd < 0)
+        return metal_fail("could not arm the private water capture: %s",
+                          strerror(errno));
+    if (close(fd) != 0) {
+        int error = errno;
+        (void)unlink(s_water_capture_trigger);
+        return metal_fail("could not close the private water capture trigger: %s",
+                          strerror(error));
+    }
+    s_water_capture_trigger_active = 1;
+    return 1;
+}
+
+static int water_capture_frame(void)
+{
+    if (!s_water_capture_enabled || s_water_capture_complete)
+        return 1;
+    if (s_active_water_preset != s_water_capture_preset)
+        return metal_fail("the active preset changed during private water capture");
+    if (s_water_capture_trigger_active) {
+        if (unlink(s_water_capture_trigger) != 0)
+            return metal_fail("could not clear the private water capture trigger: %s",
+                              strerror(errno));
+        s_water_capture_trigger_active = 0;
+        s_water_capture_images++;
+        if (s_water_capture_images == METAL_WATER_CAPTURE_IMAGES) {
+            s_water_capture_complete = 1;
+            fprintf(stderr,
+                    "[GPU-METAL] water capture v1 preset=%s images=%u "
+                    "supported_offsets=%u,%u,%u,%u width=%u height=%u\n",
+                    s_water_capture_preset == BW_METAL_WATER_REALISTIC
+                        ? "realistic" : "retail",
+                    METAL_WATER_CAPTURE_IMAGES,
+                    water_capture_offset(0), water_capture_offset(1),
+                    water_capture_offset(2), water_capture_offset(3),
+                    s_present_framebuffer.width, s_present_framebuffer.height);
+        }
+    }
+    if (s_frame_supported_water_batches)
+        s_water_capture_supported_frames++;
+    return 1;
 }
 
 static const char s_shader[] =
@@ -1322,20 +1472,65 @@ static int encode_surface_copy(id<MTLTexture> source, id<MTLTexture> destination
     return 1;
 }
 
-static int seed_color_surface(id<MTLTexture> destination, const Nv2aSurface *surface)
+static int seed_color_surface(id<MTLTexture> destination,
+                              const Nv2aSurface *surface,
+                              const void *pixels, size_t row)
 {
     if (!ensure_surface_upload(surface->width, surface->height))
         return 0;
     [s_surface_upload replaceRegion:MTLRegionMake2D(0, 0, surface->width, surface->height)
-                        mipmapLevel:0 withBytes:guest_pointer(surface->color_va)
-                        bytesPerRow:surface->pitch];
+                        mipmapLevel:0 withBytes:pixels bytesPerRow:row];
+    s_surface_seed_count++;
     return encode_surface_copy(s_surface_upload, destination, 0);
+}
+
+static int ensure_surface_sync_pixels(BWMetalColorSurface *entry, size_t bytes)
+{
+    if (entry->guest_sync.length == bytes)
+        return 1;
+    entry->guest_sync = [NSMutableData dataWithLength:bytes];
+    if (!entry->guest_sync)
+        return metal_fail("could not allocate colour surface synchronization snapshot");
+    return 1;
+}
+
+static int record_surface_sync_from_guest(BWMetalColorSurface *entry,
+                                          const Nv2aSurface *surface,
+                                          uint32_t format)
+{
+    size_t row = (size_t)surface->width * 4u;
+    if ((size_t)surface->height > SIZE_MAX / row ||
+        !ensure_surface_sync_pixels(entry, row * surface->height))
+        return 0;
+    for (uint32_t y = 0; y < surface->height; y++)
+        memcpy((uint8_t *)entry->guest_sync.mutableBytes + (size_t)y * row,
+               guest_pointer(surface->color_va) + (size_t)y * surface->pitch,
+               row);
+    entry->row = row;
+    entry->surface = *surface;
+    entry->format = format;
+    entry->sync_valid = 1;
+    return 1;
+}
+
+static int surface_matches_guest_sync(BWMetalColorSurface *entry,
+                                      const Nv2aSurface *surface,
+                                      uint32_t format)
+{
+    if (!entry->sync_valid || format != entry->format ||
+        !same_surface(surface, &entry->surface))
+        return 0;
+    for (uint32_t y = 0; y < surface->height; y++)
+        if (memcmp(guest_pointer(surface->color_va) + (size_t)y * surface->pitch,
+                   (const uint8_t *)entry->guest_sync.bytes + (size_t)y * entry->row,
+                   entry->row))
+            return 0;
+    return 1;
 }
 
 static int writeback(void)
 {
     size_t row, bytes;
-    uint8_t *pixels;
 
     if (s_surface && s_dirty) {
         if (!ensure_surface_readback(s_current.width, s_current.height) ||
@@ -1350,16 +1545,20 @@ static int writeback(void)
     if ((size_t)s_current.height > SIZE_MAX / row)
         return metal_fail("colour surface readback size overflows");
     bytes = row * s_current.height;
-    pixels = malloc(bytes);
-    if (!pixels)
-        return metal_fail("could not allocate colour surface readback");
-    [s_surface_readback getBytes:pixels bytesPerRow:row
+    if (!s_surface_entry)
+        return metal_fail("active colour surface has no cache entry");
+    if (!ensure_surface_sync_pixels(s_surface_entry, bytes))
+        return 0;
+    [s_surface_readback getBytes:s_surface_entry->guest_sync.mutableBytes bytesPerRow:row
                       fromRegion:MTLRegionMake2D(0, 0, s_current.width, s_current.height)
                      mipmapLevel:0];
     for (uint32_t y = 0; y < s_current.height; y++)
         memcpy(guest_pointer(s_current.color_va) + (size_t)y * s_current.pitch,
-               pixels + (size_t)y * row, row);
-    free(pixels);
+               (const uint8_t *)s_surface_entry->guest_sync.bytes + (size_t)y * row, row);
+    s_surface_entry->row = row;
+    s_surface_entry->surface = s_current;
+    s_surface_entry->format = s_current_format;
+    s_surface_entry->sync_valid = 1;
     invalidate_texture_cache(s_current.color_va,
                              span_end(s_current.color_va, s_current.width,
                                       s_current.height, s_current.pitch));
@@ -1367,7 +1566,7 @@ static int writeback(void)
     return 1;
 }
 
-static id<MTLTexture> cached_surface(const Nv2aSurface *s, uint32_t format)
+static BWMetalColorSurface *cached_surface(const Nv2aSurface *s, uint32_t format)
 {
     uint32_t physical_width, physical_height;
     if (!surface_physical_size(s, &physical_width, &physical_height))
@@ -1386,9 +1585,9 @@ static id<MTLTexture> cached_surface(const Nv2aSurface *s, uint32_t format)
         .scale_epoch = s_render_scale_epoch,
     };
     NSData *key = [NSData dataWithBytes:&value length:sizeof value];
-    id<MTLTexture> texture = s_color_surfaces[key];
-    if (texture)
-        return texture;
+    BWMetalColorSurface *entry = s_color_surfaces[key];
+    if (entry)
+        return entry;
     if (!s_color_surfaces)
         s_color_surfaces = [NSMutableDictionary new];
     if (!s_color_surfaces)
@@ -1402,18 +1601,21 @@ static id<MTLTexture> cached_surface(const Nv2aSurface *s, uint32_t format)
                                                          mipmapped:NO];
     desc.storageMode = MTLStorageModePrivate;
     desc.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
-    texture = [s_device newTextureWithDescriptor:desc];
-    if (!texture)
+    entry = [BWMetalColorSurface new];
+    if (!entry)
+        return metal_fail("could not create colour surface cache entry"), nil;
+    entry->texture = [s_device newTextureWithDescriptor:desc];
+    if (!entry->texture)
         return metal_fail("could not create colour surface %ux%u (guest %ux%u)",
                           physical_width, physical_height, s->width, s->height), nil;
-    s_color_surfaces[key] = texture;
-    return texture;
+    s_color_surfaces[key] = entry;
+    return entry;
 }
 
 static int prepare_surface(const Nv2aSurface *s)
 {
     uint32_t format = bw_backend_reg(0x0208u) & 0xFu;
-    id<MTLTexture> surface;
+    BWMetalColorSurface *entry;
 
     if (!surface_valid(s))
         return 0;
@@ -1423,12 +1625,18 @@ static int prepare_surface(const Nv2aSurface *s)
         return 1;
     if (!writeback())
         return 0;
-    surface = cached_surface(s, format);
-    if (!surface)
+    entry = cached_surface(s, format);
+    if (!entry)
         return 0;
-    if (!seed_color_surface(surface, s))
-        return 0;
-    s_surface = surface;
+    if (surface_matches_guest_sync(entry, s, format)) {
+        s_surface_cache_reuses++;
+    } else {
+        if (!record_surface_sync_from_guest(entry, s, format) ||
+            !seed_color_surface(entry->texture, s, entry->guest_sync.bytes, entry->row))
+            return 0;
+    }
+    s_surface_entry = entry;
+    s_surface = entry->texture;
     s_current = *s;
     s_current_format = format;
     s_dirty = 0;
@@ -1546,7 +1754,25 @@ static int flush_commands(void)
     s_pending_command = nil;
     int water_command = s_pending_supported_water;
     s_pending_supported_water = 0;
+    uint64_t wait_start = s_frame_timing_enabled ? xbox_HostNowNs() : 0;
     int result = finish_command(command);
+    uint64_t wait_end = s_frame_timing_enabled ? xbox_HostNowNs() : 0;
+    if (wait_start && wait_end > wait_start &&
+        UINT64_MAX - s_frame_command_wait_ns >= wait_end - wait_start)
+        s_frame_command_wait_ns += wait_end - wait_start;
+    if (result && s_frame_timing_enabled) {
+        CFTimeInterval start = command.GPUStartTime;
+        CFTimeInterval end = command.GPUEndTime;
+        double duration = (end - start) * 1.0e9;
+        if (isfinite(start) && isfinite(end) && end > start &&
+            isfinite(duration) && duration > 0.0 &&
+            duration <= (double)(UINT64_MAX - s_frame_gpu_command_ns)) {
+            s_frame_gpu_command_ns += (uint64_t)llround(duration);
+            s_frame_gpu_command_valid = 1;
+        } else {
+            s_gpu_command_timestamp_failures++;
+        }
+    }
     if (result && water_command && s_water_benchmark_enabled &&
         !s_water_benchmark_complete && !s_water_benchmark_failed) {
         CFTimeInterval start = command.GPUStartTime;
@@ -1955,14 +2181,16 @@ static int blend_operation(uint32_t equation, MTLBlendOperation *result)
 static id<MTLRenderPipelineState> draw_pipeline(int shader_kind, const Nv2aRenderState *rs,
                                                 int has_depth)
 {
+    int depth_only = shader_kind == METAL_SHADER_DEPTH_ONLY;
     MetalPipelineKey key = {
         .textured = (uint32_t)shader_kind,
-        .color_mask = rs->color_mask & 0x01010101u,
-        .fixed_alpha_zero = (bw_backend_reg(0x0208u) & 0xFu) == METAL_COLOR_XRGB_ZERO,
-        .blend_enable = rs->blend_enable != 0,
-        .blend_src = rs->blend_enable ? rs->blend_src : 0,
-        .blend_dst = rs->blend_enable ? rs->blend_dst : 0,
-        .blend_eq = rs->blend_enable ? rs->blend_eq : 0,
+        .color_mask = depth_only ? 0u : rs->color_mask & 0x01010101u,
+        .fixed_alpha_zero = !depth_only &&
+                            (bw_backend_reg(0x0208u) & 0xFu) == METAL_COLOR_XRGB_ZERO,
+        .blend_enable = !depth_only && rs->blend_enable != 0,
+        .blend_src = !depth_only && rs->blend_enable ? rs->blend_src : 0,
+        .blend_dst = !depth_only && rs->blend_enable ? rs->blend_dst : 0,
+        .blend_eq = !depth_only && rs->blend_enable ? rs->blend_eq : 0,
         .depth_attachment = has_depth != 0,
     };
     MTLBlendFactor src_rgb, dst_rgb, src_alpha, dst_alpha;
@@ -1994,8 +2222,9 @@ static id<MTLRenderPipelineState> draw_pipeline(int shader_kind, const Nv2aRende
     pipeline.fragmentFunction =
         shader_kind == METAL_SHADER_REALISTIC_WATER ? s_realistic_water_fragment_function
       : shader_kind == METAL_SHADER_EXTENDED ? s_extended_fragment_function
+      : shader_kind == METAL_SHADER_DEPTH_ONLY ? nil
       : shader_kind == METAL_SHADER_TEXTURE ? s_texture_function : s_color_function;
-    if (!pipeline.fragmentFunction)
+    if (!pipeline.fragmentFunction && !depth_only)
         return nil;
     MTLRenderPipelineColorAttachmentDescriptor *attachment = pipeline.colorAttachments[0];
     attachment.pixelFormat = MTLPixelFormatBGRA8Unorm;
@@ -2140,6 +2369,174 @@ static id<MTLRenderCommandEncoder> draw_encoder(BWMetalDepthSurface *depth)
     s_draw_depth = depth_texture;
     s_draw_encoder_creations++;
     return s_draw_encoder;
+}
+
+static void water_reflect_reset_run(void)
+{
+    s_water_reflect_active = 0;
+    s_water_reflect_primed = 0;
+    s_water_reflect_view = BW_X_WATER_VIEW_UNKNOWN;
+    s_water_reflect_source = nil;
+}
+
+static void water_reflect_fail(const char *reason)
+{
+    if (!s_water_reflect_single_failed)
+        fprintf(stderr,
+                "[GPU-METAL] distant-water-line fix unavailable: %s; "
+                "using retail reflection depth\n", reason);
+    s_water_reflect_single_failed = 1;
+    water_reflect_reset_run();
+}
+
+static id<MTLDepthStencilState> water_reflect_depth_state(int write)
+{
+    id<MTLDepthStencilState> state =
+        write ? s_water_reflect_prime_state : s_water_reflect_test_state;
+    if (state)
+        return state;
+    MTLDepthStencilDescriptor *descriptor = [MTLDepthStencilDescriptor new];
+    if (!descriptor)
+        return nil;
+    descriptor.depthCompareFunction = MTLCompareFunctionLessEqual;
+    descriptor.depthWriteEnabled = write != 0;
+    state = [s_device newDepthStencilStateWithDescriptor:descriptor];
+    if (write)
+        s_water_reflect_prime_state = state;
+    else
+        s_water_reflect_test_state = state;
+    return state;
+}
+
+static int water_reflect_copy_depth(BWMetalDepthSurface *source)
+{
+#if defined(BW_METAL_TESTING)
+    if (s_water_reflect_test_failure)
+        return 0;
+#endif
+    if (!source || !source->texture)
+        return 0;
+    if (s_water_reflect_depth &&
+        (s_water_reflect_depth->width != source->width ||
+         s_water_reflect_depth->height != source->height ||
+         s_water_reflect_depth->scale_epoch != source->scale_epoch))
+        s_water_reflect_depth = nil;
+    if (!s_water_reflect_depth) {
+        MTLTextureDescriptor *descriptor =
+            [MTLTextureDescriptor
+                texture2DDescriptorWithPixelFormat:MTLPixelFormatDepth32Float_Stencil8
+                                             width:source->width
+                                            height:source->height
+                                         mipmapped:NO];
+        if (!descriptor)
+            return 0;
+        descriptor.storageMode = MTLStorageModePrivate;
+        descriptor.usage = MTLTextureUsageRenderTarget;
+        BWMetalDepthSurface *depth = [BWMetalDepthSurface new];
+        if (!depth)
+            return 0;
+        depth->texture = [s_device newTextureWithDescriptor:descriptor];
+        if (!depth->texture)
+            return 0;
+        depth->width = source->width;
+        depth->height = source->height;
+        depth->guest_width = source->guest_width;
+        depth->guest_height = source->guest_height;
+        depth->scale_epoch = source->scale_epoch;
+        s_water_reflect_depth = depth;
+    }
+    end_draw_encoder();
+    id<MTLCommandBuffer> command = pending_command();
+    id<MTLBlitCommandEncoder> blit = [command blitCommandEncoder];
+    if (!command || !blit)
+        return 0;
+    [blit copyFromTexture:source->texture
+              sourceSlice:0
+              sourceLevel:0
+             sourceOrigin:MTLOriginMake(0, 0, 0)
+               sourceSize:MTLSizeMake(source->width, source->height, 1)
+                toTexture:s_water_reflect_depth->texture
+         destinationSlice:0
+         destinationLevel:0
+        destinationOrigin:MTLOriginMake(0, 0, 0)];
+    [blit endEncoding];
+    s_water_reflect_source = source;
+    s_water_reflect_copies++;
+    return 1;
+}
+
+enum {
+    WATER_REFLECT_RETAIL,
+    WATER_REFLECT_FILTER,
+    WATER_REFLECT_PRIME,
+};
+
+static int water_reflect_mode(const BwXBatch *batch, BWMetalDepthSurface *depth)
+{
+    int current = batch->water.version == BW_X_WATER_SEMANTIC_VERSION;
+    int lit = current && batch->water.pass == BW_X_WATER_PASS_LIT;
+    int reflection = current && batch->water.pass == BW_X_WATER_PASS_REFLECTION;
+    int foam = current && batch->water.pass == BW_X_WATER_PASS_FOAM;
+
+    if (!s_water_reflect_single_enabled || s_water_reflect_single_failed ||
+        bw_ab_off("oceanreflect") || !depth) {
+        water_reflect_reset_run();
+        return WATER_REFLECT_RETAIL;
+    }
+    if (lit) {
+        if (batch->water.view == BW_X_WATER_VIEW_UNKNOWN) {
+            water_reflect_reset_run();
+            return WATER_REFLECT_RETAIL;
+        }
+        if (!s_water_reflect_active ||
+            s_water_reflect_source != depth ||
+            s_water_reflect_view != batch->water.view) {
+            water_reflect_reset_run();
+            if (!water_reflect_copy_depth(depth)) {
+                water_reflect_fail("private depth allocation or copy failed");
+                return WATER_REFLECT_RETAIL;
+            }
+            s_water_reflect_active = 1;
+            s_water_reflect_view = batch->water.view;
+        }
+        return WATER_REFLECT_PRIME;
+    }
+    if (reflection && s_water_reflect_active && s_water_reflect_primed &&
+        s_water_reflect_source == depth && s_water_reflect_depth &&
+        s_water_reflect_view == batch->water.view)
+        return WATER_REFLECT_FILTER;
+    if (foam && s_water_reflect_active &&
+        s_water_reflect_source == depth &&
+        s_water_reflect_view == batch->water.view) {
+        s_water_reflect_primed = 0;
+        return WATER_REFLECT_RETAIL;
+    }
+    water_reflect_reset_run();
+    return WATER_REFLECT_RETAIL;
+}
+
+static int water_reflect_prime(id<MTLBuffer> vertices, NSUInteger vertex_offset,
+                               const MetalExtendedUniforms *uniforms,
+                               const Nv2aRenderState *state, uint32_t count)
+{
+    id<MTLRenderPipelineState> pipeline =
+        draw_pipeline(METAL_SHADER_DEPTH_ONLY, state, 1);
+    id<MTLDepthStencilState> depth_state = water_reflect_depth_state(1);
+    id<MTLRenderCommandEncoder> encoder = draw_encoder(s_water_reflect_depth);
+    float factor = 0.0f, units = 0.0f;
+    int offset = polygon_offset_state(&factor, &units);
+    if (!pipeline || !depth_state || !encoder || offset < 0)
+        return 0;
+    [encoder setRenderPipelineState:pipeline];
+    [encoder setVertexBuffer:vertices offset:vertex_offset atIndex:0];
+    [encoder setVertexBytes:uniforms length:sizeof *uniforms atIndex:1];
+    [encoder setDepthStencilState:depth_state];
+    set_draw_state(encoder, state);
+    [encoder setDepthBias:units + 64.0f slopeScale:factor + 2.0f clamp:0.0f];
+    [encoder drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:count];
+    s_water_reflect_prime_draws++;
+    s_water_reflect_primed = 1;
+    return 1;
 }
 
 static id<MTLTexture> decode_texture(const Nv2aTexture *tex)
@@ -2568,6 +2965,7 @@ static void metal_clear(const Nv2aSurface *s, const Nv2aRenderState *rs,
         BWMetalDepthSurface *depth = nil;
         if (bw_metal_backend_error())
             return;
+        water_reflect_reset_run();
         if (flags & ~0xF3u) {
             metal_fail("unsupported clear flags 0x%08x", flags);
             return;
@@ -2815,6 +3213,7 @@ static void metal_draw(const Nv2aSurface *s, const Nv2aBatch *batch)
     @autoreleasepool {
         if (bw_metal_backend_error())
             return;
+        water_reflect_reset_run();
         if (!batch || !batch->vertices || !batch->count || batch->count % 3u ||
             (size_t)batch->count > SIZE_MAX / sizeof(MetalVertex)) {
             metal_fail("invalid triangle batch");
@@ -2943,14 +3342,22 @@ static id<MTLTexture> inactive_cube_texture(void)
     return s_inactive_cube_texture;
 }
 
-/* The marked ocean path binds its sampled water/reflection input at stage 0
- * and carries the encoded normal and eye basis through stages 1 and 2. */
+static int lit_water_batch(const BwXBatch *batch)
+{
+    if (batch->water.version)
+        return batch->water.version == BW_X_WATER_SEMANTIC_VERSION &&
+               batch->water.pass == BW_X_WATER_PASS_LIT;
+    return batch->draw_marker == BW_X_DRAW_MARKER_OCEAN;
+}
+
+/* The marked lit-water path binds its sampled water/reflection input at stage
+ * 0 and carries the encoded normal and eye basis through stages 1 and 2. */
 static int realistic_water_supported(const BwXBatch *batch, uint32_t stage_mask,
                                      uint32_t cube_mask)
 {
     uint32_t program = batch->rc->stage_program;
     (void)cube_mask;
-    return batch->draw_marker == BW_X_DRAW_MARKER_OCEAN &&
+    return lit_water_batch(batch) &&
            (stage_mask & 1u) &&
            (program & 31u) == 1u &&
            ((program >> 5) & 31u) == 4u &&
@@ -2994,7 +3401,7 @@ static void metal_draw_extended(const Nv2aSurface *surface, const BwXBatch *batc
         int realistic_water =
             s_active_water_preset == BW_METAL_WATER_REALISTIC && supported_water;
         if (s_active_water_preset == BW_METAL_WATER_REALISTIC &&
-            batch->draw_marker == BW_X_DRAW_MARKER_OCEAN) {
+            lit_water_batch(batch)) {
             if (!supported_water) {
                 s_realistic_water_fallback_batches++;
                 if (!s_realistic_water_fallback_reported) {
@@ -3062,10 +3469,13 @@ static void metal_draw_extended(const Nv2aSurface *surface, const BwXBatch *batc
         BWMetalDepthSurface *depth = prepare_draw_depth(surface, batch->state);
         if (batch->state->zeta_va && !depth)
             return;
+        int reflect_mode = water_reflect_mode(batch, depth);
+        BWMetalDepthSurface *draw_depth =
+            reflect_mode == WATER_REFLECT_FILTER ? s_water_reflect_depth : depth;
         id<MTLRenderPipelineState> pipeline =
             draw_pipeline(realistic_water ? METAL_SHADER_REALISTIC_WATER
                                           : METAL_SHADER_EXTENDED,
-                          batch->state, depth != nil);
+                          batch->state, draw_depth != nil);
         if (!pipeline && realistic_water && !bw_metal_backend_error()) {
             realistic_water = 0;
             s_active_water_preset = BW_METAL_WATER_RETAIL;
@@ -3073,10 +3483,17 @@ static void metal_draw_extended(const Nv2aSurface *surface, const BwXBatch *batc
                                   BW_METAL_WATER_RETAIL, memory_order_release);
             s_realistic_water_fallback_batches++;
             pipeline = draw_pipeline(METAL_SHADER_EXTENDED,
-                                     batch->state, depth != nil);
+                                     batch->state, draw_depth != nil);
         }
-        id<MTLDepthStencilState> depth_state =
-            draw_depth_state(batch->state, depth != nil);
+        id<MTLDepthStencilState> depth_state = reflect_mode == WATER_REFLECT_FILTER
+            ? water_reflect_depth_state(0)
+            : draw_depth_state(batch->state, draw_depth != nil);
+        if (reflect_mode == WATER_REFLECT_FILTER && !depth_state) {
+            water_reflect_fail("private reflection depth state creation failed");
+            reflect_mode = WATER_REFLECT_RETAIL;
+            draw_depth = depth;
+            depth_state = draw_depth_state(batch->state, depth != nil);
+        }
         if (!pipeline || !depth_state)
             return;
         if (realistic_water) {
@@ -3157,7 +3574,7 @@ static void metal_draw_extended(const Nv2aSurface *surface, const BwXBatch *batc
             uniforms.factors[i][0] = batch->rc->factor0[i];
             uniforms.factors[i][1] = batch->rc->factor1[i];
         }
-        id<MTLRenderCommandEncoder> encoder = draw_encoder(depth);
+        id<MTLRenderCommandEncoder> encoder = draw_encoder(draw_depth);
         if (!encoder)
             return;
         [encoder setRenderPipelineState:pipeline];
@@ -3189,7 +3606,21 @@ static void metal_draw_extended(const Nv2aSurface *surface, const BwXBatch *batc
         [encoder setStencilReferenceValue:batch->state->stencil_ref & 0xFFu];
         set_draw_state(encoder, batch->state);
         [encoder drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:batch->count];
+        if (reflect_mode == WATER_REFLECT_FILTER) {
+            s_water_reflect_filtered_draws++;
+            if (!s_water_reflect_single_reported) {
+                fprintf(stderr,
+                        "[GPU-METAL] distant-water-line private reflection depth active\n");
+                s_water_reflect_single_reported = 1;
+            }
+        } else if (reflect_mode == WATER_REFLECT_PRIME &&
+                   !water_reflect_prime(vertices, vertex_offset, &uniforms,
+                                        batch->state, batch->count)) {
+            water_reflect_fail("private depth priming failed");
+        }
         if (supported_water) {
+            if (!s_frame_supported_water_batches && !water_capture_arm_frame())
+                return;
             s_frame_supported_water_batches++;
             s_pending_supported_water = 1;
         }
@@ -3255,6 +3686,20 @@ int bw_metal_test_current_depth(uint32_t va, uint32_t *width, uint32_t *height,
     if (height) *height = depth->height;
     if (private_storage)
         *private_storage = depth->texture.storageMode == MTLStorageModePrivate;
+    return 1;
+}
+
+int bw_metal_test_water_reflect_depth(uint32_t *width, uint32_t *height,
+                                      uint32_t *scale_epoch)
+{
+    if (!s_water_reflect_depth)
+        return 0;
+    if (width)
+        *width = s_water_reflect_depth->width;
+    if (height)
+        *height = s_water_reflect_depth->height;
+    if (scale_epoch)
+        *scale_epoch = s_water_reflect_depth->scale_epoch;
     return 1;
 }
 
@@ -3449,6 +3894,27 @@ static int direct_present(void)
     return 1;
 }
 
+static BWMetalColorSurface *prepare_present_surface_texture(const Nv2aSurface *surface,
+                                                            uint32_t format)
+{
+    BWMetalColorSurface *entry = cached_surface(surface, format);
+    if (!entry)
+        return nil;
+    if (entry->texture == s_surface)
+        return entry;
+    if (surface_matches_guest_sync(entry, surface, format)) {
+        s_present_cache_reuses++;
+    } else {
+        if (!record_surface_sync_from_guest(entry, surface, format) ||
+            !seed_color_surface(entry->texture, surface,
+                                entry->guest_sync.bytes, entry->row) ||
+            !flush_commands())
+            return nil;
+        s_present_guest_reseeds++;
+    }
+    return entry;
+}
+
 static int report_framebuffer(const Nv2aSurface *surface, uint32_t format)
 {
     if (format != METAL_COLOR_ARGB8 && format != METAL_COLOR_XRGB_ZERO)
@@ -3466,13 +3932,10 @@ static int report_framebuffer(const Nv2aSurface *surface, uint32_t format)
     if (s_framebuffer_callback && !s_framebuffer_callback(&info))
         return metal_fail("presenter rejected framebuffer descriptor");
     if (s_present_layer) {
-        id<MTLTexture> texture = cached_surface(surface, format);
-        if (!texture)
+        BWMetalColorSurface *entry = prepare_present_surface_texture(surface, format);
+        if (!entry)
             return 0;
-        if (texture != s_surface &&
-            (!seed_color_surface(texture, surface) || !flush_commands()))
-            return 0;
-        s_present_surface = texture;
+        s_present_surface = entry->texture;
         s_present_framebuffer = info;
     }
     return 1;
@@ -3507,12 +3970,42 @@ static void metal_flip(void)
     @autoreleasepool {
         if (bw_metal_backend_error())
             return;
+        water_reflect_reset_run();
         if (s_dirty) {
             metal_fail("flip occurred without a successful surface readback");
             return;
         }
+        if (!water_capture_frame())
+            return;
         water_benchmark_frame();
         apply_pending_render_settings();
+        if (s_frame_timing_enabled) {
+            if (s_frame_gpu_command_valid &&
+                s_gpu_command_time_count < METAL_MAX_FRAME_SAMPLES) {
+                s_gpu_command_times[s_gpu_command_time_count++] =
+                    s_frame_gpu_command_ns;
+                if (s_gpu_command_time_count >= 300u &&
+                    !(s_gpu_command_time_count % 100u))
+                    report_duration_times(
+                        "GPU command", "300-frame window",
+                        s_gpu_command_times + s_gpu_command_time_count - 300u,
+                        300u);
+            }
+            if (s_frame_command_wait_ns &&
+                s_command_wait_time_count < METAL_MAX_FRAME_SAMPLES) {
+                s_command_wait_times[s_command_wait_time_count++] =
+                    s_frame_command_wait_ns;
+                if (s_command_wait_time_count >= 300u &&
+                    !(s_command_wait_time_count % 100u))
+                    report_duration_times(
+                        "command wait", "300-frame window",
+                        s_command_wait_times + s_command_wait_time_count - 300u,
+                        300u);
+            }
+            s_frame_gpu_command_ns = 0;
+            s_frame_command_wait_ns = 0;
+            s_frame_gpu_command_valid = 0;
+        }
         uint64_t now = xbox_HostNowNs();
         if (now && s_last_flip_ns && now > s_last_flip_ns &&
             s_frame_time_count < METAL_MAX_FRAME_SAMPLES) {
@@ -3521,6 +4014,14 @@ static void metal_flip(void)
                 !(s_frame_time_count % 100u))
                 report_frame_times("300-frame window",
                                    s_frame_times + s_frame_time_count - 300u, 300u);
+            if (s_frame_timing_enabled && s_frame_time_count >= 300u &&
+                !(s_frame_time_count % 100u))
+                fprintf(stderr,
+                        "[GPU-METAL] surface-cache totals: %llu target reuses, "
+                        "%llu present reuses, %llu present guest reseeds\n",
+                        (unsigned long long)s_surface_cache_reuses,
+                        (unsigned long long)s_present_cache_reuses,
+                        (unsigned long long)s_present_guest_reseeds);
         }
         if (now)
             s_last_flip_ns = now;
@@ -3528,6 +4029,7 @@ static void metal_flip(void)
             return;
         s_present_surface = nil;
         s_surface = nil;
+        s_surface_entry = nil;
         if (!refresh_render_scale(1))
             return;
         bw_ab_frame(++s_frame);
@@ -3750,6 +4252,13 @@ static int start_with_regions(void *guest_memory, size_t low_size,
         s_active_water_preset = preset;
     }
     {
+        const char *single = getenv("BW_OCEAN_REFLECT_SINGLE");
+        s_water_reflect_single_enabled =
+            bw_edition_at_least(BW_ED_REMASTERED) &&
+            bw_fix_enabled(BW_FIX_OCEAN_REFLECT_SINGLE) &&
+            !(single && single[0] == '0');
+    }
+    {
         const char *benchmark = getenv("BW_METAL_WATER_BENCHMARK");
         s_water_benchmark_enabled = 0;
         if (benchmark) {
@@ -3768,6 +4277,34 @@ static int start_with_regions(void *guest_memory, size_t low_size,
             s_water_benchmark_enabled = 1;
         }
     }
+    {
+        const char *capture = getenv("BW_METAL_WATER_CAPTURE_TRIGGER");
+        s_water_capture_enabled = 0;
+        s_water_capture_trigger[0] = '\0';
+        if (capture) {
+            const char *diagnostic = getenv("BW_NATIVE_DIAGNOSTIC");
+            const char *audit = getenv("BW_GPU_AUDIT");
+            const char *dump = getenv("RECOMP_FB_DUMP");
+            const char *flips = getenv("RECOMP_FB_DUMP_FLIPS");
+            if (!*capture || capture[0] != '/' ||
+                strlen(capture) >= sizeof s_water_capture_trigger)
+                return metal_fail("BW_METAL_WATER_CAPTURE_TRIGGER must be a bounded absolute path");
+            if (!bw_edition_at_least(BW_ED_REMASTERED))
+                return metal_fail("private water capture requires Remastered");
+            if (!diagnostic || strcmp(diagnostic, "1"))
+                return metal_fail("private water capture requires the private diagnostic runner");
+            if (!audit || strcmp(audit, "1"))
+                return metal_fail("private water capture requires BW_GPU_AUDIT=1");
+            if (s_water_benchmark_enabled)
+                return metal_fail("private water capture cannot run with the water benchmark");
+            if (!dump || !*dump || dump[0] != '/' ||
+                !flips || strcmp(flips, capture))
+                return metal_fail("private water capture requires matching framebuffer dump paths");
+            memcpy(s_water_capture_trigger, capture, strlen(capture) + 1u);
+            s_water_capture_preset = s_active_water_preset;
+            s_water_capture_enabled = 1;
+        }
+    }
     s_pending_command = nil;
     s_draw_encoder = nil;
     s_draw_color = nil;
@@ -3779,10 +4316,29 @@ static int start_with_regions(void *guest_memory, size_t low_size,
     s_vertex_upload_offset = 0;
     s_vertex_upload_allocations = 0;
     s_texture_uploads = 0;
+    s_surface_seed_count = 0;
+    s_surface_cache_reuses = 0;
+    s_present_cache_reuses = 0;
+    s_present_guest_reseeds = 0;
     s_realistic_water_batches = 0;
     s_realistic_water_fallback_batches = 0;
     s_realistic_water_reported = 0;
     s_realistic_water_fallback_reported = 0;
+    s_water_reflect_single_failed = 0;
+    s_water_reflect_single_reported = 0;
+    s_water_reflect_active = 0;
+    s_water_reflect_primed = 0;
+    s_water_reflect_view = BW_X_WATER_VIEW_UNKNOWN;
+    s_water_reflect_depth = nil;
+    s_water_reflect_source = nil;
+    s_water_reflect_prime_state = nil;
+    s_water_reflect_test_state = nil;
+    s_water_reflect_copies = 0;
+    s_water_reflect_prime_draws = 0;
+    s_water_reflect_filtered_draws = 0;
+#if defined(BW_METAL_TESTING)
+    s_water_reflect_test_failure = 0;
+#endif
     s_water_benchmark_started = 0;
     s_water_benchmark_complete = 0;
     s_water_benchmark_failed = 0;
@@ -3791,6 +4347,10 @@ static int start_with_regions(void *guest_memory, size_t low_size,
     s_water_benchmark_sampling = 0;
     memset(s_water_benchmark_samples, 0, sizeof s_water_benchmark_samples);
     memset(s_water_benchmark_sample_count, 0, sizeof s_water_benchmark_sample_count);
+    s_water_capture_complete = 0;
+    s_water_capture_trigger_active = 0;
+    s_water_capture_supported_frames = 0;
+    s_water_capture_images = 0;
     s_frame_supported_water_batches = 0;
     s_frame_water_gpu_ns = 0;
     s_frame_water_gpu_valid = 0;
@@ -3807,9 +4367,18 @@ static int start_with_regions(void *guest_memory, size_t low_size,
     s_presented_frames = 0;
     s_dropped_drawables = 0;
     s_frame_time_count = 0;
+    s_gpu_command_time_count = 0;
+    s_command_wait_time_count = 0;
+    s_frame_gpu_command_ns = 0;
+    s_frame_command_wait_ns = 0;
+    s_frame_gpu_command_valid = 0;
+    s_gpu_command_timestamp_failures = 0;
     s_last_flip_ns = 0;
     const char *audit = getenv("BW_GPU_AUDIT");
-    s_frame_timing_enabled = audit && !strcmp(audit, "1");
+    const char *frame_timing = getenv("BW_METAL_FRAME_TIMING");
+    s_frame_timing_enabled =
+        (audit && !strcmp(audit, "1")) ||
+        (frame_timing && !strcmp(frame_timing, "1"));
     const char *approx = getenv("BW_METAL_QUINCUNX_APPROX");
     s_quincunx_approx = approx && !strcmp(approx, "1");
     if (!configure_render_scale()) {
@@ -3832,6 +4401,10 @@ static int start_with_regions(void *guest_memory, size_t low_size,
         fprintf(stderr,
                 "[GPU-METAL] diagnostic water benchmark armed; Retail remains active "
                 "until a supported marked ocean frame arrives\n");
+    if (s_water_capture_enabled)
+        fprintf(stderr,
+                "[GPU-METAL] private water capture armed for four bounded "
+                "supported-ocean frames\n");
     return 1;
 }
 
@@ -3881,12 +4454,45 @@ void bw_metal_backend_stop(void)
     if (s_frame_timing_enabled && trailing && trailing != s_frame_time_count)
         report_frame_times("trailing 300",
                            s_frame_times + s_frame_time_count - trailing, trailing);
+    if (s_frame_timing_enabled)
+        report_duration_times("GPU command", "all",
+                              s_gpu_command_times, s_gpu_command_time_count);
+    trailing = s_gpu_command_time_count < 300u ? s_gpu_command_time_count : 300u;
+    if (s_frame_timing_enabled && trailing &&
+        trailing != s_gpu_command_time_count)
+        report_duration_times("GPU command", "trailing 300",
+                              s_gpu_command_times +
+                                  s_gpu_command_time_count - trailing,
+                              trailing);
+    if (s_frame_timing_enabled)
+        report_duration_times("command wait", "all",
+                              s_command_wait_times, s_command_wait_time_count);
+    trailing = s_command_wait_time_count < 300u ? s_command_wait_time_count : 300u;
+    if (s_frame_timing_enabled && trailing &&
+        trailing != s_command_wait_time_count)
+        report_duration_times("command wait", "trailing 300",
+                              s_command_wait_times +
+                                  s_command_wait_time_count - trailing,
+                              trailing);
+    if (s_frame_timing_enabled && s_gpu_command_timestamp_failures)
+        fprintf(stderr,
+                "[GPU-METAL] GPU command timing omitted %llu commands with "
+                "unavailable timestamps\n",
+                (unsigned long long)s_gpu_command_timestamp_failures);
     if (s_realistic_water_batches || s_realistic_water_fallback_batches)
         fprintf(stderr,
                 "[GPU-METAL] realistic water summary: %llu enhanced batches, "
                 "%llu retail fallbacks\n",
                 (unsigned long long)s_realistic_water_batches,
                 (unsigned long long)s_realistic_water_fallback_batches);
+    if (s_water_reflect_copies || s_water_reflect_prime_draws ||
+        s_water_reflect_filtered_draws)
+        fprintf(stderr,
+                "[GPU-METAL] distant-water-line summary: %llu depth copies, "
+                "%llu lit primes, %llu filtered reflection draws\n",
+                (unsigned long long)s_water_reflect_copies,
+                (unsigned long long)s_water_reflect_prime_draws,
+                (unsigned long long)s_water_reflect_filtered_draws);
     if (s_registered && s_water_benchmark_enabled &&
         !s_water_benchmark_complete && !s_water_benchmark_failed)
         fprintf(stderr,
@@ -3897,6 +4503,17 @@ void bw_metal_backend_stop(void)
                 s_water_benchmark_frames,
                 s_water_benchmark_sample_count[BW_METAL_WATER_RETAIL],
                 s_water_benchmark_sample_count[BW_METAL_WATER_REALISTIC]);
+    if (s_water_capture_trigger_active &&
+        unlink(s_water_capture_trigger) != 0)
+        metal_fail("could not remove the private water capture trigger: %s",
+                   strerror(errno));
+    if (s_registered && s_water_capture_enabled &&
+        !s_water_capture_complete)
+        fprintf(stderr,
+                "[GPU-METAL] water capture incomplete: %u/%u images, "
+                "%u supported frames\n",
+                s_water_capture_images, METAL_WATER_CAPTURE_IMAGES,
+                s_water_capture_supported_frames);
     if (s_registered) {
         bw_backend_ext_unregister_if_current(&s_extended_backend);
         bw_backend_unregister_if_current(&s_backend);
@@ -3909,6 +4526,19 @@ void bw_metal_backend_stop(void)
     s_realistic_water_fallback_batches = 0;
     s_realistic_water_reported = 0;
     s_realistic_water_fallback_reported = 0;
+    s_water_reflect_single_enabled = 0;
+    s_water_reflect_single_failed = 0;
+    s_water_reflect_single_reported = 0;
+    s_water_reflect_active = 0;
+    s_water_reflect_primed = 0;
+    s_water_reflect_view = BW_X_WATER_VIEW_UNKNOWN;
+    s_water_reflect_depth = nil;
+    s_water_reflect_source = nil;
+    s_water_reflect_prime_state = nil;
+    s_water_reflect_test_state = nil;
+    s_water_reflect_copies = 0;
+    s_water_reflect_prime_draws = 0;
+    s_water_reflect_filtered_draws = 0;
     s_water_benchmark_enabled = 0;
     s_water_benchmark_started = 0;
     s_water_benchmark_complete = 0;
@@ -3918,6 +4548,13 @@ void bw_metal_backend_stop(void)
     s_water_benchmark_sampling = 0;
     memset(s_water_benchmark_samples, 0, sizeof s_water_benchmark_samples);
     memset(s_water_benchmark_sample_count, 0, sizeof s_water_benchmark_sample_count);
+    s_water_capture_enabled = 0;
+    s_water_capture_complete = 0;
+    s_water_capture_trigger_active = 0;
+    s_water_capture_supported_frames = 0;
+    s_water_capture_images = 0;
+    s_water_capture_preset = BW_METAL_WATER_RETAIL;
+    s_water_capture_trigger[0] = '\0';
     s_frame_supported_water_batches = 0;
     s_frame_water_gpu_ns = 0;
     s_frame_water_gpu_valid = 0;
@@ -3926,6 +4563,7 @@ void bw_metal_backend_stop(void)
     s_current_format = 0;
     s_framebuffer_callback = NULL;
     s_surface = nil;
+    s_surface_entry = nil;
     s_present_surface = nil;
     memset(&s_present_framebuffer, 0, sizeof s_present_framebuffer);
     s_present_resolve = nil;
@@ -3994,6 +4632,27 @@ void bw_metal_backend_stop(void)
 }
 
 #ifdef BW_METAL_TESTING
+int bw_metal_test_prepare_surface(const Nv2aSurface *surface)
+{
+    @autoreleasepool {
+        return prepare_surface(surface);
+    }
+}
+
+int bw_metal_test_prepare_present_surface(const Nv2aSurface *surface, uint32_t format)
+{
+    @autoreleasepool {
+        if (!writeback())
+            return 0;
+        return prepare_present_surface_texture(surface, format) != nil;
+    }
+}
+
+uint64_t bw_metal_test_surface_seed_count(void)
+{
+    return s_surface_seed_count;
+}
+
 unsigned bw_metal_test_sampler_anisotropy(int min_linear, unsigned mip_mode)
 {
     return sampler_anisotropy(min_linear, mip_mode);
@@ -4017,6 +4676,22 @@ void bw_metal_test_realistic_water_counts(uint64_t *enhanced, uint64_t *fallback
         *fallback = s_realistic_water_fallback_batches;
 }
 
+void bw_metal_test_water_reflect_counts(uint64_t *copies, uint64_t *primes,
+                                        uint64_t *filtered)
+{
+    if (copies)
+        *copies = s_water_reflect_copies;
+    if (primes)
+        *primes = s_water_reflect_prime_draws;
+    if (filtered)
+        *filtered = s_water_reflect_filtered_draws;
+}
+
+void bw_metal_test_water_reflect_fail(int fail)
+{
+    s_water_reflect_test_failure = fail != 0;
+}
+
 void bw_metal_test_water_benchmark(int *complete, size_t *retail_samples,
                                    size_t *realistic_samples)
 {
@@ -4028,5 +4703,16 @@ void bw_metal_test_water_benchmark(int *complete, size_t *retail_samples,
     if (realistic_samples)
         *realistic_samples =
             s_water_benchmark_sample_count[BW_METAL_WATER_REALISTIC];
+}
+
+void bw_metal_test_water_capture(int *complete, unsigned *images,
+                                 unsigned *supported_frames)
+{
+    if (complete)
+        *complete = s_water_capture_complete;
+    if (images)
+        *images = s_water_capture_images;
+    if (supported_frames)
+        *supported_frames = s_water_capture_supported_frames;
 }
 #endif

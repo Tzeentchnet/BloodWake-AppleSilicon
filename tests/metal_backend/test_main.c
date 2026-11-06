@@ -1,6 +1,7 @@
 #include <stddef.h>
 #include <stdint.h>
 #include <float.h>
+#include <limits.h>
 #include <math.h>
 #include <pthread.h>
 #include <sched.h>
@@ -9,6 +10,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
+#include <unistd.h>
 
 #include "bw_metal_backend.h"
 #include "bw_backend_sync.h"
@@ -44,6 +46,8 @@ static volatile uint32_t s_fence_register;
 static int s_failed;
 static bw_edition_t s_edition = BW_ED_ORIGINAL;
 static int s_audit_enabled;
+static char s_water_capture_prefix[PATH_MAX];
+static char s_water_capture_trigger[PATH_MAX];
 static uint64_t s_ocean_audit_hashes[64];
 static int s_ocean_audit_mismatches[64];
 static unsigned s_ocean_audit_count;
@@ -158,6 +162,7 @@ void bw_audit_clear(uint32_t flags, uint32_t width, uint32_t height, const uint3
 void bw_audit_flip(uint32_t offset, uint32_t format) { (void)offset; (void)format; }
 
 extern void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param);
+extern void nv2a_pb_exec_report(void);
 extern void nv2a_pb_set_semaphore_target(uint32_t guest_va);
 extern int bw_metal_test_read_depth(uint32_t va, uint32_t x, uint32_t y,
                                     float *z, uint8_t *stencil);
@@ -169,20 +174,34 @@ extern uint64_t bw_metal_test_command_submission_count(void);
 extern uint64_t bw_metal_test_draw_encoder_creation_count(void);
 extern uint64_t bw_metal_test_vertex_upload_allocation_count(void);
 extern uint64_t bw_metal_test_texture_upload_count(void);
+extern uint64_t bw_metal_test_surface_seed_count(void);
+extern int bw_metal_test_prepare_surface(const Nv2aSurface *surface);
+extern int bw_metal_test_prepare_present_surface(const Nv2aSurface *surface,
+                                                 uint32_t format);
 extern int bw_metal_test_current_surface(uint32_t *width, uint32_t *height,
                                          int *private_storage);
 extern int bw_metal_test_current_depth(uint32_t va, uint32_t *width, uint32_t *height,
                                        int *private_storage);
+extern int bw_metal_test_water_reflect_depth(uint32_t *width, uint32_t *height,
+                                             uint32_t *scale_epoch);
 extern void bw_metal_test_set_present_size(uint32_t width, uint32_t height);
 extern int bw_metal_test_write_surface_pixel(uint32_t x, uint32_t y, uint32_t argb);
 extern unsigned bw_metal_test_sampler_anisotropy(int min_linear, unsigned mip_mode);
 extern void bw_metal_test_apply_pending_render_settings(void);
 extern unsigned bw_metal_test_active_water_preset(void);
 extern void bw_metal_test_realistic_water_counts(uint64_t *enhanced, uint64_t *fallback);
+extern void bw_metal_test_water_reflect_counts(uint64_t *copies, uint64_t *primes,
+                                               uint64_t *filtered);
+extern void bw_metal_test_water_reflect_fail(int fail);
 extern void bw_metal_test_water_benchmark(int *complete, size_t *retail_samples,
                                           size_t *realistic_samples);
+extern void bw_metal_test_water_capture(int *complete, unsigned *images,
+                                        unsigned *supported_frames);
 extern void bw_ocean_marker_test_counts(unsigned long *received, unsigned long *scopes,
                                         unsigned long *rejected);
+extern void bw_water_marker_test_semantics(unsigned long pass_scopes[3],
+                                           unsigned long view_begins[4],
+                                           unsigned long view_ends[4]);
 extern uint64_t bw_ocean_fingerprint_test_hash(const BwXBatch *batch,
                                                const uint32_t (*program)[4],
                                                uint32_t ninstr);
@@ -284,6 +303,57 @@ static void water_benchmark_validation_test(void)
     unsetenv("BW_NATIVE_DIAGNOSTIC");
     unsetenv("BW_GPU_AUDIT");
     unsetenv("BW_METAL_WATER");
+}
+
+static void water_capture_validation_test(void)
+{
+    const char *absolute = "/tmp/bw-metal-water-capture-validation.trigger";
+    struct {
+        const char *value;
+        bw_edition_t edition;
+        int diagnostic, audit, benchmark, dump_paths;
+        const char *error;
+    } cases[] = {
+        {"relative", BW_ED_REMASTERED, 1, 1, 0, 1, "bounded absolute path"},
+        {absolute, BW_ED_ORIGINAL, 1, 1, 0, 1, "requires Remastered"},
+        {absolute, BW_ED_REMASTERED, 0, 1, 0, 1, "private diagnostic runner"},
+        {absolute, BW_ED_REMASTERED, 1, 0, 0, 1, "requires BW_GPU_AUDIT=1"},
+        {absolute, BW_ED_REMASTERED, 1, 1, 1, 1, "cannot run with"},
+        {absolute, BW_ED_REMASTERED, 1, 1, 0, 0, "matching framebuffer dump paths"},
+    };
+    for (size_t i = 0; i < sizeof cases / sizeof cases[0]; i++) {
+        s_edition = cases[i].edition;
+        setenv("BW_METAL_WATER_CAPTURE_TRIGGER", cases[i].value, 1);
+        if (cases[i].diagnostic)
+            setenv("BW_NATIVE_DIAGNOSTIC", "1", 1);
+        else
+            unsetenv("BW_NATIVE_DIAGNOSTIC");
+        if (cases[i].audit)
+            setenv("BW_GPU_AUDIT", "1", 1);
+        else
+            unsetenv("BW_GPU_AUDIT");
+        if (cases[i].benchmark)
+            setenv("BW_METAL_WATER_BENCHMARK", "1", 1);
+        else
+            unsetenv("BW_METAL_WATER_BENCHMARK");
+        if (cases[i].dump_paths) {
+            setenv("RECOMP_FB_DUMP", "/tmp/bw-metal-water-capture-", 1);
+            setenv("RECOMP_FB_DUMP_FLIPS", cases[i].value, 1);
+        } else {
+            unsetenv("RECOMP_FB_DUMP");
+            unsetenv("RECOMP_FB_DUMP_FLIPS");
+        }
+        CHECK(!bw_metal_backend_start_for_test(s_mem, sizeof s_mem));
+        CHECK(bw_metal_backend_error() &&
+              strstr(bw_metal_backend_error(), cases[i].error));
+        bw_metal_backend_stop();
+    }
+    unsetenv("BW_METAL_WATER_CAPTURE_TRIGGER");
+    unsetenv("BW_METAL_WATER_BENCHMARK");
+    unsetenv("BW_NATIVE_DIAGNOSTIC");
+    unsetenv("BW_GPU_AUDIT");
+    unsetenv("RECOMP_FB_DUMP");
+    unsetenv("RECOMP_FB_DUMP_FLIPS");
 }
 
 static void method_float(uint32_t method_number, float value)
@@ -2174,14 +2244,18 @@ static void extended_basic_test(void)
 
 #define OCEAN_MARKER_REPEAT_COUNT 4096u
 
-static uint8_t s_ocean_marker_seen[16];
+static uint8_t s_ocean_marker_seen[40];
+static BwXWaterDraw s_water_draw_seen[40];
 static unsigned s_ocean_marker_seen_count;
 
 static void ocean_marker_probe_draw(const Nv2aSurface *surface, const BwXBatch *batch)
 {
     CHECK(surface && batch && s_ocean_marker_seen_count < sizeof s_ocean_marker_seen);
-    if (batch && s_ocean_marker_seen_count < sizeof s_ocean_marker_seen)
-        s_ocean_marker_seen[s_ocean_marker_seen_count++] = batch->draw_marker;
+    if (batch && s_ocean_marker_seen_count < sizeof s_ocean_marker_seen) {
+        s_ocean_marker_seen[s_ocean_marker_seen_count] = batch->draw_marker;
+        s_water_draw_seen[s_ocean_marker_seen_count] = batch->water;
+        s_ocean_marker_seen_count++;
+    }
 }
 
 static void check_ocean_marker_counts(unsigned long received, unsigned long scopes,
@@ -2192,6 +2266,24 @@ static void check_ocean_marker_counts(unsigned long received, unsigned long scop
     CHECK(actual_received == received);
     CHECK(actual_scopes == scopes);
     CHECK(actual_rejected == rejected);
+}
+
+static void check_water_marker_semantics(const unsigned long pass_scopes[3],
+                                         const unsigned long view_begins[4],
+                                         const unsigned long view_ends[4])
+{
+    unsigned long actual_pass_scopes[3] = {0};
+    unsigned long actual_view_begins[4] = {0};
+    unsigned long actual_view_ends[4] = {0};
+
+    bw_water_marker_test_semantics(actual_pass_scopes, actual_view_begins,
+                                   actual_view_ends);
+    for (unsigned i = 0; i < 3; i++)
+        CHECK(actual_pass_scopes[i] == pass_scopes[i]);
+    for (unsigned i = 0; i < 4; i++) {
+        CHECK(actual_view_begins[i] == view_begins[i]);
+        CHECK(actual_view_ends[i] == view_ends[i]);
+    }
 }
 
 static void reset_ocean_audit_capture(void)
@@ -2391,7 +2483,91 @@ static void ocean_marker_batches_test(void)
     draw(3);
     check_ocean_marker_counts(repeated + 10, 3, 8);
 
-    CHECK(s_ocean_marker_seen_count == 12);
+    method(0x0100, BW_DRAW_MARKER_WATER_BEGIN(2));
+    method(0x0100, BW_DRAW_MARKER_WATER_REFLECTION);
+    draw(3);
+    method(0x0100, BW_DRAW_MARKER_WATER_FOAM);
+    draw(3);
+    method(0x0100, BW_DRAW_MARKER_WATER_LIT);
+    draw(3);
+    method(0x0100, BW_DRAW_MARKER_WATER_END(2));
+    method(0x0100, BW_DRAW_MARKER_OCEAN_DRAW_LEGACY);
+    draw(3);
+    check_ocean_marker_counts(repeated + 16, 7, 8);
+
+    method(0x0100, BW_DRAW_MARKER_WATER_BEGIN(1));
+    method(0x0100, BW_DRAW_MARKER_WATER_PASS_BEGIN(
+        BW_DRAW_MARKER_WATER_PASS_REFLECTION));
+    draw(3);
+    draw(3);
+    draw(3);
+    method(0x0100, BW_DRAW_MARKER_WATER_PASS_END(
+        BW_DRAW_MARKER_WATER_PASS_REFLECTION));
+    method(0x0100, BW_DRAW_MARKER_WATER_PASS_BEGIN(
+        BW_DRAW_MARKER_WATER_PASS_FOAM));
+    draw(3);
+    draw(3);
+    method(0x0100, BW_DRAW_MARKER_WATER_PASS_END(
+        BW_DRAW_MARKER_WATER_PASS_FOAM));
+    method(0x0100, BW_DRAW_MARKER_WATER_PASS_BEGIN(
+        BW_DRAW_MARKER_WATER_PASS_LIT));
+    method(0x0100, BW_DRAW_MARKER_WATER_PASS_END(
+        BW_DRAW_MARKER_WATER_PASS_LIT));
+    method(0x0100, BW_DRAW_MARKER_WATER_END(1));
+    check_ocean_marker_counts(repeated + 24, 12, 8);
+
+    method(0x0100, BW_DRAW_MARKER_MAKE(
+        BW_DRAW_MARKER_OP_WATER_EVENT,
+        BW_DRAW_MARKER_WATER_ARG_VERSION(
+            2, BW_DRAW_MARKER_WATER_LIT_DRAW, 0)));
+    draw(3);
+    check_ocean_marker_counts(repeated + 25, 12, 9);
+
+    method(0x0100, BW_DRAW_MARKER_WATER_BEGIN(1));
+    method(0x0100, BW_DRAW_MARKER_WATER_END(2));
+    draw(3);
+    check_ocean_marker_counts(repeated + 27, 12, 10);
+
+    method(0x0100, BW_DRAW_MARKER_WATER_BEGIN(3));
+    method(0x0100, BW_DRAW_MARKER_WATER_REFLECTION);
+    method(0x0100, BW_DRAW_MARKER_WATER_END(3));
+    draw(3);
+    check_ocean_marker_counts(repeated + 30, 12, 11);
+
+    method(0x0100, BW_DRAW_MARKER_WATER_PASS_BEGIN(
+        BW_DRAW_MARKER_WATER_PASS_REFLECTION));
+    method(0x0100, BW_DRAW_MARKER_WATER_PASS_BEGIN(
+        BW_DRAW_MARKER_WATER_PASS_FOAM));
+    draw(3);
+    check_ocean_marker_counts(repeated + 32, 12, 12);
+
+    method(0x0100, BW_DRAW_MARKER_WATER_PASS_BEGIN(
+        BW_DRAW_MARKER_WATER_PASS_REFLECTION));
+    method(0x0100, BW_DRAW_MARKER_WATER_PASS_END(
+        BW_DRAW_MARKER_WATER_PASS_FOAM));
+    draw(3);
+    check_ocean_marker_counts(repeated + 34, 12, 13);
+
+    method(0x0100, BW_DRAW_MARKER_WATER_PASS_BEGIN(
+        BW_DRAW_MARKER_WATER_PASS_FOAM));
+    flip();
+    draw(3);
+    check_ocean_marker_counts(repeated + 35, 12, 14);
+
+    method(0x0100, BW_DRAW_MARKER_WATER_BEGIN(0));
+    method(0x0100, BW_DRAW_MARKER_WATER_PASS_BEGIN(
+        BW_DRAW_MARKER_WATER_PASS_LIT));
+    method(0x0100, BW_DRAW_MARKER_WATER_END(0));
+    draw(3);
+    check_ocean_marker_counts(repeated + 38, 12, 15);
+
+    method(0x0100, BW_DRAW_MARKER_WATER_PASS_BEGIN(
+        BW_DRAW_MARKER_WATER_PASS_REFLECTION));
+    method(0x0100, BW_DRAW_MARKER_WATER_LIT);
+    draw(3);
+    check_ocean_marker_counts(repeated + 40, 12, 16);
+
+    CHECK(s_ocean_marker_seen_count == 29);
     CHECK(s_ocean_marker_seen[0] == BW_X_DRAW_MARKER_NONE);
     CHECK(s_ocean_marker_seen[1] == BW_X_DRAW_MARKER_OCEAN);
     CHECK(s_ocean_marker_seen[2] == BW_X_DRAW_MARKER_NONE);
@@ -2404,6 +2580,44 @@ static void ocean_marker_batches_test(void)
     CHECK(s_ocean_marker_seen[9] == BW_X_DRAW_MARKER_NONE);
     CHECK(s_ocean_marker_seen[10] == BW_X_DRAW_MARKER_OCEAN);
     CHECK(s_ocean_marker_seen[11] == BW_X_DRAW_MARKER_NONE);
+    CHECK(s_ocean_marker_seen[12] == BW_X_DRAW_MARKER_OCEAN);
+    CHECK(s_water_draw_seen[12].version == BW_X_WATER_SEMANTIC_VERSION);
+    CHECK(s_water_draw_seen[12].pass == BW_X_WATER_PASS_REFLECTION);
+    CHECK(s_water_draw_seen[12].view == 2);
+    CHECK(s_ocean_marker_seen[13] == BW_X_DRAW_MARKER_OCEAN);
+    CHECK(s_water_draw_seen[13].pass == BW_X_WATER_PASS_FOAM);
+    CHECK(s_water_draw_seen[13].view == 2);
+    CHECK(s_ocean_marker_seen[14] == BW_X_DRAW_MARKER_OCEAN);
+    CHECK(s_water_draw_seen[14].pass == BW_X_WATER_PASS_LIT);
+    CHECK(s_water_draw_seen[14].view == 2);
+    CHECK(s_ocean_marker_seen[15] == BW_X_DRAW_MARKER_OCEAN);
+    CHECK(s_water_draw_seen[15].pass == BW_X_WATER_PASS_LIT);
+    CHECK(s_water_draw_seen[15].view == BW_X_WATER_VIEW_UNKNOWN);
+    for (unsigned i = 16; i <= 18; i++) {
+        CHECK(s_ocean_marker_seen[i] == BW_X_DRAW_MARKER_OCEAN);
+        CHECK(s_water_draw_seen[i].pass == BW_X_WATER_PASS_REFLECTION);
+        CHECK(s_water_draw_seen[i].view == 1);
+    }
+    for (unsigned i = 19; i <= 20; i++) {
+        CHECK(s_ocean_marker_seen[i] == BW_X_DRAW_MARKER_OCEAN);
+        CHECK(s_water_draw_seen[i].pass == BW_X_WATER_PASS_FOAM);
+        CHECK(s_water_draw_seen[i].view == 1);
+    }
+    for (unsigned i = 21; i < s_ocean_marker_seen_count; i++)
+        CHECK(s_ocean_marker_seen[i] == BW_X_DRAW_MARKER_NONE);
+    method(0x0100, BW_DRAW_MARKER_WATER_PASS_BEGIN(
+        BW_DRAW_MARKER_WATER_PASS_REFLECTION));
+    method(0x17FC, 5);
+    method(0x17FC, 0);
+    method(0x0100, BW_DRAW_MARKER_WATER_PASS_END(
+        BW_DRAW_MARKER_WATER_PASS_REFLECTION));
+    check_ocean_marker_counts(repeated + 42, 13, 16);
+    {
+        const unsigned long pass_scopes[3] = {5, 5, 3};
+        const unsigned long view_begins[4] = {1, 2, 1, 1};
+        const unsigned long view_ends[4] = {0, 1, 1, 0};
+        check_water_marker_semantics(pass_scopes, view_begins, view_ends);
+    }
     bw_backend_ext_register(NULL);
 }
 
@@ -3279,6 +3493,185 @@ static void realistic_water_fallback_test(void)
     CHECK(enhanced == 0 && fallback == 1);
 }
 
+static void setup_ocean_reflect_scene(void)
+{
+    Nv2aCombiner rc = synthetic_combiner();
+
+    setup_dxt1_texture(0xF800u, 0x001Fu, 0);
+    setup_combiner(&rc);
+    setup_depth(ZETA_AT);
+    depth_clear(3, 0xFFFFFF42u);
+    clear(0xFF000000u);
+    method(0x030C, 1);
+    method(0x0354, 0x203u);
+    method(0x035C, 0);
+    method(0x0358, 0);
+    method(0x0100, BW_DRAW_MARKER_WATER_BEGIN(0));
+}
+
+static void end_ocean_reflect_scene(void)
+{
+    method(0x0100, BW_DRAW_MARKER_WATER_END(0));
+}
+
+static void draw_ocean_lit_layers(void)
+{
+    method(0x0100, BW_DRAW_MARKER_WATER_PASS_BEGIN(
+        BW_DRAW_MARKER_WATER_PASS_LIT));
+    triangle_z(0xFFFFFFFFu, 0.6f);
+    draw(3);
+    triangle_z(0xFFFFFFFFu, 0.4f);
+    draw(3);
+    method(0x0100, BW_DRAW_MARKER_WATER_PASS_END(
+        BW_DRAW_MARKER_WATER_PASS_LIT));
+}
+
+static void draw_ocean_reflection_layers(void)
+{
+    method(0x0358, 0x01010101u);
+    method(0x0304, 1);
+    method(0x0344, 0x302u);
+    method(0x0348, 0x303u);
+    method(0x0100, BW_DRAW_MARKER_WATER_PASS_BEGIN(
+        BW_DRAW_MARKER_WATER_PASS_REFLECTION));
+    triangle_z(0x80FFFFFFu, 0.6f);
+    draw(3);
+    triangle_z(0x80FFFFFFu, 0.4f);
+    draw(3);
+    method(0x0100, BW_DRAW_MARKER_WATER_PASS_END(
+        BW_DRAW_MARKER_WATER_PASS_REFLECTION));
+}
+
+static void draw_ocean_foam_layer(void)
+{
+    method(0x0100, BW_DRAW_MARKER_WATER_PASS_BEGIN(
+        BW_DRAW_MARKER_WATER_PASS_FOAM));
+    triangle_z(0x00000000u, 0.8f);
+    draw(3);
+    method(0x0100, BW_DRAW_MARKER_WATER_PASS_END(
+        BW_DRAW_MARKER_WATER_PASS_FOAM));
+}
+
+static void check_ocean_reflect_pixel(int filtered)
+{
+    uint32_t color = pixel(4, 3);
+    uint32_t red = (color >> 16) & 0xFFu;
+    CHECK(filtered ? red >= 127u && red <= 129u
+                   : red >= 190u && red <= 192u);
+}
+
+static void ocean_reflect_single_test(int enabled, int fail)
+{
+    uint64_t copies = 0, primes = 0, filtered = 0;
+    float z;
+    uint8_t stencil;
+
+    setup_ocean_reflect_scene();
+    bw_metal_test_water_reflect_fail(fail);
+    draw_ocean_lit_layers();
+    draw_ocean_reflection_layers();
+    end_ocean_reflect_scene();
+    flip();
+    expect_no_error();
+
+    check_ocean_reflect_pixel(enabled && !fail);
+    CHECK(bw_metal_test_read_depth(ZETA_AT, 4, 3, &z, &stencil));
+    CHECK(fabsf(z - 1.0f) < 0.000001f && stencil == 0x42u);
+    bw_metal_test_water_reflect_counts(&copies, &primes, &filtered);
+    if (!enabled || fail)
+        CHECK(copies == 0 && primes == 0 && filtered == 0);
+    else
+        CHECK(copies == 1 && primes == 2 && filtered == 2);
+}
+
+static void ocean_reflect_single_target_switch_test(void)
+{
+    uint64_t copies = 0, primes = 0, filtered = 0;
+    float z;
+    uint8_t stencil;
+
+    setup_ocean_reflect_scene();
+    for (uint32_t y = 0; y < HEIGHT; y++)
+        for (uint32_t x = 0; x < WIDTH; x++)
+            put32(ZETA2_AT + y * PITCH + x * 4u, 0xFFFFFF42u);
+    draw_ocean_lit_layers();
+    setup_depth(ZETA2_AT);
+    draw_ocean_reflection_layers();
+    end_ocean_reflect_scene();
+    flip();
+    expect_no_error();
+    check_ocean_reflect_pixel(0);
+    bw_metal_test_water_reflect_counts(&copies, &primes, &filtered);
+    CHECK(copies == 1 && primes == 2 && filtered == 0);
+
+    clear(0xFF000000u);
+    method(0x0358, 0);
+    method(0x0100, BW_DRAW_MARKER_WATER_BEGIN(0));
+    draw_ocean_lit_layers();
+    draw_ocean_reflection_layers();
+    end_ocean_reflect_scene();
+    flip();
+    expect_no_error();
+    check_ocean_reflect_pixel(1);
+    CHECK(bw_metal_test_read_depth(ZETA_AT, 4, 3, &z, &stencil));
+    CHECK(fabsf(z - 1.0f) < 0.000001f && stencil == 0x42u);
+    CHECK(bw_metal_test_read_depth(ZETA2_AT, 4, 3, &z, &stencil));
+    CHECK(fabsf(z - 1.0f) < 0.000001f && stencil == 0x42u);
+    bw_metal_test_water_reflect_counts(&copies, &primes, &filtered);
+    CHECK(copies == 2 && primes == 4 && filtered == 2);
+}
+
+static void ocean_reflect_single_groups_test(void)
+{
+    uint64_t copies = 0, primes = 0, filtered = 0;
+
+    setup_ocean_reflect_scene();
+    draw_ocean_lit_layers();
+    draw_ocean_reflection_layers();
+    draw_ocean_foam_layer();
+    method(0x0358, 0);
+    draw_ocean_lit_layers();
+    draw_ocean_reflection_layers();
+    end_ocean_reflect_scene();
+    flip();
+    expect_no_error();
+    bw_metal_test_water_reflect_counts(&copies, &primes, &filtered);
+    CHECK(copies == 1 && primes == 4 && filtered == 4);
+}
+
+static void ocean_reflect_single_resize_test(void)
+{
+    uint64_t copies = 0, primes = 0, filtered = 0;
+    uint32_t width = 0, height = 0, epoch = 0;
+
+    setup_ocean_reflect_scene();
+    draw_ocean_lit_layers();
+    draw_ocean_reflection_layers();
+    CHECK(bw_metal_test_water_reflect_depth(&width, &height, &epoch));
+    CHECK(width == WIDTH && height == HEIGHT && epoch == 1u);
+    bw_metal_test_set_present_size(1280, 960);
+    end_ocean_reflect_scene();
+    flip();
+    expect_no_error();
+    check_ocean_reflect_pixel(1);
+
+    setup_depth(ZETA_AT);
+    depth_clear(3, 0xFFFFFF42u);
+    clear(0xFF000000u);
+    method(0x0358, 0);
+    method(0x0100, BW_DRAW_MARKER_WATER_BEGIN(0));
+    draw_ocean_lit_layers();
+    draw_ocean_reflection_layers();
+    CHECK(bw_metal_test_water_reflect_depth(&width, &height, &epoch));
+    CHECK(width == WIDTH * 2u && height == HEIGHT * 2u && epoch == 2u);
+    end_ocean_reflect_scene();
+    flip();
+    expect_no_error();
+    check_ocean_reflect_pixel(1);
+    bw_metal_test_water_reflect_counts(&copies, &primes, &filtered);
+    CHECK(copies == 2 && primes == 4 && filtered == 4);
+}
+
 static void water_benchmark_test(void)
 {
     int complete = 0;
@@ -3300,6 +3693,54 @@ static void water_benchmark_test(void)
     CHECK(realistic_samples == 4u);
     CHECK(bw_metal_backend_water_preset() == BW_METAL_WATER_RETAIL);
     CHECK(bw_metal_test_active_water_preset() == BW_METAL_WATER_RETAIL);
+}
+
+static void water_capture_test(void)
+{
+    int complete = 0;
+    unsigned images = 0, supported_frames = 0;
+    setup_realistic_water_scene();
+    CHECK(!bw_metal_backend_set_water_preset(BW_METAL_WATER_REALISTIC));
+    for (unsigned frame = 0; frame < 8u && !complete; frame++) {
+        clear(0xFF102030u + frame);
+        method(0x0100, BW_DRAW_MARKER_OCEAN_DRAW);
+        draw(3);
+        flip();
+        expect_no_error();
+        bw_metal_test_water_capture(&complete, &images, &supported_frames);
+    }
+    CHECK(complete);
+    CHECK(images == 4u);
+    CHECK(supported_frames == 4u);
+    CHECK(access(s_water_capture_trigger, F_OK) != 0);
+    CHECK(bw_metal_backend_set_water_preset(BW_METAL_WATER_RETAIL));
+    nv2a_pb_exec_report();
+    for (unsigned image = 0; image < 4u; image++) {
+        char path[PATH_MAX];
+        uint8_t header[54] = {0};
+        uint32_t width = 0, height = 0;
+        uint16_t bits = 0;
+        snprintf(path, sizeof path, "%s%05u.bmp",
+                 s_water_capture_prefix, image);
+        FILE *file = fopen(path, "rb");
+        CHECK(file != NULL);
+        if (file) {
+            CHECK(fread(header, 1, sizeof header, file) == sizeof header);
+            fclose(file);
+            memcpy(&width, header + 18, sizeof width);
+            memcpy(&height, header + 22, sizeof height);
+            memcpy(&bits, header + 28, sizeof bits);
+            CHECK(header[0] == 'B' && header[1] == 'M');
+            CHECK(width == WIDTH && height == HEIGHT && bits == 24u);
+        }
+        remove(path);
+    }
+    {
+        char path[PATH_MAX];
+        snprintf(path, sizeof path, "%s%05u.bmp",
+                 s_water_capture_prefix, 4u);
+        CHECK(access(path, F_OK) != 0);
+    }
 }
 
 static void extended_swizzled_test(void)
@@ -5542,6 +5983,39 @@ static void surface_switch_test(void)
     CHECK(pixel(4, 3) == draw_color);
 }
 
+static void present_surface_reuse_test(void)
+{
+    const uint32_t next_at = COLOR_AT + 0x2000u;
+    const Nv2aSurface first_surface = {COLOR_AT, WIDTH, HEIGHT, PITCH, 4, 1, 1};
+    const Nv2aSurface next_surface = {next_at, WIDTH, HEIGHT, PITCH, 4, 1, 1};
+    const uint32_t cpu_color = 0xFFABCDEFu;
+
+    clear(0xFF214365u);
+    CHECK(bw_metal_test_prepare_surface(&next_surface));
+    uint64_t submissions = bw_metal_test_command_submission_count();
+    uint64_t seeds = bw_metal_test_surface_seed_count();
+
+    CHECK(bw_metal_test_prepare_present_surface(&first_surface, 8u));
+    CHECK(bw_metal_test_command_submission_count() == submissions + 1u);
+    CHECK(bw_metal_test_surface_seed_count() == seeds);
+
+    put32(COLOR_AT, cpu_color);
+    CHECK(bw_metal_test_prepare_present_surface(&first_surface, 8u));
+    CHECK(bw_metal_test_command_submission_count() == submissions + 2u);
+    CHECK(bw_metal_test_surface_seed_count() == seeds + 1u);
+    CHECK(pixel(0, 0) == cpu_color);
+
+    CHECK(bw_metal_test_prepare_present_surface(&first_surface, 8u));
+    CHECK(bw_metal_test_command_submission_count() == submissions + 2u);
+    CHECK(bw_metal_test_surface_seed_count() == seeds + 1u);
+
+    CHECK(bw_metal_test_prepare_surface(&first_surface));
+    CHECK(bw_metal_test_surface_seed_count() == seeds + 1u);
+    put32(next_at, 0xFF102030u);
+    CHECK(bw_metal_test_prepare_surface(&next_surface));
+    CHECK(bw_metal_test_surface_seed_count() == seeds + 2u);
+}
+
 static void extended_render_target_texture_test(void)
 {
     Nv2aCombiner rc = synthetic_combiner();
@@ -5753,6 +6227,7 @@ int main(int argc, char **argv)
     unsetenv("BW_VFX_AF");
     unsetenv("BW_METAL_WATER");
     unsetenv("BW_METAL_WATER_BENCHMARK");
+    unsetenv("BW_METAL_WATER_CAPTURE_TRIGGER");
     unsetenv("BW_NATIVE_DIAGNOSTIC");
     unsetenv("BW_GPU_AUDIT");
     unsetenv("RECOMP_WINDOW_SCALE");
@@ -5783,11 +6258,44 @@ int main(int argc, char **argv)
         setenv("BW_METAL_WATER_BENCHMARK", "1", 1);
         setenv("BW_NATIVE_DIAGNOSTIC", "1", 1);
         setenv("BW_GPU_AUDIT", "1", 1);
+    } else if (!strcmp(argv[1], "water-capture")) {
+        char path[PATH_MAX];
+        s_edition = BW_ED_REMASTERED;
+        snprintf(s_water_capture_prefix, sizeof s_water_capture_prefix,
+                 "/tmp/bw-metal-water-capture-%ld-", (long)getpid());
+        snprintf(s_water_capture_trigger, sizeof s_water_capture_trigger,
+                 "/tmp/bw-metal-water-capture-%ld.trigger", (long)getpid());
+        unlink(s_water_capture_trigger);
+        for (unsigned image = 0; image < 4u; image++) {
+            snprintf(path, sizeof path, "%s%05u.bmp",
+                     s_water_capture_prefix, image);
+            remove(path);
+        }
+        setenv("BW_METAL_WATER_CAPTURE_TRIGGER",
+               s_water_capture_trigger, 1);
+        setenv("RECOMP_FB_DUMP", s_water_capture_prefix, 1);
+        setenv("RECOMP_FB_DUMP_FLIPS", s_water_capture_trigger, 1);
+        setenv("BW_NATIVE_DIAGNOSTIC", "1", 1);
+        setenv("BW_GPU_AUDIT", "1", 1);
     } else if (!strcmp(argv[1], "water-preset") ||
                !strcmp(argv[1], "ocean-realistic") ||
                !strcmp(argv[1], "ocean-realistic-fallback")) {
         s_edition = BW_ED_REMASTERED;
         setenv("BW_METAL_WATER", "realistic", 1);
+    } else if (!strcmp(argv[1], "ocean-reflect-single-original")) {
+        g_bw_fix_on[BW_FIX_OCEAN_REFLECT_SINGLE] = 1;
+    } else if (!strcmp(argv[1], "ocean-reflect-single-disabled")) {
+        s_edition = BW_ED_REMASTERED;
+    } else if (!strncmp(argv[1], "ocean-reflect-single",
+                        sizeof("ocean-reflect-single") - 1u)) {
+        s_edition = BW_ED_REMASTERED;
+        g_bw_fix_on[BW_FIX_OCEAN_REFLECT_SINGLE] = 1;
+        if (!strcmp(argv[1], "ocean-reflect-single-scale"))
+            setenv("BW_METAL_RENDER_SCALE", "2", 1);
+        else if (!strcmp(argv[1], "ocean-reflect-single-resize")) {
+            setenv("BW_METAL_RENDER_SCALE", "auto", 1);
+            setenv("RECOMP_WINDOW_SCALE", "1", 1);
+        }
     } else if (!strcmp(argv[1], "water-preset-invalid")) {
         s_edition = BW_ED_REMASTERED;
         setenv("BW_METAL_WATER", "cinematic", 1);
@@ -5811,6 +6319,10 @@ int main(int argc, char **argv)
     }
     if (!strcmp(argv[1], "water-benchmark-validation")) {
         water_benchmark_validation_test();
+        return s_failed ? 1 : 0;
+    }
+    if (!strcmp(argv[1], "water-capture-validation")) {
+        water_capture_validation_test();
         return s_failed ? 1 : 0;
     }
     if (!strcmp(argv[1], "invalid-base")) {
@@ -5862,6 +6374,8 @@ int main(int argc, char **argv)
         anisotropy_test(1);
     else if (!strcmp(argv[1], "water-benchmark"))
         water_benchmark_test();
+    else if (!strcmp(argv[1], "water-capture"))
+        water_capture_test();
     else if (!strcmp(argv[1], "water-preset"))
         water_preset_test();
     else if (!strcmp(argv[1], "water-preset-original"))
@@ -5884,6 +6398,8 @@ int main(int argc, char **argv)
         seed_order_test();
     else if (!strcmp(argv[1], "command-batching"))
         command_batching_test();
+    else if (!strcmp(argv[1], "present-surface-reuse"))
+        present_surface_reuse_test();
     else if (!strcmp(argv[1], "perspective"))
         perspective_test();
     else if (!strcmp(argv[1], "blend"))
@@ -5988,6 +6504,18 @@ int main(int argc, char **argv)
         realistic_water_test();
     else if (!strcmp(argv[1], "ocean-realistic-fallback"))
         realistic_water_fallback_test();
+    else if (!strcmp(argv[1], "ocean-reflect-single-target-switch"))
+        ocean_reflect_single_target_switch_test();
+    else if (!strcmp(argv[1], "ocean-reflect-single-groups"))
+        ocean_reflect_single_groups_test();
+    else if (!strcmp(argv[1], "ocean-reflect-single-resize"))
+        ocean_reflect_single_resize_test();
+    else if (!strncmp(argv[1], "ocean-reflect-single",
+                      sizeof("ocean-reflect-single") - 1u))
+        ocean_reflect_single_test(
+            strcmp(argv[1], "ocean-reflect-single-disabled") &&
+            strcmp(argv[1], "ocean-reflect-single-original"),
+            !strcmp(argv[1], "ocean-reflect-single-fallback"));
     else if (!strcmp(argv[1], "extended-texture-cache"))
         extended_texture_cache_test();
     else if (!strcmp(argv[1], "extended-combiner"))

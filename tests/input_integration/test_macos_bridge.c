@@ -217,6 +217,8 @@ typedef struct {
     unsigned press_epochs;
     uint16_t digital;
     int analog_a;
+    int secondary_a;
+    uint16_t secondary_digital;
 } ExpectedScriptStep;
 
 static uint32_t poll_script_state(uint32_t handle, XBOX_GAMEPAD *pad)
@@ -239,20 +241,34 @@ static void check_script_released(const XBOX_GAMEPAD *pad)
           "synthetic script poll is released");
 }
 
-static void synthetic_script_test(uint32_t handle)
+static void synthetic_script_test(uint32_t handle, uint32_t second)
 {
     static const ExpectedScriptStep expected[] = {
-        {300, 4, XBOX_GAMEPAD_START, 0},
-        {120, 3, XBOX_GAMEPAD_DPAD_DOWN, 0},
-        { 12, 3, XBOX_GAMEPAD_DPAD_DOWN, 0},
-        { 12, 3, XBOX_GAMEPAD_DPAD_DOWN, 0},
-        { 12, 3, XBOX_GAMEPAD_DPAD_DOWN, 0},
-        { 60, 4, 0, 1},
-        {120, 4, 0, 1},
-        {120, 4, 0, 1},
-        {180, 4, 0, 1},
-        {180, 4, 0, 1},
-        {240, 4, 0, 1},
+        {300, 4, XBOX_GAMEPAD_START, 0, 0},
+        {120, 3, XBOX_GAMEPAD_DPAD_DOWN, 0, 0},
+        { 12, 3, XBOX_GAMEPAD_DPAD_DOWN, 0, 0},
+        { 12, 3, XBOX_GAMEPAD_DPAD_DOWN, 0, 0},
+        { 12, 3, XBOX_GAMEPAD_DPAD_DOWN, 0, 0},
+        { 60, 4, 0, 1, 0},
+        {120, 4, 0, 1, 0},
+        { 60, 3, XBOX_GAMEPAD_DPAD_DOWN, 0, 0},
+        { 30, 4, 0, 1, 0},
+        {180, 4, 0, 1, 0},
+        {180, 4, 0, 1, 0},
+        {240, 4, 0, 1, 0},
+    };
+    static const ExpectedScriptStep expected_two_player[] = {
+        {600, 30, XBOX_GAMEPAD_START, 0, 0, 0},
+        {180, 12, XBOX_GAMEPAD_DPAD_DOWN, 0, 0, 0},
+        { 90, 12, 0, 1, 0, 0},
+        {180, 12, XBOX_GAMEPAD_DPAD_DOWN, 0, 0, 0},
+        { 60, 12, 0, 1, 0, 0},
+        {180, 12, 0, 1, 0, 0},
+        {180, 12, 0, 1, 0, 0},
+        {240, 12, 0, 1, 0, 0},
+        {180, 12, 0, 1, 0, 0},
+        {240, 30, 0, 0, 1, 0},
+        {180, 30, 0, 0, 1, 0},
     };
     XBOX_GAMEPAD pad;
     uint32_t packet, next;
@@ -319,6 +335,53 @@ static void synthetic_script_test(uint32_t handle)
     next = poll_script_state(handle, &pad);
     check_script_packet(packet, next);
     check_script_released(&pad);
+
+    check(bw_macos_input_bridge_select_synthetic_script(
+              "remastered-boot-menu-to-gameplay-2p-v1"),
+          "two-player synthetic script can be selected after cancellation");
+    packet = next;
+    for (size_t step = 0;
+         step < sizeof expected_two_player / sizeof expected_two_player[0];
+         step++) {
+        for (unsigned epoch = 0;
+             epoch < expected_two_player[step].wait_epochs;
+             epoch++) {
+            next = poll_script_state(handle, &pad);
+            check_script_packet(packet, next);
+            check_script_released(&pad);
+            packet = next;
+            poll_script_state(second, &pad);
+            check_script_released(&pad);
+        }
+        for (unsigned epoch = 0;
+             epoch < expected_two_player[step].press_epochs;
+             epoch++) {
+            next = poll_script_state(handle, &pad);
+            check_script_packet(packet, next);
+            check((pad.wButtons &
+                       (XBOX_GAMEPAD_START | XBOX_GAMEPAD_DPAD_DOWN)) ==
+                      expected_two_player[step].digital &&
+                  (pad.bAnalogButtons[XBOX_BUTTON_A] == 255) ==
+                      expected_two_player[step].analog_a,
+                  "two-player script has one expected pressed button");
+            packet = next;
+            poll_script_state(second, &pad);
+            check((pad.wButtons &
+                       (XBOX_GAMEPAD_START | XBOX_GAMEPAD_DPAD_DOWN)) ==
+                      (epoch + 1 < expected_two_player[step].press_epochs
+                           ? expected_two_player[step].secondary_digital : 0) &&
+                  (pad.bAnalogButtons[XBOX_BUTTON_A] == 255) ==
+                      (expected_two_player[step].secondary_a &&
+                       epoch + 1 < expected_two_player[step].press_epochs),
+                  "two-player script targets the expected secondary state");
+        }
+        next = poll_script_state(handle, &pad);
+        check_script_packet(packet, next);
+        check_script_released(&pad);
+        packet = next;
+        poll_script_state(second, &pad);
+        check_script_released(&pad);
+    }
 }
 #endif
 
@@ -342,14 +405,33 @@ static void enabled_test(void)
 {
     uint32_t args[4] = {0};
     uint32_t handle, next;
+#ifdef BW_EXPERIMENTAL_SYNTHETIC_INPUT
+    uint32_t second;
+#endif
     XBOX_GAMEPAD pad;
+#ifdef BW_EXPERIMENTAL_SYNTHETIC_INPUT
+    check(bw_macos_input_bridge_select_synthetic_script(
+              "remastered-boot-menu-to-gameplay-2p-v1"),
+          "two-player synthetic script is selected explicitly");
+#endif
     bw_macos_input_bridge_configure(1);
     check(call(sub_0016F121, 2, args) == 0, "initialize");
     args[0] = TYPE_AT;
     write32(TYPE_AT + 4, 0xFFFFFFFFu);
     write32(TYPE_AT + 8, 0xFFFFFFFFu);
-    check(call(sub_0016F126, 1, args) == 1, "enumerate keyboard on port zero");
-    check(read32(TYPE_AT + 4) == 0 && read32(TYPE_AT + 8) == 1,
+    check(call(sub_0016F126, 1, args) ==
+#ifdef BW_EXPERIMENTAL_SYNTHETIC_INPUT
+              3,
+#else
+              1,
+#endif
+          "enumerate configured synthetic controllers");
+    check(read32(TYPE_AT + 4) == 0 && read32(TYPE_AT + 8) ==
+#ifdef BW_EXPERIMENTAL_SYNTHETIC_INPUT
+              3,
+#else
+              1,
+#endif
           "enumeration updates device-type bookkeeping");
     args[1] = OUTPUT_AT;
     args[2] = OUTPUT_AT + 4;
@@ -362,6 +444,19 @@ static void enabled_test(void)
     handle = call(sub_0016DC16, 4, args);
     check(handle != 0, "open port zero");
     check(call(sub_0016DC16, 4, args) == 0, "duplicate open rejected");
+
+#ifdef BW_EXPERIMENTAL_SYNTHETIC_INPUT
+    args[1] = 1;
+    second = call(sub_0016DC16, 4, args);
+    check(second && second != handle, "open synthetic port one");
+    args[0] = second;
+    args[1] = OUTPUT_AT;
+    memset(s_memory + OUTPUT_AT, 0xA5, 22);
+    check(call(sub_0016DE89, 2, args) == 0, "poll neutral synthetic port one");
+    memcpy(&pad, s_memory + OUTPUT_AT + 4, sizeof pad);
+    check(!pad.wButtons && !pad.bAnalogButtons[XBOX_BUTTON_A],
+          "synthetic port one remains neutral");
+#endif
 
     args[0] = handle;
     args[1] = OUTPUT_AT;
@@ -396,7 +491,10 @@ static void enabled_test(void)
           read32(OUTPUT_AT) != packet, "release and packet update");
 
 #ifdef BW_EXPERIMENTAL_SYNTHETIC_INPUT
-    synthetic_script_test(handle);
+    synthetic_script_test(handle, second);
+    args[0] = second;
+    call(sub_0016DC8B, 1, args);
+    args[0] = handle;
     bw_macos_input_bridge_trace_synthetic(1);
 #endif
     queued_keyboard_test(handle);

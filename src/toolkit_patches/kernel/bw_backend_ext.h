@@ -26,6 +26,23 @@ enum {
     BW_X_DRAW_MARKER_OCEAN = 1
 };
 
+enum {
+    BW_X_WATER_PASS_NONE = 0,
+    BW_X_WATER_PASS_LIT = 1,
+    BW_X_WATER_PASS_REFLECTION = 2,
+    BW_X_WATER_PASS_FOAM = 3
+};
+
+#define BW_X_WATER_SEMANTIC_VERSION 1u
+#define BW_X_WATER_VIEW_UNKNOWN 0xFFu
+
+typedef struct {
+    uint8_t version;
+    uint8_t pass;
+    uint8_t view;
+    uint8_t reserved;
+} BwXWaterDraw;
+
 typedef struct {
     float x, y, z, rhw;         /* surface pixels, z as produced, 1/w */
     float d0[4], d1[4];         /* diffuse, specular: r, g, b, a in [0,1] */
@@ -49,7 +66,8 @@ typedef struct {
     uint32_t other_stage_input; /* SET_SHADER_OTHER_STAGE_INPUT: stage 2's source in 16-19, 3's in 20-23 */
     uint32_t tex_border[4];     /* SET_TEXTURE_BORDER_COLOR (0xAARRGGBB) per stage */
     uint8_t tex_border_src[4];  /* FORMAT's border source: 1 = that colour, 0 = the texture's edge */
-    uint8_t draw_marker;        /* BW_X_DRAW_MARKER_*; copied from the in-stream batch scope */
+    uint8_t draw_marker;        /* BW_X_DRAW_MARKER_* compatibility presence marker */
+    BwXWaterDraw water;         /* versioned pass/view identity; zero version means unavailable */
 } BwXBatch;
 
 /* Vertex programs on the GPU. Instead of running the title's vertex program

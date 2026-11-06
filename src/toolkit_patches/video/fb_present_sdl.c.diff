@@ -1,5 +1,5 @@
---- xboxrecomp/src/video/fb_present_sdl.c
-+++ src/toolkit_patches/video/fb_present_sdl.c
+--- build/xboxrecomp/src/video/fb_present_sdl.c	2026-10-28 18:09:59
++++ src/toolkit_patches/video/fb_present_sdl.c	2026-11-05 22:20:42
 @@ -14,20 +14,21 @@
   * window) it opens the window, starts the guest on a pthread with at least
   * the main thread's stack and, on macOS, its QoS, and pumps events and
@@ -30,7 +30,7 @@
   *
   * Knobs: RECOMP_PRESENT_VSYNC=0 presents without waiting for the display;
   * RECOMP_WINDOW_SCALE=<n> sizes the window (default 2).
-@@ -35,21 +36,33 @@
+@@ -35,21 +36,37 @@
  #if !defined(_WIN32)
  
  #include <SDL.h>
@@ -55,6 +55,10 @@
 +#include <mach/mach_vm.h>
 +#include <SDL_metal.h>
 +#include "bw_framebuffer_metal.h"
++#include "../../bw_macos_settings_panel.h"
++#ifdef BW_EXPERIMENTAL_SYNTHETIC_INPUT
++#include "../../bw_macos_input_bridge.h"
++#endif
 +#endif
  
  extern ptrdiff_t xbox_GetMemoryOffset(void);
@@ -65,7 +69,7 @@
  
  #define FB_W 640u
  #define FB_H 480u
-@@ -59,10 +72,10 @@
+@@ -59,10 +76,10 @@
  struct fb_slot {
      uint8_t *px;
      size_t   cap;
@@ -78,7 +82,7 @@
  #define FBWIN_SDL_SUBSYSTEMS \
      (SDL_INIT_VIDEO | SDL_INIT_EVENTS | SDL_INIT_GAMECONTROLLER)
  
-@@ -70,12 +83,19 @@
+@@ -70,12 +87,19 @@
  static int             s_back = 0, s_ready = 1, s_front = 2;
  static uint64_t        s_ready_seq;          /* frames published */
  static pthread_mutex_t s_lock = PTHREAD_MUTEX_INITIALIZER;
@@ -102,7 +106,7 @@
  /* Counted at the flip, read once a second for the title bar. */
  static uint64_t s_flips;
  static uint32_t s_frame_draws;
-@@ -89,23 +109,38 @@
+@@ -89,23 +113,38 @@
  
  void xbox_FramebufferWindowSet(uint32_t fb_va, uint32_t pitch)
  {
@@ -147,7 +151,7 @@
      pthread_mutex_lock(&s_lock);
      {
          int t = s_ready;
-@@ -114,19 +149,49 @@
+@@ -114,19 +153,49 @@
          s_ready_seq++;
      }
      pthread_mutex_unlock(&s_lock);
@@ -207,7 +211,7 @@
  static void present_copy(uint32_t fb_va, uint32_t pitch)
  {
      struct fb_slot *s = &s_slot[s_back];
-@@ -134,40 +199,242 @@
+@@ -134,40 +203,242 @@
      uint32_t bpp = pitch / FB_W, y;
      size_t need;
  
@@ -240,8 +244,8 @@
 +    if (bpp == 4)
 +        bw_gamma_apply_xrgb((uint32_t *)s->px, (size_t)FB_W * FB_H);
 +    publish(bpp, FB_W, FB_H);
- }
- 
++}
++
 +#if defined(__APPLE__)
 +static _Atomic int s_metal_expected;
 +static _Atomic int s_metal_direct;
@@ -304,8 +308,8 @@
 +                                  (mach_vm_size_t)bytes,
 +                                  (mach_vm_address_t)(uintptr_t)dst,
 +                                  &copied) == KERN_SUCCESS && copied == bytes;
-+}
-+
+ }
+ 
 +/* Numeric mapping bounds do not guarantee that the current pages are
 + * readable. Mach copies fail cleanly if guest protection changes underneath
 + * a snapshot. Padding is not read, even when it contains inaccessible pages. */
@@ -462,7 +466,7 @@
  static char s_title[128] = "Xbox Recomp";
  
  void xbox_FramebufferWindowSetTitle(const uint16_t *name, int max_chars)
-@@ -198,7 +465,9 @@
+@@ -198,7 +469,9 @@
      }
      if (o) {
          buf[o] = 0;
@@ -472,7 +476,7 @@
      }
  }
  
-@@ -211,25 +480,33 @@
+@@ -211,25 +484,33 @@
  /* ── The guest thread ─────────────────────────────────────────────────── */
  
  static int (*s_guest_main)(void);
@@ -509,7 +513,7 @@
      struct rlimit rl;
      size_t stack = 64u << 20;
      int rc;
-@@ -240,8 +517,14 @@
+@@ -240,8 +521,14 @@
              && rl.rlim_cur > stack)
          stack = (size_t)rl.rlim_cur;
  
@@ -526,7 +530,7 @@
  #if defined(__APPLE__)
      /* Same scheduling class as the thread it replaces, so moving the guest
       * off the main thread does not move it to the efficiency cores. */
-@@ -253,12 +536,9 @@
+@@ -253,12 +540,9 @@
              pthread_attr_set_qos_class_np(&attr, qos, rel);
      }
  #endif
@@ -541,14 +545,22 @@
  }
  
  /* ── The window, on the process main thread ───────────────────────────── */
-@@ -269,16 +549,56 @@
+@@ -269,16 +553,108 @@
      return e && *e && *e != '0';
  }
  
+-int xbox_HostWindowMain(int (*guest_main)(void))
 +static int s_window_started;
 +
 +static void runtime_failure(const char *what)
-+{
+ {
+-    SDL_Window *win;
+-    SDL_Renderer *ren;
+-    SDL_Texture *tex = NULL;
+-    uint32_t tex_bpp = 0;
+-    uint64_t shown_seq = 0, t_title = 0, flips_title = 0;
+-    const char *e;
+-    int vsync, scale, quit = 0, guest_done = 0, dirty = 1;
 +    fprintf(stderr, "  [FBWIN] %s: %s\n", what, SDL_GetError());
 +    fflush(stderr);
 +    _exit(1);
@@ -570,26 +582,73 @@
 +        _exit(1);
 +    }
 +}
+ 
++#if defined(__APPLE__)
++static void release_guest_input(Uint32 window_id)
++{
++    SDL_Event lost;
++    memset(&lost, 0, sizeof lost);
++    lost.type = SDL_WINDOWEVENT;
++    lost.window.windowID = window_id;
++    lost.window.event = SDL_WINDOWEVENT_FOCUS_LOST;
++    xbox_InputSdlEvent(&lost);
++#ifdef BW_EXPERIMENTAL_SYNTHETIC_INPUT
++    bw_macos_input_bridge_cancel_synthetic_script();
++#endif
++}
 +
- int xbox_HostWindowMain(int (*guest_main)(void))
- {
--    SDL_Window *win;
--    SDL_Renderer *ren;
++static int settings_panel_consumes(const SDL_Event *event)
++{
++    int open;
++    if ((event->type != SDL_KEYDOWN && event->type != SDL_KEYUP) ||
++        event->key.keysym.sym != SDLK_F1)
++        return 0;
++    if (event->type == SDL_KEYDOWN && !event->key.repeat) {
++        open = bw_macos_settings_panel_toggle();
++        if (open > 0)
++            release_guest_input(event->key.windowID);
++        else if (open < 0) {
++            fprintf(stderr, "  [FBWIN] cannot toggle the macOS settings panel\n");
++            fflush(stderr);
++        }
++    }
++    return 1;
++}
++
++static int settings_panel_blocks_guest_input(const SDL_Event *event)
++{
++    if (!bw_macos_settings_panel_is_open())
++        return 0;
++    switch (event->type) {
++    case SDL_KEYDOWN:
++    case SDL_KEYUP:
++    case SDL_TEXTEDITING:
++    case SDL_TEXTINPUT:
++    case SDL_MOUSEMOTION:
++    case SDL_MOUSEBUTTONDOWN:
++    case SDL_MOUSEBUTTONUP:
++    case SDL_MOUSEWHEEL:
++        return 1;
++    default:
++        return 0;
++    }
++}
++#endif
++
++int xbox_HostWindowMain(int (*guest_main)(void))
++{
 +    SDL_Window *win = NULL;
 +    SDL_Renderer *ren = NULL;
-     SDL_Texture *tex = NULL;
--    uint32_t tex_bpp = 0;
++    SDL_Texture *tex = NULL;
 +#if defined(__APPLE__)
 +    SDL_MetalView metal_view = NULL;
 +#endif
 +    pthread_t guest;
 +    uint32_t tex_bpp = 0, tex_width = 0, tex_height = 0;
-     uint64_t shown_seq = 0, t_title = 0, flips_title = 0;
--    const char *e;
--    int vsync, scale, quit = 0, guest_done = 0, dirty = 1;
++    uint64_t shown_seq = 0, t_title = 0, flips_title = 0;
 +    const char *e, *driver;
 +    int vsync, scale, dirty = 1, sdl_started = 0, rc;
- 
++
 +#if defined(__APPLE__)
 +    if (!pthread_main_np()) {
 +        fprintf(stderr, "  [FBWIN] the host window must run on the process main thread\n");
@@ -603,7 +662,7 @@
      /* Ctrl-C and SIGTERM keep their default meaning; SDL would turn them
       * into an SDL_QUIT that a headless run never reads. Set before the
       * headless return: audio and input start SDL subsystems there too. */
-@@ -295,85 +615,175 @@
+@@ -295,85 +671,189 @@
  
      SDL_SetHint(SDL_HINT_RENDER_SCALE_QUALITY, "nearest");
      if (SDL_Init(FBWIN_SDL_SUBSYSTEMS) != 0) {
@@ -786,6 +845,16 @@
              do {
                  /* Keys for the pad stand-in, and the window events that
                   * release them; it only reads the event. */
++#if defined(__APPLE__)
++                if (!settings_panel_consumes(&ev) &&
++                    !settings_panel_blocks_guest_input(&ev))
++                    xbox_InputSdlEvent(&ev);
++#ifdef BW_EXPERIMENTAL_SYNTHETIC_INPUT
++                if (ev.type == SDL_WINDOWEVENT &&
++                    ev.window.event == SDL_WINDOWEVENT_FOCUS_LOST)
++                    bw_macos_input_bridge_cancel_synthetic_script();
++#endif
++#else
                  xbox_InputSdlEvent(&ev);
 -                if (ev.type == SDL_QUIT)
 -                    quit = 1;
@@ -793,7 +862,11 @@
 -                    guest_done = 1;
 -                else if (ev.type == s_frame_event)
 -                    __atomic_store_n(&s_wake_pending, 0, __ATOMIC_RELEASE);
++#endif
 +                if (ev.type == SDL_QUIT) {
++#ifdef BW_EXPERIMENTAL_SYNTHETIC_INPUT
++                    bw_macos_input_bridge_cancel_synthetic_script();
++#endif
 +                    fprintf(stderr, "  [FBWIN] window closed\n");
 +                    fflush(stderr);
 +                    _exit(0);
@@ -826,7 +899,7 @@
          pthread_mutex_lock(&s_lock);
          seq = s_ready_seq;
          if (seq != shown_seq) {
-@@ -387,42 +797,47 @@
+@@ -387,42 +867,47 @@
              shown_seq = seq;
              px = s_slot[s_front].px;
              bpp = s_slot[s_front].bpp;
@@ -890,11 +963,11 @@
 +            pthread_mutex_lock(&s_lock);
 +            memcpy(title, s_title, sizeof title);
 +            pthread_mutex_unlock(&s_lock);
-+            snprintf(tb, sizeof tb, "%s | FPS: %.1f | draws: %u", title,
++            snprintf(tb, sizeof tb, "%s | Game FPS: %.1f | draws: %u", title,
                       t_title ? (double)(f - flips_title) * 1000.0 / (double)(now - t_title)
                               : 0.0,
                       (unsigned)__atomic_load_n(&s_frame_draws, __ATOMIC_RELAXED));
-@@ -430,32 +845,41 @@
+@@ -430,32 +915,51 @@
              t_title = now;
              flips_title = f;
          }
@@ -905,6 +978,9 @@
 -    /* No present may be mid-publish (it pushes an SDL event) once SDL goes. */
 -    __atomic_store_n(&s_running, 0, __ATOMIC_SEQ_CST);
 -    while (__atomic_load_n(&s_in_present, __ATOMIC_SEQ_CST))
++#ifdef BW_EXPERIMENTAL_SYNTHETIC_INPUT
++    bw_macos_input_bridge_cancel_synthetic_script();
++#endif
 +    /* No frame copy may still touch guest memory when the host resumes. */
 +    atomic_store_explicit(&s_running, 0, memory_order_seq_cst);
 +    while (atomic_load_explicit(&s_in_present, memory_order_seq_cst))
@@ -936,12 +1012,19 @@
 -        SDL_QuitSubSystem(FBWIN_SDL_SUBSYSTEMS);
 -    if (quit)
 -        exit(0);
++#if defined(__APPLE__)
++    bw_macos_settings_panel_close();
++#endif
++
 +    /* Detached guest/USB workers may still use SDL and guest memory. The host
 +     * stops those it can before unmapping, or exits the process without
 +     * teardown. Leave the main-pump flag and all SDL resources intact. */
      return s_guest_rc;
 +
 +startup_failed:
++#ifdef BW_EXPERIMENTAL_SYNTHETIC_INPUT
++    bw_macos_input_bridge_cancel_synthetic_script();
++#endif
 +#if defined(__APPLE__)
 +    if (metal_view)
 +        SDL_Metal_DestroyView(metal_view);

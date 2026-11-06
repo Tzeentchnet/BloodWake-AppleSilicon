@@ -63,7 +63,9 @@ void bw_macos_input_bridge_configure(int enabled) { (void)enabled; }
 void bw_macos_input_bridge_trace_synthetic(int enabled) { check(enabled); }
 int bw_macos_input_bridge_select_synthetic_script(const char *name)
 {
-    return name && !strcmp(name, "remastered-boot-menu-to-gameplay-v1");
+    return name &&
+        (!strcmp(name, "remastered-boot-menu-to-gameplay-v1") ||
+         !strcmp(name, "remastered-boot-menu-to-gameplay-2p-v1"));
 }
 #endif
 

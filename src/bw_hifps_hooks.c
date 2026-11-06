@@ -85,7 +85,6 @@
 #include <math.h>
 
 #include "bw_edition.h"
-#include "bw_draw_marker.h"
 #include "bw_hook_platform.h"
 #if defined(_WIN32)
 #include "gpu/bw_d3d11.h"
@@ -1376,8 +1375,8 @@ static const uint32_t s_ob_lerp_off[OB_LERP_FIELDS] = { 0x08u, 0x0Cu, 0x1Cu, 0x2
 
 static unsigned long s_ob_marker_unknown;
 
-static void ob_finish_draw_marker(int marker_ok, uint32_t flags, uint32_t side,
-                                  uint32_t base, uint32_t stride)
+static void ob_finish_render_batch(int marker_ok, uint32_t flags, uint32_t side,
+                                   uint32_t base, uint32_t stride)
 {
     if (!bw_edition_at_least(BW_ED_REMASTERED))
         return;
@@ -1388,10 +1387,6 @@ static void ob_finish_draw_marker(int marker_ok, uint32_t flags, uint32_t side,
                     flags, side, base, stride);
         return;
     }
-    /* The validated call is inside Ocean_FillVertices. Appending the NOP
-     * before that caller resumes puts it in the command stream before the
-     * corresponding tile submission, where the executor consumes it. */
-    bw_draw_marker_emit(BW_DRAW_MARKER_OCEAN_DRAW);
 }
 
 void sub_00098130(void)
@@ -1417,13 +1412,13 @@ void sub_00098130(void)
              && HU32(WW_VA + 0xCCB8u) == base + 8u;
     if (!s_on || !s_oceancache || s_water_on_frame) {
         bw_ocean_eval();
-        ob_finish_draw_marker(marker_ok, flags, side, base, stride);
+        ob_finish_render_batch(marker_ok, flags, side, base, stride);
         return;
     }
     nv = side;                                  /* vertices: 5 x 5 per tile (seen: 25 written) */
     if (!marker_ok) {                            /* not the layout read above */
         bw_ocean_eval();
-        ob_finish_draw_marker(0, flags, side, base, stride);
+        ob_finish_render_batch(0, flags, side, base, stride);
         return;
     }
     if (!s_ob) {
@@ -1433,7 +1428,7 @@ void sub_00098130(void)
         if (!s_ob) {
             s_oceancache = 0;
             bw_ocean_eval();
-            ob_finish_draw_marker(1, flags, side, base, stride);
+            ob_finish_render_batch(1, flags, side, base, stride);
             return;
         }
     }
@@ -1521,5 +1516,5 @@ void sub_00098130(void)
         memcpy(HP(base), e->bytes, len);
     }
     g_esp = esp0 + 12;                       /* the function's own `ret 8`, once */
-    ob_finish_draw_marker(1, flags, side, base, stride);
+    ob_finish_render_batch(1, flags, side, base, stride);
 }

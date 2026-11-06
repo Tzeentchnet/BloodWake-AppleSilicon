@@ -18,6 +18,7 @@ add_executable(hook_integration
     test_hooks.c
     "${BW_SRC}/recomp_manual.c"
     "${BW_SRC}/bw_hifps_hooks.c"
+    "${BW_SRC}/bw_water_hooks.c"
     "${BW_SRC}/bw_widescreen.c"
     "${BW_SRC}/bw_remaster_hooks.c"
     "${BW_SRC}/bw_audio_hooks.c"
@@ -53,5 +54,6 @@ set_tests_properties(hooks-unpaced-warning PROPERTIES
 add_test(NAME hooks-widescreen-unavailable COMMAND hook_integration widescreen)
 add_test(NAME hooks-marker-dispatch COMMAND hook_markers)
 add_test(NAME hooks-ocean-marker-boundary COMMAND hook_integration ocean-marker)
+add_test(NAME hooks-water-pass-boundaries COMMAND hook_integration water-boundaries)
 add_test(NAME hooks-ocean-fenv-and-fallback COMMAND hook_ocean)
 add_test(NAME hooks-mission-file-case COMMAND hook_mission_files)

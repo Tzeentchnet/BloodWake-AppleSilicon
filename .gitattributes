@@ -9,6 +9,8 @@ tools/git-hooks/* text eol=lf
 
 # A unified diff's empty context line consists of a single required space.
 src/toolkit_patches/apu/*.diff whitespace=-blank-at-eol
+src/toolkit_patches/kernel/*.diff whitespace=-blank-at-eol
+src/toolkit_patches/video/*.diff whitespace=-blank-at-eol
 
 # Windows-only scripts keep CRLF.
 *.bat           text eol=crlf

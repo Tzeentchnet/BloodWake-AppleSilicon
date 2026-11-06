@@ -375,7 +375,12 @@ class GeneratedFingerprintTests(unittest.TestCase):
         self.gen.mkdir()
         self.source = self.gen / "fixture.c"
         self.source.write_bytes(b"first line\nsecond line\n")
-        reference = b"first line\r\nsecond line\r\n"
+        self.write_reference(b"first line\r\nsecond line\r\n")
+        patcher = mock.patch.object(build_from_disc, "FINGERPRINTS", str(self.root))
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def write_reference(self, reference):
         digest = hashlib.sha256(reference).hexdigest()
         self.total = build_from_disc.total_digest([("fixture.c", digest)])
         (self.root / "generated.json").write_text(json.dumps({
@@ -383,9 +388,6 @@ class GeneratedFingerprintTests(unittest.TestCase):
             "files": {"fixture.c": {"size": len(reference), "sha256": digest}},
             "inputs": {},
         }), encoding="utf-8")
-        patcher = mock.patch.object(build_from_disc, "FINGERPRINTS", str(self.root))
-        patcher.start()
-        self.addCleanup(patcher.stop)
 
     def test_lf_output_matches_windows_fingerprint_without_rewriting(self):
         progress = mock.Mock()
@@ -402,6 +404,34 @@ class GeneratedFingerprintTests(unittest.TestCase):
                 build_from_disc.verify_gen(str(ROOT), str(self.gen), mock.Mock())
         self.assertEqual(exc.exception.code, build_from_disc.EXIT_GEN)
         self.assertIn("fixture.c", exc.exception.msg)
+
+    def test_water_hook_wrapper_names_are_fingerprint_equivalent(self):
+        baseline = (
+            b"void sub_00037D60(void);\r\n"
+            b"/** sub_00037D60 */\r\n"
+            b"void sub_00037D60(void)\r\n"
+            b"void sub_00037E20(void);\r\n"
+            b"/** sub_00037E20 */\r\n"
+            b"void sub_00037E20(void)\r\n"
+        )
+        generated = (
+            b"void sub_00037D60_gen(void);\n"
+            b"void sub_00037D60(void);  /* 0x00037D60 */\n"
+            b"/** sub_00037D60_gen */\n"
+            b"void sub_00037D60_gen(void)\n"
+            b"void sub_00037E20_gen(void);\n"
+            b"void sub_00037E20(void);  /* 0x00037E20 */\n"
+            b"/** sub_00037E20_gen */\n"
+            b"void sub_00037E20_gen(void)\n"
+        )
+        self.write_reference(baseline)
+        self.source.write_bytes(generated)
+        progress = mock.Mock()
+        with mock.patch.object(build_from_disc.os, "linesep", "\n"):
+            result = build_from_disc.verify_gen(str(ROOT), str(self.gen), progress)
+        self.assertEqual(result, self.total)
+        self.assertEqual(self.source.read_bytes(), generated)
+        self.assertIn("line endings normalized", progress.call_args.args[2])
 
     def test_extra_file_is_rejected(self):
         (self.gen / "extra.c").write_bytes(b"extra\n")

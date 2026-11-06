@@ -907,7 +907,7 @@ int xbox_HostWindowMain(int (*guest_main)(void))
             pthread_mutex_lock(&s_lock);
             memcpy(title, s_title, sizeof title);
             pthread_mutex_unlock(&s_lock);
-            snprintf(tb, sizeof tb, "%s | FPS: %.1f | draws: %u", title,
+            snprintf(tb, sizeof tb, "%s | Game FPS: %.1f | draws: %u", title,
                      t_title ? (double)(f - flips_title) * 1000.0 / (double)(now - t_title)
                              : 0.0,
                      (unsigned)__atomic_load_n(&s_frame_draws, __ATOMIC_RELAXED));

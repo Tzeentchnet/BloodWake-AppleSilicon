@@ -149,6 +149,25 @@ def tree_digest(files):
 
 
 GEN_SKIP = {"bw_ocean_native.inc"}      # written by the build (tools/bw_ocean_xlate.py), not the pipeline
+GEN_FINGERPRINT_EQUIVALENT_HOOKS = (
+    b"sub_00037D60",
+    b"sub_00037E20",
+    b"sub_000389D0",
+    b"sub_00038EC0",
+)
+
+
+def normalize_generated_fingerprint_data(data):
+    for symbol in GEN_FINGERPRINT_EQUIVALENT_HOOKS:
+        data = data.replace(symbol + b"_gen", symbol)
+        for newline in (b"\r\n", b"\n"):
+            manual_declaration = (
+                b"void " + symbol + b"(void);  /* 0x" +
+                symbol[len(b"sub_"):] + b" */" + newline
+            )
+            if data.count(manual_declaration) == 1:
+                data = data.replace(manual_declaration, b"", 1)
+    return data
 
 
 def gen_fingerprint(gen_dir, windows_line_endings=False):
@@ -158,12 +177,11 @@ def gen_fingerprint(gen_dir, windows_line_endings=False):
         p = os.path.join(gen_dir, name)
         if name in GEN_SKIP or not os.path.isfile(p):
             continue
+        with open(p, "rb") as f:
+            data = normalize_generated_fingerprint_data(f.read())
         if windows_line_endings:
-            with open(p, "rb") as f:
-                data = f.read().replace(b"\r\n", b"\n").replace(b"\n", b"\r\n")
-            out[name] = {"size": len(data), "sha256": hashlib.sha256(data).hexdigest()}
-        else:
-            out[name] = {"size": os.path.getsize(p), "sha256": sha256_file(p)}
+            data = data.replace(b"\r\n", b"\n").replace(b"\n", b"\r\n")
+        out[name] = {"size": len(data), "sha256": hashlib.sha256(data).hexdigest()}
     return out
 
 

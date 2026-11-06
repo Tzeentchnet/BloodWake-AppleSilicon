@@ -289,6 +289,9 @@ static struct {
     uint32_t   prim;                    /* SET_BEGIN_END parameter, 0 = ended */
     uint8_t    draw_marker;             /* BW_X_DRAW_MARKER_* for this BEGIN/END scope */
     uint32_t   draw_marker_copies;      /* extended batches handed the marker */
+    BwXWaterDraw water;                 /* pass/view identity for this BEGIN/END scope */
+    uint32_t   water_marker_param;      /* original marker for diagnostics */
+    uint8_t    water_marker_from_run;   /* empty scopes are valid inside persistent runs */
     uint32_t   idx[NV_MAX_INDICES];     /* DRAW_ARRAYS starts are 24-bit */
     uint32_t   idx_count;
     /* INLINE_ARRAY payload: vertices written straight into the pushbuffer
@@ -804,13 +807,19 @@ static uint32_t surface_bpp(void)
  * ponytail: bottom-up 24bpp BMP, no palette, no compression. That is the one
  * format every viewer reads and it is 30 lines; PNG would need a dependency.
  */
-/* Set while RECOMP_FB_DUMP_FLIPS is dumping every flip: the report and
- * after-draw dumps stand down then, or they would put duplicate frames into
- * the sequence. */
+/* Set while RECOMP_FB_DUMP_FLIPS is dumping the current flip. When a flip
+ * sequence is configured at all, incidental report/after-draw captures also
+ * stand down so a trigger-file sequence contains only requested frames. */
 static int s_flip_dumping;
 /* Blood Wake (TK-39): is this flip being dumped (the back end then reads it
  * back synchronously, so the dump is the frame presented). */
 int nv2a_pb_exec_flip_dumping(void) { return s_flip_dumping; }
+
+static int flip_dump_sequence_configured(void)
+{
+    const char *spec = getenv("RECOMP_FB_DUMP_FLIPS");
+    return spec && *spec;
+}
 
 static void dump_surface_bmp_at(uint32_t resolved)
 {
@@ -2411,6 +2420,7 @@ static void fill_xbatch(BwXBatch *xb, const Nv2aRenderState *rs)
     xb->dot_rgbmapping = s_gpu.dot_rgbmapping;
     xb->other_stage_input = s_gpu.other_stage_input;
     xb->draw_marker = s_gpu.draw_marker;
+    xb->water = s_gpu.water;
     if (xb->draw_marker == BW_X_DRAW_MARKER_OCEAN)
         s_gpu.draw_marker_copies++;
 }
@@ -4771,7 +4781,7 @@ static void raster_batch(void)
      * triangles went down correctly just before it. A few frames that actually
      * contain geometry are worth more than any number of clears. */
     if (s_gpu.tris_drawn != before && s_drawn_dumps < FB_DUMP_AFTER_DRAW
-        && !s_flip_dumping) {
+        && !s_flip_dumping && !flip_dump_sequence_configured()) {
         s_drawn_dumps++;
         dump_surface_bmp();
     }
@@ -5350,8 +5360,17 @@ enum {
     BW_OCEAN_MARKER_INVALID
 };
 static uint8_t s_bw_ocean_marker_pending;
+static BwXWaterDraw s_bw_ocean_pending_draw;
+static uint32_t s_bw_ocean_pending_param;
+static uint8_t s_bw_water_view_active;
+static uint8_t s_bw_water_view = BW_X_WATER_VIEW_UNKNOWN;
+static uint8_t s_bw_water_pass_run_active;
+static BwXWaterDraw s_bw_water_pass_run_draw;
+static uint32_t s_bw_water_pass_run_param;
 static unsigned long s_bw_ocean_markers, s_bw_ocean_marker_batches;
 static unsigned long s_bw_ocean_marker_rejected;
+static unsigned long s_bw_water_pass_batches[4];
+static unsigned long s_bw_water_view_begins[4], s_bw_water_view_ends[4];
 
 static void bw_ocean_marker_reject(const char *reason, uint32_t param)
 {
@@ -5361,60 +5380,253 @@ static void bw_ocean_marker_reject(const char *reason, uint32_t param)
                         "the draw stays retail\n", reason, param);
 }
 
-/* The marker and the draw are decoded on this executor thread. It arms only
- * the next BEGIN/END scope; the scope value is then copied into every
- * extended batch derived synchronously from that draw and cleared at END. */
+static void bw_water_draw_clear(BwXWaterDraw *draw)
+{
+    memset(draw, 0, sizeof *draw);
+    draw->view = BW_X_WATER_VIEW_UNKNOWN;
+}
+
+static void bw_ocean_marker_clear_pending(void)
+{
+    s_bw_ocean_marker_pending = BW_OCEAN_MARKER_IDLE;
+    bw_water_draw_clear(&s_bw_ocean_pending_draw);
+    s_bw_ocean_pending_param = 0;
+}
+
+static void bw_water_view_clear(void)
+{
+    s_bw_water_view_active = 0;
+    s_bw_water_view = BW_X_WATER_VIEW_UNKNOWN;
+}
+
+static void bw_water_pass_run_clear(void)
+{
+    s_bw_water_pass_run_active = 0;
+    bw_water_draw_clear(&s_bw_water_pass_run_draw);
+    s_bw_water_pass_run_param = 0;
+}
+
+static void bw_ocean_marker_invalidate(const char *reason, uint32_t param)
+{
+    s_bw_ocean_marker_pending = BW_OCEAN_MARKER_INVALID;
+    bw_water_draw_clear(&s_bw_ocean_pending_draw);
+    s_bw_ocean_pending_param = param;
+    bw_water_pass_run_clear();
+    bw_water_view_clear();
+    bw_ocean_marker_reject(reason, param);
+}
+
+static int bw_water_marker_decode(uint32_t param, uint8_t *event, uint8_t *payload)
+{
+    uint32_t op = (param >> 8) & 0xFFu;
+    uint32_t arg = param & 0xFFu;
+
+    if (op == BW_DRAW_MARKER_OP_OCEAN_DRAW) {
+        if (param != BW_DRAW_MARKER_OCEAN_DRAW_LEGACY)
+            return 0;
+        *event = BW_DRAW_MARKER_WATER_LIT_DRAW;
+        *payload = 0;
+        return 1;
+    }
+    if (op != BW_DRAW_MARKER_OP_WATER_EVENT ||
+        (arg >> 5) != BW_DRAW_MARKER_WATER_VERSION)
+        return 0;
+    *event = (uint8_t)((arg >> 2) & 7u);
+    *payload = (uint8_t)(arg & 3u);
+    if (*event == BW_DRAW_MARKER_WATER_VIEW_BEGIN ||
+        *event == BW_DRAW_MARKER_WATER_VIEW_END)
+        return 1;
+    if ((*event == BW_DRAW_MARKER_WATER_LIT_DRAW ||
+         *event == BW_DRAW_MARKER_WATER_REFLECTION_DRAW ||
+         *event == BW_DRAW_MARKER_WATER_FOAM_DRAW) && !*payload)
+        return 1;
+    if ((*event == BW_DRAW_MARKER_WATER_PASS_RUN_BEGIN ||
+         *event == BW_DRAW_MARKER_WATER_PASS_RUN_END) &&
+        *payload >= BW_DRAW_MARKER_WATER_PASS_LIT &&
+        *payload <= BW_DRAW_MARKER_WATER_PASS_FOAM)
+        return 1;
+    return 0;
+}
+
+static uint8_t bw_water_pass_for_event(uint8_t event)
+{
+    switch (event) {
+    case BW_DRAW_MARKER_WATER_LIT_DRAW:
+        return BW_X_WATER_PASS_LIT;
+    case BW_DRAW_MARKER_WATER_REFLECTION_DRAW:
+        return BW_X_WATER_PASS_REFLECTION;
+    case BW_DRAW_MARKER_WATER_FOAM_DRAW:
+        return BW_X_WATER_PASS_FOAM;
+    default:
+        return BW_X_WATER_PASS_NONE;
+    }
+}
+
+static int bw_water_draw_equal(const BwXWaterDraw *a, const BwXWaterDraw *b)
+{
+    return a->version == b->version && a->pass == b->pass && a->view == b->view;
+}
+
+/* The marker and the draw are decoded on this executor thread. Draw events
+ * arm only the next BEGIN/END scope. Pass runs describe every scope until
+ * their matching end; view events provide split-view identity for both. */
 static void bw_ocean_marker_nop(uint32_t param)
 {
+    BwXWaterDraw draw;
+    uint8_t event, payload, pass;
+
     s_bw_ocean_markers++;
     if (s_gpu.prim) {
         s_gpu.draw_marker = BW_X_DRAW_MARKER_NONE;
-        s_bw_ocean_marker_pending = BW_OCEAN_MARKER_IDLE;
+        bw_water_draw_clear(&s_gpu.water);
+        s_gpu.water_marker_param = 0;
+        s_gpu.water_marker_from_run = 0;
+        bw_ocean_marker_clear_pending();
+        bw_water_pass_run_clear();
+        bw_water_view_clear();
         bw_ocean_marker_reject("inside a draw", param);
-    } else if (param != BW_DRAW_MARKER_OCEAN_DRAW) {
-        s_bw_ocean_marker_pending = BW_OCEAN_MARKER_INVALID;
-        bw_ocean_marker_reject("unknown version", param);
-    } else if (s_bw_ocean_marker_pending == BW_OCEAN_MARKER_ARMED) {
+        return;
+    }
+    if (!bw_water_marker_decode(param, &event, &payload)) {
+        bw_ocean_marker_invalidate("unknown version or event", param);
+        return;
+    }
+    if (event == BW_DRAW_MARKER_WATER_VIEW_BEGIN) {
+        if (s_bw_ocean_marker_pending != BW_OCEAN_MARKER_IDLE) {
+            bw_ocean_marker_invalidate("view began with a pending draw", param);
+        } else if (s_bw_water_pass_run_active) {
+            bw_ocean_marker_invalidate("view began inside a pass run", param);
+        } else if (s_bw_water_view_active) {
+            bw_ocean_marker_invalidate("nested water view", param);
+        } else {
+            s_bw_water_view_active = 1;
+            s_bw_water_view = payload;
+            s_bw_water_view_begins[payload]++;
+        }
+        return;
+    }
+    if (event == BW_DRAW_MARKER_WATER_VIEW_END) {
+        if (s_bw_ocean_marker_pending != BW_OCEAN_MARKER_IDLE) {
+            bw_ocean_marker_invalidate("view ended with a pending draw", param);
+        } else if (s_bw_water_pass_run_active) {
+            bw_ocean_marker_invalidate("view ended inside a pass run", param);
+        } else if (!s_bw_water_view_active) {
+            bw_ocean_marker_invalidate("view ended without a begin", param);
+        } else if (s_bw_water_view != payload) {
+            bw_ocean_marker_invalidate("water view mismatch", param);
+        } else {
+            s_bw_water_view_ends[payload]++;
+            bw_water_view_clear();
+        }
+        return;
+    }
+
+    pass = event == BW_DRAW_MARKER_WATER_PASS_RUN_BEGIN ||
+                   event == BW_DRAW_MARKER_WATER_PASS_RUN_END
+               ? payload : bw_water_pass_for_event(event);
+    bw_water_draw_clear(&draw);
+    draw.version = BW_X_WATER_SEMANTIC_VERSION;
+    draw.pass = pass;
+    draw.view = s_bw_water_view_active ? s_bw_water_view : BW_X_WATER_VIEW_UNKNOWN;
+    if (event == BW_DRAW_MARKER_WATER_PASS_RUN_BEGIN) {
+        if (s_bw_ocean_marker_pending != BW_OCEAN_MARKER_IDLE) {
+            bw_ocean_marker_invalidate("pass run began with a pending draw", param);
+        } else if (s_bw_water_pass_run_active) {
+            bw_ocean_marker_invalidate("nested water pass run", param);
+        } else {
+            s_bw_water_pass_run_active = 1;
+            s_bw_water_pass_run_draw = draw;
+            s_bw_water_pass_run_param = param;
+        }
+        return;
+    }
+    if (event == BW_DRAW_MARKER_WATER_PASS_RUN_END) {
+        if (s_bw_ocean_marker_pending != BW_OCEAN_MARKER_IDLE) {
+            bw_ocean_marker_invalidate("pass run ended with a pending draw", param);
+        } else if (!s_bw_water_pass_run_active) {
+            bw_ocean_marker_invalidate("pass run ended without a begin", param);
+        } else if (!bw_water_draw_equal(&s_bw_water_pass_run_draw, &draw)) {
+            bw_ocean_marker_invalidate("water pass run mismatch", param);
+        } else {
+            bw_water_pass_run_clear();
+        }
+        return;
+    }
+    if (s_bw_water_pass_run_active) {
+        bw_ocean_marker_invalidate("one-shot marker inside a pass run", param);
+        return;
+    }
+    if (s_bw_ocean_marker_pending == BW_OCEAN_MARKER_ARMED &&
+        bw_water_draw_equal(&s_bw_ocean_pending_draw, &draw)) {
         /* Ocean_FillVertices can reach the same boundary repeatedly while
          * building one later submission. Identical current-version markers
          * still describe that one next scope. */
     } else if (s_bw_ocean_marker_pending != BW_OCEAN_MARKER_IDLE) {
-        s_bw_ocean_marker_pending = BW_OCEAN_MARKER_INVALID;
-        bw_ocean_marker_reject("conflicting markers before a draw", param);
+        bw_ocean_marker_invalidate("conflicting markers before a draw", param);
     } else {
         s_bw_ocean_marker_pending = BW_OCEAN_MARKER_ARMED;
+        s_bw_ocean_pending_draw = draw;
+        s_bw_ocean_pending_param = param;
     }
 }
 
 static void bw_ocean_marker_begin(void)
 {
     bw_ocean_fingerprint_scope_reset();
-    s_gpu.draw_marker = s_bw_ocean_marker_pending == BW_OCEAN_MARKER_ARMED
+    bw_water_draw_clear(&s_gpu.water);
+    s_gpu.water_marker_param = 0;
+    s_gpu.water_marker_from_run = 0;
+    if (s_bw_ocean_marker_pending == BW_OCEAN_MARKER_ARMED) {
+        s_gpu.water = s_bw_ocean_pending_draw;
+        s_gpu.water_marker_param = s_bw_ocean_pending_param;
+    } else if (s_bw_water_pass_run_active) {
+        s_gpu.water = s_bw_water_pass_run_draw;
+        s_gpu.water_marker_param = s_bw_water_pass_run_param;
+        s_gpu.water_marker_from_run = 1;
+    }
+    s_gpu.draw_marker = s_gpu.water.pass != BW_X_WATER_PASS_NONE
                       ? BW_X_DRAW_MARKER_OCEAN : BW_X_DRAW_MARKER_NONE;
     s_gpu.draw_marker_copies = 0;
-    if (s_gpu.draw_marker == BW_X_DRAW_MARKER_OCEAN)
+    if (s_gpu.draw_marker == BW_X_DRAW_MARKER_OCEAN) {
         s_bw_ocean_marker_batches++;
-    s_bw_ocean_marker_pending = BW_OCEAN_MARKER_IDLE;
+        if (s_gpu.water.pass <= BW_X_WATER_PASS_FOAM)
+            s_bw_water_pass_batches[s_gpu.water.pass]++;
+    }
+    bw_ocean_marker_clear_pending();
 }
 
 static void bw_ocean_marker_end(void)
 {
-    if (s_gpu.draw_marker == BW_X_DRAW_MARKER_OCEAN && !s_gpu.draw_marker_copies)
+    if (s_gpu.draw_marker == BW_X_DRAW_MARKER_OCEAN &&
+        !s_gpu.draw_marker_copies && !s_gpu.water_marker_from_run)
         bw_ocean_marker_reject("marked draw produced no extended batch",
-                               BW_DRAW_MARKER_OCEAN_DRAW);
+                               s_gpu.water_marker_param);
     s_gpu.draw_marker = BW_X_DRAW_MARKER_NONE;
     s_gpu.draw_marker_copies = 0;
+    bw_water_draw_clear(&s_gpu.water);
+    s_gpu.water_marker_param = 0;
+    s_gpu.water_marker_from_run = 0;
     bw_ocean_fingerprint_scope_reset();
 }
 
 static void bw_ocean_marker_frame_end(void)
 {
-    if (s_bw_ocean_marker_pending != BW_OCEAN_MARKER_IDLE || s_gpu.draw_marker) {
+    if (s_bw_ocean_marker_pending != BW_OCEAN_MARKER_IDLE || s_gpu.draw_marker ||
+        s_bw_water_pass_run_active || s_bw_water_view_active) {
         bw_ocean_marker_reject("not consumed before the frame ended",
-                               BW_DRAW_MARKER_OCEAN_DRAW);
-        s_bw_ocean_marker_pending = BW_OCEAN_MARKER_IDLE;
+                               s_bw_ocean_pending_param
+                                   ? s_bw_ocean_pending_param
+                                   : s_gpu.water_marker_param
+                                         ? s_gpu.water_marker_param
+                                         : s_bw_water_pass_run_param);
+        bw_ocean_marker_clear_pending();
+        bw_water_pass_run_clear();
+        bw_water_view_clear();
         s_gpu.draw_marker = BW_X_DRAW_MARKER_NONE;
         s_gpu.draw_marker_copies = 0;
+        bw_water_draw_clear(&s_gpu.water);
+        s_gpu.water_marker_param = 0;
+        s_gpu.water_marker_from_run = 0;
     }
     bw_ocean_fingerprint_scope_reset();
 }
@@ -5429,6 +5641,23 @@ void bw_ocean_marker_test_counts(unsigned long *received, unsigned long *scopes,
         *scopes = s_bw_ocean_marker_batches;
     if (rejected)
         *rejected = s_bw_ocean_marker_rejected;
+}
+
+void bw_water_marker_test_semantics(unsigned long pass_scopes[3],
+                                    unsigned long view_begins[4],
+                                    unsigned long view_ends[4])
+{
+    unsigned i;
+
+    if (pass_scopes)
+        for (i = 0; i < 3; i++)
+            pass_scopes[i] = s_bw_water_pass_batches[i + 1];
+    if (view_begins)
+        for (i = 0; i < 4; i++)
+            view_begins[i] = s_bw_water_view_begins[i];
+    if (view_ends)
+        for (i = 0; i < 4; i++)
+            view_ends[i] = s_bw_water_view_ends[i];
 }
 #endif
 
@@ -5937,8 +6166,12 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
     case NV097_SET_BEGIN_END:
         if (param) {
             if (s_gpu.prim) {
-                s_bw_ocean_marker_pending = BW_OCEAN_MARKER_IDLE;
+                bw_ocean_marker_clear_pending();
+                bw_water_pass_run_clear();
+                bw_water_view_clear();
                 s_gpu.draw_marker = BW_X_DRAW_MARKER_NONE;
+                bw_water_draw_clear(&s_gpu.water);
+                s_gpu.water_marker_param = 0;
                 bw_ocean_marker_reject("nested draw scope", BW_DRAW_MARKER_OCEAN_DRAW);
             } else {
                 bw_ocean_marker_begin();
@@ -5948,10 +6181,16 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
             s_gpu.inline_count = 0;
             s_gpu.imm_count = 0;
         } else {
-            if (!s_gpu.prim && s_bw_ocean_marker_pending != BW_OCEAN_MARKER_IDLE) {
+            if (!s_gpu.prim &&
+                (s_bw_ocean_marker_pending != BW_OCEAN_MARKER_IDLE ||
+                 s_bw_water_pass_run_active)) {
                 bw_ocean_marker_reject("END without a marked BEGIN",
-                                       BW_DRAW_MARKER_OCEAN_DRAW);
-                s_bw_ocean_marker_pending = BW_OCEAN_MARKER_IDLE;
+                                       s_bw_ocean_pending_param
+                                           ? s_bw_ocean_pending_param
+                                           : s_bw_water_pass_run_param);
+                bw_ocean_marker_clear_pending();
+                bw_water_pass_run_clear();
+                bw_water_view_clear();
             }
             /* Three ways a batch can have arrived, and only one is in use at
              * a time: vertices completed by SET_VERTEX4F, a payload written
@@ -6012,7 +6251,8 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
     case NV097_NO_OPERATION:
         if ((param >> 16) == BW_DRAW_MARKER_TAG) {
             uint32_t op = (param >> 8) & 0xFFu;
-            if (op == BW_DRAW_MARKER_OP_OCEAN_DRAW) {
+            if (op == BW_DRAW_MARKER_OP_OCEAN_DRAW ||
+                op == BW_DRAW_MARKER_OP_WATER_EVENT) {
                 bw_ocean_marker_nop(param);
                 return;
             }
@@ -6483,16 +6723,16 @@ void nv2a_pb_exec_report(void)
     int i, j;
 
     {
-        /* Frames per second of guest time, from flips between reports. */
+        /* Completed guest flips per host-wall-clock second. */
         static uint32_t last_flips;
-        static unsigned long last_ms;
-        unsigned long now = (unsigned long)(clock() * 1000.0 / CLOCKS_PER_SEC);
-        if (last_ms && now > last_ms)
+        static uint64_t last_ns;
+        uint64_t now = xbox_HostNowNs();
+        if (last_ns && now > last_ns)
             fprintf(stderr, "[GPU] %.2f fps (%u flips)%c",
-                    (s_gpu.flips - last_flips) * 1000.0 / (now - last_ms),
+                    (s_gpu.flips - last_flips) * 1e9 / (double)(now - last_ns),
                     s_gpu.flips, 10);
         last_flips = s_gpu.flips;
-        last_ms = now;
+        last_ns = now;
     }
     flip_hold_report();
     fprintf(stderr, "[GPU] surface 0x%08X pitch %u clip %ux%u+%u+%u"
@@ -6508,9 +6748,22 @@ void nv2a_pb_exec_report(void)
         fprintf(stderr, "[GPU] ocean draw markers: %lu received, %lu batch scopes, "
                         "%lu rejected\n", s_bw_ocean_markers,
                 s_bw_ocean_marker_batches, s_bw_ocean_marker_rejected);
+    if (s_bw_ocean_marker_batches)
+        fprintf(stderr, "[GPU] water pass scopes: lit %lu, reflection %lu, foam %lu\n",
+                s_bw_water_pass_batches[BW_X_WATER_PASS_LIT],
+                s_bw_water_pass_batches[BW_X_WATER_PASS_REFLECTION],
+                s_bw_water_pass_batches[BW_X_WATER_PASS_FOAM]);
+    if (s_bw_water_view_begins[0] || s_bw_water_view_begins[1] ||
+        s_bw_water_view_begins[2] || s_bw_water_view_begins[3])
+        fprintf(stderr, "[GPU] water views: begin %lu/%lu/%lu/%lu, "
+                        "end %lu/%lu/%lu/%lu\n",
+                s_bw_water_view_begins[0], s_bw_water_view_begins[1],
+                s_bw_water_view_begins[2], s_bw_water_view_begins[3],
+                s_bw_water_view_ends[0], s_bw_water_view_ends[1],
+                s_bw_water_view_ends[2], s_bw_water_view_ends[3]);
     /* One picture per report rather than per clear: a title clears hundreds of
      * times a second and nobody wants that many files. */
-    if (!s_flip_dumping)
+    if (!s_flip_dumping && !flip_dump_sequence_configured())
         dump_surface_bmp();
 
     /* Drawn and skipped separately: "nothing appeared" and "every batch needed

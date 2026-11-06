@@ -16,6 +16,7 @@
 
 static uint32_t *guest_words;
 #define G32(va) (guest_words[(uint32_t)(va) / 4u])
+#define G8(va) (((uint8_t *)guest_words)[(uint32_t)(va)])
 #define GF32(va) (*(float *)&G32(va))
 
 ptrdiff_t g_xbox_mem_offset;
@@ -42,6 +43,18 @@ static int relaunch_fail, relaunch_stage;
 static int ocean_eval_calls, ocean_gen_calls;
 static unsigned ocean_marker_calls;
 static uint32_t ocean_marker_param;
+static int lit_gen_calls, reflection_gen_calls, foam_gen_calls, ocean_render_gen_calls;
+static int water_trace_enabled;
+static uint32_t water_trace[16];
+static unsigned water_trace_count;
+
+static void water_trace_push(uint32_t value)
+{
+    if (water_trace_enabled) {
+        assert(water_trace_count < sizeof water_trace / sizeof water_trace[0]);
+        water_trace[water_trace_count++] = value;
+    }
+}
 
 bw_edition_t bw_edition(void) { return edition; }
 const char *bw_edition_name(bw_edition_t e) { return e == BW_ED_ORIGINAL ? "original" : "remastered"; }
@@ -59,6 +72,30 @@ void sub_00013180_gen(void) { splash_calls++; g_eax = 0x12340001u; g_esp += 4; }
 void sub_00038720_gen(void) { split_calls++; split_arg = GF32(g_esp + 0x14); g_esp += 24; }
 void sub_0012C9F0_gen(void) { assert(!"unexpected original kickoff"); }
 void sub_00098130_gen(void) { ocean_gen_calls++; g_esp += 12; }
+void sub_00037D60_gen(void)
+{
+    lit_gen_calls++;
+    water_trace_push(0x00037D60u);
+    g_eax = 0x37D60u; g_ecx = 0xA37D60u; g_edx = 0xB37D60u; g_esp += 8;
+}
+void sub_00037E20_gen(void)
+{
+    reflection_gen_calls++;
+    water_trace_push(0x00037E20u);
+    g_eax = 0x37E20u; g_ecx = 0xA37E20u; g_edx = 0xB37E20u; g_esp += 8;
+}
+void sub_000389D0_gen(void)
+{
+    foam_gen_calls++;
+    water_trace_push(0x000389D0u);
+    g_eax = 0x389D0u; g_ecx = 0xA389D0u; g_edx = 0xB389D0u; g_esp += 8;
+}
+void sub_00038EC0_gen(void)
+{
+    ocean_render_gen_calls++;
+    water_trace_push(0x00038EC0u);
+    g_eax = 0x38EC0u; g_ecx = 0xA38EC0u; g_edx = 0xB38EC0u; g_esp += 8;
+}
 void bw_ocean_eval(void) { ocean_eval_calls++; g_esp += 12; }
 
 void xbox_IrqSafePoint(void) { safepoints++; }
@@ -87,6 +124,7 @@ static void marker_guest(void)
     assert(g_ecx == BW_DRAW_MARKER_NOP_HEADER);
     ocean_marker_calls++;
     ocean_marker_param = g_edx;
+    water_trace_push(g_edx);
     g_esp += 4;
 }
 
@@ -161,6 +199,10 @@ void sub_000FE041(void);
 void sub_0012C9F0(void);
 void sub_000DB8B9(void);
 void sub_00098130(void);
+void sub_00037D60(void);
+void sub_00037E20(void);
+void sub_000389D0(void);
+void sub_00038EC0(void);
 unsigned bw_hifps_boot(int gameplay);
 extern int g_bw_kickoff_async;
 
@@ -445,8 +487,7 @@ static void test_ocean_marker_boundary(void)
         sub_00098130();
     }
     assert(ocean_eval_calls == (int)repeats + 1 &&
-           ocean_marker_calls == repeats &&
-           ocean_marker_param == BW_DRAW_MARKER_OCEAN_DRAW);
+           ocean_marker_calls == 0 && !ocean_marker_param);
 
     ocean_marker_param = 0;
     G32(sp) = 0x00037CC2u;
@@ -455,14 +496,133 @@ static void test_ocean_marker_boundary(void)
     g_ecx = ww; g_esp = sp;
     sub_00098130();
     assert(ocean_eval_calls == (int)repeats + 2 &&
-           ocean_marker_calls == repeats && !ocean_marker_param);
+           ocean_marker_calls == 0 && !ocean_marker_param);
 
     G32(sp + 4u) = 0x1Du;
     G32(sp) = 0x00000000u;
     g_ecx = ww; g_esp = sp;
     sub_00098130();
-    assert(ocean_gen_calls == 1 && ocean_marker_calls == repeats &&
+    assert(ocean_gen_calls == 1 && ocean_marker_calls == 0 &&
            !ocean_marker_param);
+}
+
+static void test_water_pass_boundaries(void)
+{
+    const uint32_t sp = 0x20000u;
+    const uint32_t ocean = 0x001C6990u;
+    const uint32_t render_manager = 0x001A9C50u;
+    const uint32_t draw_root = 0x24000u;
+    unsigned marker_base = ocean_marker_calls;
+
+    edition = BW_ED_REMASTERED;
+    G32(0x001A9A78u) = 2;
+    G32(render_manager + 0x2D8u) = 1;
+    G32(ocean + 0x90u) = draw_root;
+    G32(ocean + 0x6F8u) = 0;
+    G8(0x0018F534u) = 1;
+    G8(0x0018F535u) = 1;
+    G8(0x0018F536u) = 1;
+    water_trace_enabled = 1;
+
+    G32(sp) = 0x00039210u;
+    G32(sp + 4) = draw_root;
+    g_ecx = ocean; g_esp = sp;
+    sub_00037D60();
+    assert(lit_gen_calls == 1 && g_esp == sp + 8);
+    assert(g_eax == 0x37D60u && g_ecx == 0xA37D60u && g_edx == 0xB37D60u);
+    assert(water_trace_count == 3);
+    assert(water_trace[0] == BW_DRAW_MARKER_WATER_PASS_BEGIN(
+               BW_DRAW_MARKER_WATER_PASS_LIT));
+    assert(water_trace[1] == 0x00037D60u);
+    assert(water_trace[2] == BW_DRAW_MARKER_WATER_PASS_END(
+               BW_DRAW_MARKER_WATER_PASS_LIT));
+
+    water_trace_count = 0;
+    G32(ocean + 0x6F8u) = 3;
+    G32(sp) = 0x00039262u;
+    G32(sp + 4) = draw_root;
+    g_ecx = ocean; g_esp = sp;
+    sub_00037E20();
+    assert(reflection_gen_calls == 1 && g_esp == sp + 8);
+    assert(g_eax == 0x37E20u && g_ecx == 0xA37E20u && g_edx == 0xB37E20u);
+    assert(water_trace_count == 3);
+    assert(water_trace[0] == BW_DRAW_MARKER_WATER_PASS_BEGIN(
+               BW_DRAW_MARKER_WATER_PASS_REFLECTION));
+    assert(water_trace[1] == 0x00037E20u);
+    assert(water_trace[2] == BW_DRAW_MARKER_WATER_PASS_END(
+               BW_DRAW_MARKER_WATER_PASS_REFLECTION));
+
+    water_trace_count = 0;
+    G32(render_manager + 0x2D8u) = 2;
+    G32(sp) = 0x000392B4u;
+    G32(sp + 4) = draw_root;
+    g_ecx = ocean; g_esp = sp;
+    sub_000389D0();
+    assert(foam_gen_calls == 1 && g_esp == sp + 8);
+    assert(g_eax == 0x389D0u && g_ecx == 0xA389D0u && g_edx == 0xB389D0u);
+    assert(water_trace_count == 3);
+    assert(water_trace[0] == BW_DRAW_MARKER_WATER_PASS_BEGIN(
+               BW_DRAW_MARKER_WATER_PASS_FOAM));
+    assert(water_trace[1] == 0x000389D0u);
+    assert(water_trace[2] == BW_DRAW_MARKER_WATER_PASS_END(
+               BW_DRAW_MARKER_WATER_PASS_FOAM));
+
+    water_trace_count = 0;
+    G32(sp) = 0x0002E0CDu;
+    G32(sp + 4) = 1;
+    g_ecx = ocean; g_esp = sp;
+    sub_00038EC0();
+    assert(ocean_render_gen_calls == 1 && g_esp == sp + 8);
+    assert(g_eax == 0x38EC0u && g_ecx == 0xA38EC0u && g_edx == 0xB38EC0u);
+    assert(water_trace_count == 3);
+    assert(water_trace[0] == BW_DRAW_MARKER_WATER_BEGIN(1));
+    assert(water_trace[1] == 0x00038EC0u);
+    assert(water_trace[2] == BW_DRAW_MARKER_WATER_END(1));
+    assert(ocean_marker_calls == marker_base + 8);
+
+    water_trace_count = 0;
+    edition = BW_ED_ORIGINAL;
+    G32(sp) = 0x00039262u;
+    G32(sp + 4) = draw_root;
+    g_ecx = ocean; g_esp = sp;
+    sub_00037E20();
+    assert(reflection_gen_calls == 2 && g_esp == sp + 8);
+    assert(water_trace_count == 1 && water_trace[0] == 0x00037E20u);
+    assert(ocean_marker_calls == marker_base + 8);
+
+    water_trace_count = 0;
+    edition = BW_ED_REMASTERED;
+    G32(ocean + 0x6F8u) = 0;
+    G32(sp) = 0x000392B4u;
+    G32(sp + 4) = draw_root;
+    g_ecx = ocean; g_esp = sp;
+    sub_000389D0();
+    assert(foam_gen_calls == 2 && g_esp == sp + 8);
+    assert(water_trace_count == 1 && water_trace[0] == 0x000389D0u);
+    assert(ocean_marker_calls == marker_base + 8);
+
+    water_trace_count = 0;
+    G32(ocean + 0x6F8u) = 3;
+    G8(0x0018F535u) = 0;
+    G32(sp) = 0x00039262u;
+    G32(sp + 4) = draw_root;
+    g_ecx = ocean; g_esp = sp;
+    sub_00037E20();
+    assert(reflection_gen_calls == 3 && g_esp == sp + 8);
+    assert(water_trace_count == 1 && water_trace[0] == 0x00037E20u);
+    assert(ocean_marker_calls == marker_base + 8);
+
+    water_trace_count = 0;
+    G32(render_manager + 0x2D8u) = 3;
+    G32(sp) = 0x0002E0CDu;
+    G32(sp + 4) = 1;
+    g_ecx = ocean; g_esp = sp;
+    sub_00038EC0();
+    assert(ocean_render_gen_calls == 2 && g_esp == sp + 8);
+    assert(water_trace_count == 1 && water_trace[0] == 0x00038EC0u);
+    assert(ocean_marker_calls == marker_base + 8);
+
+    water_trace_enabled = 0;
 }
 
 int main(int argc, char **argv)
@@ -482,6 +642,8 @@ int main(int argc, char **argv)
         test_widescreen_diagnostic();
     } else if (!strcmp(argv[1], "ocean-marker")) {
         test_ocean_marker_boundary();
+    } else if (!strcmp(argv[1], "water-boundaries")) {
+        test_water_pass_boundaries();
     } else {
         assert(!strcmp(argv[1], "passthrough"));
         test_platform();

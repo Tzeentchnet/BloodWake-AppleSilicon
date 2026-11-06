@@ -97,9 +97,11 @@ foreach(case semaphore-release semaphore-concurrent visual
              anisotropy anisotropy-original anisotropy-invalid
              water-preset water-preset-original water-preset-invalid
              water-preset-original-env water-benchmark water-benchmark-validation
+             water-capture water-capture-validation
              render-scale render-scale-aa render-scale-partial render-scale-box
              render-scale-depth render-scale-auto render-scale-invalid render-scale-ssaa-min
-             seed-order command-batching perspective blend color-mask alpha-test pipeline-cache cull full-rect depth-clear
+             seed-order command-batching present-surface-reuse
+             perspective blend color-mask alpha-test pipeline-cache cull full-rect depth-clear
              depth-draw stencil-draw polygon-offset polygon-offset-disabled polygon-offset-zero
              partial-color partial-color-masks partial-color-default-rect partial-clip partial-empty
              partial-depth partial-depth-seed partial-depth-empty partial-depth-unbound
@@ -117,7 +119,11 @@ foreach(case semaphore-release semaphore-concurrent visual
              xrgb-single-reject-incomplete-rect xrgb-single-reject-depth
              extended-basic extended-texture-cache
              ocean-marker-batches ocean-fingerprint ocean-marker-retail
-             ocean-realistic ocean-realistic-fallback
+             ocean-realistic ocean-realistic-fallback ocean-reflect-single
+             ocean-reflect-single-scale ocean-reflect-single-fallback
+             ocean-reflect-single-disabled ocean-reflect-single-original
+             ocean-reflect-single-target-switch ocean-reflect-single-groups
+             ocean-reflect-single-resize
              extended-combiner extended-multistage extended-combiner-mappings
              extended-combiner-operations extended-combiner-constants
              extended-combiner-secondary extended-fog extended-passthrough-stage

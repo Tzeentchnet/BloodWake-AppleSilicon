@@ -155,6 +155,7 @@ set(GAME_SOURCES
     src/bw_edition.c
     src/bw_settings.c
     src/bw_hifps_hooks.c
+    src/bw_water_hooks.c
     src/bw_widescreen.c
     src/bw_remaster_hooks.c
     src/bw_audio_hooks.c
@@ -181,6 +182,7 @@ set(GAME_SOURCES
     src/bw_edition.c          # BW_EDITION: the editions (D-015)
     src/bw_settings.c         # the launcher's settings file (bw_settings.h)
     src/bw_hifps_hooks.c      # Remastered high frame rate (D-016): D-011 wrappers, see the file
+    src/bw_water_hooks.c       # Remastered semantic water view/pass boundaries
     src/bw_widescreen.c       # Remastered widescreen: the picture's shape
     src/bw_remaster_hooks.c   # edition hooks (D-011 wrappers; run_pipeline scans it)
     ${BW_EDITION_EXTRA_SOURCES}
