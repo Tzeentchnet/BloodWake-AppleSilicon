@@ -1,6 +1,6 @@
 # Apple Silicon validation
 
-Updated 2026-11-03. This document records measured behavior and regression
+Updated 2026-11-05. This document records measured behavior and regression
 coverage. Implementation history is in
 [WORK_COMPLETED.md](WORK_COMPLETED.md), and current priorities are in
 [APPLE_SILICON_HANDOFF.md](APPLE_SILICON_HANDOFF.md).
@@ -23,8 +23,10 @@ experimental keyboard bridge and quincunx approximation enabled.
 - The title exited normally through `HalReturnToFirmware` routine 2 with no
   sticky Metal or command-buffer error.
 
-The older `[GPU] ... fps` line uses C `clock()` CPU time and is not accepted as
-wall-clock performance evidence.
+Runs made before 2026-11-05 used C `clock()` for the older `[GPU] ... fps`
+line, so those values are not accepted as wall-clock evidence. The reporter
+now uses `xbox_HostNowNs()`, and the window title labels its independently
+wall-clocked completed-flip value as `Game FPS`.
 
 ## Hands-on confirmation
 
@@ -89,13 +91,16 @@ wall-clock performance evidence.
 
 ## Current regression coverage
 
-- The Metal backend suite passes 322/322 tests, including texture-stage masks,
+- The Metal backend suite passes 324/324 tests, including texture-stage masks,
   combiner operations, cube reflection, mip selection, command-buffer and
   render-encoder batching, texture caching, upload-arena reuse, anisotropy
   selection/lifecycle, optional-water frame-boundary selection, exact default
-  Retail output, marked-only enhancement, per-pass fallback, edition gating,
-  invalid startup rejection, strict benchmark authorization, and the
-  Retail/Realistic/Realistic/Retail benchmark state machine.
+  Retail output, marked-only enhancement, typed lit/reflection/foam pass and
+  view propagation, persistent multi-draw and empty pass runs, legacy marker
+  compatibility, malformed/mismatched event and run rejection, per-pass
+  fallback, edition gating, invalid startup rejection, strict benchmark
+  authorization, and the Retail/Realistic/Realistic/Retail benchmark state
+  machine.
 - Eight dedicated scaling cases cover forced 2x private targets, guest-AA
   collapse, exact guest seeding, weighted box-filter readback, scaled colour
   and depth scissors, invalid scale rejection, SSAA minimum handling, and a
@@ -114,11 +119,13 @@ wall-clock performance evidence.
   focus-loss clearing, keyboard/controller coexistence, hotplug, slots,
   concurrent polling, and deterministic synthetic-script packet edges,
   completion, cancellation, and reselection.
-- The hook-portability suite passes 9/9 tests, including the validated ocean
-  marker boundary and retail fallback. Metal backend coverage verifies
-  marked/unmarked batches, 4,096-marker coalescing into one scope,
-  conflicting/unknown rejection, no carry-over, and byte-identical retail
-  output.
+- The hook-portability suite passes 10/10 tests, including the validated lit,
+  per-view, reflection-run, and foam-run boundaries plus Original fallback.
+  It verifies event order, disabled and empty passes, invalid views, and guest
+  state preservation. Metal backend coverage verifies marked/unmarked
+  batches, 4,096-marker coalescing into one scope, persistent multi-draw and
+  empty runs, conflicting/unknown rejection, no carry-over, and byte-identical
+  Retail output.
 - The MSAA evidence harness passes 9/9 Python tests covering 2x/4x/8x memory
   costs, strict schemas, non-finite and overflow rejection, missing evidence,
   and exact decision-threshold boundaries.
@@ -128,7 +135,7 @@ wall-clock performance evidence.
 - The standalone Metal MSAA smoke target passes 2/2 tests. The recorded Apple
   M5 passes synthetic 2x/4x/8x color, depth/stencil, resolve, readback, and
   explicit error checks; this is not game-renderer or visual evidence.
-- The focused macOS diagnostic suite passes 48/48 tests, including strict
+- The focused macOS diagnostic suite passes 59/59 tests, including strict
   edition and built-in script selection, bounded marker/fingerprint summary
   parsing, typed relaunch outcomes, integrity-failure precedence, boot-cap
   reporting, explicit audio isolation, and strict headless-audit authorization
@@ -264,6 +271,136 @@ that contained supported marked-ocean draws. They include other commands in
 the same buffers and do not claim isolated shader cost, a performance
 acceptance threshold, representative scene coverage, or improved visual
 quality. Private logs, hashes, saves, and retail data remain uncommitted.
+
+### Representative one-player water boundary
+
+A fresh private guided run used physical keyboard input to enter one-player
+Battle Mode, then remained in visible gameplay on open water for the bounded
+capture. The bridge recorded physical Start, D-pad, A, and B transitions with
+monotonic timing, and private framebuffer captures confirmed gameplay rather
+than a menu or attract sequence.
+
+- Two boots completed with one validated same-title relaunch.
+- The aggregate contained 231,292 water markers and 431,057 marked draw
+  scopes.
+- Pass totals were 2,645 lit, 214,206 reflection, and 214,206 foam scopes.
+- View 0 produced 3,253 begins and 3,253 ends; views 1-3 remained unused.
+- The run fingerprinted 427,046 batches across 10 aggregate hashes, with zero
+  table-overflow batches and zero within-scope mismatches.
+- The first implementation reported 604 rejections. Every sampled diagnostic
+  reason was a marked scope without an extended batch, originating from a
+  persistent reflection or foam run rather than a malformed marker, unmatched
+  view, or frame leak.
+
+Persistent pass runs describe all title `BEGIN/END` scopes, including scopes
+that submit no extended batch. The executor now records that provenance,
+accepts those empty persistent-run scopes, and continues to reject an
+unconsumed one-shot draw marker. A focused regression covers the distinction,
+the carried patch applies cleanly, and the production runtime rebuilds.
+
+A fresh post-fix one-player Battle run then completed two boots with one
+validated relaunch and reached its configured time limit:
+
+- 186,893 lit, 186,893 reflection, and 186,893 foam scopes;
+- 2,915 view-0 begins and 2,915 view-0 ends;
+- 560,679 marked batch scopes with zero rejection;
+- 552,477 fingerprinted batches across 10 aggregate hashes, with zero table
+  overflow and zero within-scope mismatch;
+- Realistic water active with no unsupported-pass fallback; and
+- Metal private reflection depth active with no logged fallback.
+
+The complete Metal suite passes 333/333, all eight focused private-depth
+sanitizer cases pass, and the hook suite passes 10/10. This closes NW-007 and
+NW-100 for representative single-player gameplay. Split-screen/view-1
+evidence remains deferred. Private frames, input timings, saves, logs,
+fingerprints, and retail data remain uncommitted.
+
+### Guided 4x performance observation
+
+The representative Battle captures are correctness diagnostics, not clean
+performance benchmarks. They render internally at 2560x1920 while counting
+every GPU method/draw and periodically synchronizing and writing framebuffer
+BMPs. Runs before and after the Metal reflection-depth port both sustained
+roughly 14-15 completed game flips per second in the exercised Battle scene;
+the accepted post-fix run measured about 13-14 FPS in later windows. Stable
+59.94 Hz vblank does not imply new game frames at that rate. These numbers
+show that the displayed counter was measuring real flips, but they must not be
+used as the normal-play baseline.
+
+### Clean Battle performance baseline
+
+A later one-player Battle matrix used the same validated private save and
+same-title relaunch seed, but disabled GPU audit and BMP capture. Fixed render
+scale, the lightweight Metal frame timer, and completed-command GPU timing
+were the only performance diagnostics. The title still required the
+experimental keyboard pad to remain connected; no synthetic menu input ran
+during these samples.
+
+| Fixed scale | Internal target | Completed-game FPS | GPU command median | CPU command-wait median | Wall-frame median |
+| --- | --- | --- | --- | --- | --- |
+| 1x | 640x480 | 30.53-31.89 | 17.16-17.23 ms | 17.77-17.90 ms | 30.48-30.72 ms |
+| 2.25x | 1440x1080 | 28.37-29.60 | 20.13-20.35 ms | 20.76-20.95 ms | 33.38-33.65 ms |
+| 4x | 2560x1920 | 15.76 | 48.25 ms | 48.84 ms | 62.03 ms |
+
+A separate two-minute clean 4x run began near 14.8 FPS and later measured
+about 12.7 FPS. That sustained decline is consistent with increasing load,
+but scene progression was not held constant and no direct package-power or
+thermal telemetry was collected, so it is not proof of thermal throttling.
+
+Caller-attributed native sampling identifies the serialization boundary. The
+guest thread spent 87.3% of its samples in the condition wait called by
+`bw_flush_wait`; the NV2A/Metal worker spent 79.3% in the condition wait
+called by `finish_command`. The latter commits the current command buffer and
+calls `waitUntilCompleted` while synchronizing private render surfaces with
+guest memory. The close GPU-duration and host-wait medians independently
+confirm that this is real GPU completion time rather than a faulty FPS
+counter.
+
+Resolution is a major cost, but serialization also imposes a substantial
+fixed floor. At 4x, the measured 48.25 ms median GPU command alone limits the
+current workload to about 20.7 FPS before CPU work, so removing the wait
+cannot make native 4x reach 60 FPS. At 2.25x the corresponding ideal ceiling
+is about 49 FPS, while 1x is close to a 60 FPS GPU budget but reaches only
+about 32 FPS because CPU and GPU work do not overlap. The next implementation
+boundary is bounded asynchronous resource ownership, not blindly deleting
+the wait: vertex-upload memory, readback resources, render-surface reuse,
+CPU-written guest surfaces, snapshots, and shutdown all require explicit
+completion rules. No default render scale or frame cap changed as a result of
+this diagnostic matrix.
+
+#### Synchronized private-surface reuse
+
+The first base-renderer optimization removes redundant guest-to-private color
+surface seeds without relaxing completion. Each cached Metal color target now
+retains an exact guest-resolution synchronization snapshot. Reactivation
+reuses the private texture only when the surface identity, format, dimensions,
+pitch, and every active guest byte still match; a CPU or copy-engine change
+forces the existing seed path. GPU writeback refreshes both guest memory and
+the snapshot. This keeps target switches, framebuffer descriptors, the
+CPU-write counterexample, and shutdown synchronous while avoiding an
+unnecessary upload/scale operation.
+
+The complete Metal suite passes 333/333 with a new ownership case covering
+unchanged reactivation, CPU mutation, and subsequent reuse. Clean seeded
+Battle runs reached the time limit with zero marker rejection or Metal error.
+At each scale the first 300-frame report recorded 599 target reuses and only
+one present-time guest reseed:
+
+| Fixed scale | Earlier baseline median | First optimized median | Later optimized range |
+| --- | --- | --- | --- |
+| 1x | 17.16-17.23 ms GPU / 30.48-30.72 ms wall | 16.76 ms GPU / 30.02 ms wall | 16.77-17.40 ms GPU / 29.72-30.73 ms wall |
+| 2.25x | 20.13-20.35 ms GPU / 33.38-33.65 ms wall | 19.75 ms GPU / 32.99 ms wall | 20.48-22.40 ms GPU / 33.76-36.77 ms wall |
+| 4x | 48.25 ms GPU / 62.03 ms wall | 43.38 ms GPU / 56.75 ms wall | 44.56-50.27 ms GPU / 58.46-65.24 ms wall |
+
+The early 4x window suggests a useful reduction in redundant scaled-surface
+work, and 1x wall time improves modestly. The later 2.25x and 4x windows also
+show that scene progression and sustained load can outweigh that gain. These
+were repeat runs, not interleaved process-level A/B samples with controlled
+power and temperature, so no precise percentage is claimed. Most
+importantly, GPU duration and host wait remain nearly identical: exact cache
+reuse does not remove the per-frame `waitUntilCompleted` serialization and
+does not change the conclusion that bounded asynchronous ownership is the
+next major optimization.
 
 ### Water visual-review boundary
 

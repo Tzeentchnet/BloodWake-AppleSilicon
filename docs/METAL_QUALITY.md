@@ -20,12 +20,65 @@ Invalid `BW_VFX_AF` values stop Metal startup with an explicit error. Original
 ignores the Remastered setting and stays at 1x. The settings UI exposes the
 existing Off, 4x, 8x, and 16x choices.
 
+## Current base-performance envelope
+
+A clean, seeded one-player Battle matrix disabled GPU audit and screenshot
+capture while holding render scale fixed. Lightweight Metal timing produced
+these representative rolling 300-frame windows:
+
+| Fixed scale | Internal target | Completed-game FPS | GPU command median | Command-wait median | Wall-frame median |
+| --- | --- | --- | --- | --- | --- |
+| 1x | 640x480 | 30.53-31.89 | 17.16-17.23 ms | 17.77-17.90 ms | 30.48-30.72 ms |
+| 2.25x | 1440x1080 | 28.37-29.60 | 20.13-20.35 ms | 20.76-20.95 ms | 33.38-33.65 ms |
+| 4x | 2560x1920 | 15.76 | 48.25 ms | 48.84 ms | 62.03 ms |
+
+Native sampling attributes 87.3% of the guest thread to `bw_flush_wait` and
+79.3% of the NV2A/Metal worker to `finish_command` waiting for Metal command
+completion. This explains why 1x and 2.25x wall time remains much higher than
+GPU duration: every flip currently serializes CPU and GPU work while
+synchronizing the private render surface with guest memory.
+
+The 4x command buffer already consumes a 48.25 ms median on the GPU. Perfect
+CPU/GPU overlap therefore cannot make the current 4x workload reach 60 FPS;
+the GPU-only ceiling is about 20.7 FPS. The corresponding measured ceilings
+are about 49 FPS at 2.25x and 58 FPS at 1x before further GPU optimization.
+This is why the next renderer task is a bounded asynchronous ownership model
+for vertex uploads, readback resources, and cached render surfaces. Simply
+removing `waitUntilCompleted` would reuse live resources and violate
+render-target, guest-memory, snapshot, and shutdown correctness.
+
+The first ownership-safe optimization is now implemented. Cached color
+targets retain exact guest-resolution synchronization snapshots, so an
+unchanged target can reuse its private Metal texture without another
+guest-to-private upload and scale pass. Any byte change forces the established
+seed path. The 333-case Metal suite covers unchanged reactivation, CPU
+mutation, subsequent reuse, target switching, and the existing CPU-write
+counterexample.
+
+Clean seeded runs recorded 599 target reuses and one present-time guest reseed
+in their first 300 frames at every measured scale. The first 4x window improved
+from the earlier 48.25 ms GPU / 62.03 ms wall medians to 43.38 ms / 56.75 ms;
+the first 1x window measured 16.76 ms / 30.02 ms. Sustained windows still
+reached 50.27 ms / 65.24 ms at 4x and 22.40 ms / 36.77 ms at 2.25x. Because
+scene progression, process ordering, power, and temperature were not held
+constant, these repeats establish that the cache path is active and
+correct—not a precise performance percentage. CPU/GPU serialization remains
+the dominant next boundary.
+
+The matrix does not change product defaults. Native scale, a 1080p-class
+default, adaptive internal resolution, and a 60 FPS cap remain explicit
+policy choices to evaluate after the synchronization work is measured. A
+separate sustained 4x run slowed from about 14.8 to 12.7 FPS, but scene
+progression was not fixed and no direct thermal or package-power telemetry was
+collected, so that observation is not attributed to thermal throttling.
+
 ## Optional realistic water
 
 The authoritative system and shader research is in
 [WATER_RENDERING.md](WATER_RENDERING.md). In particular, the current marker
-and optional shader cover the lit/base ocean pass; the later Retail
-dot-product cube-reflection and wake-foam passes remain unchanged.
+contract identifies lit/base, reflection, and foam passes, but the optional
+shader still covers only lit/base. The later Retail dot-product
+cube-reflection and wake-foam passes remain unchanged.
 
 `graphics.water_rendering` is a Remastered-only macOS Metal frame-boundary
 setting with `retail` and `realistic` choices. Retail is the default and keeps
@@ -49,12 +102,18 @@ existing fog visibility and Retail alpha is preserved. There are no new
 textures, art, depth reads, refraction, depth absorption, foam, or shoreline
 effects.
 
-The complete 322-case Metal suite includes exact default-Retail output,
+The complete 333-case Metal suite includes exact default-Retail output,
 marked-only enhancement, unmarked recovery, unsupported-state fallback,
 frame-boundary activation, edition gating, strict startup parsing, and the
-diagnostic benchmark state machine. A private four-boot scripted Remastered
-diagnostic activated the shader on real marked ocean batches with no observed
-fallback or Metal error.
+diagnostic benchmark state machine. It also covers typed lit, reflection, and
+foam propagation, persistent multi-draw and empty pass runs, water-view
+inheritance, legacy marker compatibility, and malformed or mismatched
+view/event/run rejection. Hook coverage separately verifies title-boundary
+event order and Original passthrough. A later one-player Battle run recorded
+186,893 scopes for each pass and 2,915 balanced view-0 pairs with zero marker
+rejection, fingerprint overflow, or within-scope mismatch. Metal private
+reflection depth and the optional shader both activated without fallback.
+Split-screen/view-1 evidence remains deferred.
 
 ### Controlled water GPU benchmark
 

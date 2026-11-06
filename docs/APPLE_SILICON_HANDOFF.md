@@ -186,6 +186,14 @@ rejected even when set to `0`.
 - Metal MSAA remains unsupported pending controlled visual/GPU-time/memory
   evidence. The F1 schema reports that limitation instead of accepting a
   no-op.
+- The current Metal backend is a low-level NV2A renderer: fixed-function
+  lighting and title vertex programs run on the CPU, and Metal receives their
+  projected color/fog/texture outputs rather than a semantic scene, material,
+  light, or world-space geometry contract. The staged investigation and
+  recommended hybrid path are in
+  [LIGHTING_RENDERING.md](LIGHTING_RENDERING.md); representative light,
+  material, shadow, and vertex-program classification is still required
+  before per-pixel lighting or PBR work.
 - Ocean draws carry an explicit, false-positive-safe game-to-executor marker,
   and the default-off realistic preset is implemented and runtime-activated.
   Retail water remains the exact default/fallback. The current marker and

@@ -1,9 +1,10 @@
 # Native feature roadmap
 
 This roadmap records the investigation and implementation status for native
-runtime settings, mouse input, data-driven mods, renderer quality, upstream
-fixes, and water rendering. Retail files, generated code, captures, and
-locally exported definition data remain private and must not be committed.
+runtime settings, mouse input, data-driven mods, renderer quality,
+lighting/rendering modernization, upstream fixes, and water rendering. Retail
+files, generated code, captures, and locally exported definition data remain
+private and must not be committed.
 
 ## Status
 
@@ -17,8 +18,10 @@ locally exported definition data remain private and must not be committed.
 | Adjustable LOD | Implemented | Validate 1x-8x visually in both editions; Original remains fixed at 1x. |
 | Metal filtering | Implemented | Collect oblique water/cliff comparisons and GPU timings for 1x/4x/8x/16x. |
 | Metal MSAA | No-go; synthetic smoke complete | Apple M5 passes 2x/4x/8x synthetic color/depth/resolve, but game-scene attachment ownership and the controlled visual/GPU-time/memory matrix are still required. |
-| Upstream fixes | Registry/source parity verified; one Metal water-backend gap identified | Re-run the offline parity checker whenever upstream changes, and port or explicitly disable the DX11-only distant-water-line fix on Metal. |
-| Realistic water | Optional preset, runtime activation, GPU benchmark, and system research complete; hands-on result is near-Retail | Mark and isolate all three ocean passes, build same-execution A/B capture, then decide whether pass-1 or pass-2 shader work is worthwhile. |
+| Base Metal performance | Clean scale matrix complete; exact private-surface reuse implemented and measured | Replace the remaining per-flip completion wait with bounded, correctness-safe upload/readback ownership, then repeat the 1x/2.25x/4x Battle matrix before changing defaults. |
+| Lighting and renderer modernization | Current path and options mapped | Inventory representative fixed-function, vertex-program, light, material, and shadow use; then pilot an explicitly marked opaque fixed-function family with a semantic Metal lighting contract. |
+| Upstream fixes | Registry/source parity verified; Metal distant-water reflection depth ported | Re-run the offline parity checker whenever upstream changes and retain explicit fallback coverage for the Metal private-depth path. |
+| Realistic water | Three pass boundaries and private reflection depth validated in representative gameplay; later visual phases paused | Resume refraction, absorption, SSR, foam, and modern composition only after the base-performance ownership work is measured. |
 
 ## F1 runtime settings
 
@@ -141,6 +144,36 @@ checks, or visual review are missing. A standalone real-Metal smoke target now
 passes 2x/4x/8x synthetic color, depth/stencil, resolve, and readback on the
 Apple M5, but it is deliberately separate from the game renderer.
 
+## Lighting and renderer modernization
+
+[LIGHTING_RENDERING.md](LIGHTING_RENDERING.md) is the authoritative map of the
+current title-to-NV2A-to-Metal path and the modernization boundary. On Apple
+Silicon, fixed-function lighting and title vertex programs currently run on
+the CPU. Metal receives their projected vertices and color/fog/texture
+outputs, then reproduces the title's texture stages and register combiners.
+It does not receive a general scene, material, light, world-position, normal,
+or shader-readable-depth contract.
+
+The recommended route is a semantic hybrid rather than an immediate renderer
+rewrite:
+
+1. collect representative aggregate fixed-function, vertex-program, light,
+   material, shadow, target, and pass evidence;
+2. close any Retail lighting-state gaps that Blood Wake actually uses;
+3. add explicit title pass/material identities instead of classifying from
+   shader patterns, texture hashes, or addresses;
+4. validate scene-color, depth, linear/HDR, split-screen, and fallback
+   ownership;
+5. pilot per-pixel lighting on one explicitly marked opaque fixed-function
+   family; and
+6. add selective PBR materials only after their geometry, light, shadow,
+   material, color-space, and composition inputs are explicit.
+
+A replacement backend that consumes only the same post-transform NV2A batches
+would still lack high-level semantics. Full renderer replacement remains a
+long-term scene-extraction project and should be considered only after a
+hybrid path proves the required contracts.
+
 ## Water-system research
 
 [WATER_RENDERING.md](WATER_RENDERING.md) is now the authoritative map of the
@@ -157,7 +190,8 @@ fix registry but its implementation is currently DX11-only.
 
 The next safe water work is:
 
-1. explicitly mark all three ocean passes at validated title boundaries;
+1. runtime-validate the newly explicit view and three-pass boundaries in
+   representative single-player and split-screen scenes;
 2. replace separate-run comparisons with same-execution aligned A/B capture;
 3. port or explicitly report the distant-water-line fix as unsupported on
    Metal;
@@ -165,6 +199,14 @@ The next safe water work is:
 5. keep scene color, sampled depth, refraction, absorption, shoreline foam,
    and replacement art out of scope until a new resource/material contract is
    designed and justified.
+
+The marker/executor foundation now has typed water-view begin/end,
+lit/reflection/foam events, persistent pass runs, legacy-lit compatibility,
+pass/view propagation, and fail-closed coverage. Validated title wrappers
+bracket the complete view plus the reflection and foam submission functions,
+while the existing lit event inherits that view. The critical-path task is
+now representative freshly prepared runtime validation; source boundaries and
+synthetic scopes alone are not acceptance evidence.
 
 ## Upstream parity
 

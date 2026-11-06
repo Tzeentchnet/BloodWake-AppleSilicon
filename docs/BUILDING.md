@@ -235,6 +235,19 @@ releases state on completion, focus loss, and shutdown. Reaching `--max-boots`
 is intentionally reported as a non-success outcome even though aggregate
 marker/fingerprint evidence is still printed.
 
+For menu timing that has not yet been made deterministic, use
+`--guided-input-capture` instead of the experimental keyboard hook or a
+synthetic script. The runner exposes two private title-level pads, reads live
+commands appended to `<output-dir>/guided-pad.txt`, and refreshes
+numbered `<output-dir>/guided-frame-NNNNN.bmp` images from the game framebuffer
+every two seconds. This captures only the game picture, not the desktop.
+Commands use the toolkit live-pad syntax, for example `start:500`, `a:250`,
+`down:250`, or `p2-a:250`. The guest log records each command and its measured
+time, plus physical Start/D-pad/A/B press and release transitions, so a
+successful guided pass can be converted into a deterministic script.
+Guided input and `--water-capture` are mutually exclusive because both own the
+framebuffer dump path.
+
 `--water-preset` strictly accepts `retail` or `realistic`, defaults to Retail,
 and discards inherited `BW_METAL_WATER` values. Realistic requires
 `--edition remastered`. After the run, the runner reports how many boots
@@ -312,6 +325,22 @@ realistic --edition remastered` for an explicit optional-water diagnostic.
 Keep the output directory, including logs, saves and any
 guest data, private. A missing sandbox or failed isolation check aborts before
 guest execution.
+
+For a low-instrumentation performance run, use `--frame-timing` without
+`--gpu-audit`. It enables only the Metal completed-flip interval report.
+`--profile` enables the existing approximately 1 kHz native thread sampler;
+`--profile-from` and `--profile-to` bound its per-boot window. Fixed
+`--render-scale 1`, `2.25`, or `4` and `--frame-cap 30`, `60`, or `120` make
+same-scene comparisons explicit. Profiles are written inside the private
+output directory as `profile.txt` or, when relaunches are followed,
+`profile-NNN.txt`. `--profile-callers` additionally attributes sampled system
+waits to the first native frame when frame-pointer unwinding succeeds.
+
+To repeat a gameplay workload without replaying menus, `--save-seed` and
+`--launch-seed` may be supplied together. The former is copied into the new
+isolated save directory with symlinks rejected and strict file/count limits;
+the latter must be a bounded, validated same-title relaunch record. Both
+inputs and all resulting profiles remain private and uncommitted.
 
 `--edition` strictly accepts `original` or `remastered` and defaults to
 `original`; inherited edition values are discarded. After each bounded run,

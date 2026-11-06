@@ -31,14 +31,23 @@ This is still a development build:
   subsystem-owned callbacks, labels restart-required choices, and disables
   unsupported Metal settings with a reason.
 - A versioned in-stream marker now identifies validated ocean submissions and
-  is copied into executor batches without changing retail rendering. A
-  four-boot Remastered diagnostic observed 41,348 markers, 512 scoped ocean
-  batches, and zero rejected markers. A later deterministic three-boot,
-  two-relaunch flow reached gameplay with 12,670 markers, 154 clean scopes,
-  and 297 fingerprinted batches across 10 aggregate hashes, with no marker
-  rejection, table overflow, or within-scope mismatch. Representative
-  calm/storm, lighting, shore, split-screen, reflection, and wake coverage
-  remains outstanding. Remastered now also has an experimental, default-off
+  is copied into executor batches without changing retail rendering. The
+  protocol can now represent water-view begin/end plus lit, reflection, and
+  foam draws and persistent pass runs, carries pass/view identity separately
+  from fingerprints, and still accepts the old lit marker. Validated
+  Remastered wrappers now bracket each title ocean view and every lit,
+  reflection, and foam submission group; Original and invalid contexts execute
+  the title body without markers. A post-fix one-player Battle run recorded
+  186,893 scopes for each pass, 2,915 balanced view-0 pairs, zero rejection,
+  and clean fingerprints. Metal private reflection depth also activated with
+  no fallback, and the 333-test Metal suite passes. Split-screen/view-1
+  validation is deferred. Earlier lit-only diagnostics observed
+  41,348 markers and 512 clean scopes in one four-boot run; a later
+  deterministic run observed 12,670 markers, 154 clean scopes, and 297
+  fingerprinted batches across 10 aggregate hashes with no rejection,
+  overflow, or within-scope mismatch. Representative calm/storm, lighting,
+  shore, split-screen, reflection, and wake coverage remains outstanding.
+  Remastered now also has an experimental, default-off
   realistic-water preset. It selects a separate Metal fragment pipeline only
   for supported marked ocean batches, preserves retail alpha, and falls back
   per batch; Retail remains the exact default for every unmarked or
@@ -74,7 +83,7 @@ This is still a development build:
   audible.
 - USB gamepads, physical-controller support, and broad mission, save, FMV,
   and edition coverage are incomplete.
-- Current regression results include 322/322 Metal backend tests, all 62
+- Current regression results include 333/333 Metal backend tests, all 62
   presenter CTest entries (including the real-window AppKit case in the
   current WindowServer session), 35/35 MMIO host tests, 8/8 normal and ASan/UBSan
   macOS host tests, 11/11 input integration tests, 6/6 APU/audio tests,
@@ -90,10 +99,21 @@ This is still a development build:
   with the headless audio sink, it completed three private boots and two
   validated relaunches, reached ocean rendering, and stopped at the configured
   boot limit. Default physical input and CoreAudio behavior are unchanged.
-- Controlled wall-clock FPS, frame-time percentiles, and memory use have not
-  yet been measured for the current 4x path. Historical 640x480 measurements
-  remain in the validation record and must not be applied to this version;
-  formal visual reference comparison also remains outstanding.
+- Clean seeded Battle runs now establish the base-performance envelope without
+  GPU audit or BMP capture. Fixed 1x reaches about 31-32 FPS with a 17.2 ms
+  median GPU command; 2.25x reaches about 28-30 FPS with a 20.1-20.4 ms
+  median; and 4x reaches about 15.8 FPS with a 48.25 ms median. Native
+  sampling shows the guest blocked in `bw_flush_wait` and the Metal worker
+  blocked in `finish_command`, so lower scales lose substantial time to
+  serialized CPU/GPU execution. The measured 4x GPU work alone cannot fit a
+  60 FPS budget. The first ownership-safe optimization now reuses cached
+  private color targets only after an exact guest-memory comparison. Clean
+  repeats recorded thousands of target reuses and one forced guest reseed per
+  run; the first 4x median improved to 43.38 ms GPU / 56.75 ms wall, although
+  later sustained windows reached 50.27 ms / 65.24 ms. Correct bounded
+  asynchronous ownership remains the renderer priority; render-scale and
+  frame-cap defaults have not been changed.
+  Precise power/thermal and formal visual-reference measurements remain open.
 
 See [Apple Silicon status](docs/APPLE_SILICON_HANDOFF.md),
 [work completed](docs/WORK_COMPLETED.md), and
@@ -178,6 +198,13 @@ are in [BUILDING.md](docs/BUILDING.md).
 - [WATER_RENDERING.md](docs/WATER_RENDERING.md) - Blood Wake water simulation
   boundaries, three-pass Retail renderer, Metal shader inputs, and safe future
   work
+- [NEWWATER.md](NEWWATER.md) - modern water architecture and phased
+  implementation plan
+- [NEWWATER_TODO.md](NEWWATER_TODO.md) - dependency-aware modern water task
+  tracker and validation status
+- [LIGHTING_RENDERING.md](docs/LIGHTING_RENDERING.md) - current title/NV2A/
+  Metal lighting path, available shader semantics, and staged real-time
+  lighting, PBR, and renderer-replacement options
 - [GPU_CAPTURE.md](docs/GPU_CAPTURE.md) - synthetic capture fixture
 - [GUEST_MEMORY_INVENTORY.md](docs/GUEST_MEMORY_INVENTORY.md) - memory-access
   inventory

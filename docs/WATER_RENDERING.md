@@ -1,6 +1,6 @@
 # Blood Wake water rendering
 
-Updated 2026-11-03.
+Updated 2026-11-05.
 
 This document is the source-grounded map of Blood Wake's water system for the
 Apple Silicon port. It separates simulation from presentation, records what
@@ -156,31 +156,55 @@ by title-provided vertex alpha. The Remastered distant-wake fix rebuilds
 incorrect lower mip alpha from the correct top level; it changes distant foam,
 not wave geometry, sea color, or the sky.
 
-The pass's complete Metal state family has not yet been explicitly marked and
-catalogued. Future foam work must first classify it without relying on texture
-names, addresses, hashes, or broad stage-pattern guesses.
+The pass now has an explicit title-level submission boundary and semantic
+marker. Its complete Metal state family has not yet been catalogued.
+Replacement foam work must use that boundary rather than texture names,
+addresses, hashes, or broad stage-pattern guesses.
 
 ## 3. From the title to Metal
 
-### Explicit ocean marker
+### Explicit water marker protocol
 
-The classifier is a versioned command in the title's own graphics stream:
+The classifier uses versioned commands in the title's own graphics stream:
 
-1. The validated `Ocean_FillVertices` render call completes.
-2. [`bw_hifps_hooks.c`](../src/bw_hifps_hooks.c) emits a tagged GPU no-op
-   before the caller resumes and submits the corresponding tile.
-3. The executor in
-   [`nv2a_pb_exec.c`](../src/toolkit_patches/kernel/nv2a_pb_exec.c) sees the
-   command in draw order and arms only the next `BEGIN/END` scope.
-4. Every extended batch produced synchronously by that scope receives
-   `BW_X_DRAW_MARKER_OCEAN`.
-5. The marker is cleared at `END`, and any unconsumed state is cleared at the
-   frame boundary.
+1. The title's split-view loop stores its current one-based view ordinal and
+   calls the complete ocean renderer once for that view.
+2. [`bw_water_hooks.c`](../src/bw_water_hooks.c) validates that call context,
+   converts the ordinal to zero-based protocol identity, and brackets the
+   complete call with view begin/end events.
+3. The validated `Ocean_FillVertices` path still emits a one-shot lit/base
+   event through [`bw_hifps_hooks.c`](../src/bw_hifps_hooks.c).
+4. Separate validated wrappers bracket the title's reflection and foam
+   submission functions with persistent pass-run begin/end events. Each
+   generated body always executes; marker emission is Remastered-only and
+   also requires the expected title object, call site, pass enable, tile
+   count, and draw root.
+5. The executor in
+   [`nv2a_pb_exec.c`](../src/toolkit_patches/kernel/nv2a_pb_exec.c) applies a
+   one-shot event to only the next `BEGIN/END` scope, or a pass run to every
+   scope until its matching end.
+6. Every classified extended batch receives `BW_X_DRAW_MARKER_OCEAN` plus a
+   versioned `BwXWaterDraw` containing the pass and inherited view.
+7. Draw state clears at `END`; unconsumed one-shots, active runs, and open
+   views reject and clear at the frame boundary.
 
 Repeated identical current-version markers may coalesce before one later draw.
-Unknown versions, conflicting markers, markers inside a draw, nested scopes,
-unmatched ends, frame carry-over, and marked draws that produce no extended
-batch are rejected explicitly. Rejection leaves the draw on Retail.
+The exact old version-1 ocean marker remains accepted as a legacy lit event.
+Unknown versions/events, payload misuse, conflicting markers, markers inside a
+draw, nested or mismatched water views or pass runs, one-shot events inside a
+run, unmatched ends, frame carry-over, and one-shot marked draws that produce
+no extended batch are rejected explicitly. Empty `BEGIN/END` scopes inside a
+valid persistent pass run are accepted because the title emits them during
+real reflection/foam gameplay. Rejection leaves the draw on Retail.
+
+Executor tests cover persistent multi-draw runs, empty runs and empty scopes
+within runs, all three passes, four-view inheritance, and fail-closed
+recovery. Hook tests cover exact event order, Original passthrough, disabled
+and empty passes, invalid views, and guest register/stack preservation. A
+freshly prepared one-player Battle run demonstrated sustained gameplay,
+nonzero scopes for all three passes, and balanced view-0 counts. A post-fix
+repeat must still demonstrate zero rejection before the runtime boundary task
+is accepted; view-1 validation is a later non-blocking protocol check.
 
 The marker is authoritative because it originates at a validated title
 boundary and travels in command order. A register-combiner pattern is not
@@ -211,7 +235,7 @@ GPU backend the inputs consumed by the Retail NV2A pixel path:
 - dot-product mapping and earlier-stage selection;
 - blend, depth, stencil, cull, alpha-test, and color-mask state;
 - fog color; and
-- the scoped draw marker.
+- the scoped compatibility marker and versioned water pass/view identity.
 
 The contract is borrowed synchronously. It does not provide world-space
 position, a material database, scene-color history, motion vectors, or a
@@ -378,14 +402,17 @@ replacement would be a separate policy decision and is out of scope here.
 | Retail dot/cube reflection | Translates NV2A reflection stages | Implemented in Metal |
 | Metal anisotropy | Eligible linear, mipmapped stages only | Implemented |
 | Optional Realistic pass-1 treatment | Separate marked fragment pipeline | Implemented, experimental, default-off |
-| Distant-water reflection line | Private-depth gating of pass 2 overlap | **DX11-only; not implemented by Metal** |
+| Distant-water reflection line | Private-depth gating of pass 2 overlap | Implemented in DX11 and Metal |
 
-The last row is an important parity distinction. The upstream registry and
-settings entry are present, so source-registry parity checks pass, but the
-effect itself lives in the DX11 backend. Enabling its registry switch does not
-make the Metal backend perform the depth-copy/reflection test. It must be
-ported or explicitly reported as unavailable before Apple Silicon can claim
-behavioral parity for that fix.
+Metal copies authoritative scene depth into a private
+`Depth32Float_Stencil8` target once per validated water view. Lit groups prime
+nearest-water depth with `LESS_EQUAL`, depth writes, and the DX11-compatible
+additional bias; reflection groups use that private depth with writes
+disabled. Foam preserves the view-level snapshot for the next group, while
+clears, flips, basic/non-water draws, target changes, view changes, and backend
+stop reset its lifetime. Scene depth and stencil are never modified. Failure
+disables the optional fix for that backend lifetime and continues with Retail
+reflection depth.
 
 ## 8. Safe improvement opportunities
 
@@ -398,15 +425,13 @@ These are the safest next investigations:
 2. **Build same-execution A/B capture.** Alternate one isolated treatment
    within a single bounded run and pair adjacent stable frames. Separate runs
    drift too much for pixel comparison.
-3. **Port the distant-water-line fix to Metal.** Reproduce the DX11 private
-   depth-copy design without writing the scene's authoritative depth.
-4. **Re-evaluate pass-1 shaping.** Treat stage 0 as a water sample, not as the
+3. **Re-evaluate pass-1 shaping.** Treat stage 0 as a water sample, not as the
    complete sky reflection, and tune only after representative pass-isolated
    evidence.
-5. **Prototype optional pass-2 shaping.** Once pass 2 is explicitly marked,
+4. **Prototype optional pass-2 shaping.** Once pass 2 is explicitly marked,
    adjust the existing cube result with the title's own normal/view basis.
    Keep alpha, pass order, and fallback exact.
-6. **Measure anisotropy on actual water stages.** Record which stages are
+5. **Measure anisotropy on actual water stages.** Record which stages are
    linear and mipmapped before expecting a visible difference.
 
 Every item remains default-off until Retail isolation, representative visual
@@ -476,8 +501,11 @@ The existing ABBA benchmark and its limits are documented in
   selection, frame-boundary activation, unmarked recovery, unsupported-state
   fallback, Original rejection, and pipeline-failure fallback.
 - Bounded private runs prove that the explicit marker and optional pipeline
-  activate in real gameplay without observed marker rejection or unsupported
-  marked-pass fallback in the exercised scene.
+  activate on the earlier lit-only runtime path without observed marker
+  rejection or unsupported marked-pass fallback in the exercised scene.
+- Source and synthetic tests prove the new view, reflection-run, and foam-run
+  lifecycle. Those new events do not yet have representative private runtime
+  acceptance evidence.
 - The controlled ABBA benchmark records a measurable whole-command-buffer
   cost for the optional shader. It is not isolated fragment cost.
 - The user's hands-on assessment is that the current treatment looks almost
@@ -491,8 +519,8 @@ The existing ABBA benchmark and its limits are documented in
 
 ## 11. Open research questions
 
-1. Which validated title boundary can mark passes 2 and 3 without relying on
-   stage-program pattern matching?
+1. Do freshly prepared single-player and split-screen runs report balanced
+   view scopes, nonzero counts for all three passes, and zero rejection?
 2. What is the precise channel role of the pass-1 stage-0 sample across every
    animated water frame and weather state?
 3. Which pass-1 and pass-2 interpolants are stable semantic inputs across all
@@ -513,7 +541,9 @@ The existing ABBA benchmark and its limits are documented in
 ## 12. Code and documentation map
 
 - [`src/bw_hifps_hooks.c`](../src/bw_hifps_hooks.c): water render
-  interpolation/cache and marker emission.
+  interpolation and cache.
+- [`src/bw_water_hooks.c`](../src/bw_water_hooks.c): validated per-view,
+  lit-run, reflection-run, and foam-run marker boundaries.
 - [`src/bw_ocean_native.c`](../src/bw_ocean_native.c): exact native
   render-vertex evaluation and diagnostic pass research.
 - [`src/bw_visextra_hooks.c`](../src/bw_visextra_hooks.c): split-screen sea
@@ -529,7 +559,7 @@ The existing ABBA benchmark and its limits are documented in
 - [`src/gpu/bw_rc_hlsl.c`](../src/gpu/bw_rc_hlsl.c): DX11 reference
   translation for NV2A texture stages and register combiners.
 - [`src/gpu/bw_d3d11.c`](../src/gpu/bw_d3d11.c): Retail reflection reference
-  and the currently DX11-only distant-water-line fix.
+  and the original distant-water-line fix design.
 - [`src/bw_settings.c`](../src/bw_settings.c): user-facing water, filtering,
   split-detail, and visual-fix settings.
 - [Metal quality settings](METAL_QUALITY.md): current optional-preset behavior

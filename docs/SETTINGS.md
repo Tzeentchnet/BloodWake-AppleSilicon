@@ -591,10 +591,11 @@ Applies to: Remastered. Default: **On**.
 | On (default) | `fix:+OCEAN_REFLECT_SINGLE` |
 | As shipped | `fix:-OCEAN_REFLECT_SINGLE` |
 
-Current Apple Silicon limitation: the private-depth implementation of this
-fix exists only in the DX11 backend. The registry choice is present on macOS,
-but Metal does not yet apply the fix. This parity gap is tracked in
-[WATER_RENDERING.md](WATER_RENDERING.md).
+On Metal, the fix copies authoritative scene depth once per validated water
+view, primes a private depth target from lit water geometry, and tests the
+reflection pass against its nearest layer. Scene depth and stencil remain
+unchanged. Allocation, copy, pipeline, or state failure logs the reason and
+falls back to the shipped reflection behavior for that backend lifetime.
 
 ## Controls
 

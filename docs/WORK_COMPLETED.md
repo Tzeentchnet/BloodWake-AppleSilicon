@@ -118,6 +118,12 @@ test coverage are in [VALIDATION.md](VALIDATION.md).
   shader inputs, optional-preset limits, mechanics-safe opportunities, and
   open evidence questions. It records that the current treatment is
   intentionally subtle and that the distant-water-line fix remains DX11-only.
+- Added the source-grounded
+  [lighting/rendering dossier](LIGHTING_RENDERING.md), tracing title scene
+  ownership through CPU fixed-function/vertex-program evaluation and Metal
+  combiner rendering, inventorying missing PBR semantics, and defining a
+  staged semantic-hybrid path from Retail fidelity through per-pixel lighting
+  and selective PBR before any full renderer replacement.
 
 ## Renderer performance
 
