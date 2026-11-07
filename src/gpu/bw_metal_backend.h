@@ -127,11 +127,18 @@ BwMetalWaterPreset bw_metal_backend_water_preset(void);
  * opt into capture of at most 128 successful canonical draw keys. The backend
  * writes a deterministic owner-only device-local artifact atomically at frame
  * boundaries. BW_METAL_PIPELINE_WARMUP may name such an artifact to validate
- * and preload its exact states before the first draw. Both options are unset
- * by default. Missing, stale, corrupt, invalid, or failed warm-up data emits
- * bounded bloodwake.metal-pipeline-warmup/v1 aggregate JSONL and uses the
- * unchanged synchronous runtime path. Reports never contain paths, keys,
- * descriptors, function constants, addresses, or texture identities.
+ * and preload its exact states before the first draw. A compatible preload
+ * also enables a 32-entry coalescing queue for untraced specialized misses:
+ * the existing exact generic extended shader renders while Metal specializes
+ * and creates the requested state asynchronously, and only the serial executor
+ * installs completed states. Stop waits for callbacks before releasing their
+ * state. Failures remain explicit and retain the generic path. The bounded
+ * bloodwake.metal-pipeline-async/v1 report contains aggregate counts and
+ * timing only. Both options are unset by default. Missing, stale, corrupt,
+ * invalid, or failed warm-up data emits bounded
+ * bloodwake.metal-pipeline-warmup/v1 aggregate JSONL and uses the unchanged
+ * synchronous runtime path. Reports never contain paths, keys, descriptors,
+ * function constants, addresses, or texture identities.
  * Up to 32 exact colour-surface descriptions are cached. Ordinary target
  * switches retain each touched private generation in the current submission;
  * presentation commits them together in queue order, while eight switches
@@ -194,20 +201,40 @@ typedef struct {
     uint64_t trace_write_failures;
 } BwMetalPipelineWarmupSnapshot;
 
+typedef struct {
+    int requested, enabled, initialization_failed;
+    size_t entries, pending, ready, failed, capacity;
+    uint64_t scheduled, coalesced_misses, generic_fallback_draws;
+    uint64_t installed, function_failures, pipeline_failures;
+    uint64_t allocation_failures, capacity_fallbacks;
+    uint64_t function_timed, function_total_ns, function_max_ns;
+    uint64_t pipeline_timed, pipeline_total_ns, pipeline_max_ns;
+    uint64_t timing_unavailable, timing_non_monotonic;
+} BwMetalPipelineAsyncSnapshot;
+
 void bw_metal_test_pipeline_diagnostic_snapshot(
     BwMetalPipelineDiagnosticSnapshot *snapshot);
 void bw_metal_test_pipeline_warmup_snapshot(
     BwMetalPipelineWarmupSnapshot *snapshot);
+void bw_metal_test_pipeline_async_snapshot(
+    BwMetalPipelineAsyncSnapshot *snapshot);
 void bw_metal_test_pipeline_diagnostic_clear(void);
 void bw_metal_test_pipeline_diagnostic_inject_cache_miss(uint64_t key_hash,
                                                          uint32_t frame);
 void bw_metal_test_fail_next_pipeline_allocation(void);
 void bw_metal_test_fail_warmup_pipeline(void);
+void bw_metal_test_hold_async_pipeline_install(int hold);
+void bw_metal_test_drain_async_pipelines(void);
+void bw_metal_test_async_pipeline_failures(int allocation,
+                                           int function,
+                                           int pipeline);
 void bw_metal_test_shader_library_failures(int offline_library,
                                            int source_library);
 const char *bw_metal_test_shader_source_sha256(void);
 int bw_metal_test_pipeline_diagnostic_format_event(char *buffer, size_t size);
 int bw_metal_test_pipeline_diagnostic_format_summary(char *buffer, size_t size);
+int bw_metal_test_pipeline_async_format_summary(char *buffer, size_t size,
+                                                int final);
 #endif
 
 #ifdef __cplusplus

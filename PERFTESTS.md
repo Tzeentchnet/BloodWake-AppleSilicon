@@ -395,12 +395,11 @@ steady-state rewrites.
 
 ### 1. Pipeline lifecycle, warm-up, and archives
 
-The backend currently compiles its stable Metal library from source and
-creates new function-constant specializations and render pipeline states
-synchronously. Its in-memory draw-pipeline cache also clears all entries when
-it reaches 128 states. The current evidence does not establish which
-operation caused each 296-330 ms maximum or whether the cache limit was
-reached, so instrumentation comes first.
+The backend loads its stable Metal library offline when available and retains
+identical-source compilation as an explicit fallback. Validated trace-derived
+states preload synchronously before the first draw; compatible preloads enable
+bounded asynchronous handling for untraced specializations. The in-memory
+draw-pipeline cache still clears all entries when it reaches 128 states.
 
 The first active task records:
 
@@ -597,13 +596,63 @@ whether startup preload time warrants the separately contract-defined kind-2
 archive; it must not be added speculatively or shipped from retail-derived
 data.
 
+#### PERF-032 implementation evidence
+
+A fully compatible `BW_METAL_PIPELINE_WARMUP` artifact is the existing opt-in
+boundary for asynchronous rare misses. An absent or rejected artifact leaves
+the original synchronous path unchanged. After a compatible preload,
+an untraced specialized key immediately creates or reuses the existing generic
+extended pipeline. That generic shader evaluates the same dynamic texture,
+stage, dot, combiner, final-combiner, and alpha routing that the specialized
+function constants freeze, so rendering remains exact while Metal executes
+`newFunctionWithName:constantValues:completionHandler:` followed by
+asynchronous render-pipeline creation.
+
+Pending, ready, and failed entries share one fixed 32-entry bound and coalesce
+by the unchanged canonical key. Metal callbacks hold their descriptor and
+result but never touch the renderer-owned dictionary. A lock-protected handoff
+lets the serial renderer install ready states at draw or flip boundaries.
+Successful entries leave the handoff queue; failed entries remain retained to
+prevent silent retry. Stop waits on a dispatch group, drains completion state,
+then releases the shader library and device. The measured 128-entry draw cache
+and its whole-cache reset rule are unchanged because PERF-028 reached only 25
+entries and zero resets.
+
+Failures do not become missing or stale success: the exact generic state
+continues rendering, a bounded human-readable warning identifies allocation,
+function, or pipeline failure, and
+`bloodwake.metal-pipeline-async/v1` reports aggregate occupancy, scheduled and
+coalesced misses, generic fallback draws, installations, stage-specific
+failures, capacity fallbacks, and separate specialization/pipeline timing.
+Output is capped at 16 summaries and contains no path, key/hash, descriptor,
+combiner word, function constant, texture identity, address, or other
+retail-derived field. With lifecycle timing enabled, asynchronous
+specialization and pipeline durations also retain canonical-key hashes and
+frame/role classification under the existing privacy contract.
+
+Ten focused scenarios cover default-disabled behavior, exact generic output,
+successful asynchronous completion and later specialized reuse, duplicate
+coalescing, allocation/function/pipeline failure, the 32-entry bound and
+unchanged 128-entry cache policy, stable machine output and prohibited-field
+absence, stop with outstanding work, and restart isolation. The two focused
+CTest selectors pass 2/2 normally, 2/2 under ASan/UBSan, and 2/2 under
+ThreadSanitizer; the integration selector executes all artifact and async
+subcases against real Metal APIs. The complete Metal backend suite passes
+363/363. Strict Objective-C warnings pass and the production offline-library
+target rebuilds. The changed strict-C test translation unit compiles cleanly;
+the aggregate strict-C target then stops on a pre-existing `-Wcomment` error
+in the pinned toolkit's `kernel.h`.
+
+These are implementation and real-API mechanics results, not cold gameplay
+qualification. No physical controller is available, so the title remains
+paused behind its reconnect overlay; no paused-run maximum or trace coverage
+advances PERF-033.
+
 The remaining implementation sequence is:
 
-1. compile rare misses asynchronously while the exact generic Retail pipeline
-   remains available; and
-2. replace whole-cache eviction only if measured state pressure requires it;
-3. capture a representative gameplay trace with a connected controller; and
-4. qualify cold behavior and evaluate a kind-2 Metal binary archive only if
+1. capture a representative gameplay trace with a connected controller;
+2. qualify cold behavior; and
+3. evaluate a kind-2 Metal binary archive only if
    measured startup preload time requires it.
 
 This follows Apple's current

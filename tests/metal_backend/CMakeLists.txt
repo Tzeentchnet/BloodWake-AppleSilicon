@@ -130,6 +130,7 @@ foreach(case semaphore-release semaphore-concurrent visual
              pipeline-diagnostic-library-fallback
              pipeline-diagnostic-library-failure
              pipeline-warmup-disabled pipeline-warmup-invalid
+             pipeline-async-disabled
              depth-draw stencil-draw polygon-offset polygon-offset-disabled polygon-offset-zero
              partial-color partial-color-masks partial-color-default-rect partial-clip partial-empty
              partial-depth partial-depth-seed partial-depth-empty partial-depth-unbound

@@ -52,6 +52,9 @@ extern uint64_t xbox_HostNowNs(void);
 #define METAL_PIPELINE_SCHEMA "bloodwake.metal-pipeline-lifecycle/v2"
 #define METAL_PIPELINE_WARMUP_SCHEMA "bloodwake.metal-pipeline-warmup/v1"
 #define METAL_PIPELINE_WARMUP_REPORT_CAPACITY 16u
+#define METAL_PIPELINE_ASYNC_SCHEMA "bloodwake.metal-pipeline-async/v1"
+#define METAL_PIPELINE_ASYNC_CAPACITY 32u
+#define METAL_PIPELINE_ASYNC_REPORT_CAPACITY 16u
 #define METAL_PIPELINE_FEATURE_LEVEL 1u
 #if defined(BW_METAL_TESTING)
 #define METAL_WATER_BENCHMARK_WARMUP_FRAMES 1u
@@ -216,6 +219,32 @@ typedef struct {
     int identity_ready, trace_dirty, trace_disabled, final_reported;
 } MetalPipelineWarmup;
 
+typedef enum {
+    METAL_ASYNC_PIPELINE_SPECIALIZING,
+    METAL_ASYNC_PIPELINE_COMPILING,
+    METAL_ASYNC_PIPELINE_READY,
+    METAL_ASYNC_PIPELINE_FAILED,
+    METAL_ASYNC_PIPELINE_FAILED_REPORTED,
+} MetalAsyncPipelineState;
+
+typedef enum {
+    METAL_ASYNC_FAILURE_NONE,
+    METAL_ASYNC_FAILURE_ALLOCATION,
+    METAL_ASYNC_FAILURE_FUNCTION,
+    METAL_ASYNC_FAILURE_PIPELINE,
+} MetalAsyncPipelineFailure;
+
+typedef struct {
+    int requested, enabled, initialization_failed;
+    int dirty, final_reported;
+    unsigned reports;
+    uint64_t scheduled, coalesced_misses, generic_fallback_draws;
+    uint64_t installed, function_failures, pipeline_failures;
+    uint64_t allocation_failures, capacity_fallbacks;
+    MetalPipelineTimingAggregate function, pipeline;
+    uint64_t timing_unavailable, timing_non_monotonic;
+} MetalAsyncPipelineDiagnostic;
+
 typedef struct {
     uint32_t depth_test, depth_func, depth_write, stencil_enable;
     uint32_t stencil_func, stencil_func_mask, stencil_write_mask;
@@ -231,6 +260,22 @@ typedef struct {
     uint32_t physical_width, physical_height;
     uint32_t format, bytes_per_pixel, aa_sx, aa_sy, scale_epoch;
 } MetalColorSurfaceKey;
+
+@interface BWMetalAsyncPipelineEntry : NSObject {
+@public
+    MetalPipelineKey key;
+    NSData *cache_key;
+    id<MTLRenderPipelineState> state;
+    uint64_t key_hash;
+    uint64_t function_start_ns, function_end_ns;
+    uint64_t pipeline_start_ns, pipeline_end_ns;
+    uint32_t frame;
+    MetalAsyncPipelineState status;
+    MetalAsyncPipelineFailure failure;
+}
+@end
+@implementation BWMetalAsyncPipelineEntry
+@end
 
 @interface BWMetalColorSurface : NSObject {
 @public
@@ -375,6 +420,10 @@ static uint64_t s_queue_saturation_waits;
 static uint64_t s_queue_saturation_wait_ns;
 static unsigned s_queue_depth_high_water;
 static MetalPipelineWarmup s_pipeline_warmup;
+static MetalAsyncPipelineDiagnostic s_async_pipeline_diagnostic;
+static NSMutableArray<BWMetalAsyncPipelineEntry *> *s_async_pipelines;
+static NSLock *s_async_pipeline_lock;
+static dispatch_group_t s_async_pipeline_group;
 static NSMutableDictionary<NSData *, id<MTLRenderPipelineState>> *s_pipelines;
 static NSMutableDictionary<NSNumber *, id<MTLRenderPipelineState>> *s_clear_pipelines;
 static NSMutableDictionary<NSData *, BWMetalColorSurface *> *s_color_surfaces;
@@ -414,6 +463,10 @@ static int s_test_fail_next_pipeline_allocation;
 static int s_test_fail_warmup_pipeline;
 static int s_test_fail_offline_library;
 static int s_test_fail_source_library;
+static int s_test_hold_async_pipeline_install;
+static int s_test_fail_async_pipeline_allocation;
+static int s_test_fail_async_function;
+static int s_test_fail_async_pipeline;
 #endif
 static id<MTLTexture> s_surface;
 static id<MTLTexture> s_inactive_texture;
@@ -490,6 +543,8 @@ static void set_draw_state(id<MTLRenderCommandEncoder> encoder,
 static int preserve_depth_surfaces(void);
 static int publish_all_dirty_color_surfaces(void);
 static int metal_fail(const char *format, ...);
+static void pipeline_async_drain(int force);
+static void pipeline_async_report(int final);
 
 static uint64_t pipeline_key_hash(uint64_t domain, const void *bytes, size_t length)
 {
@@ -682,6 +737,47 @@ static void pipeline_diagnostic_finish(
         .wall_timing_status = role == METAL_PIPELINE_ROLE_STARTUP
                             ? METAL_PIPELINE_TIMING_NOT_APPLICABLE
                             : METAL_PIPELINE_TIMING_PENDING,
+    });
+}
+
+static void pipeline_diagnostic_record_elapsed(
+    MetalPipelineEventKind kind, uint64_t key_hash, uint32_t frame,
+    MetalPipelineStatus status, uint64_t start_ns, uint64_t end_ns)
+{
+    if (!s_pipeline_diagnostic.enabled)
+        return;
+    MetalPipelineTimingAggregate *aggregate =
+        pipeline_timing_aggregate(kind);
+    MetalPipelineTimingStatus timing_status;
+    uint64_t duration = 0;
+    if (aggregate)
+        aggregate->attempts++;
+    if (!start_ns || !end_ns) {
+        timing_status = METAL_PIPELINE_TIMING_UNAVAILABLE;
+        s_pipeline_diagnostic.timing_unavailable++;
+    } else if (end_ns <= start_ns) {
+        timing_status = METAL_PIPELINE_TIMING_NON_MONOTONIC;
+        s_pipeline_diagnostic.timing_non_monotonic++;
+    } else {
+        timing_status = METAL_PIPELINE_TIMING_OK;
+        duration = end_ns - start_ns;
+        if (aggregate) {
+            aggregate->timed++;
+            if (UINT64_MAX - aggregate->total_ns >= duration)
+                aggregate->total_ns += duration;
+            if (duration > aggregate->max_ns)
+                aggregate->max_ns = duration;
+        }
+    }
+    pipeline_diagnostic_store((MetalPipelineEvent){
+        .key_hash = key_hash,
+        .duration_ns = duration,
+        .frame = frame,
+        .kind = kind,
+        .role = METAL_PIPELINE_ROLE_RENDER,
+        .status = status,
+        .timing_status = timing_status,
+        .wall_timing_status = METAL_PIPELINE_TIMING_PENDING,
     });
 }
 
@@ -997,11 +1093,135 @@ static void pipeline_warmup_report_trace(int final)
         s_pipeline_warmup.final_reported = 1;
 }
 
+static void pipeline_async_reset(void)
+{
+    memset(&s_async_pipeline_diagnostic, 0,
+           sizeof s_async_pipeline_diagnostic);
+    s_async_pipelines = nil;
+    s_async_pipeline_lock = nil;
+    s_async_pipeline_group = nil;
+}
+
+static void pipeline_async_state_counts(
+    size_t *entries, size_t *pending, size_t *ready, size_t *failed)
+{
+    size_t entry_count = 0, pending_count = 0;
+    size_t ready_count = 0, failed_count = 0;
+    [s_async_pipeline_lock lock];
+    entry_count = s_async_pipelines.count;
+    for (BWMetalAsyncPipelineEntry *entry in s_async_pipelines) {
+        if (entry->status == METAL_ASYNC_PIPELINE_SPECIALIZING ||
+            entry->status == METAL_ASYNC_PIPELINE_COMPILING)
+            pending_count++;
+        else if (entry->status == METAL_ASYNC_PIPELINE_READY)
+            ready_count++;
+        else if (entry->status == METAL_ASYNC_PIPELINE_FAILED ||
+                 entry->status == METAL_ASYNC_PIPELINE_FAILED_REPORTED)
+            failed_count++;
+    }
+    [s_async_pipeline_lock unlock];
+    if (entries)
+        *entries = entry_count;
+    if (pending)
+        *pending = pending_count;
+    if (ready)
+        *ready = ready_count;
+    if (failed)
+        *failed = failed_count;
+}
+
+static int pipeline_async_format_summary(
+    char *buffer, size_t size, int final)
+{
+    size_t entries = 0, pending = 0, ready = 0, failed = 0;
+    if (!buffer || !size)
+        return 0;
+    pipeline_async_state_counts(&entries, &pending, &ready, &failed);
+    int written = snprintf(
+        buffer, size,
+        "{\"schema\":\"" METAL_PIPELINE_ASYNC_SCHEMA "\","
+        "\"record\":\"summary\",\"requested\":%s,\"enabled\":%s,"
+        "\"entry_capacity\":%u,\"entries\":%zu,\"pending\":%zu,"
+        "\"ready\":%zu,\"failed_retained\":%zu,\"scheduled\":%llu,"
+        "\"coalesced_misses\":%llu,\"generic_fallback_draws\":%llu,"
+        "\"installed\":%llu,\"function_failures\":%llu,"
+        "\"pipeline_failures\":%llu,\"allocation_failures\":%llu,"
+        "\"capacity_fallbacks\":%llu,\"function_timed\":%llu,"
+        "\"function_total_ns\":%llu,\"function_max_ns\":%llu,"
+        "\"pipeline_timed\":%llu,\"pipeline_total_ns\":%llu,"
+        "\"pipeline_max_ns\":%llu,\"timing_unavailable\":%llu,"
+        "\"timing_non_monotonic\":%llu,\"initialization_failed\":%s,"
+        "\"final\":%s}",
+        s_async_pipeline_diagnostic.requested ? "true" : "false",
+        s_async_pipeline_diagnostic.enabled ? "true" : "false",
+        METAL_PIPELINE_ASYNC_CAPACITY, entries, pending, ready, failed,
+        (unsigned long long)s_async_pipeline_diagnostic.scheduled,
+        (unsigned long long)s_async_pipeline_diagnostic.coalesced_misses,
+        (unsigned long long)
+            s_async_pipeline_diagnostic.generic_fallback_draws,
+        (unsigned long long)s_async_pipeline_diagnostic.installed,
+        (unsigned long long)s_async_pipeline_diagnostic.function_failures,
+        (unsigned long long)s_async_pipeline_diagnostic.pipeline_failures,
+        (unsigned long long)s_async_pipeline_diagnostic.allocation_failures,
+        (unsigned long long)s_async_pipeline_diagnostic.capacity_fallbacks,
+        (unsigned long long)s_async_pipeline_diagnostic.function.timed,
+        (unsigned long long)s_async_pipeline_diagnostic.function.total_ns,
+        (unsigned long long)s_async_pipeline_diagnostic.function.max_ns,
+        (unsigned long long)s_async_pipeline_diagnostic.pipeline.timed,
+        (unsigned long long)s_async_pipeline_diagnostic.pipeline.total_ns,
+        (unsigned long long)s_async_pipeline_diagnostic.pipeline.max_ns,
+        (unsigned long long)s_async_pipeline_diagnostic.timing_unavailable,
+        (unsigned long long)s_async_pipeline_diagnostic.timing_non_monotonic,
+        s_async_pipeline_diagnostic.initialization_failed ? "true" : "false",
+        final ? "true" : "false");
+    return written >= 0 && (size_t)written < size;
+}
+
+static void pipeline_async_report(int final)
+{
+    char line[METAL_PIPELINE_REPORT_LINE_MAX];
+    unsigned limit = final ? METAL_PIPELINE_ASYNC_REPORT_CAPACITY
+                           : METAL_PIPELINE_ASYNC_REPORT_CAPACITY - 1u;
+    if (!s_async_pipeline_diagnostic.requested ||
+        (!final && !s_async_pipeline_diagnostic.dirty) ||
+        s_async_pipeline_diagnostic.reports >= limit ||
+        (final && s_async_pipeline_diagnostic.final_reported))
+        return;
+    if (pipeline_async_format_summary(line, sizeof line, final))
+        fprintf(stderr, "%s\n", line);
+    s_async_pipeline_diagnostic.reports++;
+    s_async_pipeline_diagnostic.dirty = 0;
+    if (final)
+        s_async_pipeline_diagnostic.final_reported = 1;
+}
+
+static int pipeline_async_enable(void)
+{
+    s_async_pipeline_diagnostic.requested = 1;
+    s_async_pipeline_lock = [NSLock new];
+    s_async_pipelines = [[NSMutableArray alloc]
+        initWithCapacity:METAL_PIPELINE_ASYNC_CAPACITY];
+    s_async_pipeline_group = dispatch_group_create();
+    if (!s_async_pipeline_lock || !s_async_pipelines ||
+        !s_async_pipeline_group) {
+        s_async_pipeline_diagnostic.initialization_failed = 1;
+        s_async_pipeline_diagnostic.dirty = 1;
+        fprintf(stderr,
+                "[GPU-METAL] asynchronous specialized-pipeline state "
+                "allocation failed; using synchronous rare-miss compilation\n");
+        return 0;
+    }
+    s_async_pipeline_diagnostic.enabled = 1;
+    s_async_pipeline_diagnostic.dirty = 1;
+    return 1;
+}
+
 static int configure_pipeline_warmup(void)
 {
     const char *load = getenv("BW_METAL_PIPELINE_WARMUP");
     const char *trace = getenv("BW_METAL_PIPELINE_TRACE_OUTPUT");
     memset(&s_pipeline_warmup, 0, sizeof s_pipeline_warmup);
+    pipeline_async_reset();
     s_pipeline_warmup.identity_status =
         BW_METAL_PIPELINE_ARTIFACT_UNSUPPORTED;
     s_pipeline_warmup.load_artifact_status =
@@ -3285,6 +3505,114 @@ static int pipeline_key_valid(const MetalPipelineKey *key)
     return 1;
 }
 
+static MTLFunctionConstantValues *new_pipeline_constant_values(
+    const MetalPipelineKey *key)
+{
+    MTLFunctionConstantValues *values = [MTLFunctionConstantValues new];
+    if (!values)
+        return nil;
+    const uint32_t *constant_groups[] = {
+        key->texture, key->stages, key->dot,
+    };
+    for (NSUInteger group = 0; group < 3; group++)
+        for (NSUInteger component = 0; component < 4; component++)
+            [values setConstantValue:&constant_groups[group][component]
+                                type:MTLDataTypeUInt
+                             atIndex:group * 4u + component];
+    for (NSUInteger stage = 0; stage < 8; stage++)
+        for (NSUInteger component = 0; component < 4; component++)
+            [values setConstantValue:&key->combiner[stage][component]
+                                type:MTLDataTypeUInt
+                             atIndex:12u + stage * 4u + component];
+    for (NSUInteger component = 0; component < 2; component++) {
+        [values setConstantValue:&key->final[component]
+                            type:MTLDataTypeUInt atIndex:44u + component];
+        [values setConstantValue:&key->alpha[component]
+                            type:MTLDataTypeUInt atIndex:46u + component];
+    }
+    return values;
+}
+
+static int configure_draw_pipeline_descriptor(
+    const MetalPipelineKey *key,
+    id<MTLFunction> fragment,
+    MTLRenderPipelineDescriptor *pipeline)
+{
+    int shader_kind = (int)key->textured;
+    MTLBlendFactor src_rgb = MTLBlendFactorZero;
+    MTLBlendFactor dst_rgb = MTLBlendFactorZero;
+    MTLBlendFactor src_alpha = MTLBlendFactorZero;
+    MTLBlendFactor dst_alpha = MTLBlendFactorZero;
+    MTLBlendOperation operation = MTLBlendOperationAdd;
+    if (key->blend_enable) {
+        if (key->blend_dst == 0x308u)
+            return metal_fail(
+                "unsupported destination blend factor 0x%08x",
+                key->blend_dst);
+        if (!blend_factor(key->blend_src, 0, &src_rgb) ||
+            !blend_factor(key->blend_dst, 0, &dst_rgb) ||
+            !blend_factor(key->blend_src, 1, &src_alpha) ||
+            !blend_factor(key->blend_dst, 1, &dst_alpha) ||
+            !blend_operation(key->blend_eq, &operation))
+            return 0;
+        if (key->fixed_alpha_zero) {
+            if (key->blend_src == 0x304u) src_rgb = MTLBlendFactorZero;
+            if (key->blend_src == 0x305u) src_rgb = MTLBlendFactorOne;
+            if (key->blend_src == 0x308u) src_rgb = MTLBlendFactorSourceAlpha;
+            if (key->blend_dst == 0x304u) dst_rgb = MTLBlendFactorZero;
+            if (key->blend_dst == 0x305u) dst_rgb = MTLBlendFactorOne;
+        }
+    }
+    pipeline.vertexFunction = shader_kind >= METAL_SHADER_EXTENDED
+                            ? s_extended_vertex_function : s_vertex_function;
+    pipeline.fragmentFunction = fragment;
+    MTLRenderPipelineColorAttachmentDescriptor *attachment =
+        pipeline.colorAttachments[0];
+    attachment.pixelFormat = MTLPixelFormatBGRA8Unorm;
+    if (key->depth_attachment) {
+        pipeline.depthAttachmentPixelFormat =
+            MTLPixelFormatDepth32Float_Stencil8;
+        pipeline.stencilAttachmentPixelFormat =
+            MTLPixelFormatDepth32Float_Stencil8;
+    }
+    attachment.writeMask = MTLColorWriteMaskNone;
+    if (key->color_mask & 0x00010000u)
+        attachment.writeMask |= MTLColorWriteMaskRed;
+    if (key->color_mask & 0x00000100u)
+        attachment.writeMask |= MTLColorWriteMaskGreen;
+    if (key->color_mask & 0x00000001u)
+        attachment.writeMask |= MTLColorWriteMaskBlue;
+    if (key->color_mask & 0x01000000u)
+        attachment.writeMask |= MTLColorWriteMaskAlpha;
+    if (key->blend_enable || key->fixed_alpha_zero) {
+        attachment.blendingEnabled = YES;
+        attachment.sourceRGBBlendFactor =
+            key->blend_enable ? src_rgb : MTLBlendFactorOne;
+        attachment.destinationRGBBlendFactor =
+            key->blend_enable ? dst_rgb : MTLBlendFactorZero;
+        attachment.sourceAlphaBlendFactor =
+            key->fixed_alpha_zero ? MTLBlendFactorZero : src_alpha;
+        attachment.destinationAlphaBlendFactor =
+            key->fixed_alpha_zero ? MTLBlendFactorZero : dst_alpha;
+        attachment.rgbBlendOperation =
+            key->blend_enable ? operation : MTLBlendOperationAdd;
+        attachment.alphaBlendOperation =
+            key->fixed_alpha_zero ? MTLBlendOperationAdd : operation;
+    }
+    return 1;
+}
+
+static void cache_draw_pipeline(
+    NSData *cache_key, id<MTLRenderPipelineState> state, uint64_t key_hash)
+{
+    if (s_pipelines.count >= METAL_MAX_PIPELINES) {
+        pipeline_diagnostic_cache_reset(key_hash);
+        [s_pipelines removeAllObjects];
+    }
+    s_pipelines[cache_key] = state;
+    pipeline_diagnostic_cache_count(s_pipelines.count);
+}
+
 static id<MTLRenderPipelineState> draw_pipeline_for_key(
     const MetalPipelineKey *key_value,
     uint32_t frame,
@@ -3294,25 +3622,6 @@ static id<MTLRenderPipelineState> draw_pipeline_for_key(
     MetalPipelineKey key = *key_value;
     int shader_kind = (int)key.textured;
     int depth_only = shader_kind == METAL_SHADER_DEPTH_ONLY;
-    MTLBlendFactor src_rgb, dst_rgb, src_alpha, dst_alpha;
-    MTLBlendOperation operation;
-    if (key.blend_enable) {
-        if (key.blend_dst == 0x308u)
-            return metal_fail("unsupported destination blend factor 0x%08x", key.blend_dst), nil;
-        if (!blend_factor(key.blend_src, 0, &src_rgb) ||
-            !blend_factor(key.blend_dst, 0, &dst_rgb) ||
-            !blend_factor(key.blend_src, 1, &src_alpha) ||
-            !blend_factor(key.blend_dst, 1, &dst_alpha) ||
-            !blend_operation(key.blend_eq, &operation))
-            return nil;
-        if (key.fixed_alpha_zero) {
-            if (key.blend_src == 0x304u) src_rgb = MTLBlendFactorZero;
-            if (key.blend_src == 0x305u) src_rgb = MTLBlendFactorOne;
-            if (key.blend_src == 0x308u) src_rgb = MTLBlendFactorSourceAlpha;
-            if (key.blend_dst == 0x304u) dst_rgb = MTLBlendFactorZero;
-            if (key.blend_dst == 0x305u) dst_rgb = MTLBlendFactorOne;
-        }
-    }
     uint64_t key_hash = s_pipeline_diagnostic.enabled
                       ? pipeline_key_hash(3, &key, sizeof key) : 0;
     NSData *cache_key = [NSData dataWithBytes:&key length:sizeof key];
@@ -3336,10 +3645,10 @@ static id<MTLRenderPipelineState> draw_pipeline_for_key(
              ? metal_fail("could not create draw pipeline descriptor"), nil
              : nil;
     }
-    pipeline.vertexFunction = shader_kind >= METAL_SHADER_EXTENDED
-                            ? s_extended_vertex_function : s_vertex_function;
+    id<MTLFunction> fragment;
     if (shader_kind == METAL_SHADER_EXTENDED && key.specialized) {
-        MTLFunctionConstantValues *values = [MTLFunctionConstantValues new];
+        MTLFunctionConstantValues *values =
+            new_pipeline_constant_values(&key);
         if (!values) {
             pipeline_diagnostic_finish(
                 METAL_PIPELINE_EVENT_FUNCTION_SPECIALIZATION, key_hash, frame,
@@ -3351,71 +3660,34 @@ static id<MTLRenderPipelineState> draw_pipeline_for_key(
                  ? metal_fail("could not create extended shader constants"), nil
                  : nil;
         }
-        const uint32_t *constant_groups[] = {
-            key.texture, key.stages, key.dot,
-        };
-        for (NSUInteger group = 0; group < 3; group++)
-            for (NSUInteger component = 0; component < 4; component++)
-                [values setConstantValue:&constant_groups[group][component]
-                                    type:MTLDataTypeUInt
-                                 atIndex:group * 4u + component];
-        for (NSUInteger stage = 0; stage < 8; stage++)
-            for (NSUInteger component = 0; component < 4; component++)
-                [values setConstantValue:&key.combiner[stage][component]
-                                    type:MTLDataTypeUInt
-                                 atIndex:12u + stage * 4u + component];
-        for (NSUInteger component = 0; component < 2; component++) {
-            [values setConstantValue:&key.final[component]
-                                type:MTLDataTypeUInt atIndex:44u + component];
-            [values setConstantValue:&key.alpha[component]
-                                type:MTLDataTypeUInt atIndex:46u + component];
-        }
         NSError *function_error = nil;
         MetalPipelineTimer specialization_timer = pipeline_diagnostic_begin();
-        pipeline.fragmentFunction =
+        fragment =
             [s_shader_library newFunctionWithName:@"extended_specialized_fragment"
                                    constantValues:values
                                             error:&function_error];
         pipeline_diagnostic_finish(
             METAL_PIPELINE_EVENT_FUNCTION_SPECIALIZATION, key_hash, frame,
             role,
-            pipeline.fragmentFunction ? METAL_PIPELINE_STATUS_OK
-                                      : METAL_PIPELINE_STATUS_METAL_FAILED,
+            fragment ? METAL_PIPELINE_STATUS_OK
+                     : METAL_PIPELINE_STATUS_METAL_FAILED,
             specialization_timer);
-        if (!pipeline.fragmentFunction)
+        if (!fragment)
             return runtime
                  ? metal_fail("extended shader specialization failed: %s",
                               metal_error_text(function_error)), nil
                  : nil;
     } else {
-        pipeline.fragmentFunction =
+        fragment =
             shader_kind == METAL_SHADER_REALISTIC_WATER ? s_realistic_water_fragment_function
           : shader_kind == METAL_SHADER_EXTENDED ? s_extended_fragment_function
           : shader_kind == METAL_SHADER_DEPTH_ONLY ? nil
           : shader_kind == METAL_SHADER_TEXTURE ? s_texture_function : s_color_function;
     }
-    if (!pipeline.fragmentFunction && !depth_only)
+    if (!fragment && !depth_only)
         return nil;
-    MTLRenderPipelineColorAttachmentDescriptor *attachment = pipeline.colorAttachments[0];
-    attachment.pixelFormat = MTLPixelFormatBGRA8Unorm;
-    if (key.depth_attachment) {
-        pipeline.depthAttachmentPixelFormat = MTLPixelFormatDepth32Float_Stencil8;
-        pipeline.stencilAttachmentPixelFormat = MTLPixelFormatDepth32Float_Stencil8;
-    }
-    attachment.writeMask = MTLColorWriteMaskNone;
-    if (key.color_mask & 0x00010000u) attachment.writeMask |= MTLColorWriteMaskRed;
-    if (key.color_mask & 0x00000100u) attachment.writeMask |= MTLColorWriteMaskGreen;
-    if (key.color_mask & 0x00000001u) attachment.writeMask |= MTLColorWriteMaskBlue;
-    if (key.color_mask & 0x01000000u) attachment.writeMask |= MTLColorWriteMaskAlpha;
-    if (key.blend_enable || key.fixed_alpha_zero) {
-        attachment.blendingEnabled = YES;
-        attachment.sourceRGBBlendFactor = key.blend_enable ? src_rgb : MTLBlendFactorOne;
-        attachment.destinationRGBBlendFactor = key.blend_enable ? dst_rgb : MTLBlendFactorZero;
-        attachment.sourceAlphaBlendFactor = key.fixed_alpha_zero ? MTLBlendFactorZero : src_alpha;
-        attachment.destinationAlphaBlendFactor = key.fixed_alpha_zero ? MTLBlendFactorZero : dst_alpha;
-        attachment.rgbBlendOperation = key.blend_enable ? operation : MTLBlendOperationAdd;
-        attachment.alphaBlendOperation = key.fixed_alpha_zero ? MTLBlendOperationAdd : operation;
-    }
+    if (!configure_draw_pipeline_descriptor(&key, fragment, pipeline))
+        return nil;
     NSError *error = nil;
     state = create_render_pipeline_state(
         pipeline, key_hash, frame, role, &error);
@@ -3431,12 +3703,313 @@ static id<MTLRenderPipelineState> draw_pipeline_for_key(
              ? metal_fail("draw pipeline creation failed: %s",
                           metal_error_text(error)), nil
              : nil;
-    if (s_pipelines.count >= METAL_MAX_PIPELINES) {
-        pipeline_diagnostic_cache_reset(key_hash);
-        [s_pipelines removeAllObjects];
+    cache_draw_pipeline(cache_key, state, key_hash);
+    return state;
+}
+
+static void pipeline_async_record_timing(
+    MetalPipelineTimingAggregate *aggregate,
+    uint64_t start_ns,
+    uint64_t end_ns)
+{
+    aggregate->attempts++;
+    if (!start_ns || !end_ns) {
+        s_async_pipeline_diagnostic.timing_unavailable++;
+    } else if (end_ns <= start_ns) {
+        s_async_pipeline_diagnostic.timing_non_monotonic++;
+    } else {
+        uint64_t duration = end_ns - start_ns;
+        aggregate->timed++;
+        if (UINT64_MAX - aggregate->total_ns >= duration)
+            aggregate->total_ns += duration;
+        if (duration > aggregate->max_ns)
+            aggregate->max_ns = duration;
     }
-    s_pipelines[cache_key] = state;
-    pipeline_diagnostic_cache_count(s_pipelines.count);
+}
+
+static void pipeline_async_mark_failed(
+    BWMetalAsyncPipelineEntry *entry,
+    MetalAsyncPipelineFailure failure,
+    uint64_t end_ns)
+{
+    [s_async_pipeline_lock lock];
+    entry->failure = failure;
+    if (failure == METAL_ASYNC_FAILURE_FUNCTION)
+        entry->function_end_ns = end_ns;
+    else if (failure == METAL_ASYNC_FAILURE_PIPELINE)
+        entry->pipeline_end_ns = end_ns;
+    entry->status = METAL_ASYNC_PIPELINE_FAILED;
+    [s_async_pipeline_lock unlock];
+}
+
+static int pipeline_async_schedule(
+    const MetalPipelineKey *key,
+    NSData *cache_key,
+    uint64_t key_hash)
+{
+    [s_async_pipeline_lock lock];
+    if (s_async_pipelines.count >= METAL_PIPELINE_ASYNC_CAPACITY) {
+        [s_async_pipeline_lock unlock];
+        s_async_pipeline_diagnostic.capacity_fallbacks++;
+        s_async_pipeline_diagnostic.dirty = 1;
+        return 0;
+    }
+    [s_async_pipeline_lock unlock];
+
+    BWMetalAsyncPipelineEntry *entry = [BWMetalAsyncPipelineEntry new];
+#if defined(BW_METAL_TESTING)
+    int fail_allocation = s_test_fail_async_pipeline_allocation;
+    int fail_function = s_test_fail_async_function;
+    int fail_pipeline = s_test_fail_async_pipeline;
+    s_test_fail_async_pipeline_allocation = 0;
+    s_test_fail_async_function = 0;
+    s_test_fail_async_pipeline = 0;
+#else
+    int fail_allocation = 0, fail_function = 0, fail_pipeline = 0;
+#endif
+    MTLRenderPipelineDescriptor *pipeline =
+        fail_allocation ? nil : new_pipeline_descriptor();
+    MTLFunctionConstantValues *values =
+        fail_allocation ? nil : new_pipeline_constant_values(key);
+    if (!entry || !pipeline || !values ||
+        !configure_draw_pipeline_descriptor(key, nil, pipeline)) {
+        if (!entry) {
+            s_async_pipeline_diagnostic.allocation_failures++;
+            s_async_pipeline_diagnostic.dirty = 1;
+            return 0;
+        }
+        entry->key = *key;
+        entry->cache_key = cache_key;
+        entry->key_hash = key_hash;
+        entry->frame = s_frame;
+        entry->failure = METAL_ASYNC_FAILURE_ALLOCATION;
+        entry->status = METAL_ASYNC_PIPELINE_FAILED;
+        [s_async_pipeline_lock lock];
+        [s_async_pipelines addObject:entry];
+        [s_async_pipeline_lock unlock];
+        s_async_pipeline_diagnostic.scheduled++;
+        s_async_pipeline_diagnostic.dirty = 1;
+        return 1;
+    }
+
+    entry->key = *key;
+    entry->cache_key = cache_key;
+    entry->key_hash = key_hash;
+    entry->frame = s_frame;
+    entry->status = METAL_ASYNC_PIPELINE_SPECIALIZING;
+    entry->function_start_ns = xbox_HostNowNs();
+    [s_async_pipeline_lock lock];
+    [s_async_pipelines addObject:entry];
+    [s_async_pipeline_lock unlock];
+    s_async_pipeline_diagnostic.scheduled++;
+    s_async_pipeline_diagnostic.dirty = 1;
+
+    id<MTLLibrary> library = s_shader_library;
+    id<MTLDevice> device = s_device;
+    NSLock *lock = s_async_pipeline_lock;
+    dispatch_group_t group = s_async_pipeline_group;
+    dispatch_group_enter(group);
+    [library
+        newFunctionWithName:@"extended_specialized_fragment"
+        constantValues:values
+        completionHandler:^(id<MTLFunction> function, NSError *function_error) {
+            @autoreleasepool {
+                (void)function_error;
+                uint64_t function_end = xbox_HostNowNs();
+                if (!function || fail_function) {
+                    pipeline_async_mark_failed(
+                        entry, METAL_ASYNC_FAILURE_FUNCTION, function_end);
+                    dispatch_group_leave(group);
+                    return;
+                }
+                uint64_t pipeline_start = xbox_HostNowNs();
+                [lock lock];
+                entry->function_end_ns = function_end;
+                entry->pipeline_start_ns = pipeline_start;
+                entry->status = METAL_ASYNC_PIPELINE_COMPILING;
+                [lock unlock];
+                if (fail_pipeline) {
+                    pipeline_async_mark_failed(
+                        entry, METAL_ASYNC_FAILURE_PIPELINE,
+                        xbox_HostNowNs());
+                    dispatch_group_leave(group);
+                    return;
+                }
+                pipeline.fragmentFunction = function;
+                [device
+                    newRenderPipelineStateWithDescriptor:pipeline
+                    completionHandler:^(
+                        id<MTLRenderPipelineState> pipeline_state,
+                        NSError *pipeline_error) {
+                        @autoreleasepool {
+                            (void)pipeline_error;
+                            uint64_t pipeline_end = xbox_HostNowNs();
+                            [lock lock];
+                            entry->pipeline_end_ns = pipeline_end;
+                            if (pipeline_state) {
+                                entry->state = pipeline_state;
+                                entry->status =
+                                    METAL_ASYNC_PIPELINE_READY;
+                            } else {
+                                entry->failure =
+                                    METAL_ASYNC_FAILURE_PIPELINE;
+                                entry->status =
+                                    METAL_ASYNC_PIPELINE_FAILED;
+                            }
+                            [lock unlock];
+                            dispatch_group_leave(group);
+                        }
+                    }];
+            }
+        }];
+    return 1;
+}
+
+static BWMetalAsyncPipelineEntry *pipeline_async_find(
+    const MetalPipelineKey *key)
+{
+    BWMetalAsyncPipelineEntry *found = nil;
+    [s_async_pipeline_lock lock];
+    for (BWMetalAsyncPipelineEntry *entry in s_async_pipelines)
+        if (!memcmp(&entry->key, key, sizeof *key)) {
+            found = entry;
+            break;
+        }
+    [s_async_pipeline_lock unlock];
+    return found;
+}
+
+static void pipeline_async_drain(int force)
+{
+    if (!s_async_pipeline_diagnostic.enabled)
+        return;
+#if defined(BW_METAL_TESTING)
+    if (s_test_hold_async_pipeline_install && !force)
+        return;
+#endif
+    NSMutableArray<BWMetalAsyncPipelineEntry *> *ready =
+        [NSMutableArray arrayWithCapacity:METAL_PIPELINE_ASYNC_CAPACITY];
+    NSMutableArray<BWMetalAsyncPipelineEntry *> *failed =
+        [NSMutableArray arrayWithCapacity:METAL_PIPELINE_ASYNC_CAPACITY];
+    if (!ready || !failed) {
+        s_async_pipeline_diagnostic.allocation_failures++;
+        s_async_pipeline_diagnostic.dirty = 1;
+        return;
+    }
+    [s_async_pipeline_lock lock];
+    for (BWMetalAsyncPipelineEntry *entry in s_async_pipelines) {
+        if (entry->status == METAL_ASYNC_PIPELINE_READY)
+            [ready addObject:entry];
+        else if (entry->status == METAL_ASYNC_PIPELINE_FAILED) {
+            entry->status = METAL_ASYNC_PIPELINE_FAILED_REPORTED;
+            [failed addObject:entry];
+        }
+    }
+    [s_async_pipelines removeObjectsInArray:ready];
+    [s_async_pipeline_lock unlock];
+
+    for (BWMetalAsyncPipelineEntry *entry in ready) {
+        pipeline_async_record_timing(
+            &s_async_pipeline_diagnostic.function,
+            entry->function_start_ns, entry->function_end_ns);
+        pipeline_async_record_timing(
+            &s_async_pipeline_diagnostic.pipeline,
+            entry->pipeline_start_ns, entry->pipeline_end_ns);
+        pipeline_diagnostic_record_elapsed(
+            METAL_PIPELINE_EVENT_FUNCTION_SPECIALIZATION,
+            entry->key_hash, s_frame, METAL_PIPELINE_STATUS_OK,
+            entry->function_start_ns, entry->function_end_ns);
+        pipeline_diagnostic_record_elapsed(
+            METAL_PIPELINE_EVENT_PIPELINE_CREATE,
+            entry->key_hash, s_frame, METAL_PIPELINE_STATUS_OK,
+            entry->pipeline_start_ns, entry->pipeline_end_ns);
+        cache_draw_pipeline(entry->cache_key, entry->state,
+                            entry->key_hash);
+        s_async_pipeline_diagnostic.installed++;
+        s_async_pipeline_diagnostic.dirty = 1;
+    }
+    for (BWMetalAsyncPipelineEntry *entry in failed) {
+        if (entry->failure == METAL_ASYNC_FAILURE_ALLOCATION) {
+            s_async_pipeline_diagnostic.allocation_failures++;
+            fprintf(stderr,
+                    "[GPU-METAL] asynchronous specialized-pipeline allocation "
+                    "failed; retaining exact generic pipeline\n");
+        } else if (entry->failure == METAL_ASYNC_FAILURE_FUNCTION) {
+            pipeline_async_record_timing(
+                &s_async_pipeline_diagnostic.function,
+                entry->function_start_ns, entry->function_end_ns);
+            pipeline_diagnostic_record_elapsed(
+                METAL_PIPELINE_EVENT_FUNCTION_SPECIALIZATION,
+                entry->key_hash, s_frame,
+                METAL_PIPELINE_STATUS_METAL_FAILED,
+                entry->function_start_ns, entry->function_end_ns);
+            s_async_pipeline_diagnostic.function_failures++;
+            fprintf(stderr,
+                    "[GPU-METAL] asynchronous shader specialization failed; "
+                    "retaining exact generic pipeline\n");
+        } else if (entry->failure == METAL_ASYNC_FAILURE_PIPELINE) {
+            pipeline_async_record_timing(
+                &s_async_pipeline_diagnostic.function,
+                entry->function_start_ns, entry->function_end_ns);
+            pipeline_async_record_timing(
+                &s_async_pipeline_diagnostic.pipeline,
+                entry->pipeline_start_ns, entry->pipeline_end_ns);
+            pipeline_diagnostic_record_elapsed(
+                METAL_PIPELINE_EVENT_FUNCTION_SPECIALIZATION,
+                entry->key_hash, s_frame, METAL_PIPELINE_STATUS_OK,
+                entry->function_start_ns, entry->function_end_ns);
+            pipeline_diagnostic_record_elapsed(
+                METAL_PIPELINE_EVENT_PIPELINE_CREATE,
+                entry->key_hash, s_frame,
+                METAL_PIPELINE_STATUS_METAL_FAILED,
+                entry->pipeline_start_ns, entry->pipeline_end_ns);
+            s_async_pipeline_diagnostic.pipeline_failures++;
+            fprintf(stderr,
+                    "[GPU-METAL] asynchronous render-pipeline creation failed; "
+                    "retaining exact generic pipeline\n");
+        }
+        s_async_pipeline_diagnostic.dirty = 1;
+    }
+}
+
+static id<MTLRenderPipelineState> draw_pipeline_async(
+    const MetalPipelineKey *key)
+{
+    pipeline_async_drain(0);
+    uint64_t key_hash = s_pipeline_diagnostic.enabled
+                      ? pipeline_key_hash(3, key, sizeof *key) : 0;
+    NSData *cache_key = [NSData dataWithBytes:key length:sizeof *key];
+    if (!cache_key)
+        return metal_fail("could not create draw pipeline cache key"), nil;
+    id<MTLRenderPipelineState> state = s_pipelines[cache_key];
+    if (state) {
+        pipeline_diagnostic_cache_hit();
+        return state;
+    }
+    BWMetalAsyncPipelineEntry *entry = pipeline_async_find(key);
+    if (!entry)
+        pipeline_diagnostic_cache_miss(key_hash);
+
+    MetalPipelineKey generic = *key;
+    generic.specialized = 0;
+    memset(generic.texture, 0, sizeof generic.texture);
+    memset(generic.stages, 0, sizeof generic.stages);
+    memset(generic.dot, 0, sizeof generic.dot);
+    memset(generic.combiner, 0, sizeof generic.combiner);
+    memset(generic.final, 0, sizeof generic.final);
+    memset(generic.alpha, 0, sizeof generic.alpha);
+    state = draw_pipeline_for_key(
+        &generic, s_frame, METAL_PIPELINE_ROLE_RENDER, 1);
+    if (!state)
+        return nil;
+
+    if (entry) {
+        s_async_pipeline_diagnostic.coalesced_misses++;
+    } else {
+        (void)pipeline_async_schedule(key, cache_key, key_hash);
+    }
+    s_async_pipeline_diagnostic.generic_fallback_draws++;
+    s_async_pipeline_diagnostic.dirty = 1;
     return state;
 }
 
@@ -3468,8 +4041,11 @@ static id<MTLRenderPipelineState> draw_pipeline(
         memcpy(key.final, specialization->final, sizeof key.final);
         memcpy(key.alpha, specialization->alpha, sizeof key.alpha);
     }
-    id<MTLRenderPipelineState> state = draw_pipeline_for_key(
-        &key, s_frame, METAL_PIPELINE_ROLE_RENDER, 1);
+    id<MTLRenderPipelineState> state =
+        key.specialized && s_async_pipeline_diagnostic.enabled
+            ? draw_pipeline_async(&key)
+            : draw_pipeline_for_key(
+                  &key, s_frame, METAL_PIPELINE_ROLE_RENDER, 1);
     if (state)
         pipeline_trace_record(&key);
     return state;
@@ -3538,6 +4114,7 @@ static void pipeline_warmup_load(void)
     }
     s_pipeline_warmup.load_payload_status =
         METAL_PIPELINE_WARMUP_PAYLOAD_OK;
+    (void)pipeline_async_enable();
     pipeline_warmup_report_load();
 }
 
@@ -5386,6 +5963,7 @@ static void metal_flip(void)
     @autoreleasepool {
         if (bw_metal_backend_error())
             return;
+        pipeline_async_drain(0);
         water_reflect_reset_run();
         int asynchronous_display = s_present_layer != nil;
 #if defined(BW_METAL_TESTING)
@@ -5555,6 +6133,7 @@ static void metal_flip(void)
         }
         if (s_pipeline_warmup.trace_path[0])
             pipeline_trace_flush(0);
+        pipeline_async_report(0);
         if (now)
             s_last_flip_ns = now;
         if (!direct_present())
@@ -6201,6 +6780,10 @@ int bw_metal_backend_start_for_test(void *guest_memory, size_t guest_size)
 void bw_metal_backend_stop(void)
 {
     (void)flush_commands();
+    if (s_async_pipeline_group)
+        dispatch_group_wait(s_async_pipeline_group, DISPATCH_TIME_FOREVER);
+    pipeline_async_drain(1);
+    pipeline_async_report(1);
     pipeline_trace_flush(1);
     pipeline_diagnostic_report();
     if (s_frame_timing_enabled)
@@ -6376,6 +6959,10 @@ void bw_metal_backend_stop(void)
     atomic_store_explicit(&s_requested_water_preset,
                           BW_METAL_WATER_RETAIL, memory_order_release);
     s_pipelines = nil;
+    s_async_pipelines = nil;
+    s_async_pipeline_lock = nil;
+    s_async_pipeline_group = nil;
+    s_async_pipeline_diagnostic.enabled = 0;
     s_clear_pipelines = nil;
     s_color_surfaces = nil;
     s_textures = nil;
@@ -6651,6 +7238,52 @@ void bw_metal_test_pipeline_warmup_snapshot(
         s_pipeline_warmup.trace_write_failures;
 }
 
+void bw_metal_test_pipeline_async_snapshot(
+    BwMetalPipelineAsyncSnapshot *snapshot)
+{
+    if (!snapshot)
+        return;
+    memset(snapshot, 0, sizeof *snapshot);
+    snapshot->requested = s_async_pipeline_diagnostic.requested;
+    snapshot->enabled = s_async_pipeline_diagnostic.enabled;
+    snapshot->initialization_failed =
+        s_async_pipeline_diagnostic.initialization_failed;
+    snapshot->capacity = METAL_PIPELINE_ASYNC_CAPACITY;
+    pipeline_async_state_counts(
+        &snapshot->entries, &snapshot->pending,
+        &snapshot->ready, &snapshot->failed);
+    snapshot->scheduled = s_async_pipeline_diagnostic.scheduled;
+    snapshot->coalesced_misses =
+        s_async_pipeline_diagnostic.coalesced_misses;
+    snapshot->generic_fallback_draws =
+        s_async_pipeline_diagnostic.generic_fallback_draws;
+    snapshot->installed = s_async_pipeline_diagnostic.installed;
+    snapshot->function_failures =
+        s_async_pipeline_diagnostic.function_failures;
+    snapshot->pipeline_failures =
+        s_async_pipeline_diagnostic.pipeline_failures;
+    snapshot->allocation_failures =
+        s_async_pipeline_diagnostic.allocation_failures;
+    snapshot->capacity_fallbacks =
+        s_async_pipeline_diagnostic.capacity_fallbacks;
+    snapshot->function_timed =
+        s_async_pipeline_diagnostic.function.timed;
+    snapshot->function_total_ns =
+        s_async_pipeline_diagnostic.function.total_ns;
+    snapshot->function_max_ns =
+        s_async_pipeline_diagnostic.function.max_ns;
+    snapshot->pipeline_timed =
+        s_async_pipeline_diagnostic.pipeline.timed;
+    snapshot->pipeline_total_ns =
+        s_async_pipeline_diagnostic.pipeline.total_ns;
+    snapshot->pipeline_max_ns =
+        s_async_pipeline_diagnostic.pipeline.max_ns;
+    snapshot->timing_unavailable =
+        s_async_pipeline_diagnostic.timing_unavailable;
+    snapshot->timing_non_monotonic =
+        s_async_pipeline_diagnostic.timing_non_monotonic;
+}
+
 void bw_metal_test_pipeline_diagnostic_clear(void)
 {
     int enabled = s_pipeline_diagnostic.enabled;
@@ -6676,6 +7309,25 @@ void bw_metal_test_fail_next_pipeline_allocation(void)
 void bw_metal_test_fail_warmup_pipeline(void)
 {
     s_test_fail_warmup_pipeline = 1;
+}
+
+void bw_metal_test_hold_async_pipeline_install(int hold)
+{
+    s_test_hold_async_pipeline_install = hold != 0;
+}
+
+void bw_metal_test_drain_async_pipelines(void)
+{
+    pipeline_async_drain(0);
+}
+
+void bw_metal_test_async_pipeline_failures(int allocation,
+                                           int function,
+                                           int pipeline)
+{
+    s_test_fail_async_pipeline_allocation = allocation != 0;
+    s_test_fail_async_function = function != 0;
+    s_test_fail_async_pipeline = pipeline != 0;
 }
 
 void bw_metal_test_shader_library_failures(int offline_library,
@@ -6716,5 +7368,11 @@ int bw_metal_test_pipeline_diagnostic_format_event(char *buffer, size_t size)
 int bw_metal_test_pipeline_diagnostic_format_summary(char *buffer, size_t size)
 {
     return pipeline_diagnostic_format_summary(buffer, size);
+}
+
+int bw_metal_test_pipeline_async_format_summary(char *buffer, size_t size,
+                                                int final)
+{
+    return pipeline_async_format_summary(buffer, size, final != 0);
 }
 #endif

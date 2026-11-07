@@ -1,11 +1,13 @@
 # Metal pipeline-artifact contract
 
-Status: PERF-029 compatibility contract and PERF-031 trace-key payload
+Status: PERF-029 compatibility contract, PERF-031 trace-key payload, and
+PERF-032 rare-miss lifecycle
 
-This contract defines how later Metal pipeline warm-up work identifies and
-rejects local artifacts. It does not record pipeline keys, create or load a
-binary archive, prewarm a pipeline, or change cache policy. Those behaviors
-remain in PERF-031 and PERF-032.
+This contract defines how Metal pipeline warm-up identifies and rejects local
+artifacts. PERF-031 records bounded canonical keys and preloads compatible
+states. PERF-032 uses the validated preload as the opt-in boundary for bounded
+asynchronous compilation of untraced specializations. No binary archive is
+created or loaded, and the 128-entry draw-cache policy is unchanged.
 
 ## Artifact classes
 
@@ -169,3 +171,27 @@ Reporting is bounded to `bloodwake.metal-pipeline-warmup/v1` JSONL with
 artifact status and aggregate entry/write/preload counts. It never includes a
 path, key, descriptor, combiner word, function constant, texture identity, or
 address.
+
+A fully compatible preload enables asynchronous handling only for a later
+specialized key that was not in the artifact. The first request creates or
+reuses the existing exact generic extended pipeline, queues Metal function
+specialization and render-pipeline creation, and renders through the generic
+pipeline until the specialized state is ready. Duplicate requests coalesce by
+the unchanged canonical key. Completion handlers never mutate the draw cache;
+the serial renderer installs completed states at a draw or flip boundary.
+
+The queue retains at most 32 pending, ready, or failed entries. A full queue
+keeps rendering through the generic pipeline and counts the bounded-capacity
+fallback. Successful entries leave the queue after installation. Failed
+entries remain retained so they cannot silently retry; function, pipeline,
+allocation, and timing failures are explicit. Backend stop waits for all Metal
+callbacks and drains their state before releasing the library or device.
+Missing or rejected artifacts never enable this path and retain synchronous
+runtime creation.
+
+`bloodwake.metal-pipeline-async/v1` JSONL is bounded to 16 aggregate summaries.
+It reports queue occupancy/capacity, scheduled and coalesced misses, generic
+fallback draws, installed states, stage-specific failures, capacity
+fallbacks, and specialization/pipeline timing. It contains no paths, canonical
+keys or hashes, descriptors, combiner words, function constants, texture
+identities, addresses, or other retail-derived values.

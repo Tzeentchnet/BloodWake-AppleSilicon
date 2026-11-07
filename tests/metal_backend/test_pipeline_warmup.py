@@ -12,11 +12,12 @@ import tempfile
 
 
 SCHEMA = "bloodwake.metal-pipeline-warmup/v1"
+ASYNC_SCHEMA = "bloodwake.metal-pipeline-async/v1"
 HEADER_BYTES = 176
 TRACE_ENTRY_BYTES = 228
 
 
-def run_case(executable, case, **environment):
+def run_case(executable, case, include_async=False, **environment):
     child_environment = os.environ.copy()
     child_environment.pop("BW_METAL_PIPELINE_WARMUP", None)
     child_environment.pop("BW_METAL_PIPELINE_TRACE_OUTPUT", None)
@@ -36,9 +37,12 @@ def run_case(executable, case, **environment):
             f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}"
         )
     reports = []
+    async_reports = []
     for line in result.stderr.splitlines():
         if line.startswith('{"schema":"' + SCHEMA + '"'):
             reports.append(json.loads(line))
+        elif line.startswith('{"schema":"' + ASYNC_SCHEMA + '"'):
+            async_reports.append(json.loads(line))
     prohibited = (
         "path",
         "descriptor",
@@ -53,7 +57,11 @@ def run_case(executable, case, **environment):
         serialized = json.dumps(report, sort_keys=True)
         for field in prohibited:
             assert field not in serialized
-    return reports
+    for report in async_reports:
+        serialized = json.dumps(report, sort_keys=True)
+        for field in prohibited:
+            assert field not in serialized
+    return (reports, async_reports) if include_async else reports
 
 
 def write_variant(source, destination, mutator):
@@ -110,6 +118,116 @@ def main():
             "preloaded": 2,
             "runtime_fallback": False,
         }]
+
+        async_keys = {
+            "schema",
+            "record",
+            "requested",
+            "enabled",
+            "entry_capacity",
+            "entries",
+            "pending",
+            "ready",
+            "failed_retained",
+            "scheduled",
+            "coalesced_misses",
+            "generic_fallback_draws",
+            "installed",
+            "function_failures",
+            "pipeline_failures",
+            "allocation_failures",
+            "capacity_fallbacks",
+            "function_timed",
+            "function_total_ns",
+            "function_max_ns",
+            "pipeline_timed",
+            "pipeline_total_ns",
+            "pipeline_max_ns",
+            "timing_unavailable",
+            "timing_non_monotonic",
+            "initialization_failed",
+            "final",
+        }
+
+        def run_async(case):
+            warmup, reports = run_case(
+                executable,
+                case,
+                include_async=True,
+                BW_METAL_PIPELINE_WARMUP=str(artifact),
+            )
+            assert warmup
+            assert warmup[0]["payload_status"] == "compatible"
+            assert reports
+            for report in reports:
+                assert set(report) == async_keys
+                assert report["requested"] is True
+                assert report["enabled"] is True
+                assert report["entry_capacity"] == 32
+                assert report["initialization_failed"] is False
+            assert reports[-1]["final"] is True
+            return reports
+
+        report_only = run_async("pipeline-async-report")
+        assert report_only[-1]["scheduled"] == 0
+        assert report_only[-1]["entries"] == 0
+
+        success = run_async("pipeline-async-success")[-1]
+        assert success["scheduled"] == 1
+        assert success["installed"] == 1
+        assert success["function_timed"] == 1
+        assert success["pipeline_timed"] == 1
+        assert success["generic_fallback_draws"] >= 1
+
+        coalesced = run_async("pipeline-async-coalescing")[-1]
+        assert coalesced["scheduled"] == 1
+        assert coalesced["installed"] == 1
+        assert coalesced["coalesced_misses"] >= 1
+        assert coalesced["generic_fallback_draws"] >= 2
+
+        allocation = run_async(
+            "pipeline-async-allocation-failure"
+        )[-1]
+        assert allocation["allocation_failures"] == 1
+        assert allocation["failed_retained"] == 1
+        assert allocation["installed"] == 0
+
+        function = run_async("pipeline-async-function-failure")[-1]
+        assert function["function_failures"] == 1
+        assert function["failed_retained"] == 1
+        assert function["installed"] == 0
+
+        pipeline = run_async("pipeline-async-pipeline-failure")[-1]
+        assert pipeline["pipeline_failures"] == 1
+        assert pipeline["failed_retained"] == 1
+        assert pipeline["installed"] == 0
+
+        bounded_async = run_async("pipeline-async-bounded")[-1]
+        assert bounded_async["scheduled"] == 32
+        assert bounded_async["installed"] == 32
+        assert bounded_async["capacity_fallbacks"] == 1
+        assert bounded_async["entries"] == 0
+
+        stopped = run_async("pipeline-async-stop")[-1]
+        assert stopped["scheduled"] == 1
+        assert stopped["installed"] == 1
+        assert stopped["pending"] == 0
+        assert stopped["entries"] == 0
+
+        _, restart_reports = run_case(
+            executable,
+            "pipeline-async-restart",
+            include_async=True,
+            BW_METAL_PIPELINE_WARMUP=str(artifact),
+        )
+        restart_finals = [
+            report for report in restart_reports if report["final"]
+        ]
+        assert len(restart_finals) == 2
+        assert restart_finals[0]["scheduled"] == 1
+        assert restart_finals[0]["pending"] == 0
+        assert restart_finals[1]["scheduled"] == 0
+        assert restart_finals[1]["entries"] == 0
 
         missing = run_case(
             executable,

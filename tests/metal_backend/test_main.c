@@ -10,6 +10,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
+#include <time.h>
 #include <unistd.h>
 
 #include "bw_metal_backend.h"
@@ -44,7 +45,7 @@ static uint32_t s_ab_frame;
 static uint32_t s_fence_va;
 static int s_fence_register_enabled;
 static volatile uint32_t s_fence_register;
-static uint64_t s_host_now_ns, s_host_now_step;
+static atomic_uint_fast64_t s_host_now_ns, s_host_now_step;
 static int s_failed;
 static bw_edition_t s_edition = BW_ED_ORIGINAL;
 static int s_audit_enabled;
@@ -142,9 +143,13 @@ int nv2a_pb_scan_in_call(void) { return 0; }
 uint32_t xbox_VblankCount(void) { return 0; }
 uint64_t xbox_HostNowNs(void)
 {
-    uint64_t now = s_host_now_ns;
-    if (now)
-        s_host_now_ns += s_host_now_step;
+    uint64_t now = atomic_load_explicit(
+        &s_host_now_ns, memory_order_relaxed);
+    uint64_t step = atomic_load_explicit(
+        &s_host_now_step, memory_order_relaxed);
+    if (now && step)
+        now = atomic_fetch_add_explicit(
+            &s_host_now_ns, step, memory_order_relaxed);
     return now;
 }
 uint32_t xbox_Nv2aFrameCountersOwned(void) { return 0; }
@@ -977,6 +982,10 @@ static void color_mask_test(void)
 }
 
 static void extended_basic_test(void);
+static void setup_dxt1_texture(uint32_t color0, uint32_t color1,
+                               uint32_t selectors);
+static void setup_combiner(const Nv2aCombiner *rc);
+static Nv2aCombiner synthetic_combiner(void);
 
 static void pipeline_cache_test(void)
 {
@@ -1221,7 +1230,9 @@ static void pipeline_warmup_workload(void)
 static void pipeline_warmup_disabled_test(void)
 {
     BwMetalPipelineWarmupSnapshot snapshot;
+    BwMetalPipelineAsyncSnapshot async;
     bw_metal_test_pipeline_warmup_snapshot(&snapshot);
+    bw_metal_test_pipeline_async_snapshot(&async);
     CHECK(!snapshot.load_enabled);
     CHECK(!snapshot.trace_enabled);
     CHECK(!snapshot.identity_ready);
@@ -1229,6 +1240,11 @@ static void pipeline_warmup_disabled_test(void)
     CHECK(!snapshot.preloaded_entries);
     CHECK(!snapshot.trace_entries);
     CHECK(!snapshot.trace_write_attempts);
+    CHECK(!async.requested);
+    CHECK(!async.enabled);
+    CHECK(async.capacity == 32);
+    CHECK(!async.entries);
+    CHECK(!async.scheduled);
 }
 
 static void pipeline_warmup_capture_test(int expect_failure)
@@ -1268,6 +1284,7 @@ static void pipeline_warmup_capture_bounded_test(void)
 static void pipeline_warmup_load_test(void)
 {
     BwMetalPipelineWarmupSnapshot warmup;
+    BwMetalPipelineAsyncSnapshot async;
     BwMetalPipelineDiagnosticSnapshot before, after;
     bw_metal_test_pipeline_warmup_snapshot(&warmup);
     CHECK(warmup.load_enabled);
@@ -1278,6 +1295,12 @@ static void pipeline_warmup_load_test(void)
     CHECK(!warmup.runtime_fallback);
     CHECK(warmup.load_entries == 2);
     CHECK(warmup.preloaded_entries == 2);
+    bw_metal_test_pipeline_async_snapshot(&async);
+    CHECK(async.requested);
+    CHECK(async.enabled);
+    CHECK(!async.initialization_failed);
+    CHECK(!async.entries);
+    CHECK(!async.scheduled);
     bw_metal_test_pipeline_diagnostic_snapshot(&before);
     pipeline_warmup_workload();
     bw_metal_test_pipeline_diagnostic_snapshot(&after);
@@ -1297,7 +1320,7 @@ static void pipeline_warmup_fallback_test(
     bw_metal_test_pipeline_warmup_snapshot(&warmup);
     CHECK(warmup.load_enabled);
     CHECK(warmup.identity_ready);
-    CHECK(warmup.load_artifact_status == expected_status);
+    CHECK(warmup.load_artifact_status == (int)expected_status);
     CHECK(!warmup.load_compatible);
     CHECK(warmup.runtime_fallback);
     CHECK(!warmup.preloaded_entries);
@@ -1307,6 +1330,195 @@ static void pipeline_warmup_fallback_test(
     bw_metal_test_pipeline_diagnostic_snapshot(&after);
     CHECK(after.cache_misses == before.cache_misses + 2);
     CHECK(after.pipeline_attempts == before.pipeline_attempts + 2);
+    expect_no_error();
+}
+
+static BwMetalPipelineAsyncSnapshot pipeline_async_wait_for_terminal(
+    uint64_t expected)
+{
+    const struct timespec delay = {.tv_nsec = 5000000};
+    BwMetalPipelineAsyncSnapshot snapshot = {0};
+    for (unsigned attempt = 0; attempt < 400; attempt++) {
+        bw_metal_test_drain_async_pipelines();
+        bw_metal_test_pipeline_async_snapshot(&snapshot);
+        uint64_t terminal =
+            snapshot.installed + snapshot.function_failures +
+            snapshot.pipeline_failures + snapshot.allocation_failures;
+        if (terminal >= expected)
+            return snapshot;
+        nanosleep(&delay, NULL);
+    }
+    CHECK(0 && "asynchronous pipeline did not complete");
+    return snapshot;
+}
+
+static void pipeline_async_success_test(void)
+{
+    BwMetalPipelineAsyncSnapshot snapshot;
+    BwMetalPipelineDiagnosticSnapshot before, after;
+    bw_metal_test_pipeline_diagnostic_snapshot(&before);
+    extended_basic_test();
+    bw_metal_test_pipeline_async_snapshot(&snapshot);
+    CHECK(snapshot.enabled);
+    CHECK(snapshot.scheduled == 1);
+    CHECK(snapshot.generic_fallback_draws >= 1);
+    snapshot = pipeline_async_wait_for_terminal(1);
+    CHECK(snapshot.installed == 1);
+    CHECK(snapshot.function_failures == 0);
+    CHECK(snapshot.pipeline_failures == 0);
+    CHECK(snapshot.allocation_failures == 0);
+    CHECK(snapshot.function_timed == 1);
+    CHECK(snapshot.pipeline_timed == 1);
+    CHECK(snapshot.timing_unavailable == 0);
+    CHECK(snapshot.timing_non_monotonic == 0);
+    bw_metal_test_pipeline_diagnostic_snapshot(&after);
+    CHECK(after.specialization_attempts ==
+          before.specialization_attempts + 1);
+    CHECK(after.specialization_timed ==
+          before.specialization_timed + 1);
+    CHECK(after.pipeline_attempts == before.pipeline_attempts + 2);
+    CHECK(after.pipeline_timed == before.pipeline_timed + 2);
+    extended_basic_test();
+    bw_metal_test_pipeline_async_snapshot(&snapshot);
+    CHECK(snapshot.scheduled == 1);
+    expect_no_error();
+}
+
+static void pipeline_async_coalescing_test(void)
+{
+    BwMetalPipelineAsyncSnapshot snapshot;
+    bw_metal_test_hold_async_pipeline_install(1);
+    extended_basic_test();
+    extended_basic_test();
+    bw_metal_test_pipeline_async_snapshot(&snapshot);
+    CHECK(snapshot.scheduled == 1);
+    CHECK(snapshot.entries == 1);
+    CHECK(snapshot.coalesced_misses >= 1);
+    CHECK(snapshot.generic_fallback_draws >= 2);
+    bw_metal_test_hold_async_pipeline_install(0);
+    snapshot = pipeline_async_wait_for_terminal(1);
+    CHECK(snapshot.installed == 1);
+    CHECK(snapshot.entries == 0);
+    expect_no_error();
+}
+
+static void pipeline_async_failure_test(unsigned stage)
+{
+    BwMetalPipelineAsyncSnapshot snapshot;
+    bw_metal_test_async_pipeline_failures(
+        stage == 0, stage == 1, stage == 2);
+    extended_basic_test();
+    snapshot = pipeline_async_wait_for_terminal(1);
+    CHECK(snapshot.enabled);
+    CHECK(snapshot.scheduled == 1);
+    CHECK(snapshot.installed == 0);
+    CHECK(snapshot.entries == 1);
+    CHECK(snapshot.failed == 1);
+    CHECK(snapshot.allocation_failures == (stage == 0));
+    CHECK(snapshot.function_failures == (stage == 1));
+    CHECK(snapshot.pipeline_failures == (stage == 2));
+    extended_basic_test();
+    bw_metal_test_pipeline_async_snapshot(&snapshot);
+    CHECK(snapshot.scheduled == 1);
+    CHECK(snapshot.coalesced_misses >= 1);
+    CHECK(snapshot.generic_fallback_draws >= 2);
+    expect_no_error();
+}
+
+static void pipeline_async_report_test(void)
+{
+    static const char expected[] =
+        "{\"schema\":\"bloodwake.metal-pipeline-async/v1\","
+        "\"record\":\"summary\",\"requested\":true,\"enabled\":true,"
+        "\"entry_capacity\":32,\"entries\":0,\"pending\":0,\"ready\":0,"
+        "\"failed_retained\":0,\"scheduled\":0,\"coalesced_misses\":0,"
+        "\"generic_fallback_draws\":0,\"installed\":0,"
+        "\"function_failures\":0,\"pipeline_failures\":0,"
+        "\"allocation_failures\":0,\"capacity_fallbacks\":0,"
+        "\"function_timed\":0,\"function_total_ns\":0,"
+        "\"function_max_ns\":0,\"pipeline_timed\":0,"
+        "\"pipeline_total_ns\":0,\"pipeline_max_ns\":0,"
+        "\"timing_unavailable\":0,\"timing_non_monotonic\":0,"
+        "\"initialization_failed\":false,\"final\":false}";
+    static const char *prohibited[] = {
+        "path", "descriptor", "combiner", "function_constants",
+        "retail", "texture_identity", "address", "key_hash",
+    };
+    char report[2048], too_small[32];
+    CHECK(bw_metal_test_pipeline_async_format_summary(
+        report, sizeof report, 0));
+    CHECK(!strcmp(report, expected));
+    CHECK(!bw_metal_test_pipeline_async_format_summary(
+        too_small, sizeof too_small, 0));
+    for (size_t i = 0; i < sizeof prohibited / sizeof prohibited[0]; i++)
+        CHECK(!strstr(report, prohibited[i]));
+}
+
+static void pipeline_async_bounded_test(void)
+{
+    const uint32_t factors[] = {0, 1, 0x300};
+    const uint32_t nv_bits[] = {
+        0x00010000u, 0x00000100u, 0x00000001u, 0x01000000u,
+    };
+    Nv2aCombiner rc = synthetic_combiner();
+    BwMetalPipelineAsyncSnapshot snapshot;
+    BwMetalPipelineDiagnosticSnapshot diagnostic;
+    setup_dxt1_texture(0xF800u, 0x001Fu, 0);
+    setup_combiner(&rc);
+    triangle(0x8064C832u);
+    bw_metal_test_hold_async_pipeline_install(1);
+    for (unsigned i = 0; i < 33; i++) {
+        unsigned mask = (i + 15u) % 16u;
+        uint32_t nv_mask = 0;
+        for (unsigned j = 0; j < 4; j++)
+            if (mask & (1u << j))
+                nv_mask |= nv_bits[j];
+        method(0x0358, nv_mask);
+        blend_state(factors[i / 16u], 1, 0x8006, 0);
+        clear(0xFF102030u);
+        draw(3);
+    }
+    flip();
+    expect_no_error();
+    bw_metal_test_pipeline_async_snapshot(&snapshot);
+    CHECK(snapshot.capacity == 32);
+    CHECK(snapshot.entries == snapshot.capacity);
+    CHECK(snapshot.scheduled == snapshot.capacity);
+    CHECK(snapshot.capacity_fallbacks == 1);
+    CHECK(snapshot.generic_fallback_draws == 33);
+    bw_metal_test_pipeline_diagnostic_snapshot(&diagnostic);
+    CHECK(diagnostic.cache_entry_high_water <= 128);
+    CHECK(diagnostic.whole_cache_resets == 0);
+    bw_metal_test_hold_async_pipeline_install(0);
+    snapshot = pipeline_async_wait_for_terminal(32);
+    CHECK(snapshot.installed == 32);
+    CHECK(snapshot.entries == 0);
+}
+
+static void pipeline_async_stop_test(void)
+{
+    BwMetalPipelineAsyncSnapshot snapshot;
+    bw_metal_test_hold_async_pipeline_install(1);
+    extended_basic_test();
+    bw_metal_test_pipeline_async_snapshot(&snapshot);
+    CHECK(snapshot.scheduled == 1);
+    CHECK(snapshot.entries == 1);
+}
+
+static void pipeline_async_restart_test(void)
+{
+    BwMetalPipelineAsyncSnapshot snapshot;
+    bw_metal_test_hold_async_pipeline_install(1);
+    extended_basic_test();
+    bw_metal_backend_stop();
+    bw_metal_test_hold_async_pipeline_install(0);
+    CHECK(bw_metal_backend_start_for_test(s_mem, sizeof s_mem));
+    setup_surface(1);
+    bw_metal_test_pipeline_async_snapshot(&snapshot);
+    CHECK(snapshot.requested);
+    CHECK(snapshot.enabled);
+    CHECK(snapshot.scheduled == 0);
+    CHECK(snapshot.entries == 0);
     expect_no_error();
 }
 
@@ -6862,6 +7074,12 @@ int main(int argc, char **argv)
         if (!strcmp(argv[1], "pipeline-warmup-pipeline-failure"))
             bw_metal_test_fail_warmup_pipeline();
     }
+    if (!strncmp(argv[1], "pipeline-async-",
+                 sizeof("pipeline-async-") - 1u)) {
+        setenv("BW_METAL_PIPELINE_TIMING", "1", 1);
+        s_host_now_ns = UINT64_C(1000000000);
+        s_host_now_step = 1000;
+    }
     if (!strcmp(argv[1], "pipeline-diagnostic-library-fallback") ||
         !strcmp(argv[1], "pipeline-diagnostic-library-failure"))
         bw_metal_test_shader_library_failures(
@@ -7027,6 +7245,8 @@ int main(int argc, char **argv)
         pipeline_diagnostic_library_fallback_test();
     else if (!strcmp(argv[1], "pipeline-warmup-disabled"))
         pipeline_warmup_disabled_test();
+    else if (!strcmp(argv[1], "pipeline-async-disabled"))
+        pipeline_warmup_disabled_test();
     else if (!strcmp(argv[1], "pipeline-warmup-capture"))
         pipeline_warmup_capture_test(0);
     else if (!strcmp(argv[1], "pipeline-warmup-capture-failure"))
@@ -7048,6 +7268,24 @@ int main(int argc, char **argv)
              !strcmp(argv[1], "pipeline-warmup-pipeline-failure"))
         pipeline_warmup_fallback_test(
             BW_METAL_PIPELINE_ARTIFACT_OK, 1);
+    else if (!strcmp(argv[1], "pipeline-async-success"))
+        pipeline_async_success_test();
+    else if (!strcmp(argv[1], "pipeline-async-coalescing"))
+        pipeline_async_coalescing_test();
+    else if (!strcmp(argv[1], "pipeline-async-allocation-failure"))
+        pipeline_async_failure_test(0);
+    else if (!strcmp(argv[1], "pipeline-async-function-failure"))
+        pipeline_async_failure_test(1);
+    else if (!strcmp(argv[1], "pipeline-async-pipeline-failure"))
+        pipeline_async_failure_test(2);
+    else if (!strcmp(argv[1], "pipeline-async-report"))
+        pipeline_async_report_test();
+    else if (!strcmp(argv[1], "pipeline-async-bounded"))
+        pipeline_async_bounded_test();
+    else if (!strcmp(argv[1], "pipeline-async-stop"))
+        pipeline_async_stop_test();
+    else if (!strcmp(argv[1], "pipeline-async-restart"))
+        pipeline_async_restart_test();
     else if (!strcmp(argv[1], "cull"))
         cull_test();
     else if (!strcmp(argv[1], "full-rect"))

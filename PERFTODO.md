@@ -34,6 +34,9 @@ loads them without source fallback, and the explicit fallback remains tested.
 PERF-031 is complete: bounded private canonical-key traces are written
 atomically, compatibility-validated, and preloaded before first use while
 every rejection retains synchronous runtime creation.
+PERF-032 is complete: compatible preloads enable bounded asynchronous
+compilation for untraced specializations while the exact generic pipeline
+renders; failures remain explicit and callback ownership is drained at stop.
 Presentation timing instrumentation and the workload/device protocol may
 proceed independently, but default pacing and deeper renderer work remain
 gated on their measurements.
@@ -77,7 +80,7 @@ temperature evidence when privileged telemetry is available.
 | PERF-029 | Define the native pipeline-artifact contract | `[x]` | PERF-028 |
 | PERF-030 | Compile stable Metal shaders offline | `[x]` | PERF-029 |
 | PERF-031 | Add device-local trace-derived pipeline warm-up | `[x]` | PERF-028, PERF-029, PERF-030 |
-| PERF-032 | Add asynchronous rare-miss compilation and bounded retention | `[ ]` | PERF-028, PERF-029, PERF-030 |
+| PERF-032 | Add asynchronous rare-miss compilation and bounded retention | `[x]` | PERF-028, PERF-029, PERF-030 |
 | PERF-033 | Qualify cold-start pipeline behavior | `[ ]` | PERF-031, PERF-032 |
 | PERF-034 | Instrument presentation and display timing | `[ ]` | PERF-027 |
 | PERF-035 | Evaluate a gated `CAMetalDisplayLink` path | `[ ]` | PERF-034 |
@@ -425,12 +428,13 @@ PERF-030 through PERF-032 implement the measured path:
   without changing shader entry points or math policy.
 - [x] Preload validated local pipeline states before their first use in the
   traced workload.
-- [ ] Compile an untraced specialization asynchronously and retain the exact
+- [x] Compile an untraced specialization asynchronously and retain the exact
   generic Retail pipeline until it is ready.
-- [ ] Propagate compilation failure explicitly and keep rendering exact;
+- [x] Propagate compilation failure explicitly and keep rendering exact;
   never return success with a missing pipeline or stale state.
-- [ ] Replace whole-cache eviction only after PERF-028 proves the required
-  bounded retention policy.
+- [x] Keep the measured 128-entry whole-cache policy unchanged; PERF-028
+  reached only 25 entries with zero resets, while rare-miss state is separately
+  bounded to 32 coalesced entries.
 
 PERF-030 implementation preserves one 20,571-byte project-owned `.metal`
 source and generates default-math and safe-math embedded libraries when both
@@ -461,6 +465,28 @@ states loaded before use, then more than one million cache hits and zero
 misses. Because the title remained paused behind its reconnect overlay, those
 artifacts are not representative gameplay traces, their frame timings are not
 retained, and PERF-033 remains open.
+
+PERF-032 activates only after a fully compatible PERF-031 preload. An untraced
+specialized miss immediately uses the existing exact generic extended shader
+while Metal specializes the function and creates the render pipeline
+asynchronously. Duplicate canonical keys coalesce in a fixed 32-entry queue.
+Completion callbacks transfer only bounded state under a lock; the serial
+renderer installs ready states at draw or flip boundaries, and stop waits for
+all callbacks before releasing Metal objects. Allocation, function, pipeline,
+timing, and capacity outcomes remain explicit in bounded aggregate JSONL.
+Missing or rejected artifacts retain the unchanged synchronous path.
+
+Ten focused async scenarios cover default-disabled behavior, exact generic
+output, successful specialization/pipeline timing, duplicate coalescing,
+allocation/function/pipeline failures, the 32-entry bound, stable private
+reporting, pending-stop ownership, and restart isolation. They pass normally,
+under ASan/UBSan, and under ThreadSanitizer. The complete Metal backend suite
+passes 363/363, strict Objective-C warnings pass, and the production
+offline-library target rebuilds. The changed strict-C test translation unit
+compiles cleanly; the aggregate warning target is currently blocked later by
+a pre-existing `-Wcomment` error in the pinned toolkit's `kernel.h`. No
+no-controller result is treated as gameplay or cold-performance evidence;
+PERF-033 remains open.
 
 PERF-033 exit gates:
 

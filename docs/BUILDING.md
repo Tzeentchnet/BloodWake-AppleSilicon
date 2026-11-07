@@ -370,7 +370,13 @@ regular `.bwmpa` file outside the repository, prepared tree, and toolkit.
 Capture retains at most 128 canonical keys and writes atomically at frame
 boundaries. Warm-up validates the executable, stable shader, OS, SDK, Metal
 feature level, GPU family, payload digest, and key schema before preloading.
-Missing or rejected data emits bounded
+After a compatible preload, an untraced specialized key uses the exact generic
+extended pipeline while function specialization and pipeline creation run
+asynchronously. Duplicate misses coalesce in a 32-entry queue; completed states
+are installed only by the serial renderer, and stop drains all callbacks.
+Bounded `bloodwake.metal-pipeline-async/v1` JSONL reports only aggregate queue,
+fallback, completion, failure, and timing counts. Missing or rejected data
+never enables asynchronous rare-miss handling, emits bounded
 `bloodwake.metal-pipeline-warmup/v1` aggregate JSONL and uses unchanged
 synchronous runtime creation. Keep all `.bwmpa` files private and uncommitted.
 
