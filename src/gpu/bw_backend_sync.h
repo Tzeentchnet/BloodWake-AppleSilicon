@@ -17,6 +17,15 @@ void bw_backend_register_with_present_ops(
     int (*prepare_present)(uint32_t color_va, uint32_t pitch),
     int (*publish_snapshot)(uint32_t color_va, uint32_t pitch));
 
+/* Register only for the current backend while the executor is idle. The
+ * callbacks run serially on the executor thread. flip_stall receives the host
+ * time immediately before presentation work; flip_release receives the host
+ * time when the guest-facing flip hold releases, including immediate flips. */
+void bw_backend_register_flip_timing(
+    const Nv2aBackend *backend,
+    void (*flip_stall)(uint64_t host_ns),
+    void (*flip_release)(uint64_t host_ns));
+
 /* Remove only registrations still owned by the caller. */
 void bw_backend_unregister_if_current(const Nv2aBackend *backend);
 void bw_backend_ext_unregister_if_current(const BwXBackend *backend);

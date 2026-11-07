@@ -131,6 +131,13 @@ foreach(case semaphore-release semaphore-concurrent visual
              pipeline-diagnostic-library-failure
              pipeline-warmup-disabled pipeline-warmup-invalid
              pipeline-async-disabled
+             presentation-timing-disabled presentation-timing-lifecycle
+             presentation-timing-stream
+             presentation-timing-paced-release
+             presentation-timing-report presentation-timing-fractional
+             presentation-timing-failure presentation-timing-bounded
+             presentation-timing-allocation-failure presentation-timing-stop
+             presentation-timing-restart
              depth-draw stencil-draw polygon-offset polygon-offset-disabled polygon-offset-zero
              partial-color partial-color-masks partial-color-default-rect partial-clip partial-empty
              partial-depth partial-depth-seed partial-depth-empty partial-depth-unbound
@@ -252,6 +259,12 @@ add_test(NAME metal_pipeline-warmup-integration
             "${CMAKE_CURRENT_LIST_DIR}/test_pipeline_warmup.py"
             "$<TARGET_FILE:bw_metal_backend_test>")
 set_tests_properties(metal_pipeline-warmup-integration PROPERTIES TIMEOUT 120)
+
+add_test(NAME metal_presentation-timing-integration
+    COMMAND "${Python3_EXECUTABLE}"
+            "${CMAKE_CURRENT_LIST_DIR}/test_presentation_timing.py"
+            "$<TARGET_FILE:bw_metal_backend_test>")
+set_tests_properties(metal_presentation-timing-integration PROPERTIES TIMEOUT 120)
 
 add_test(NAME metal_cpu_write_counterexample
     COMMAND bw_metal_backend_test cpu-write-counterexample)

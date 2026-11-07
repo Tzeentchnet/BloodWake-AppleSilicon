@@ -648,6 +648,70 @@ qualification. No physical controller is available, so the title remains
 paused behind its reconnect overlay; no paused-run maximum or trace coverage
 advances PERF-033.
 
+#### PERF-034 implementation evidence
+
+`BW_METAL_FRAME_TIMING=1` now also enables fixed-capacity
+`bloodwake.metal-presentation-timing/v1` JSONL. No new environment contract is
+needed. The disabled path allocates no presentation state. An enabled run
+retains at most 512 records and streams each completed record once, so a
+bounded diagnostic timeout does not depend on backend stop. Stop waits at
+most one second for owned command-completion and presented callbacks, emits
+any remaining records and one summary, and reports unresolved callbacks
+explicitly.
+
+The executor records flip stall immediately before backend presentation and
+flip release when the existing host-paced hold releases, including the
+immediate/no-hold case. The Metal backend correlates those milestones with
+drawable acquisition, present request, command commit/completion, and the
+actual-presentation callback on `xbox_HostNowNs()`. A valid
+`MTLDrawable.presentedTime` is calibrated onto that monotonic clock at callback
+time. Exact consecutive intervals remain integer nanoseconds, including
+fractional and variable cadence; no display rate is rounded or inferred.
+
+The explicit `presentDrawable:` API does not expose a display target
+timestamp. It therefore reports
+`display_target_status:"unavailable_explicit_presenter"` and a null target.
+Zero, non-finite, unavailable, or backward actual times retain distinct
+explicit status instead of a success-shaped value. Output contains only
+sequence/frame, classifications, status, timestamps, intervals, durations,
+and aggregate counters. It contains no descriptor, combiner value, function
+constant, key/hash, retail address/state, or texture identity.
+
+Eleven focused direct cases cover default-off behavior, lifecycle
+correlation, runtime streaming without stop, delayed host-paced release,
+stable private output, exact fractional/variable intervals, unavailable and
+invalid timing, the 512-record bound, allocation failure, stop with
+outstanding callbacks, and restart isolation. The separate integration case
+validates exact JSON field sets, bounds, privacy, and deterministic output.
+All 12 selectors pass normally, under ASan/UBSan, and under ThreadSanitizer.
+The complete Metal backend suite passes 375/375. Strict Objective-C and
+changed-source C warning checks pass; the production offline-library target
+rebuilds. The aggregate production build still reports the pre-existing
+nested-comment warning in the pinned toolkit `kernel.h`.
+
+#### PERF-034 paused-renderer mechanics evidence
+
+The first private bounded exact-default smoke revealed that stop-only
+reporting produced no records when the runner reached its configured limit.
+After adding bounded in-run streaming and a focused no-stop regression case,
+a second private smoke retained four consecutive records, frames 0 through 3,
+before the controller-reconnect overlay became static.
+
+All four records used the direct presenter, acquired a drawable, completed
+their Metal command, and invoked the presented callback. Drawable acquisition
+ranged from 0.290 to 3.756 ms, command commit-to-completion from 4.368 to
+11.469 ms, and observed flip hold from 0.314 to 15.166 ms. There were zero
+malformed records, ordering failures, or prohibited fields; the largest JSON
+record was 719 bytes.
+
+All four callbacks returned an unavailable actual-presentation timestamp, and
+the explicit presenter reported display targets unavailable as designed.
+Consequently this run provides no actual-present interval and cannot
+attribute the historical wall p95. It validates real drawable, completion,
+callback, streaming, and explicit-unavailability mechanics only. The title
+was paused without a physical controller, so none of these phase durations
+are retained as gameplay pacing or PERF-034 causal evidence.
+
 The remaining implementation sequence is:
 
 1. capture a representative gameplay trace with a connected controller;
@@ -741,6 +805,7 @@ They live outside the repository and must remain uncommitted:
 - `runtime-native-4x60-consolidated-002`
 - `runtime-native-4x60-consolidated-fixed4-001`
 - `runtime-native-4x60-consolidated-fixed4-002`
+- `runtime-perf034-paused-002`
 
 ## Reproduction template
 

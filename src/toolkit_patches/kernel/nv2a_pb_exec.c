@@ -939,6 +939,8 @@ static void surface_apply_clip(void)
 /* ---- Render back end (nv2a_backend.h) ------------------------------- */
 
 static const Nv2aBackend *s_backend;
+static void (*s_backend_flip_stall)(uint64_t);
+static void (*s_backend_flip_release)(uint64_t);
 
 void bw_backend_register_with_present_ops(
     const Nv2aBackend *backend,
@@ -948,6 +950,19 @@ void bw_backend_register_with_present_ops(
     s_backend = backend;
     s_backend_present_prepare = backend ? prepare_present : NULL;
     s_backend_snapshot_publish = backend ? publish_snapshot : NULL;
+    s_backend_flip_stall = NULL;
+    s_backend_flip_release = NULL;
+}
+
+void bw_backend_register_flip_timing(
+    const Nv2aBackend *backend,
+    void (*flip_stall)(uint64_t),
+    void (*flip_release)(uint64_t))
+{
+    if (backend && backend == s_backend) {
+        s_backend_flip_stall = flip_stall;
+        s_backend_flip_release = flip_release;
+    }
 }
 
 void nv2a_backend_register(const Nv2aBackend *backend)
@@ -5795,7 +5810,10 @@ int nv2a_pb_exec_flip_poll(void)
         return 0;
     now = xbox_HostNowNs();
     c = flip_clock(now, &ok);
-    return xbox_FlipHoldPoll(&s_flip_hold, c, now, ok);
+    int held = xbox_FlipHoldPoll(&s_flip_hold, c, now, ok);
+    if (!held && s_backend_flip_release)
+        s_backend_flip_release(now);
+    return held;
 }
 
 /* The hold's line in the periodic [GPU] report, then reset. */
@@ -6331,6 +6349,8 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
         int snapshot_ok, synchronized;
         uint32_t snapshot_va, snapshot_pitch, snapshot_aa_sy;
         uint32_t stall_vbl;
+        if (s_backend_flip_stall)
+            s_backend_flip_stall(stall_ns);
         bw_ocean_marker_frame_end();
         (void)flip_clock(stall_ns, &clock_ok);
         stall_vbl = s_walk_vbl;
@@ -6451,6 +6471,8 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
             xbox_FlipHoldStall(&s_flip_hold, stall_vbl, stall_ns,
                                clock_ok && !nv2a_pb_scan_in_call());
         }
+        if (!s_flip_hold.held && s_backend_flip_release)
+            s_backend_flip_release(xbox_HostNowNs());
         return;
     }
 

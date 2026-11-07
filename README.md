@@ -83,7 +83,7 @@ This is still a development build:
   audible.
 - USB gamepads, physical-controller support, and broad mission, save, FMV,
   and edition coverage are incomplete.
-- Current regression results include 337/337 Metal backend tests, all 62
+- Current regression results include 375/375 Metal backend tests, all 62
   presenter CTest entries (including the real-window AppKit case in the
   current WindowServer session), 35/35 MMIO host tests, 8/8 normal and ASan/UBSan
   macOS host tests, 11/11 input integration tests, 6/6 APU/audio tests,
@@ -126,9 +126,12 @@ order:
    offline-library, device-local preload, and exact asynchronous rare-miss
    path. Missing or rejected artifacts retain synchronous runtime creation.
    Retail-derived traces and archives remain private.
-2. Measure drawable acquisition, flip release, command completion, and actual
-   presentation timestamps before evaluating a gated `CAMetalDisplayLink`
-   match-display path. The current path remains the fallback.
+2. Obtain representative gameplay evidence from the new bounded presentation
+   telemetry before evaluating a gated `CAMetalDisplayLink` match-display
+   path. A paused-renderer smoke validated real drawable, command-completion,
+   presented-callback, and explicit-unavailability handling, but supplied no
+   usable actual-present or display-target timestamp. The current path remains
+   the fallback.
 3. Qualify cold start, frame pacing, missions, split-screen, heavy effects,
    long-duration behavior, and available Apple Silicon device classes with
    direct power and temperature evidence where approved.

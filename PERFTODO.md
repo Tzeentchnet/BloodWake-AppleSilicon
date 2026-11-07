@@ -1,7 +1,7 @@
 # Apple Silicon performance work tracker
 
 Status: tracked performance tracker
-Last updated: 2026-11-06
+Last updated: 2026-11-07
 
 This tracker covers base-game frame rate, efficiency, and thermal work. The
 bounded ownership, 30 FPS closure, and representative sustained Native 4x/60
@@ -37,9 +37,11 @@ every rejection retains synchronous runtime creation.
 PERF-032 is complete: compatible preloads enable bounded asynchronous
 compilation for untraced specializations while the exact generic pipeline
 renders; failures remain explicit and callback ownership is drained at stop.
-Presentation timing instrumentation and the workload/device protocol may
-proceed independently, but default pacing and deeper renderer work remain
-gated on their measurements.
+PERF-034 instrumentation is implemented and validated, including bounded
+runtime streaming, but remains active: the no-controller production smoke
+reached only the paused reconnect overlay, and its real presented callbacks
+reported no usable actual or display-target timestamp. Default pacing and
+deeper renderer work remain gated on representative measurements.
 
 Render scale, filtering, LOD, Retail draw coverage, quincunx behavior, and
 Retail-water defaults remain fixed. Continue collecting direct power and
@@ -82,7 +84,7 @@ temperature evidence when privileged telemetry is available.
 | PERF-031 | Add device-local trace-derived pipeline warm-up | `[x]` | PERF-028, PERF-029, PERF-030 |
 | PERF-032 | Add asynchronous rare-miss compilation and bounded retention | `[x]` | PERF-028, PERF-029, PERF-030 |
 | PERF-033 | Qualify cold-start pipeline behavior | `[ ]` | PERF-031, PERF-032 |
-| PERF-034 | Instrument presentation and display timing | `[ ]` | PERF-027 |
+| PERF-034 | Instrument presentation and display timing | `[~]` | PERF-027 |
 | PERF-035 | Evaluate a gated `CAMetalDisplayLink` path | `[ ]` | PERF-034 |
 | PERF-036 | Qualify match-display pacing and latency | `[ ]` | PERF-035 |
 | PERF-037 | Define the broader workload and device matrix | `[ ]` | PERF-027 |
@@ -500,6 +502,37 @@ PERF-033 exit gates:
   explicit fallback.
 
 ### Presentation pacing: PERF-034 through PERF-036
+
+PERF-034 reuses the disabled-by-default exact-value
+`BW_METAL_FRAME_TIMING=1` switch. It retains at most 512 flip records and
+streams each completed record once as
+`bloodwake.metal-presentation-timing/v1`, with a final aggregate summary when
+backend stop runs. Flip stall/release, drawable acquisition, present request,
+command commit/completion, and the actual-presentation callback use the
+existing monotonic host clock. Valid `MTLDrawable.presentedTime` values are
+converted onto that clock at callback time; invalid or unavailable values
+remain explicit. Exact nanosecond intervals are never rounded to an assumed
+integer refresh rate.
+
+The current explicit `presentDrawable:` API exposes no display target
+timestamp, so its status is `unavailable_explicit_presenter` with a null
+value. A target timestamp is available only through the gated display-link
+experiment in PERF-035. Eleven focused lifecycle, streaming, paced-release,
+fractional/variable interval, failure, bound, allocation, callback-stop, and
+restart cases plus the machine-readable integration case pass normally,
+under ASan/UBSan, and under ThreadSanitizer. The complete Metal backend suite
+passes 375/375, strict C and Objective-C validation pass, and the production
+offline-library target rebuilds.
+
+A private exact-default production smoke retained four paused-renderer
+events before the controller overlay stopped producing new flips. All four
+acquired a drawable, completed their command, and invoked the presented
+callback with no ordering, JSON, or privacy failure. All four returned an
+unavailable actual presentation time, and the explicit presenter had no
+display target timestamp. This proves callback mechanics and explicit failure
+reporting only. It does not provide display cadence, gameplay pacing, or
+causal evidence for the 17.06-17.46 ms wall p95, so the first three runtime
+items below remain open.
 
 - [ ] Correlate flip release, command commit/completion, drawable acquisition,
   requested presentation, actual presentation, and display target timestamps.

@@ -327,7 +327,26 @@ guest data, private. A missing sandbox or failed isolation check aborts before
 guest execution.
 
 For a low-instrumentation performance run, use `--frame-timing` without
-`--gpu-audit`. It enables only the Metal completed-flip interval report.
+`--gpu-audit`. It enables the Metal completed-flip interval report and bounded
+`bloodwake.metal-presentation-timing/v1` JSONL. The presentation stream retains
+at most 512 flips and records frame/sequence, flip stall/release and hold,
+drawable acquisition, present request, command commit/completion, the actual
+presentation callback, exact consecutive actual-present intervals, and
+explicit phase status on the existing monotonic host clock. Completed records
+stream while the guest runs so a bounded diagnostic timeout does not require
+backend shutdown; stop emits any remaining records plus one aggregate summary
+after waiting at most one second for owned callbacks.
+
+The explicit `presentDrawable:` path does not expose a display target
+timestamp. Its records therefore use
+`display_target_status:"unavailable_explicit_presenter"` and
+`display_target_ns:null`; they never infer or round a refresh rate. A missing,
+zero, non-finite, or backward actual-presentation time is also reported
+explicitly rather than converted into a successful timestamp. Records contain
+only classifications, counters, timestamps, durations, and explicit status,
+not descriptors, retail addresses/state, or texture identities. Keep the
+resulting logs private.
+
 Add `--pipeline-timing` to opt into bounded
 `bloodwake.metal-pipeline-lifecycle/v2` JSONL. It sets the exact-value
 `BW_METAL_PIPELINE_TIMING=1` child switch, retains at most 512 expensive

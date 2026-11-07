@@ -55,6 +55,10 @@ extern uint64_t xbox_HostNowNs(void);
 #define METAL_PIPELINE_ASYNC_SCHEMA "bloodwake.metal-pipeline-async/v1"
 #define METAL_PIPELINE_ASYNC_CAPACITY 32u
 #define METAL_PIPELINE_ASYNC_REPORT_CAPACITY 16u
+#define METAL_PRESENTATION_SCHEMA "bloodwake.metal-presentation-timing/v1"
+#define METAL_PRESENTATION_EVENT_CAPACITY 512u
+#define METAL_PRESENTATION_REPORT_LINE_MAX 2048u
+#define METAL_PRESENTATION_CALLBACK_WAIT_NS UINT64_C(1000000000)
 #define METAL_PIPELINE_FEATURE_LEVEL 1u
 #if defined(BW_METAL_TESTING)
 #define METAL_WATER_BENCHMARK_WARMUP_FRAMES 1u
@@ -245,6 +249,21 @@ typedef struct {
     uint64_t timing_unavailable, timing_non_monotonic;
 } MetalAsyncPipelineDiagnostic;
 
+typedef enum {
+    METAL_PRESENTATION_COMMAND_NOT_SUBMITTED,
+    METAL_PRESENTATION_COMMAND_PENDING,
+    METAL_PRESENTATION_COMMAND_COMPLETED,
+    METAL_PRESENTATION_COMMAND_FAILED,
+} MetalPresentationCommandStatus;
+
+typedef enum {
+    METAL_PRESENTATION_ACTUAL_NOT_REQUESTED,
+    METAL_PRESENTATION_ACTUAL_PENDING,
+    METAL_PRESENTATION_ACTUAL_PRESENTED,
+    METAL_PRESENTATION_ACTUAL_UNAVAILABLE,
+    METAL_PRESENTATION_ACTUAL_INVALID,
+} MetalPresentationActualStatus;
+
 typedef struct {
     uint32_t depth_test, depth_func, depth_write, stencil_enable;
     uint32_t stencil_func, stencil_func_mask, stencil_write_mask;
@@ -275,6 +294,24 @@ typedef struct {
 }
 @end
 @implementation BWMetalAsyncPipelineEntry
+@end
+
+@interface BWMetalPresentationRecord : NSObject {
+@public
+    uint64_t sequence;
+    uint64_t flip_stall_ns, flip_release_ns;
+    uint64_t drawable_acquire_start_ns, drawable_acquire_end_ns;
+    uint64_t present_request_ns, command_commit_ns, command_complete_ns;
+    uint64_t actual_present_ns, actual_callback_ns;
+    uint32_t frame;
+    int direct_presenter;
+    int drawable_acquired;
+    int reported;
+    MetalPresentationCommandStatus command_status;
+    MetalPresentationActualStatus actual_status;
+}
+@end
+@implementation BWMetalPresentationRecord
 @end
 
 @interface BWMetalColorSurface : NSObject {
@@ -338,6 +375,7 @@ typedef struct {
     uint32_t reason_mask;
     int water_command;
     int presented;
+    BWMetalPresentationRecord *presentation_record;
 #if defined(BW_METAL_TESTING)
     int test_failure;
 #endif
@@ -424,6 +462,19 @@ static MetalAsyncPipelineDiagnostic s_async_pipeline_diagnostic;
 static NSMutableArray<BWMetalAsyncPipelineEntry *> *s_async_pipelines;
 static NSLock *s_async_pipeline_lock;
 static dispatch_group_t s_async_pipeline_group;
+static NSMutableArray<BWMetalPresentationRecord *> *s_presentation_records;
+static NSLock *s_presentation_lock;
+static dispatch_group_t s_presentation_group;
+static BWMetalPresentationRecord *s_presentation_current;
+static int s_presentation_flip_open;
+static uint64_t s_presentation_events_seen;
+static uint64_t s_presentation_events_dropped;
+static uint64_t s_presentation_allocation_failures;
+static uint64_t s_presentation_callback_timeouts;
+static uint64_t s_presentation_last_reported_actual_ns;
+static int s_presentation_timing_enabled;
+static int s_presentation_timing_initialization_failed;
+static int s_presentation_timing_final_reported;
 static NSMutableDictionary<NSData *, id<MTLRenderPipelineState>> *s_pipelines;
 static NSMutableDictionary<NSNumber *, id<MTLRenderPipelineState>> *s_clear_pipelines;
 static NSMutableDictionary<NSData *, BWMetalColorSurface *> *s_color_surfaces;
@@ -467,6 +518,7 @@ static int s_test_hold_async_pipeline_install;
 static int s_test_fail_async_pipeline_allocation;
 static int s_test_fail_async_function;
 static int s_test_fail_async_pipeline;
+static int s_test_fail_presentation_record_allocation;
 #endif
 static id<MTLTexture> s_surface;
 static id<MTLTexture> s_inactive_texture;
@@ -545,6 +597,8 @@ static int publish_all_dirty_color_surfaces(void);
 static int metal_fail(const char *format, ...);
 static void pipeline_async_drain(int force);
 static void pipeline_async_report(int final);
+static void presentation_timing_report_ready(void);
+static void presentation_timing_report(void);
 
 static uint64_t pipeline_key_hash(uint64_t domain, const void *bytes, size_t length)
 {
@@ -1214,6 +1268,504 @@ static int pipeline_async_enable(void)
     s_async_pipeline_diagnostic.enabled = 1;
     s_async_pipeline_diagnostic.dirty = 1;
     return 1;
+}
+
+static const char *presentation_command_status_name(
+    MetalPresentationCommandStatus status)
+{
+    switch (status) {
+    case METAL_PRESENTATION_COMMAND_NOT_SUBMITTED: return "not_submitted";
+    case METAL_PRESENTATION_COMMAND_PENDING: return "pending";
+    case METAL_PRESENTATION_COMMAND_COMPLETED: return "completed";
+    case METAL_PRESENTATION_COMMAND_FAILED: return "failed";
+    }
+    return "invalid";
+}
+
+static const char *presentation_actual_status_name(
+    MetalPresentationActualStatus status)
+{
+    switch (status) {
+    case METAL_PRESENTATION_ACTUAL_NOT_REQUESTED: return "not_requested";
+    case METAL_PRESENTATION_ACTUAL_PENDING: return "pending";
+    case METAL_PRESENTATION_ACTUAL_PRESENTED: return "presented";
+    case METAL_PRESENTATION_ACTUAL_UNAVAILABLE: return "unavailable";
+    case METAL_PRESENTATION_ACTUAL_INVALID: return "invalid";
+    }
+    return "invalid";
+}
+
+static void presentation_timing_reset(int enabled)
+{
+    s_presentation_records = nil;
+    s_presentation_lock = nil;
+    s_presentation_group = nil;
+    s_presentation_current = nil;
+    s_presentation_flip_open = 0;
+    s_presentation_events_seen = 0;
+    s_presentation_events_dropped = 0;
+    s_presentation_allocation_failures = 0;
+    s_presentation_callback_timeouts = 0;
+    s_presentation_last_reported_actual_ns = 0;
+    s_presentation_timing_enabled = 0;
+    s_presentation_timing_initialization_failed = 0;
+    s_presentation_timing_final_reported = 0;
+    if (!enabled)
+        return;
+    s_presentation_records = [[NSMutableArray alloc]
+        initWithCapacity:METAL_PRESENTATION_EVENT_CAPACITY];
+    s_presentation_lock = [NSLock new];
+    s_presentation_group = dispatch_group_create();
+    if (!s_presentation_records || !s_presentation_lock ||
+        !s_presentation_group) {
+        s_presentation_timing_initialization_failed = 1;
+        fprintf(stderr,
+                "[GPU-METAL] presentation timing unavailable: "
+                "could not allocate bounded diagnostic state\n");
+        return;
+    }
+    s_presentation_timing_enabled = 1;
+}
+
+static BWMetalPresentationRecord *presentation_timing_new_record(
+    uint64_t stall_ns)
+{
+    if (!s_presentation_timing_enabled)
+        return nil;
+    uint64_t sequence = s_presentation_events_seen++;
+    if (s_presentation_records.count >=
+        METAL_PRESENTATION_EVENT_CAPACITY) {
+        s_presentation_events_dropped++;
+        return nil;
+    }
+#if defined(BW_METAL_TESTING)
+    BWMetalPresentationRecord *record =
+        s_test_fail_presentation_record_allocation
+            ? nil : [BWMetalPresentationRecord new];
+    s_test_fail_presentation_record_allocation = 0;
+#else
+    BWMetalPresentationRecord *record =
+        [BWMetalPresentationRecord new];
+#endif
+    if (!record) {
+        s_presentation_allocation_failures++;
+        return nil;
+    }
+    record->sequence = sequence;
+    record->frame = s_frame;
+    record->flip_stall_ns = stall_ns;
+    record->direct_presenter = s_present_layer != nil;
+    record->command_status =
+        METAL_PRESENTATION_COMMAND_NOT_SUBMITTED;
+    record->actual_status =
+        METAL_PRESENTATION_ACTUAL_NOT_REQUESTED;
+    [s_presentation_records addObject:record];
+    return record;
+}
+
+static void presentation_timing_flip_stall(uint64_t stall_ns)
+{
+    if (!s_presentation_timing_enabled)
+        return;
+    presentation_timing_report_ready();
+    if (s_presentation_current) {
+        s_presentation_events_dropped++;
+        s_presentation_current = nil;
+    }
+    s_presentation_flip_open = 1;
+    s_presentation_current =
+        presentation_timing_new_record(stall_ns);
+}
+
+static void presentation_timing_flip_release(uint64_t release_ns)
+{
+    BWMetalPresentationRecord *record = s_presentation_current;
+    s_presentation_flip_open = 0;
+    if (!record)
+        return;
+    [s_presentation_lock lock];
+    record->flip_release_ns = release_ns;
+    [s_presentation_lock unlock];
+    s_presentation_current = nil;
+}
+
+static uint64_t presentation_time_to_host_ns(
+    CFTimeInterval presented_time,
+    CFTimeInterval callback_time,
+    uint64_t callback_ns,
+    MetalPresentationActualStatus *status)
+{
+    if (!isfinite(presented_time) || presented_time <= 0.0) {
+        *status = METAL_PRESENTATION_ACTUAL_UNAVAILABLE;
+        return 0;
+    }
+    if (!isfinite(callback_time) || callback_time < presented_time ||
+        !callback_ns) {
+        *status = METAL_PRESENTATION_ACTUAL_INVALID;
+        return 0;
+    }
+    double delay = (callback_time - presented_time) * 1.0e9;
+    if (!isfinite(delay) || delay < 0.0 ||
+        delay > (double)callback_ns) {
+        *status = METAL_PRESENTATION_ACTUAL_INVALID;
+        return 0;
+    }
+    uint64_t delay_ns = (uint64_t)llround(delay);
+    if (delay_ns > callback_ns) {
+        *status = METAL_PRESENTATION_ACTUAL_INVALID;
+        return 0;
+    }
+    *status = METAL_PRESENTATION_ACTUAL_PRESENTED;
+    return callback_ns - delay_ns;
+}
+
+static void presentation_timing_attach_command(
+    BWMetalPresentationRecord *record,
+    id<MTLCommandBuffer> command)
+{
+    if (!record || !command)
+        return;
+    NSLock *lock = s_presentation_lock;
+    dispatch_group_t group = s_presentation_group;
+    [lock lock];
+    record->command_status = METAL_PRESENTATION_COMMAND_PENDING;
+    [lock unlock];
+    dispatch_group_enter(group);
+    [command addCompletedHandler:^(id<MTLCommandBuffer> completed) {
+        @autoreleasepool {
+            uint64_t now = xbox_HostNowNs();
+            [lock lock];
+            record->command_complete_ns = now;
+            record->command_status =
+                completed.status == MTLCommandBufferStatusCompleted
+                    ? METAL_PRESENTATION_COMMAND_COMPLETED
+                    : METAL_PRESENTATION_COMMAND_FAILED;
+            [lock unlock];
+            dispatch_group_leave(group);
+        }
+    }];
+}
+
+static void presentation_timing_attach_drawable(
+    BWMetalPresentationRecord *record,
+    id<CAMetalDrawable> drawable)
+{
+    if (!record || !drawable)
+        return;
+    if (@available(macOS 10.15.4, *)) {
+        NSLock *lock = s_presentation_lock;
+        dispatch_group_t group = s_presentation_group;
+        [lock lock];
+        record->actual_status = METAL_PRESENTATION_ACTUAL_PENDING;
+        [lock unlock];
+        dispatch_group_enter(group);
+        [drawable addPresentedHandler:^(id<MTLDrawable> presented) {
+            @autoreleasepool {
+                uint64_t callback_ns = xbox_HostNowNs();
+                CFTimeInterval callback_time = CACurrentMediaTime();
+                MetalPresentationActualStatus status;
+                uint64_t actual_ns = presentation_time_to_host_ns(
+                    presented.presentedTime, callback_time,
+                    callback_ns, &status);
+                [lock lock];
+                record->actual_callback_ns = callback_ns;
+                record->actual_present_ns = actual_ns;
+                record->actual_status = status;
+                [lock unlock];
+                dispatch_group_leave(group);
+            }
+        }];
+    } else {
+        [s_presentation_lock lock];
+        record->actual_status =
+            METAL_PRESENTATION_ACTUAL_UNAVAILABLE;
+        [s_presentation_lock unlock];
+    }
+}
+
+static const char *presentation_event_status(
+    const BWMetalPresentationRecord *record)
+{
+    if (!record->direct_presenter)
+        return "no_direct_presenter";
+    if (!record->drawable_acquire_start_ns)
+        return "not_requested";
+    if (!record->drawable_acquired)
+        return "drawable_unavailable";
+    if (record->command_status ==
+        METAL_PRESENTATION_COMMAND_FAILED)
+        return "command_failed";
+    if (record->actual_status ==
+        METAL_PRESENTATION_ACTUAL_PRESENTED)
+        return "presented";
+    if (record->actual_status ==
+        METAL_PRESENTATION_ACTUAL_UNAVAILABLE)
+        return "actual_time_unavailable";
+    if (record->actual_status ==
+        METAL_PRESENTATION_ACTUAL_INVALID)
+        return "actual_time_invalid";
+    return "pending";
+}
+
+static const char *presentation_nullable_u64(
+    uint64_t value, char buffer[32])
+{
+    if (!value)
+        return "null";
+    snprintf(buffer, 32, "%llu", (unsigned long long)value);
+    return buffer;
+}
+
+static int presentation_timing_format_event(
+    const BWMetalPresentationRecord *record,
+    uint64_t previous_actual_ns,
+    char *buffer,
+    size_t size)
+{
+    char stall[32], release[32], hold[32], acquire_start[32];
+    char acquire_end[32], request[32], commit[32], complete[32];
+    char actual[32], callback[32], interval[32];
+    uint64_t hold_ns =
+        record->flip_stall_ns && record->flip_release_ns >
+                                     record->flip_stall_ns
+            ? record->flip_release_ns - record->flip_stall_ns : 0;
+    uint64_t actual_interval =
+        previous_actual_ns &&
+        record->actual_present_ns > previous_actual_ns
+            ? record->actual_present_ns - previous_actual_ns : 0;
+    const char *drawable_status =
+        !record->direct_presenter ? "not_applicable"
+      : !record->drawable_acquire_start_ns ? "not_attempted"
+      : record->drawable_acquired ? "acquired" : "unavailable";
+    int written = snprintf(
+        buffer, size,
+        "{\"schema\":\"" METAL_PRESENTATION_SCHEMA "\","
+        "\"record\":\"event\",\"sequence\":%llu,\"frame\":%u,"
+        "\"status\":\"%s\",\"direct_presenter\":%s,"
+        "\"flip_stall_ns\":%s,\"flip_release_ns\":%s,"
+        "\"flip_hold_ns\":%s,\"drawable_status\":\"%s\","
+        "\"drawable_acquire_start_ns\":%s,"
+        "\"drawable_acquire_end_ns\":%s,"
+        "\"present_request_ns\":%s,\"command_commit_ns\":%s,"
+        "\"command_complete_ns\":%s,\"command_status\":\"%s\","
+        "\"actual_present_ns\":%s,\"actual_callback_ns\":%s,"
+        "\"actual_present_status\":\"%s\","
+        "\"actual_present_interval_ns\":%s,"
+        "\"display_target_status\":\"%s\","
+        "\"display_target_ns\":null}",
+        (unsigned long long)record->sequence, record->frame,
+        presentation_event_status(record),
+        record->direct_presenter ? "true" : "false",
+        presentation_nullable_u64(record->flip_stall_ns, stall),
+        presentation_nullable_u64(record->flip_release_ns, release),
+        presentation_nullable_u64(hold_ns, hold),
+        drawable_status,
+        presentation_nullable_u64(
+            record->drawable_acquire_start_ns, acquire_start),
+        presentation_nullable_u64(
+            record->drawable_acquire_end_ns, acquire_end),
+        presentation_nullable_u64(
+            record->present_request_ns, request),
+        presentation_nullable_u64(
+            record->command_commit_ns, commit),
+        presentation_nullable_u64(
+            record->command_complete_ns, complete),
+        presentation_command_status_name(record->command_status),
+        presentation_nullable_u64(
+            record->actual_present_ns, actual),
+        presentation_nullable_u64(
+            record->actual_callback_ns, callback),
+        presentation_actual_status_name(record->actual_status),
+        presentation_nullable_u64(actual_interval, interval),
+        record->direct_presenter
+            ? "unavailable_explicit_presenter"
+            : "not_applicable");
+    return written >= 0 && (size_t)written < size;
+}
+
+static int presentation_timing_record_ready(
+    const BWMetalPresentationRecord *record)
+{
+    return record->flip_release_ns &&
+           record->command_status !=
+               METAL_PRESENTATION_COMMAND_PENDING &&
+           record->actual_status !=
+               METAL_PRESENTATION_ACTUAL_PENDING;
+}
+
+static void presentation_timing_report_ready(void)
+{
+    if (!s_presentation_timing_enabled)
+        return;
+    [s_presentation_lock lock];
+    char line[METAL_PRESENTATION_REPORT_LINE_MAX];
+    for (BWMetalPresentationRecord *record in s_presentation_records) {
+        if (record->reported)
+            continue;
+        if (!presentation_timing_record_ready(record))
+            break;
+        if (presentation_timing_format_event(
+                record, s_presentation_last_reported_actual_ns,
+                line, sizeof line))
+            fprintf(stderr, "%s\n", line);
+        record->reported = 1;
+        if (record->actual_present_ns)
+            s_presentation_last_reported_actual_ns =
+                record->actual_present_ns;
+    }
+    [s_presentation_lock unlock];
+}
+
+static int presentation_timing_format_summary(
+    char *buffer, size_t size)
+{
+    uint64_t releases = 0, acquired = 0, unavailable = 0;
+    uint64_t requests = 0, command_completed = 0, command_failed = 0;
+    uint64_t actual_presented = 0, actual_unavailable = 0;
+    uint64_t actual_invalid = 0, target_unavailable = 0;
+    uint64_t interval_count = 0, interval_min = UINT64_MAX;
+    uint64_t interval_max = 0, previous_actual = 0;
+    uint64_t ordering_failures = 0;
+    for (BWMetalPresentationRecord *record in s_presentation_records) {
+        releases += record->flip_release_ns != 0;
+        acquired += record->drawable_acquired != 0;
+        unavailable += record->drawable_acquire_start_ns != 0 &&
+                       !record->drawable_acquired;
+        requests += record->present_request_ns != 0;
+        command_completed += record->command_status ==
+                             METAL_PRESENTATION_COMMAND_COMPLETED;
+        command_failed += record->command_status ==
+                          METAL_PRESENTATION_COMMAND_FAILED;
+        actual_presented += record->actual_status ==
+                            METAL_PRESENTATION_ACTUAL_PRESENTED;
+        actual_unavailable += record->actual_status ==
+                              METAL_PRESENTATION_ACTUAL_UNAVAILABLE;
+        actual_invalid += record->actual_status ==
+                          METAL_PRESENTATION_ACTUAL_INVALID;
+        target_unavailable += record->direct_presenter != 0;
+        if (record->flip_release_ns && record->flip_stall_ns &&
+            record->flip_release_ns <= record->flip_stall_ns)
+            ordering_failures++;
+        if (record->drawable_acquire_end_ns &&
+            record->drawable_acquire_start_ns &&
+            record->drawable_acquire_end_ns <
+                record->drawable_acquire_start_ns)
+            ordering_failures++;
+        if (record->command_complete_ns && record->command_commit_ns &&
+            record->command_complete_ns < record->command_commit_ns)
+            ordering_failures++;
+        if (record->actual_present_ns) {
+            if (previous_actual &&
+                record->actual_present_ns > previous_actual) {
+                uint64_t interval =
+                    record->actual_present_ns - previous_actual;
+                interval_count++;
+                if (interval < interval_min)
+                    interval_min = interval;
+                if (interval > interval_max)
+                    interval_max = interval;
+            } else if (previous_actual) {
+                ordering_failures++;
+            }
+            previous_actual = record->actual_present_ns;
+        }
+    }
+    char interval_min_text[32], interval_max_text[32];
+    int written = snprintf(
+        buffer, size,
+        "{\"schema\":\"" METAL_PRESENTATION_SCHEMA "\","
+        "\"record\":\"summary\",\"enabled\":%s,"
+        "\"event_capacity\":%u,\"events_seen\":%llu,"
+        "\"events_recorded\":%zu,\"events_dropped\":%llu,"
+        "\"flip_releases\":%llu,\"drawables_acquired\":%llu,"
+        "\"drawables_unavailable\":%llu,"
+        "\"present_requests\":%llu,\"commands_completed\":%llu,"
+        "\"commands_failed\":%llu,\"actual_presented\":%llu,"
+        "\"actual_unavailable\":%llu,\"actual_invalid\":%llu,"
+        "\"display_targets_available\":0,"
+        "\"display_targets_unavailable\":%llu,"
+        "\"actual_interval_count\":%llu,"
+        "\"actual_interval_min_ns\":%s,"
+        "\"actual_interval_max_ns\":%s,"
+        "\"ordering_failures\":%llu,\"callback_timeouts\":%llu,"
+        "\"allocation_failures\":%llu,"
+        "\"initialization_failed\":%s}",
+        s_presentation_timing_enabled ? "true" : "false",
+        METAL_PRESENTATION_EVENT_CAPACITY,
+        (unsigned long long)s_presentation_events_seen,
+        s_presentation_records.count,
+        (unsigned long long)s_presentation_events_dropped,
+        (unsigned long long)releases,
+        (unsigned long long)acquired,
+        (unsigned long long)unavailable,
+        (unsigned long long)requests,
+        (unsigned long long)command_completed,
+        (unsigned long long)command_failed,
+        (unsigned long long)actual_presented,
+        (unsigned long long)actual_unavailable,
+        (unsigned long long)actual_invalid,
+        (unsigned long long)target_unavailable,
+        (unsigned long long)interval_count,
+        presentation_nullable_u64(
+            interval_count ? interval_min : 0, interval_min_text),
+        presentation_nullable_u64(
+            interval_count ? interval_max : 0, interval_max_text),
+        (unsigned long long)ordering_failures,
+        (unsigned long long)s_presentation_callback_timeouts,
+        (unsigned long long)s_presentation_allocation_failures,
+        s_presentation_timing_initialization_failed
+            ? "true" : "false");
+    return written >= 0 && (size_t)written < size;
+}
+
+static uint64_t presentation_pending_callbacks(void)
+{
+    uint64_t pending = 0;
+    for (BWMetalPresentationRecord *record in s_presentation_records) {
+        pending += record->command_status ==
+                   METAL_PRESENTATION_COMMAND_PENDING;
+        pending += record->actual_status ==
+                   METAL_PRESENTATION_ACTUAL_PENDING;
+    }
+    return pending;
+}
+
+static void presentation_timing_report(void)
+{
+    if (!s_frame_timing_enabled ||
+        s_presentation_timing_final_reported)
+        return;
+    if (s_presentation_group) {
+        long result = dispatch_group_wait(
+            s_presentation_group,
+            dispatch_time(
+                DISPATCH_TIME_NOW,
+                (int64_t)METAL_PRESENTATION_CALLBACK_WAIT_NS));
+        if (result != 0) {
+            [s_presentation_lock lock];
+            s_presentation_callback_timeouts =
+                presentation_pending_callbacks();
+            [s_presentation_lock unlock];
+        }
+    }
+    [s_presentation_lock lock];
+    char line[METAL_PRESENTATION_REPORT_LINE_MAX];
+    uint64_t previous_actual =
+        s_presentation_last_reported_actual_ns;
+    for (BWMetalPresentationRecord *record in s_presentation_records) {
+        if (record->reported)
+            continue;
+        if (presentation_timing_format_event(
+                record, previous_actual, line, sizeof line))
+            fprintf(stderr, "%s\n", line);
+        record->reported = 1;
+        if (record->actual_present_ns)
+            previous_actual = record->actual_present_ns;
+    }
+    if (presentation_timing_format_summary(line, sizeof line))
+        fprintf(stderr, "%s\n", line);
+    [s_presentation_lock unlock];
+    s_presentation_timing_final_reported = 1;
 }
 
 static int configure_pipeline_warmup(void)
@@ -2933,6 +3485,7 @@ static int retire_oldest_submission(int wait, int saturation_wait)
     submission->frame = 0;
     submission->water_command = 0;
     submission->presented = 0;
+    submission->presentation_record = nil;
 #if defined(BW_METAL_TESTING)
     submission->test_failure = 0;
 #endif
@@ -2988,6 +3541,7 @@ static id<MTLCommandBuffer> pending_command(void)
         submission->frame = s_frame;
         submission->vertex_upload_offset = 0;
         submission->reason_mask = 0;
+        submission->presentation_record = nil;
         s_encoding_submission = submission;
         s_pending_command = submission->command;
     }
@@ -3011,6 +3565,12 @@ static int submit_commands(int wait)
         submission->test_failure = s_test_fail_next_submission;
         s_test_fail_next_submission = 0;
 #endif
+        if (submission->presentation_record) {
+            [s_presentation_lock lock];
+            submission->presentation_record->command_commit_ns =
+                xbox_HostNowNs();
+            [s_presentation_lock unlock];
+        }
         submission->commit_time = CACurrentMediaTime();
         [submission->command commit];
         s_command_submissions++;
@@ -5773,7 +6333,20 @@ static int direct_present(void)
 {
     if (!s_present_layer || !s_present_surface)
         return 1;
+    BWMetalPresentationRecord *timing = s_presentation_current;
+    if (timing) {
+        [s_presentation_lock lock];
+        timing->direct_presenter = 1;
+        timing->drawable_acquire_start_ns = xbox_HostNowNs();
+        [s_presentation_lock unlock];
+    }
     id<CAMetalDrawable> drawable = [s_present_layer nextDrawable];
+    if (timing) {
+        [s_presentation_lock lock];
+        timing->drawable_acquire_end_ns = xbox_HostNowNs();
+        timing->drawable_acquired = drawable != nil;
+        [s_presentation_lock unlock];
+    }
     if (!drawable) {
         s_dropped_drawables++;
         if (s_dropped_drawables <= 3u)
@@ -5855,6 +6428,14 @@ static int direct_present(void)
     [encoder setFragmentBytes:&uniforms length:sizeof uniforms atIndex:0];
     [encoder drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
     [encoder endEncoding];
+    if (timing) {
+        presentation_timing_attach_command(timing, command);
+        presentation_timing_attach_drawable(timing, drawable);
+        [s_presentation_lock lock];
+        timing->present_request_ns = xbox_HostNowNs();
+        [s_presentation_lock unlock];
+        s_encoding_submission->presentation_record = timing;
+    }
     [command presentDrawable:drawable];
     s_encoding_submission->presented = 1;
     s_presented_frames++;
@@ -5963,6 +6544,9 @@ static void metal_flip(void)
     @autoreleasepool {
         if (bw_metal_backend_error())
             return;
+        if (s_presentation_timing_enabled &&
+            !s_presentation_flip_open)
+            presentation_timing_flip_stall(xbox_HostNowNs());
         pipeline_async_drain(0);
         water_reflect_reset_run();
         int asynchronous_display = s_present_layer != nil;
@@ -6656,6 +7240,7 @@ static int start_with_regions(void *guest_memory, size_t low_size,
     s_test_defer_retirement = 0;
     s_test_fail_next_submission = 0;
     s_test_fail_next_pipeline_allocation = 0;
+    s_test_fail_presentation_record_allocation = 0;
 #endif
     s_water_benchmark_started = 0;
     s_water_benchmark_complete = 0;
@@ -6717,6 +7302,7 @@ static int start_with_regions(void *guest_memory, size_t low_size,
     s_frame_timing_enabled =
         (audit && !strcmp(audit, "1")) ||
         (frame_timing && !strcmp(frame_timing, "1"));
+    presentation_timing_reset(s_frame_timing_enabled);
     const char *approx = getenv("BW_METAL_QUINCUNX_APPROX");
     s_quincunx_approx = approx && !strcmp(approx, "1");
     if (!configure_render_scale()) {
@@ -6729,6 +7315,9 @@ static int start_with_regions(void *guest_memory, size_t low_size,
     }
     bw_backend_register_with_present_ops(&s_backend, metal_prepare_present,
                                          metal_publish_snapshot);
+    bw_backend_register_flip_timing(
+        &s_backend, presentation_timing_flip_stall,
+        presentation_timing_flip_release);
     bw_backend_ext_register(&s_extended_backend);
     s_frame = 0;
     bw_ab_frame(0);
@@ -6780,6 +7369,7 @@ int bw_metal_backend_start_for_test(void *guest_memory, size_t guest_size)
 void bw_metal_backend_stop(void)
 {
     (void)flush_commands();
+    presentation_timing_report();
     if (s_async_pipeline_group)
         dispatch_group_wait(s_async_pipeline_group, DISPATCH_TIME_FOREVER);
     pipeline_async_drain(1);
@@ -6963,6 +7553,12 @@ void bw_metal_backend_stop(void)
     s_async_pipeline_lock = nil;
     s_async_pipeline_group = nil;
     s_async_pipeline_diagnostic.enabled = 0;
+    s_presentation_records = nil;
+    s_presentation_lock = nil;
+    s_presentation_group = nil;
+    s_presentation_current = nil;
+    s_presentation_flip_open = 0;
+    s_presentation_timing_enabled = 0;
     s_clear_pipelines = nil;
     s_color_surfaces = nil;
     s_textures = nil;
@@ -7284,6 +7880,86 @@ void bw_metal_test_pipeline_async_snapshot(
         s_async_pipeline_diagnostic.timing_non_monotonic;
 }
 
+void bw_metal_test_presentation_timing_snapshot(
+    BwMetalPresentationTimingSnapshot *snapshot)
+{
+    if (!snapshot)
+        return;
+    memset(snapshot, 0, sizeof *snapshot);
+    snapshot->enabled = s_presentation_timing_enabled;
+    snapshot->initialization_failed =
+        s_presentation_timing_initialization_failed;
+    snapshot->event_capacity = METAL_PRESENTATION_EVENT_CAPACITY;
+    [s_presentation_lock lock];
+    snapshot->event_count = s_presentation_records.count;
+    snapshot->events_seen = s_presentation_events_seen;
+    snapshot->events_dropped = s_presentation_events_dropped;
+    uint64_t previous_actual = 0;
+    snapshot->actual_interval_min_ns = UINT64_MAX;
+    for (BWMetalPresentationRecord *record in s_presentation_records) {
+        snapshot->flip_releases += record->flip_release_ns != 0;
+        snapshot->drawables_acquired +=
+            record->drawable_acquired != 0;
+        snapshot->drawables_unavailable +=
+            record->drawable_acquire_start_ns != 0 &&
+            !record->drawable_acquired;
+        snapshot->present_requests +=
+            record->present_request_ns != 0;
+        snapshot->commands_completed +=
+            record->command_status ==
+                METAL_PRESENTATION_COMMAND_COMPLETED;
+        snapshot->commands_failed +=
+            record->command_status ==
+                METAL_PRESENTATION_COMMAND_FAILED;
+        snapshot->actual_presented +=
+            record->actual_status ==
+                METAL_PRESENTATION_ACTUAL_PRESENTED;
+        snapshot->actual_unavailable +=
+            record->actual_status ==
+                METAL_PRESENTATION_ACTUAL_UNAVAILABLE;
+        snapshot->actual_invalid +=
+            record->actual_status ==
+                METAL_PRESENTATION_ACTUAL_INVALID;
+        if (record->flip_release_ns && record->flip_stall_ns &&
+            record->flip_release_ns <= record->flip_stall_ns)
+            snapshot->ordering_failures++;
+        if (record->drawable_acquire_end_ns &&
+            record->drawable_acquire_start_ns &&
+            record->drawable_acquire_end_ns <
+                record->drawable_acquire_start_ns)
+            snapshot->ordering_failures++;
+        if (record->command_complete_ns &&
+            record->command_commit_ns &&
+            record->command_complete_ns <
+                record->command_commit_ns)
+            snapshot->ordering_failures++;
+        if (record->actual_present_ns) {
+            if (previous_actual &&
+                record->actual_present_ns > previous_actual) {
+                uint64_t interval =
+                    record->actual_present_ns - previous_actual;
+                snapshot->actual_interval_count++;
+                if (interval <
+                    snapshot->actual_interval_min_ns)
+                    snapshot->actual_interval_min_ns = interval;
+                if (interval >
+                    snapshot->actual_interval_max_ns)
+                    snapshot->actual_interval_max_ns = interval;
+            } else if (previous_actual) {
+                snapshot->ordering_failures++;
+            }
+            previous_actual = record->actual_present_ns;
+        }
+    }
+    if (!snapshot->actual_interval_count)
+        snapshot->actual_interval_min_ns = 0;
+    snapshot->callback_timeouts =
+        s_presentation_callback_timeouts;
+    snapshot->allocation_failures =
+        s_presentation_allocation_failures;
+    [s_presentation_lock unlock];
+}
+
 void bw_metal_test_pipeline_diagnostic_clear(void)
 {
     int enabled = s_pipeline_diagnostic.enabled;
@@ -7330,6 +8006,92 @@ void bw_metal_test_async_pipeline_failures(int allocation,
     s_test_fail_async_pipeline = pipeline != 0;
 }
 
+void bw_metal_test_fail_presentation_record_allocation(void)
+{
+    s_test_fail_presentation_record_allocation = 1;
+}
+
+void bw_metal_test_presentation_inject(uint32_t frame,
+                                       uint64_t base_ns,
+                                       int presented)
+{
+    BWMetalPresentationRecord *record =
+        presentation_timing_new_record(base_ns);
+    if (!record)
+        return;
+    [s_presentation_lock lock];
+    record->frame = frame;
+    record->direct_presenter = 1;
+    record->flip_release_ns = base_ns + 100u;
+    record->drawable_acquire_start_ns = base_ns + 200u;
+    record->drawable_acquire_end_ns = base_ns + 300u;
+    record->drawable_acquired = presented != 0;
+    if (presented) {
+        record->present_request_ns = base_ns + 400u;
+        record->command_commit_ns = base_ns + 500u;
+        record->command_complete_ns = base_ns + 600u;
+        record->command_status =
+            METAL_PRESENTATION_COMMAND_COMPLETED;
+        if (presented == 1) {
+            record->actual_present_ns = base_ns + 700u;
+            record->actual_callback_ns = base_ns + 800u;
+            record->actual_status =
+                METAL_PRESENTATION_ACTUAL_PRESENTED;
+        } else if (presented == 2) {
+            record->actual_status =
+                METAL_PRESENTATION_ACTUAL_UNAVAILABLE;
+        } else {
+            record->actual_status =
+                METAL_PRESENTATION_ACTUAL_INVALID;
+        }
+    }
+    [s_presentation_lock unlock];
+}
+
+void bw_metal_test_presentation_schedule_callbacks(
+    uint32_t frame, uint64_t base_ns)
+{
+    BWMetalPresentationRecord *record =
+        presentation_timing_new_record(base_ns);
+    if (!record)
+        return;
+    NSLock *lock = s_presentation_lock;
+    dispatch_group_t group = s_presentation_group;
+    [lock lock];
+    record->frame = frame;
+    record->direct_presenter = 1;
+    record->flip_release_ns = base_ns + 100u;
+    record->drawable_acquire_start_ns = base_ns + 200u;
+    record->drawable_acquire_end_ns = base_ns + 300u;
+    record->drawable_acquired = 1;
+    record->present_request_ns = base_ns + 400u;
+    record->command_commit_ns = base_ns + 500u;
+    record->command_status =
+        METAL_PRESENTATION_COMMAND_PENDING;
+    record->actual_status =
+        METAL_PRESENTATION_ACTUAL_PENDING;
+    [lock unlock];
+    dispatch_group_enter(group);
+    dispatch_group_enter(group);
+    dispatch_after(
+        dispatch_time(DISPATCH_TIME_NOW, 10000000),
+        dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+            [lock lock];
+            record->command_complete_ns = base_ns + 600u;
+            record->command_status =
+                METAL_PRESENTATION_COMMAND_COMPLETED;
+            [lock unlock];
+            dispatch_group_leave(group);
+            [lock lock];
+            record->actual_present_ns = base_ns + 700u;
+            record->actual_callback_ns = base_ns + 800u;
+            record->actual_status =
+                METAL_PRESENTATION_ACTUAL_PRESENTED;
+            [lock unlock];
+            dispatch_group_leave(group);
+        });
+}
+
 void bw_metal_test_shader_library_failures(int offline_library,
                                            int source_library)
 {
@@ -7374,5 +8136,28 @@ int bw_metal_test_pipeline_async_format_summary(char *buffer, size_t size,
                                                 int final)
 {
     return pipeline_async_format_summary(buffer, size, final != 0);
+}
+
+int bw_metal_test_presentation_format_event(
+    size_t index, uint64_t previous_actual_ns,
+    char *buffer, size_t size)
+{
+    if (index >= s_presentation_records.count)
+        return 0;
+    [s_presentation_lock lock];
+    int result = presentation_timing_format_event(
+        s_presentation_records[index], previous_actual_ns,
+        buffer, size);
+    [s_presentation_lock unlock];
+    return result;
+}
+
+int bw_metal_test_presentation_format_summary(char *buffer, size_t size)
+{
+    [s_presentation_lock lock];
+    int result =
+        presentation_timing_format_summary(buffer, size);
+    [s_presentation_lock unlock];
+    return result;
 }
 #endif

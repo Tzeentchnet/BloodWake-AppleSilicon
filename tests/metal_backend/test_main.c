@@ -161,6 +161,9 @@ int bw_ab_off(const char *fix) { (void)fix; return 0; }
 void bw_ab_frame(uint32_t frame) { s_ab_frame = frame; }
 int bw_audit_on(void) { return s_audit_enabled; }
 int bw_gamma_lut(uint8_t lut[768]) { (void)lut; return 0; }
+void bw_set_host_flip_pace(unsigned hz);
+void nv2a_pb_exec_walk_begin(void);
+int nv2a_pb_exec_flip_poll(void);
 unsigned char g_bw_fix_on[BW_FIX_COUNT];
 bw_edition_t bw_edition(void) { return s_edition; }
 void bw_audit_method(uint32_t subch, uint32_t method, uint32_t param)
@@ -1519,6 +1522,195 @@ static void pipeline_async_restart_test(void)
     CHECK(snapshot.enabled);
     CHECK(snapshot.scheduled == 0);
     CHECK(snapshot.entries == 0);
+    expect_no_error();
+}
+
+static void presentation_timing_disabled_test(void)
+{
+    BwMetalPresentationTimingSnapshot snapshot;
+    bw_metal_test_presentation_timing_snapshot(&snapshot);
+    CHECK(!snapshot.enabled);
+    CHECK(!snapshot.initialization_failed);
+    CHECK(snapshot.event_capacity == 512);
+    CHECK(snapshot.event_count == 0);
+    CHECK(snapshot.events_seen == 0);
+}
+
+static void presentation_timing_lifecycle_test(void)
+{
+    BwMetalPresentationTimingSnapshot snapshot;
+    triangle(0xFF807060u);
+    draw(3);
+    flip();
+    expect_no_error();
+    bw_metal_test_presentation_timing_snapshot(&snapshot);
+    CHECK(snapshot.enabled);
+    CHECK(snapshot.event_count == 1);
+    CHECK(snapshot.events_seen == 1);
+    CHECK(snapshot.events_dropped == 0);
+    CHECK(snapshot.flip_releases == 1);
+    CHECK(snapshot.drawables_acquired == 0);
+    CHECK(snapshot.present_requests == 0);
+    CHECK(snapshot.ordering_failures == 0);
+}
+
+static void presentation_timing_stream_test(void)
+{
+    flip();
+    flip();
+    fflush(stderr);
+    _Exit(s_failed ? 1 : 0);
+}
+
+static void presentation_timing_paced_release_test(void)
+{
+    BwMetalPresentationTimingSnapshot snapshot;
+    bw_set_host_flip_pace(60);
+    s_host_now_step = UINT64_C(1000000);
+    nv2a_pb_exec_walk_begin();
+    flip();
+    nv2a_pb_exec_walk_begin();
+    flip();
+    bw_metal_test_presentation_timing_snapshot(&snapshot);
+    CHECK(snapshot.event_count == 2);
+    CHECK(snapshot.flip_releases == 1);
+    unsigned polls = 0;
+    while (nv2a_pb_exec_flip_poll() && polls++ < 100)
+        ;
+    CHECK(polls < 100);
+    bw_metal_test_presentation_timing_snapshot(&snapshot);
+    CHECK(snapshot.flip_releases == 2);
+    CHECK(snapshot.ordering_failures == 0);
+    expect_no_error();
+}
+
+static void presentation_timing_report_test(void)
+{
+    static const char expected_event[] =
+        "{\"schema\":\"bloodwake.metal-presentation-timing/v1\","
+        "\"record\":\"event\",\"sequence\":0,\"frame\":42,"
+        "\"status\":\"presented\",\"direct_presenter\":true,"
+        "\"flip_stall_ns\":1000,\"flip_release_ns\":1100,"
+        "\"flip_hold_ns\":100,\"drawable_status\":\"acquired\","
+        "\"drawable_acquire_start_ns\":1200,"
+        "\"drawable_acquire_end_ns\":1300,"
+        "\"present_request_ns\":1400,\"command_commit_ns\":1500,"
+        "\"command_complete_ns\":1600,\"command_status\":\"completed\","
+        "\"actual_present_ns\":1700,\"actual_callback_ns\":1800,"
+        "\"actual_present_status\":\"presented\","
+        "\"actual_present_interval_ns\":1200,"
+        "\"display_target_status\":\"unavailable_explicit_presenter\","
+        "\"display_target_ns\":null}";
+    static const char expected_summary[] =
+        "{\"schema\":\"bloodwake.metal-presentation-timing/v1\","
+        "\"record\":\"summary\",\"enabled\":true,\"event_capacity\":512,"
+        "\"events_seen\":1,\"events_recorded\":1,\"events_dropped\":0,"
+        "\"flip_releases\":1,\"drawables_acquired\":1,"
+        "\"drawables_unavailable\":0,\"present_requests\":1,"
+        "\"commands_completed\":1,\"commands_failed\":0,"
+        "\"actual_presented\":1,\"actual_unavailable\":0,"
+        "\"actual_invalid\":0,\"display_targets_available\":0,"
+        "\"display_targets_unavailable\":1,"
+        "\"actual_interval_count\":0,\"actual_interval_min_ns\":null,"
+        "\"actual_interval_max_ns\":null,\"ordering_failures\":0,"
+        "\"callback_timeouts\":0,\"allocation_failures\":0,"
+        "\"initialization_failed\":false}";
+    static const char *prohibited[] = {
+        "descriptor", "combiner", "function_constants", "retail",
+        "texture_identity", "address", "key_hash",
+    };
+    char event[2048], summary[2048], too_small[32];
+    bw_metal_test_presentation_inject(42, 1000, 1);
+    CHECK(bw_metal_test_presentation_format_event(
+        0, 500, event, sizeof event));
+    CHECK(!strcmp(event, expected_event));
+    CHECK(!bw_metal_test_presentation_format_event(
+        0, 500, too_small, sizeof too_small));
+    CHECK(bw_metal_test_presentation_format_summary(
+        summary, sizeof summary));
+    CHECK(!strcmp(summary, expected_summary));
+    for (size_t i = 0; i < sizeof prohibited / sizeof prohibited[0]; i++) {
+        CHECK(!strstr(event, prohibited[i]));
+        CHECK(!strstr(summary, prohibited[i]));
+    }
+}
+
+static void presentation_timing_fractional_test(void)
+{
+    BwMetalPresentationTimingSnapshot snapshot;
+    bw_metal_test_presentation_inject(1, 1000, 1);
+    bw_metal_test_presentation_inject(
+        2, UINT64_C(16667667), 1);
+    bw_metal_test_presentation_inject(
+        3, UINT64_C(33351001), 1);
+    bw_metal_test_presentation_timing_snapshot(&snapshot);
+    CHECK(snapshot.actual_presented == 3);
+    CHECK(snapshot.actual_interval_count == 2);
+    CHECK(snapshot.actual_interval_min_ns == UINT64_C(16666667));
+    CHECK(snapshot.actual_interval_max_ns == UINT64_C(16683334));
+    CHECK(snapshot.ordering_failures == 0);
+}
+
+static void presentation_timing_failure_test(void)
+{
+    BwMetalPresentationTimingSnapshot snapshot;
+    bw_metal_test_presentation_inject(1, 1000, 0);
+    bw_metal_test_presentation_inject(2, 2000, 2);
+    bw_metal_test_presentation_inject(3, 3000, 3);
+    bw_metal_test_presentation_timing_snapshot(&snapshot);
+    CHECK(snapshot.drawables_unavailable == 1);
+    CHECK(snapshot.actual_unavailable == 1);
+    CHECK(snapshot.actual_invalid == 1);
+    CHECK(snapshot.actual_presented == 0);
+}
+
+static void presentation_timing_bounded_test(void)
+{
+    BwMetalPresentationTimingSnapshot snapshot;
+    for (unsigned i = 0; i < 515; i++)
+        bw_metal_test_presentation_inject(
+            i, UINT64_C(1000000) * (i + 1u), 1);
+    bw_metal_test_presentation_timing_snapshot(&snapshot);
+    CHECK(snapshot.event_capacity == 512);
+    CHECK(snapshot.event_count == snapshot.event_capacity);
+    CHECK(snapshot.events_seen == 515);
+    CHECK(snapshot.events_dropped == 3);
+}
+
+static void presentation_timing_allocation_failure_test(void)
+{
+    BwMetalPresentationTimingSnapshot snapshot;
+    bw_metal_test_fail_presentation_record_allocation();
+    flip();
+    expect_no_error();
+    bw_metal_test_presentation_timing_snapshot(&snapshot);
+    CHECK(snapshot.events_seen == 1);
+    CHECK(snapshot.event_count == 0);
+    CHECK(snapshot.allocation_failures == 1);
+}
+
+static void presentation_timing_stop_test(void)
+{
+    BwMetalPresentationTimingSnapshot snapshot;
+    bw_metal_test_presentation_schedule_callbacks(7, 1000);
+    bw_metal_test_presentation_timing_snapshot(&snapshot);
+    CHECK(snapshot.event_count == 1);
+    CHECK(snapshot.commands_completed == 0);
+    CHECK(snapshot.actual_presented == 0);
+}
+
+static void presentation_timing_restart_test(void)
+{
+    BwMetalPresentationTimingSnapshot snapshot;
+    bw_metal_test_presentation_inject(1, 1000, 1);
+    bw_metal_backend_stop();
+    CHECK(bw_metal_backend_start_for_test(s_mem, sizeof s_mem));
+    setup_surface(1);
+    bw_metal_test_presentation_timing_snapshot(&snapshot);
+    CHECK(snapshot.enabled);
+    CHECK(snapshot.event_count == 0);
+    CHECK(snapshot.events_seen == 0);
+    CHECK(snapshot.callback_timeouts == 0);
     expect_no_error();
 }
 
@@ -7080,6 +7272,15 @@ int main(int argc, char **argv)
         s_host_now_ns = UINT64_C(1000000000);
         s_host_now_step = 1000;
     }
+    if (!strncmp(argv[1], "presentation-timing-",
+                 sizeof("presentation-timing-") - 1u) &&
+        strcmp(argv[1], "presentation-timing-disabled")) {
+        setenv("BW_METAL_FRAME_TIMING", "1", 1);
+        s_host_now_ns = UINT64_C(1000000000);
+        s_host_now_step = 1000;
+        if (!strcmp(argv[1], "presentation-timing-paced-release"))
+            setenv("RECOMP_FLIP_PACING", "1", 1);
+    }
     if (!strcmp(argv[1], "pipeline-diagnostic-library-fallback") ||
         !strcmp(argv[1], "pipeline-diagnostic-library-failure"))
         bw_metal_test_shader_library_failures(
@@ -7286,6 +7487,28 @@ int main(int argc, char **argv)
         pipeline_async_stop_test();
     else if (!strcmp(argv[1], "pipeline-async-restart"))
         pipeline_async_restart_test();
+    else if (!strcmp(argv[1], "presentation-timing-disabled"))
+        presentation_timing_disabled_test();
+    else if (!strcmp(argv[1], "presentation-timing-lifecycle"))
+        presentation_timing_lifecycle_test();
+    else if (!strcmp(argv[1], "presentation-timing-stream"))
+        presentation_timing_stream_test();
+    else if (!strcmp(argv[1], "presentation-timing-paced-release"))
+        presentation_timing_paced_release_test();
+    else if (!strcmp(argv[1], "presentation-timing-report"))
+        presentation_timing_report_test();
+    else if (!strcmp(argv[1], "presentation-timing-fractional"))
+        presentation_timing_fractional_test();
+    else if (!strcmp(argv[1], "presentation-timing-failure"))
+        presentation_timing_failure_test();
+    else if (!strcmp(argv[1], "presentation-timing-bounded"))
+        presentation_timing_bounded_test();
+    else if (!strcmp(argv[1], "presentation-timing-allocation-failure"))
+        presentation_timing_allocation_failure_test();
+    else if (!strcmp(argv[1], "presentation-timing-stop"))
+        presentation_timing_stop_test();
+    else if (!strcmp(argv[1], "presentation-timing-restart"))
+        presentation_timing_restart_test();
     else if (!strcmp(argv[1], "cull"))
         cull_test();
     else if (!strcmp(argv[1], "full-rect"))

@@ -115,6 +115,15 @@ BwMetalWaterPreset bw_metal_backend_water_preset(void);
  * With BW_METAL_FRAME_TIMING=1, the backend reports monotonic wall-clock,
  * completed-command, exact command-reason, wait, submission-latency,
  * command-role, and feedback CPU statistics for rolling 300-frame windows.
+ * The same opt-in emits bloodwake.metal-presentation-timing/v1 JSONL for at
+ * most 512 flips. Each completed record is streamed once and correlates flip
+ * stall/release, drawable acquisition, present request, command
+ * commit/completion, the actual-presentation callback, and exact consecutive
+ * actual-present intervals on the monotonic host clock. The current explicit
+ * presenter has no display-target timestamp, so it reports
+ * unavailable_explicit_presenter and null rather than inferring a refresh
+ * rate. Invalid or unavailable actual times remain explicit. Stop waits at
+ * most one second for owned timing callbacks, then reports any pending count.
  * With BW_METAL_PIPELINE_TIMING=1, the backend emits bounded
  * bloodwake.metal-pipeline-lifecycle/v2 JSONL as event frames complete and at
  * stop. The exact-value opt-in records at most 512 offline-library load,
@@ -212,12 +221,26 @@ typedef struct {
     uint64_t timing_unavailable, timing_non_monotonic;
 } BwMetalPipelineAsyncSnapshot;
 
+typedef struct {
+    int enabled, initialization_failed;
+    size_t event_count, event_capacity;
+    uint64_t events_seen, events_dropped;
+    uint64_t flip_releases, drawables_acquired, drawables_unavailable;
+    uint64_t present_requests, commands_completed, commands_failed;
+    uint64_t actual_presented, actual_unavailable, actual_invalid;
+    uint64_t actual_interval_count, actual_interval_min_ns;
+    uint64_t actual_interval_max_ns, ordering_failures;
+    uint64_t callback_timeouts, allocation_failures;
+} BwMetalPresentationTimingSnapshot;
+
 void bw_metal_test_pipeline_diagnostic_snapshot(
     BwMetalPipelineDiagnosticSnapshot *snapshot);
 void bw_metal_test_pipeline_warmup_snapshot(
     BwMetalPipelineWarmupSnapshot *snapshot);
 void bw_metal_test_pipeline_async_snapshot(
     BwMetalPipelineAsyncSnapshot *snapshot);
+void bw_metal_test_presentation_timing_snapshot(
+    BwMetalPresentationTimingSnapshot *snapshot);
 void bw_metal_test_pipeline_diagnostic_clear(void);
 void bw_metal_test_pipeline_diagnostic_inject_cache_miss(uint64_t key_hash,
                                                          uint32_t frame);
@@ -228,6 +251,11 @@ void bw_metal_test_drain_async_pipelines(void);
 void bw_metal_test_async_pipeline_failures(int allocation,
                                            int function,
                                            int pipeline);
+void bw_metal_test_fail_presentation_record_allocation(void);
+void bw_metal_test_presentation_inject(uint32_t frame, uint64_t base_ns,
+                                       int presented);
+void bw_metal_test_presentation_schedule_callbacks(uint32_t frame,
+                                                   uint64_t base_ns);
 void bw_metal_test_shader_library_failures(int offline_library,
                                            int source_library);
 const char *bw_metal_test_shader_source_sha256(void);
@@ -235,6 +263,10 @@ int bw_metal_test_pipeline_diagnostic_format_event(char *buffer, size_t size);
 int bw_metal_test_pipeline_diagnostic_format_summary(char *buffer, size_t size);
 int bw_metal_test_pipeline_async_format_summary(char *buffer, size_t size,
                                                 int final);
+int bw_metal_test_presentation_format_event(size_t index,
+                                            uint64_t previous_actual_ns,
+                                            char *buffer, size_t size);
+int bw_metal_test_presentation_format_summary(char *buffer, size_t size);
 #endif
 
 #ifdef __cplusplus
