@@ -122,10 +122,10 @@ This is still a development build:
 The steady-state representative target is closed. Work now proceeds in this
 order:
 
-1. Trace Metal library, function-specialization, pipeline-creation, cache-hit,
-   cache-miss, and cache-eviction timing; then move stable shaders to an
-   offline library and build a versioned, device-local pipeline warm-up and
-   archive path. Retail-derived traces and archives remain private.
+1. Finish real-Xcode validation of the implemented stable offline Metal
+   libraries, then build the versioned, device-local pipeline warm-up and
+   archive path. Missing or rejected libraries retain explicit source
+   compilation. Retail-derived traces and archives remain private.
 2. Measure drawable acquisition, flip release, command completion, and actual
    presentation timestamps before evaluating a gated `CAMetalDisplayLink`
    match-display path. The current path remains the fallback.

@@ -1011,6 +1011,8 @@ static void pipeline_diagnostic_disabled_test(void)
     CHECK(snapshot.event_count == 0);
     CHECK(snapshot.cache_hits == 0);
     CHECK(snapshot.cache_misses == 0);
+    CHECK(snapshot.library_load_attempts == 0);
+    CHECK(snapshot.library_fallbacks == 0);
     CHECK(snapshot.library_attempts == 0);
     CHECK(snapshot.specialization_attempts == 0);
     CHECK(snapshot.pipeline_attempts == 0);
@@ -1027,8 +1029,14 @@ static void pipeline_diagnostic_lifecycle_test(void)
     expect_no_error();
     bw_metal_test_pipeline_diagnostic_snapshot(&snapshot);
     CHECK(snapshot.enabled);
-    CHECK(snapshot.library_attempts == 1);
+    CHECK(snapshot.library_load_timed == snapshot.library_load_attempts);
     CHECK(snapshot.library_timed == snapshot.library_attempts);
+    CHECK(snapshot.library_artifact_loaded
+              ? snapshot.library_attempts == 0
+              : snapshot.library_attempts == 1);
+    CHECK(snapshot.library_fallbacks == snapshot.library_attempts);
+    CHECK(snapshot.library_artifact_loaded + snapshot.library_unavailable +
+              snapshot.library_rejections == 1);
     CHECK(snapshot.specialization_attempts >= 2);
     CHECK(snapshot.specialization_timed == snapshot.specialization_attempts);
     CHECK(snapshot.pipeline_attempts >= 6);
@@ -1059,7 +1067,7 @@ static void pipeline_diagnostic_cache_test(void)
 static void pipeline_diagnostic_report_test(void)
 {
     static const char expected_event[] =
-        "{\"schema\":\"bloodwake.metal-pipeline-lifecycle/v1\","
+        "{\"schema\":\"bloodwake.metal-pipeline-lifecycle/v2\","
         "\"record\":\"event\",\"sequence\":7,"
         "\"kind\":\"function_specialization\","
         "\"key_hash\":\"0123456789abcdef\",\"frame\":42,"
@@ -1067,13 +1075,27 @@ static void pipeline_diagnostic_report_test(void)
         "\"timing_status\":\"ok\",\"duration_ns\":1234,"
         "\"wall_timing_status\":\"ok\",\"wall_frame_ns\":16666667,"
         "\"wall_frame_max_so_far\":true}";
-    static const char expected_summary[] =
-        "{\"schema\":\"bloodwake.metal-pipeline-lifecycle/v1\","
+    static const char *prohibited[] = {
+        "descriptor", "combiner", "function_constants", "retail",
+        "texture_identity", "address", "\"va\"",
+    };
+    char event[1024], summary[2048], expected_summary[2048], too_small[32];
+    BwMetalPipelineDiagnosticSnapshot snapshot;
+    bw_metal_test_pipeline_diagnostic_clear();
+    bw_metal_test_pipeline_diagnostic_snapshot(&snapshot);
+    snprintf(
+        expected_summary, sizeof expected_summary,
+        "{\"schema\":\"bloodwake.metal-pipeline-lifecycle/v2\","
         "\"record\":\"summary\",\"sequence\":0,\"enabled\":true,"
         "\"event_capacity\":512,\"events_recorded\":0,\"events_reported\":0,"
         "\"events_dropped\":0,\"cache_hits\":0,"
         "\"cache_misses\":0,\"cache_entry_high_water\":0,"
         "\"cache_entry_limit\":128,\"whole_cache_resets\":0,"
+        "\"library_artifact_available\":%s,\"library_artifact_loaded\":false,"
+        "\"library_load_attempts\":0,\"library_load_timed\":0,"
+        "\"library_load_total_ns\":0,\"library_load_max_ns\":0,"
+        "\"library_fallbacks\":0,\"library_unavailable\":0,"
+        "\"library_rejections\":0,"
         "\"library_attempts\":0,\"library_timed\":0,\"library_total_ns\":0,"
         "\"library_max_ns\":0,\"specialization_attempts\":0,"
         "\"specialization_timed\":0,\"specialization_total_ns\":0,"
@@ -1083,14 +1105,8 @@ static void pipeline_diagnostic_report_test(void)
         "\"wall_frame_max_ns\":null,\"timing_unavailable\":0,"
         "\"timing_non_monotonic\":0,\"wall_timing_unavailable\":0,"
         "\"wall_timing_non_monotonic\":0,\"allocation_failures\":0,"
-        "\"metal_failures\":0}";
-    static const char *prohibited[] = {
-        "descriptor", "combiner", "function_constants", "retail",
-        "texture_identity", "address", "\"va\"",
-    };
-    char event[1024], summary[2048], too_small[32];
-    BwMetalPipelineDiagnosticSnapshot snapshot;
-    bw_metal_test_pipeline_diagnostic_clear();
+        "\"metal_failures\":0}",
+        snapshot.library_artifact_available ? "true" : "false");
     CHECK(bw_metal_test_pipeline_diagnostic_format_event(event, sizeof event));
     CHECK(!strcmp(event, expected_event));
     CHECK(!bw_metal_test_pipeline_diagnostic_format_event(
@@ -1122,10 +1138,12 @@ static void pipeline_diagnostic_failure_test(void)
     BwMetalPipelineDiagnosticSnapshot snapshot;
     bw_metal_test_pipeline_diagnostic_snapshot(&snapshot);
     CHECK(snapshot.enabled);
-    CHECK(snapshot.library_attempts == 1);
+    CHECK(snapshot.library_load_attempts + snapshot.library_attempts >= 1);
     CHECK(snapshot.pipeline_attempts == 4);
     CHECK(snapshot.timing_unavailable ==
-          snapshot.library_attempts + snapshot.pipeline_attempts);
+          snapshot.library_load_attempts + snapshot.library_attempts +
+              snapshot.pipeline_attempts);
+    CHECK(snapshot.library_load_timed == 0);
     CHECK(snapshot.library_timed == 0);
     CHECK(snapshot.pipeline_timed == 0);
 
@@ -1141,6 +1159,51 @@ static void pipeline_diagnostic_failure_test(void)
     CHECK(snapshot.pipeline_timed == 0);
     CHECK(snapshot.allocation_failures == 1);
     CHECK(snapshot.metal_failures == 0);
+}
+
+static void pipeline_diagnostic_library_selection_test(void)
+{
+    BwMetalPipelineDiagnosticSnapshot snapshot;
+    bw_metal_test_pipeline_diagnostic_snapshot(&snapshot);
+    CHECK(snapshot.enabled);
+    CHECK(!strcmp(
+        bw_metal_test_shader_source_sha256(),
+        "3fda260b7e0584eeea7d6a6d55229854dd67b310a447f9c1b45e21f617a2dec7"));
+    if (snapshot.library_artifact_available) {
+        CHECK(snapshot.library_artifact_loaded);
+        CHECK(snapshot.library_load_attempts == 1);
+        CHECK(snapshot.library_load_timed == 1);
+        CHECK(snapshot.library_attempts == 0);
+        CHECK(snapshot.library_fallbacks == 0);
+        CHECK(snapshot.library_unavailable == 0);
+        CHECK(snapshot.library_rejections == 0);
+    } else {
+        CHECK(!snapshot.library_artifact_loaded);
+        CHECK(snapshot.library_load_attempts == 0);
+        CHECK(snapshot.library_attempts == 1);
+        CHECK(snapshot.library_fallbacks == 1);
+        CHECK(snapshot.library_unavailable == 1);
+        CHECK(snapshot.library_rejections == 0);
+    }
+}
+
+static void pipeline_diagnostic_library_fallback_test(void)
+{
+    BwMetalPipelineDiagnosticSnapshot snapshot;
+    bw_metal_test_pipeline_diagnostic_snapshot(&snapshot);
+    CHECK(snapshot.enabled);
+    CHECK(!snapshot.library_artifact_loaded);
+    CHECK(snapshot.library_load_attempts == 1);
+    CHECK(snapshot.library_load_timed == 1);
+    CHECK(snapshot.library_attempts == 1);
+    CHECK(snapshot.library_timed == 1);
+    CHECK(snapshot.library_fallbacks == 1);
+    CHECK(snapshot.library_unavailable == 0);
+    CHECK(snapshot.library_rejections == 1);
+    triangle(0xFF807060u);
+    draw(3);
+    flip();
+    expect_no_error();
 }
 
 static void cull_test(void)
@@ -6685,6 +6748,10 @@ int main(int argc, char **argv)
             s_host_now_step = 1000;
         }
     }
+    if (!strcmp(argv[1], "pipeline-diagnostic-library-fallback") ||
+        !strcmp(argv[1], "pipeline-diagnostic-library-failure"))
+        bw_metal_test_shader_library_failures(
+            1, !strcmp(argv[1], "pipeline-diagnostic-library-failure"));
     setenv("BW_IMMEDIATE_PRESENT", "1", 1);
     memset(s_mem, 0, sizeof s_mem);
     memset(s_mem + COLOR_AT, 0xA5, PITCH * HEIGHT);
@@ -6741,6 +6808,20 @@ int main(int argc, char **argv)
         CHECK(bw_metal_backend_error() &&
               strstr(bw_metal_backend_error(),
                      "BW_METAL_PIPELINE_TIMING must be 1 when set"));
+        bw_metal_backend_stop();
+        return s_failed ? 1 : 0;
+    }
+    if (!strcmp(argv[1], "pipeline-diagnostic-library-failure")) {
+        BwMetalPipelineDiagnosticSnapshot snapshot;
+        CHECK(!bw_metal_backend_start_for_test(s_mem, sizeof s_mem));
+        CHECK(bw_metal_backend_error() &&
+              strstr(bw_metal_backend_error(), "shader compilation failed"));
+        bw_metal_test_pipeline_diagnostic_snapshot(&snapshot);
+        CHECK(snapshot.library_load_attempts == 1);
+        CHECK(snapshot.library_fallbacks == 1);
+        CHECK(snapshot.library_rejections == 1);
+        CHECK(snapshot.library_attempts == 1);
+        CHECK(snapshot.metal_failures == 1);
         bw_metal_backend_stop();
         return s_failed ? 1 : 0;
     }
@@ -6817,6 +6898,11 @@ int main(int argc, char **argv)
         pipeline_diagnostic_report_test();
     else if (!strcmp(argv[1], "pipeline-diagnostic-failure"))
         pipeline_diagnostic_failure_test();
+    else if (!strcmp(argv[1], "pipeline-diagnostic-library-selection") ||
+             !strcmp(argv[1], "pipeline-diagnostic-library-precise"))
+        pipeline_diagnostic_library_selection_test();
+    else if (!strcmp(argv[1], "pipeline-diagnostic-library-fallback"))
+        pipeline_diagnostic_library_fallback_test();
     else if (!strcmp(argv[1], "cull"))
         cull_test();
     else if (!strcmp(argv[1], "full-rect"))

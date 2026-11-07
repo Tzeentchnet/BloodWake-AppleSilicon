@@ -329,11 +329,24 @@ guest execution.
 For a low-instrumentation performance run, use `--frame-timing` without
 `--gpu-audit`. It enables only the Metal completed-flip interval report.
 Add `--pipeline-timing` to opt into bounded
-`bloodwake.metal-pipeline-lifecycle/v1` JSONL. It sets the exact-value
+`bloodwake.metal-pipeline-lifecycle/v2` JSONL. It sets the exact-value
 `BW_METAL_PIPELINE_TIMING=1` child switch, retains at most 512 expensive
 pipeline events and 64 summaries, and reports cache hits only in aggregate.
-The records contain canonical-key hashes and timing/classification data, not
-descriptors or retail-derived fields. Keep the resulting logs private.
+Version 2 distinguishes offline-library loads from runtime source compilation
+and reports unavailable/rejected artifact fallback explicitly. The records
+contain canonical-key hashes and timing/classification data, not descriptors
+or retail-derived fields. Keep the resulting logs private.
+
+The macOS build keeps the stable project-owned shader in
+`src/gpu/bw_metal_shaders.metal`. When the selected Xcode developer directory
+provides both `metal` and `metallib`, CMake builds and embeds default-math and
+safe-math libraries. If either tool is unavailable, configuration warns and
+embeds the same source bytes for the explicit runtime compilation fallback.
+Set `BW_METAL_OFFLINE_SHADERS=OFF` only to exercise that fallback
+deliberately. Command Line Tools alone may not include the Metal compiler;
+select a full Xcode installation through `DEVELOPER_DIR` or `xcode-select` to
+build the offline libraries.
+
 `--profile` enables the existing approximately 1 kHz native thread sampler;
 `--profile-from` and `--profile-to` bound its per-boot window. Fixed
 `--render-scale 1`, `2.25`, or `4` and `--frame-cap 30`, `60`, or `120` make

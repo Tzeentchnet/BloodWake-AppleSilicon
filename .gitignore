@@ -37,6 +37,8 @@ play.log
 *.dmp
 *.bwgpu
 *.bwmpa
+*.air
+*.metallib
 
 # Archives (an image inside a zip is still an image)
 *.zip

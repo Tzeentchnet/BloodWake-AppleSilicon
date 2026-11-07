@@ -416,7 +416,7 @@ The first active task records:
 
 `BW_METAL_PIPELINE_TIMING=1` is an exact-value, disabled-by-default opt-in.
 It uses the existing monotonic host clock and emits
-`bloodwake.metal-pipeline-lifecycle/v1` JSONL. Expensive events retain only a
+`bloodwake.metal-pipeline-lifecycle/v2` JSONL. Expensive events retain only a
 canonical-key hash, phase, duration or explicit timing state, frame, command
 role, wall-frame interval, and explicit operation status. Cache hits are
 aggregate-only so hot draws cannot displace cold misses. Storage is fixed at
@@ -502,6 +502,51 @@ disabled. The complete Metal backend suite passes 349/349, and the production
 synthetic-input target rebuilds successfully. These are implementation
 results only: PERF-029 generated no runtime trace, key set, `.metallib`, or
 binary archive and changed no pipeline selection behavior.
+
+#### PERF-030 implementation evidence
+
+The stable shader is now one 20,571-byte project-owned
+`src/gpu/bw_metal_shaders.metal` source with SHA-256
+`3fda260b7e0584eeea7d6a6d55229854dd67b310a447f9c1b45e21f617a2dec7`.
+The extracted bytes exactly match the former runtime C string. A deterministic
+bounded generator validates all 15 existing entry points and embeds the source
+plus paired default-math and `-fno-fast-math` libraries. No shader entry point,
+equation, constant index, or runtime pipeline key changed.
+
+When Xcode supplies `metal` and `metallib`, CMake compiles and embeds both
+variants. Startup first loads the variant matching the existing quincunx math
+policy and requires every entry point before selecting it. Missing, rejected,
+allocation-failed, or incomplete offline data retains an explicit status and
+compiles the identical source bytes. A failed source fallback remains a
+sticky backend failure. Pipeline lifecycle schema v2 reports library load,
+rejection/unavailability, fallback count, and source compilation separately.
+
+Four generator cases and seven focused backend/schema cases pass normally;
+the eight-case combined focused selection passes under ASan/UBSan with leak
+detection disabled. The complete Metal backend suite passes 354/354, strict
+Objective-C warnings pass, and the production synthetic-input target rebuilds
+through the source fallback. A deterministic fake toolchain also proves the
+offline CMake branch, paired embedding, rejection, and fallback behavior.
+
+This is not yet retained offline-runtime evidence. The selected Command Line
+Tools installation returns status 72 for `xcrun --find metal`, has no
+`metallib`, and has no full Xcode developer directory. Therefore no real
+`.metallib` was generated or successfully loaded, no cold boot was run against
+one, and PERF-030 remains partial. After installing/selecting Xcode, validate
+with:
+
+```sh
+DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer \
+  xcrun --find metal
+DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer \
+  cmake -S tests/metal_backend -B build/test-metal-backend-offline \
+    -DCMAKE_BUILD_TYPE=Release
+DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer \
+  cmake --build build/test-metal-backend-offline --parallel
+DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer \
+  ctest --test-dir build/test-metal-backend-offline --output-on-failure \
+    -R '^metal_pipeline-diagnostic-library-(selection|precise)$'
+```
 
 The remaining implementation sequence is:
 

@@ -3,15 +3,23 @@
 Status: PERF-029 compatibility contract
 
 This contract defines how later Metal pipeline warm-up work identifies and
-rejects local artifacts. It does not generate an offline `.metallib`, record
-pipeline keys, create or load a binary archive, prewarm a pipeline, or change
-runtime pipeline compilation. Those behaviors remain in PERF-030 through
-PERF-032.
+rejects local artifacts. It does not record pipeline keys, create or load a
+binary archive, prewarm a pipeline, or change cache policy. Those behaviors
+remain in PERF-031 and PERF-032.
 
 ## Artifact classes
 
 Project-owned offline shader output is a normal build product. It is not a
 `.bwmpa` file and must not contain game-derived inputs.
+
+The project-owned stable source is `src/gpu/bw_metal_shaders.metal`. The build
+produces default-math and safe-math `.metallib` variants when the selected
+Xcode toolchain provides the Metal compiler, then embeds them in the
+executable. Their source identity is SHA-256
+`3fda260b7e0584eeea7d6a6d55229854dd67b310a447f9c1b45e21f617a2dec7`.
+Builds without those tools embed the identical source bytes and retain
+explicit runtime compilation; they do not create a success-shaped offline
+artifact.
 
 Trace-derived key sets and compiled binary archives are private, device-local
 `.bwmpa` files. They must live under an owner-controlled host cache directory,

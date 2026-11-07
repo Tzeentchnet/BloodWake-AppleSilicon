@@ -115,14 +115,14 @@ BwMetalWaterPreset bw_metal_backend_water_preset(void);
  * With BW_METAL_FRAME_TIMING=1, the backend reports monotonic wall-clock,
  * completed-command, exact command-reason, wait, submission-latency,
  * command-role, and feedback CPU statistics for rolling 300-frame windows.
- * With BW_METAL_PIPELINE_TIMING=1, the backend emits bounded JSONL pipeline
- * lifecycle diagnostics as event frames complete and at stop. The exact-value
- * opt-in records at most 512
- * library, cache-miss/reset, function-specialization, and render-pipeline
- * events; cache hits remain aggregate-only. Records contain canonical-key
- * hashes, durations, frame/command classifications, aggregate cache counters,
- * wall-frame correlation, and explicit error states, never descriptors or
- * retail-derived fields.
+ * With BW_METAL_PIPELINE_TIMING=1, the backend emits bounded
+ * bloodwake.metal-pipeline-lifecycle/v2 JSONL as event frames complete and at
+ * stop. The exact-value opt-in records at most 512 offline-library load,
+ * runtime-library compile, cache-miss/reset, function-specialization, and
+ * render-pipeline events; cache hits remain aggregate-only. Records contain
+ * canonical-key hashes, durations, frame/command classifications, aggregate
+ * cache counters, wall-frame correlation, artifact selection/fallback state,
+ * and explicit errors, never descriptors or retail-derived fields.
  * Up to 32 exact colour-surface descriptions are cached. Ordinary target
  * switches retain each touched private generation in the current submission;
  * presentation commits them together in queue order, while eight switches
@@ -161,6 +161,9 @@ typedef struct {
     uint64_t events_dropped;
     uint64_t cache_hits, cache_misses, whole_cache_resets;
     unsigned cache_entry_high_water;
+    int library_artifact_available, library_artifact_loaded;
+    uint64_t library_load_attempts, library_load_timed;
+    uint64_t library_fallbacks, library_unavailable, library_rejections;
     uint64_t library_attempts, library_timed;
     uint64_t specialization_attempts, specialization_timed;
     uint64_t pipeline_attempts, pipeline_timed;
@@ -178,6 +181,9 @@ void bw_metal_test_pipeline_diagnostic_clear(void);
 void bw_metal_test_pipeline_diagnostic_inject_cache_miss(uint64_t key_hash,
                                                          uint32_t frame);
 void bw_metal_test_fail_next_pipeline_allocation(void);
+void bw_metal_test_shader_library_failures(int offline_library,
+                                           int source_library);
+const char *bw_metal_test_shader_source_sha256(void);
 int bw_metal_test_pipeline_diagnostic_format_event(char *buffer, size_t size);
 int bw_metal_test_pipeline_diagnostic_format_summary(char *buffer, size_t size);
 #endif

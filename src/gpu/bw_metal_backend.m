@@ -1,6 +1,7 @@
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
 #import <QuartzCore/CAMetalLayer.h>
+#import <dispatch/dispatch.h>
 
 #include <float.h>
 #include <errno.h>
@@ -19,6 +20,7 @@
 #include "bw_metal_backend.h"
 #include "bw_backend_sync.h"
 #include "bw_gamma.h"
+#include "bw_metal_shader_data.inc"
 #include "../bw_edition.h"
 #include "d3d/d3d8_swizzle.h"
 #include "../toolkit_patches/bw_runtime_lifecycle.h"
@@ -44,7 +46,7 @@ extern uint64_t xbox_HostNowNs(void);
 #define METAL_PIPELINE_EVENT_CAPACITY 512u
 #define METAL_PIPELINE_SUMMARY_CAPACITY 64u
 #define METAL_PIPELINE_REPORT_LINE_MAX 2048u
-#define METAL_PIPELINE_SCHEMA "bloodwake.metal-pipeline-lifecycle/v1"
+#define METAL_PIPELINE_SCHEMA "bloodwake.metal-pipeline-lifecycle/v2"
 #if defined(BW_METAL_TESTING)
 #define METAL_WATER_BENCHMARK_WARMUP_FRAMES 1u
 #define METAL_WATER_BENCHMARK_SAMPLE_FRAMES 2u
@@ -125,6 +127,7 @@ enum {
 };
 
 typedef enum {
+    METAL_PIPELINE_EVENT_LIBRARY_LOAD,
     METAL_PIPELINE_EVENT_LIBRARY_COMPILE,
     METAL_PIPELINE_EVENT_FUNCTION_SPECIALIZATION,
     METAL_PIPELINE_EVENT_PIPELINE_CREATE,
@@ -139,6 +142,8 @@ typedef enum {
 
 typedef enum {
     METAL_PIPELINE_STATUS_OK,
+    METAL_PIPELINE_STATUS_ARTIFACT_UNAVAILABLE,
+    METAL_PIPELINE_STATUS_ARTIFACT_REJECTED,
     METAL_PIPELINE_STATUS_ALLOCATION_FAILED,
     METAL_PIPELINE_STATUS_METAL_FAILED,
 } MetalPipelineStatus;
@@ -178,7 +183,9 @@ typedef struct {
     uint64_t events_dropped;
     uint64_t cache_hits, cache_misses, whole_cache_resets;
     unsigned cache_entry_high_water;
-    MetalPipelineTimingAggregate library, specialization, pipeline;
+    MetalPipelineTimingAggregate library_load, library, specialization, pipeline;
+    uint64_t library_fallbacks, library_unavailable, library_rejections;
+    int library_artifact_loaded;
     uint64_t timing_unavailable, timing_non_monotonic;
     uint64_t wall_timing_unavailable, wall_timing_non_monotonic;
     uint64_t allocation_failures, metal_failures;
@@ -380,6 +387,8 @@ static int s_test_async_display;
 static int s_test_defer_retirement;
 static int s_test_fail_next_submission;
 static int s_test_fail_next_pipeline_allocation;
+static int s_test_fail_offline_library;
+static int s_test_fail_source_library;
 #endif
 static id<MTLTexture> s_surface;
 static id<MTLTexture> s_inactive_texture;
@@ -484,6 +493,7 @@ static void pipeline_diagnostic_reset(int enabled)
 static const char *pipeline_event_kind_name(MetalPipelineEventKind kind)
 {
     switch (kind) {
+    case METAL_PIPELINE_EVENT_LIBRARY_LOAD: return "library_load";
     case METAL_PIPELINE_EVENT_LIBRARY_COMPILE: return "library_compile";
     case METAL_PIPELINE_EVENT_FUNCTION_SPECIALIZATION:
         return "function_specialization";
@@ -507,6 +517,10 @@ static const char *pipeline_status_name(MetalPipelineStatus status)
 {
     switch (status) {
     case METAL_PIPELINE_STATUS_OK: return "ok";
+    case METAL_PIPELINE_STATUS_ARTIFACT_UNAVAILABLE:
+        return "artifact_unavailable";
+    case METAL_PIPELINE_STATUS_ARTIFACT_REJECTED:
+        return "artifact_rejected";
     case METAL_PIPELINE_STATUS_ALLOCATION_FAILED: return "allocation_failed";
     case METAL_PIPELINE_STATUS_METAL_FAILED: return "metal_failed";
     }
@@ -530,6 +544,8 @@ static MetalPipelineTimingAggregate *pipeline_timing_aggregate(
     MetalPipelineEventKind kind)
 {
     switch (kind) {
+    case METAL_PIPELINE_EVENT_LIBRARY_LOAD:
+        return &s_pipeline_diagnostic.library_load;
     case METAL_PIPELINE_EVENT_LIBRARY_COMPILE:
         return &s_pipeline_diagnostic.library;
     case METAL_PIPELINE_EVENT_FUNCTION_SPECIALIZATION:
@@ -777,6 +793,11 @@ static int pipeline_diagnostic_format_summary(char *buffer, size_t size)
         "\"events_dropped\":%llu,\"cache_hits\":%llu,\"cache_misses\":%llu,"
         "\"cache_entry_high_water\":%u,\"cache_entry_limit\":%u,"
         "\"whole_cache_resets\":%llu,"
+        "\"library_artifact_available\":%s,\"library_artifact_loaded\":%s,"
+        "\"library_load_attempts\":%llu,\"library_load_timed\":%llu,"
+        "\"library_load_total_ns\":%llu,\"library_load_max_ns\":%llu,"
+        "\"library_fallbacks\":%llu,\"library_unavailable\":%llu,"
+        "\"library_rejections\":%llu,"
         "\"library_attempts\":%llu,\"library_timed\":%llu,"
         "\"library_total_ns\":%llu,\"library_max_ns\":%llu,"
         "\"specialization_attempts\":%llu,\"specialization_timed\":%llu,"
@@ -797,6 +818,15 @@ static int pipeline_diagnostic_format_summary(char *buffer, size_t size)
         (unsigned long long)s_pipeline_diagnostic.cache_misses,
         s_pipeline_diagnostic.cache_entry_high_water, METAL_MAX_PIPELINES,
         (unsigned long long)s_pipeline_diagnostic.whole_cache_resets,
+        BW_METAL_OFFLINE_SHADER_LIBRARIES ? "true" : "false",
+        s_pipeline_diagnostic.library_artifact_loaded ? "true" : "false",
+        (unsigned long long)s_pipeline_diagnostic.library_load.attempts,
+        (unsigned long long)s_pipeline_diagnostic.library_load.timed,
+        (unsigned long long)s_pipeline_diagnostic.library_load.total_ns,
+        (unsigned long long)s_pipeline_diagnostic.library_load.max_ns,
+        (unsigned long long)s_pipeline_diagnostic.library_fallbacks,
+        (unsigned long long)s_pipeline_diagnostic.library_unavailable,
+        (unsigned long long)s_pipeline_diagnostic.library_rejections,
         (unsigned long long)s_pipeline_diagnostic.library.attempts,
         (unsigned long long)s_pipeline_diagnostic.library.timed,
         (unsigned long long)s_pipeline_diagnostic.library.total_ns,
@@ -1301,383 +1331,6 @@ static int water_capture_frame(void)
         s_water_capture_supported_frames++;
     return 1;
 }
-
-static const char s_shader[] =
-    "#include <metal_stdlib>\n"
-    "using namespace metal;\n"
-    "struct Vertex { float4 position; float4 color; float4 texcoord; };\n"
-    "struct Uniforms { float4 surface_texture; float4 depth; float4 alpha; };\n"
-    "struct Varying { float4 position [[position]]; float4 color; float2 uv; };\n"
-    "vertex Varying vertex_main(uint i [[vertex_id]],\n"
-    "    const device Vertex *vertices [[buffer(0)]],\n"
-    "    constant Uniforms &u [[buffer(1)]]) {\n"
-    "  Vertex v = vertices[i]; Varying out;\n"
-    "  float w = 1.0 / v.position.w;\n"
-    "  float x = 2.0 * v.position.x / u.surface_texture.x - 1.0;\n"
-    "  float y = 1.0 - 2.0 * v.position.y / u.surface_texture.y;\n"
-    "  float z = (v.position.z - u.depth.x) / (u.depth.y - u.depth.x);\n"
-    "  out.position = float4(x * w, y * w, z * w, w);\n"
-    "  out.color = v.color;\n"
-    "  out.uv = v.texcoord.xy / u.surface_texture.zw;\n"
-    "  return out;\n"
-    "}\n"
-    /* Match the D3D11 basic path, including its equality tolerance. */
-    "float4 alpha_test(float4 color, constant Uniforms &u) {\n"
-    "  if (u.alpha.z > 0.5) {\n"
-    "    float a = color.a, r = u.alpha.y; int f = int(u.alpha.x);\n"
-    "    bool ok = (f == 7) || (f == 1 && a < r) || (f == 2 && abs(a-r) < 0.002)\n"
-    "           || (f == 3 && a <= r) || (f == 4 && a > r)\n"
-    "           || (f == 5 && abs(a-r) >= 0.002) || (f == 6 && a >= r);\n"
-    "    if (!ok) discard_fragment();\n"
-    "  }\n"
-    "  return color;\n"
-    "}\n"
-    "fragment float4 color_main(Varying in [[stage_in]],\n"
-    "    constant Uniforms &u [[buffer(1)]]) { return alpha_test(in.color, u); }\n"
-    "fragment float4 texture_main(Varying in [[stage_in]],\n"
-    "    constant Uniforms &u [[buffer(1)]],\n"
-    "    texture2d<float> tex [[texture(0)]], sampler samp [[sampler(0)]]) {\n"
-    "  return alpha_test(in.color * tex.sample(samp, in.uv), u);\n"
-    "}\n"
-    "struct XVertex { float4 position, d0, d1, fog, tc0, tc1, tc2, tc3; };\n"
-    "struct XUniforms { float4 surface_texture, depth, alpha, fog_color; uint4 combiner[8], factors[8], final, texture, stages, dot_state; };\n"
-    "constant uint sx0 [[function_constant(0)]], sx1 [[function_constant(1)]], sx2 [[function_constant(2)]], sx3 [[function_constant(3)]];\n"
-    "constant uint ss0 [[function_constant(4)]], ss1 [[function_constant(5)]], ss2 [[function_constant(6)]], ss3 [[function_constant(7)]];\n"
-    "constant uint sd0 [[function_constant(8)]], sd1 [[function_constant(9)]], sd2 [[function_constant(10)]], sd3 [[function_constant(11)]];\n"
-    "constant uint sc00 [[function_constant(12)]], sc01 [[function_constant(13)]], sc02 [[function_constant(14)]], sc03 [[function_constant(15)]];\n"
-    "constant uint sc10 [[function_constant(16)]], sc11 [[function_constant(17)]], sc12 [[function_constant(18)]], sc13 [[function_constant(19)]];\n"
-    "constant uint sc20 [[function_constant(20)]], sc21 [[function_constant(21)]], sc22 [[function_constant(22)]], sc23 [[function_constant(23)]];\n"
-    "constant uint sc30 [[function_constant(24)]], sc31 [[function_constant(25)]], sc32 [[function_constant(26)]], sc33 [[function_constant(27)]];\n"
-    "constant uint sc40 [[function_constant(28)]], sc41 [[function_constant(29)]], sc42 [[function_constant(30)]], sc43 [[function_constant(31)]];\n"
-    "constant uint sc50 [[function_constant(32)]], sc51 [[function_constant(33)]], sc52 [[function_constant(34)]], sc53 [[function_constant(35)]];\n"
-    "constant uint sc60 [[function_constant(36)]], sc61 [[function_constant(37)]], sc62 [[function_constant(38)]], sc63 [[function_constant(39)]];\n"
-    "constant uint sc70 [[function_constant(40)]], sc71 [[function_constant(41)]], sc72 [[function_constant(42)]], sc73 [[function_constant(43)]];\n"
-    "constant uint sf0 [[function_constant(44)]], sf1 [[function_constant(45)]];\n"
-    "constant uint sa0 [[function_constant(46)]], sa1 [[function_constant(47)]];\n"
-    "struct XVarying { float4 position [[position]]; float4 d0; float4 d1; float fog; float fogp; float4 tc0, tc1, tc2, tc3; };\n"
-    "vertex XVarying extended_vertex(uint i [[vertex_id]],\n"
-    "    const device XVertex *vertices [[buffer(0)]], constant XUniforms &u [[buffer(1)]]) {\n"
-    "  XVertex v = vertices[i]; XVarying out; float w = 1.0 / v.position.w;\n"
-    "  float x = 2.0 * v.position.x / u.surface_texture.x - 1.0;\n"
-    "  float y = 1.0 - 2.0 * v.position.y / u.surface_texture.y;\n"
-    "  float z = (v.position.z - u.depth.x) / (u.depth.y - u.depth.x);\n"
-    "  out.position = float4(x * w, y * w, z * w, w);\n"
-    "  out.d0 = v.d0; out.d1 = v.d1; out.fog = v.fog.x; out.fogp = v.fog.y;\n"
-    "  out.tc0 = v.tc0; out.tc1 = v.tc1;\n"
-    "  out.tc2 = v.tc2; out.tc3 = v.tc3; return out;\n"
-    "}\n"
-    "float xmap(float x, uint m) {\n"
-    "  float p = max(x, 0.0);\n"
-    "  if (m == 0u) return p; if (m == 1u) return 1.0 - saturate(x);\n"
-    "  if (m == 2u) return 2.0 * p - 1.0; if (m == 3u) return 1.0 - 2.0 * p;\n"
-    "  if (m == 4u) return p - 0.5; if (m == 5u) return 0.5 - p;\n"
-    "  return m == 6u ? x : -x;\n"
-    "}\n"
-    "float3 xrgb(thread const float4 *r, uint b) {\n"
-    "  float4 v = r[b & 15u]; float3 c = (b & 16u) ? v.aaa : v.rgb;\n"
-    "  uint m = (b >> 5) & 7u;\n"
-    "  return float3(xmap(c.r, m), xmap(c.g, m), xmap(c.b, m));\n"
-    "}\n"
-    "float xa(thread const float4 *r, uint b) {\n"
-    "  float4 v = r[b & 15u]; return xmap((b & 16u) ? v.a : v.b, (b >> 5) & 7u);\n"
-    "}\n"
-    "float3 xout(float3 x, uint m) {\n"
-    "  if (m == 0x08u) return x - 0.5; if (m == 0x10u) return x * 2.0;\n"
-    "  if (m == 0x18u) return (x - 0.5) * 2.0; if (m == 0x20u) return x * 4.0;\n"
-    "  if (m == 0x30u) return x * 0.5; return x;\n"
-    "}\n"
-    "float4 xunpack(uint c) {\n"
-    "  return float4((c >> 16) & 255u, (c >> 8) & 255u, c & 255u, c >> 24) / 255.0;\n"
-    "}\n"
-    "float2 finite_uv(float2 uv) { return all(isfinite(uv)) ? uv : float2(0.0); }\n"
-    "float4 finite_tc(float4 tc) { return select(float4(0.0), tc, isfinite(tc)); }\n"
-    "float3 dot_map(float4 c, uint m) {\n"
-    "  float3 x = c.rgb * 255.0;\n"
-    "  if (m == 1u) return (x - 128.0) / 127.0;\n"
-    "  if (m == 2u) return select((x + 0.5) / 127.5, (x - 255.5) / 127.5, x >= 128.0);\n"
-    "  if (m == 3u) return select(x / 127.0, (x - 256.0) / 127.0, x >= 128.0);\n"
-    "  return c.rgb;\n"
-    "}\n"
-    "float4 cube_sample(texture2d_array<float> tex, sampler samp, float3 d) {\n"
-    "  float3 a = abs(d); float ma, sc, tc; uint face;\n"
-    "  if (a.x >= a.y && a.x >= a.z) {\n"
-    "    face = d.x > 0.0 ? 0u : 1u; ma = a.x; sc = d.x > 0.0 ? -d.z : d.z; tc = -d.y;\n"
-    "  } else if (a.y >= a.z) {\n"
-    "    face = d.y > 0.0 ? 2u : 3u; ma = a.y; sc = d.x; tc = d.y > 0.0 ? d.z : -d.z;\n"
-    "  } else {\n"
-    "    face = d.z > 0.0 ? 4u : 5u; ma = a.z; sc = d.z > 0.0 ? d.x : -d.x; tc = -d.y;\n"
-    "  }\n"
-    "  if (ma == 0.0) ma = 1.0;\n"
-    "  return tex.sample(samp, float2(sc / ma + 1.0, tc / ma + 1.0) * 0.5, face);\n"
-    "}\n"
-    /* Explicit bilinear arithmetic and half-up output rounding match the
-     * legacy CPU reference where sampler/UNorm hardware can differ by 1. */
-    "float4 legacy_linear(texture2d<float> tex, float2 uv) {\n"
-    "  float2 size = float2(tex.get_width(), tex.get_height());\n"
-    "  float2 p = clamp(uv, float2(-1.0), size + 1.0) - 0.5;\n"
-    "  float2 base = floor(p), f = p - base;\n"
-    "  int2 lo = clamp(int2(base), int2(0), int2(size) - 1);\n"
-    "  int2 hi = clamp(int2(base) + 1, int2(0), int2(size) - 1);\n"
-    "  float4 a = tex.read(uint2(lo.x, lo.y)), b = tex.read(uint2(hi.x, lo.y));\n"
-    "  float4 c = tex.read(uint2(lo.x, hi.y)), d = tex.read(uint2(hi.x, hi.y));\n"
-    "  return (a * (1.0 - f.x) + b * f.x) * (1.0 - f.y)\n"
-    "       + (c * (1.0 - f.x) + d * f.x) * f.y;\n"
-    "}\n"
-    "float4 extended_shade(XVarying in, constant XUniforms &u,\n"
-    "    texture2d<float> tex, texture2d<float> tex1,\n"
-    "    texture2d<float> tex2, texture2d<float> tex3,\n"
-    "    texture2d_array<float> cube0, texture2d_array<float> cube1,\n"
-    "    texture2d_array<float> cube2, texture2d_array<float> cube3,\n"
-    "    sampler samp, sampler samp1, sampler samp2, sampler samp3,\n"
-    "    bool realistic, uint4 texture_state, uint4 stages_state,\n"
-    "    uint4 dot_state, uint4 c0, uint4 c1, uint4 c2, uint4 c3,\n"
-    "    uint4 c4, uint4 c5, uint4 c6, uint4 c7,\n"
-    "    uint2 final_state, uint2 alpha_state) {\n"
-    "  float4 r[16]; for (uint i = 0; i < 16; ++i) r[i] = 0.0;\n"
-    "  uint4 combiner_state[8] = { c0, c1, c2, c3, c4, c5, c6, c7 };\n"
-    "  r[3] = float4(u.fog_color.rgb, saturate(in.fogp));\n"
-    "  r[4] = in.d0; r[5] = in.d1;\n"
-    "  float4 tc[4] = { finite_tc(in.tc0), finite_tc(in.tc1), finite_tc(in.tc2), finite_tc(in.tc3) };\n"
-    "  float q0 = tc[0].w != 0.0 ? tc[0].w : 1.0;\n"
-    "  float q1 = tc[1].w != 0.0 ? tc[1].w : 1.0;\n"
-    "  float q2 = tc[2].w != 0.0 ? tc[2].w : 1.0;\n"
-    "  float q3 = tc[3].w != 0.0 ? tc[3].w : 1.0;\n"
-    "  float2 uv0 = tc[0].xy / q0, uv1 = tc[1].xy / q1;\n"
-    "  float2 uv2 = tc[2].xy / q2, uv3 = tc[3].xy / q3;\n"
-    "  uv0 = finite_uv(uv0); uv1 = finite_uv(uv1);\n"
-    "  uv2 = finite_uv(uv2); uv3 = finite_uv(uv3);\n"
-    "  if (stages_state.y & 1u) uv0 /= float2(tex.get_width(), tex.get_height());\n"
-    "  if (stages_state.y & 2u) uv1 /= float2(tex1.get_width(), tex1.get_height());\n"
-    "  if (stages_state.y & 4u) uv2 /= float2(tex2.get_width(), tex2.get_height());\n"
-    "  if (stages_state.y & 8u) uv3 /= float2(tex3.get_width(), tex3.get_height());\n"
-    "  uint m0 = dot_state.x & 31u, m1 = (dot_state.x >> 5) & 31u;\n"
-    "  uint m2 = (dot_state.x >> 10) & 31u, m3 = (dot_state.x >> 15) & 31u;\n"
-    "  float dp1 = 0.0, dp2 = 0.0, dp3 = 0.0;\n"
-    "  if (m0 == 4u) r[8] = saturate(tc[0]);\n"
-    "  else if (!(stages_state.x & 1u)) r[8] = m0 == 1u ? float4(1.0) : float4(0, 0, 0, 1);\n"
-    "  else if (texture_state.x) {\n"
-    "    float2 uv = finite_uv(tc[0].xy / q0);\n"
-    "    r[8] = 0.0;\n"
-    "    for (int y = -1; y <= 1; ++y) for (int x = -1; x <= 1; ++x)\n"
-    "      r[8] += legacy_linear(tex, uv + float2(x, y))\n"
-    "            * (float((2 - abs(x)) * (2 - abs(y))) / 16.0);\n"
-    "  } else r[8] = tex.sample(samp, uv0);\n"
-    "  if (texture_state.x) r[8].a = 1.0;\n"
-    "  if (m1 == 17u) {\n"
-    "    r[9] = float4(0.0); dp1 = dot(tc[1].xyz, dot_map(r[8], dot_state.y & 15u));\n"
-    "  } else if (m1 == 4u) r[9] = saturate(tc[1]);\n"
-    "  else if (m1 == 1u) r[9] = (stages_state.x & 2u) ? tex1.sample(samp1, uv1) : float4(1.0);\n"
-    "  else r[9] = float4(0, 0, 0, 1);\n"
-    "  if (m2 == 11u) {\n"
-    "    r[10] = float4(0.0);\n"
-    "    uint input2 = (dot_state.z >> 16) & 15u; if (input2 >= 2u) input2 = 0u;\n"
-    "    dp2 = dot(tc[2].xyz, dot_map(r[8u + input2], (dot_state.y >> 4) & 15u));\n"
-    "    uint input3 = (dot_state.z >> 20) & 15u; if (input3 >= 3u) input3 = 0u;\n"
-    "    dp3 = dot(tc[3].xyz, dot_map(r[8u + input3], (dot_state.y >> 8) & 15u));\n"
-    "    if (stages_state.w & 4u) r[10] = cube_sample(cube2, samp2, float3(dp1, dp2, dp3));\n"
-    "  } else if (m2 == 4u) r[10] = saturate(tc[2]);\n"
-    "  else if (m2 == 1u) r[10] = (stages_state.x & 4u) ? tex2.sample(samp2, uv2) : float4(1.0);\n"
-    "  else r[10] = float4(0, 0, 0, 1);\n"
-    "  if (m3 == 12u) {\n"
-    "    r[11] = float4(0.0);\n"
-    "    uint input3 = (dot_state.z >> 20) & 15u; if (input3 >= 3u) input3 = 0u;\n"
-    "    dp3 = dot(tc[3].xyz, dot_map(r[8u + input3], (dot_state.y >> 8) & 15u));\n"
-    "    float3 n = float3(dp1, dp2, dp3), e = float3(tc[1].w, tc[2].w, tc[3].w);\n"
-    "    float nn = dot(n, n); float3 reflected = nn != 0.0 ? 2.0 * (dot(n, e) / nn) * n - e : e;\n"
-    "    if (stages_state.w & 8u) r[11] = cube_sample(cube3, samp3, reflected);\n"
-    "  } else if (m3 == 4u) r[11] = saturate(tc[3]);\n"
-    "  else if (m3 == 1u) r[11] = (stages_state.x & 8u) ? tex3.sample(samp3, uv3) : float4(1.0);\n"
-    "  else r[11] = float4(0, 0, 0, 1);\n"
-    "  r[12].a = r[8].a;\n"
-    "  for (uint s = 0; s < texture_state.y; ++s) {\n"
-    "    r[1] = xunpack(u.factors[(texture_state.w & 0x10u) ? s : 0].x);\n"
-    "    r[2] = xunpack(u.factors[(texture_state.w & 0x100u) ? s : 0].y);\n"
-    "    uint ci = combiner_state[s].x, ai = combiner_state[s].y;\n"
-    "    uint co = combiner_state[s].z, ao = combiner_state[s].w;\n"
-    "    float3 A = xrgb(r, ci >> 24), B = xrgb(r, ci >> 16);\n"
-    "    float3 C = xrgb(r, ci >> 8), D = xrgb(r, ci);\n"
-    "    float aA = xa(r, ai >> 24), aB = xa(r, ai >> 16);\n"
-    "    float aC = xa(r, ai >> 8), aD = xa(r, ai);\n"
-    "    uint fl = co >> 12, afl = ao >> 12;\n"
-    "    bool mux = texture_state.z ? r[12].a >= 0.5 : (int(r[12].a * 255.0) & 1) != 0;\n"
-    "    float3 pab = (fl & 2u) ? float3(dot(A, B)) : A * B;\n"
-    "    float3 pcd = (fl & 1u) ? float3(dot(C, D)) : C * D;\n"
-    "    float3 psum = (fl & 4u) ? (mux ? pcd : pab) : pab + pcd;\n"
-    "    float3 ab = clamp(xout(pab, fl & 0x38u), -1.0, 1.0);\n"
-    "    float3 cd = clamp(xout(pcd, fl & 0x38u), -1.0, 1.0);\n"
-    "    float3 sum = clamp(xout(psum, fl & 0x38u), -1.0, 1.0);\n"
-    "    float apab = aA * aB, apcd = aC * aD;\n"
-    "    float apsum = (afl & 4u) ? (mux ? apcd : apab) : apab + apcd;\n"
-    "    float aab = clamp(xout(float3(apab), afl & 0x38u).x, -1.0, 1.0);\n"
-    "    float acd = clamp(xout(float3(apcd), afl & 0x38u).x, -1.0, 1.0);\n"
-    "    float asum = clamp(xout(float3(apsum), afl & 0x38u).x, -1.0, 1.0);\n"
-    "    uint d = (co >> 4) & 15u; if (d) { r[d].rgb = ab; if (fl & 0x80u) r[d].a = ab.b; }\n"
-    "    d = co & 15u; if (d) { r[d].rgb = cd; if (fl & 0x40u) r[d].a = cd.b; }\n"
-    "    d = (co >> 8) & 15u; if (d) r[d].rgb = sum;\n"
-    "    d = (ao >> 4) & 15u; if (d) r[d].a = aab;\n"
-    "    d = ao & 15u; if (d) r[d].a = acd;\n"
-    "    d = (ao >> 8) & 15u; if (d) r[d].a = asum;\n"
-    "  }\n"
-    "  uint f0 = final_state.x, f1 = final_state.y;\n"
-    "  float4 o;\n"
-    "  if (f0 || f1) {\n"
-    "    r[1] = xunpack(u.final.z); r[2] = xunpack(u.final.w);\n"
-    "    float3 v1 = (f1 & 0x40u) ? 1.0 - r[5].rgb : r[5].rgb;\n"
-    "    float3 r0 = (f1 & 0x20u) ? 1.0 - r[12].rgb : r[12].rgb;\n"
-    "    float3 sum = v1 + r0; r[14] = float4((f1 & 0x80u) ? saturate(sum) : sum, 0.0);\n"
-    "    r[15] = float4(xrgb(r, f1 >> 24) * xrgb(r, f1 >> 16), 0.0);\n"
-    "    float3 A = xrgb(r, f0 >> 24), B = xrgb(r, f0 >> 16);\n"
-    "    float3 C = xrgb(r, f0 >> 8), D = xrgb(r, f0);\n"
-    "    o = saturate(float4(D + C * (1.0 - A) + B * A, xa(r, f1 >> 8)));\n"
-    "  } else o = saturate(r[12]);\n"
-    "  if (alpha_state.y) {\n"
-    "    int a = int(o.a * 255.0 + 0.5), ref = int(u.alpha.y * 255.0 + 0.5);\n"
-    "    int f = int(alpha_state.x);\n"
-    "    bool ok = f == 7 || (f == 1 && a < ref) || (f == 2 && a == ref)\n"
-    "           || (f == 3 && a <= ref) || (f == 4 && a > ref)\n"
-    "           || (f == 5 && a != ref) || (f == 6 && a >= ref);\n"
-    "    if (!ok) discard_fragment();\n"
-    "  }\n"
-    "  if (texture_state.x) o.rgb = floor(o.rgb * 255.0 + 0.5) / 255.0;\n"
-    "  if (realistic) {\n"
-    "    float3 n = tc[1].rgb * 2.0 - 1.0;\n"
-    "    float3 e = tc[2].rgb * 2.0 - 1.0;\n"
-    "    float nl = length(n), el = length(e);\n"
-    "    if (isfinite(nl) && isfinite(el) && nl > 0.0001 && el > 0.0001) {\n"
-    "      float ndv = saturate(abs(dot(n / nl, e / el)));\n"
-    "      float edge = 1.0 - ndv, edge2 = edge * edge;\n"
-    "      float fresnel = 0.02 + 0.98 * edge2 * edge2 * edge;\n"
-    "      float3 existing_reflection = saturate(r[8].rgb);\n"
-    "      float reflection_luma = dot(existing_reflection, float3(0.2126, 0.7152, 0.0722));\n"
-    "      float3 restrained_reflection = mix(float3(reflection_luma), existing_reflection, 0.72);\n"
-    "      float3 atmosphere = saturate(u.fog_color.rgb);\n"
-    "      float3 reflection = mix(restrained_reflection, atmosphere,\n"
-    "                              0.16 + 0.30 * fresnel);\n"
-    "      float strength = saturate((0.025 + 0.18 * fresnel) * saturate(in.fogp));\n"
-    "      o.rgb = saturate(mix(o.rgb, reflection, strength));\n"
-    "    }\n"
-    "  }\n"
-    "  return o;\n"
-    "}\n"
-    "fragment float4 extended_fragment(XVarying in [[stage_in]],\n"
-    "    constant XUniforms &u [[buffer(1)]],\n"
-    "    texture2d<float> tex [[texture(0)]], texture2d<float> tex1 [[texture(1)]],\n"
-    "    texture2d<float> tex2 [[texture(2)]], texture2d<float> tex3 [[texture(3)]],\n"
-    "    texture2d_array<float> cube0 [[texture(4)]], texture2d_array<float> cube1 [[texture(5)]],\n"
-    "    texture2d_array<float> cube2 [[texture(6)]], texture2d_array<float> cube3 [[texture(7)]],\n"
-    "    sampler samp [[sampler(0)]], sampler samp1 [[sampler(1)]],\n"
-    "    sampler samp2 [[sampler(2)]], sampler samp3 [[sampler(3)]]) {\n"
-    "  return extended_shade(in, u, tex, tex1, tex2, tex3,\n"
-    "                        cube0, cube1, cube2, cube3,\n"
-    "                        samp, samp1, samp2, samp3, false,\n"
-    "                        u.texture, u.stages, u.dot_state,\n"
-    "                        u.combiner[0], u.combiner[1], u.combiner[2], u.combiner[3],\n"
-    "                        u.combiner[4], u.combiner[5], u.combiner[6], u.combiner[7],\n"
-    "                        u.final.xy, uint2(uint(u.alpha.x), uint(u.alpha.z > 0.5)));\n"
-    "}\n"
-    "fragment float4 extended_specialized_fragment(XVarying in [[stage_in]],\n"
-    "    constant XUniforms &u [[buffer(1)]],\n"
-    "    texture2d<float> tex [[texture(0)]], texture2d<float> tex1 [[texture(1)]],\n"
-    "    texture2d<float> tex2 [[texture(2)]], texture2d<float> tex3 [[texture(3)]],\n"
-    "    texture2d_array<float> cube0 [[texture(4)]], texture2d_array<float> cube1 [[texture(5)]],\n"
-    "    texture2d_array<float> cube2 [[texture(6)]], texture2d_array<float> cube3 [[texture(7)]],\n"
-    "    sampler samp [[sampler(0)]], sampler samp1 [[sampler(1)]],\n"
-    "    sampler samp2 [[sampler(2)]], sampler samp3 [[sampler(3)]]) {\n"
-    "  return extended_shade(in, u, tex, tex1, tex2, tex3,\n"
-    "                        cube0, cube1, cube2, cube3,\n"
-    "                        samp, samp1, samp2, samp3, false,\n"
-    "                        uint4(sx0, sx1, sx2, sx3),\n"
-    "                        uint4(ss0, ss1, ss2, ss3),\n"
-    "                        uint4(sd0, sd1, sd2, sd3),\n"
-    "                        uint4(sc00, sc01, sc02, sc03),\n"
-    "                        uint4(sc10, sc11, sc12, sc13),\n"
-    "                        uint4(sc20, sc21, sc22, sc23),\n"
-    "                        uint4(sc30, sc31, sc32, sc33),\n"
-    "                        uint4(sc40, sc41, sc42, sc43),\n"
-    "                        uint4(sc50, sc51, sc52, sc53),\n"
-    "                        uint4(sc60, sc61, sc62, sc63),\n"
-    "                        uint4(sc70, sc71, sc72, sc73),\n"
-    "                        uint2(sf0, sf1), uint2(sa0, sa1));\n"
-    "}\n"
-    "fragment float4 realistic_water_fragment(XVarying in [[stage_in]],\n"
-    "    constant XUniforms &u [[buffer(1)]],\n"
-    "    texture2d<float> tex [[texture(0)]], texture2d<float> tex1 [[texture(1)]],\n"
-    "    texture2d<float> tex2 [[texture(2)]], texture2d<float> tex3 [[texture(3)]],\n"
-    "    texture2d_array<float> cube0 [[texture(4)]], texture2d_array<float> cube1 [[texture(5)]],\n"
-    "    texture2d_array<float> cube2 [[texture(6)]], texture2d_array<float> cube3 [[texture(7)]],\n"
-    "    sampler samp [[sampler(0)]], sampler samp1 [[sampler(1)]],\n"
-    "    sampler samp2 [[sampler(2)]], sampler samp3 [[sampler(3)]]) {\n"
-    "  return extended_shade(in, u, tex, tex1, tex2, tex3,\n"
-    "                        cube0, cube1, cube2, cube3,\n"
-    "                        samp, samp1, samp2, samp3, true,\n"
-    "                        u.texture, u.stages, u.dot_state,\n"
-    "                        u.combiner[0], u.combiner[1], u.combiner[2], u.combiner[3],\n"
-    "                        u.combiner[4], u.combiner[5], u.combiner[6], u.combiner[7],\n"
-    "                        u.final.xy, uint2(uint(u.alpha.x), uint(u.alpha.z > 0.5)));\n"
-    "}\n"
-    "struct PresentVarying { float4 position [[position]]; float2 uv; };\n"
-    "struct ResolveUniforms { uint width, height, aa_sx, aa_sy; };\n"
-    "struct ScaleUniforms { uint source_width, source_height, destination_width, destination_height; };\n"
-    "struct PresentUniforms { uint gamma_enabled; uint3 padding; };\n"
-    "vertex PresentVarying present_vertex(uint i [[vertex_id]]) {\n"
-    "  const float2 p[3] = {float2(-1, -1), float2(3, -1), float2(-1, 3)};\n"
-    "  PresentVarying o; o.position = float4(p[i], 0, 1);\n"
-    "  o.uv = float2(p[i].x * 0.5 + 0.5, 0.5 - p[i].y * 0.5); return o;\n"
-    "}\n"
-    "fragment float4 present_resolve(PresentVarying in [[stage_in]],\n"
-    "    texture2d<float, access::read> source [[texture(0)]],\n"
-    "    constant ResolveUniforms &u [[buffer(0)]]) {\n"
-    "  uint2 logical = uint2(u.width, u.height);\n"
-    "  uint2 p = min(uint2(in.uv * float2(logical)), logical - 1u);\n"
-    "  float4 color = 0.0; uint count = u.aa_sx * u.aa_sy;\n"
-    "  for (uint y = 0; y < u.aa_sy; y++)\n"
-    "    for (uint x = 0; x < u.aa_sx; x++)\n"
-    "      color += source.read(p * uint2(u.aa_sx, u.aa_sy) + uint2(x, y));\n"
-    "  return color / float(count);\n"
-    "}\n"
-    "fragment float4 scale_fragment(PresentVarying in [[stage_in]],\n"
-    "    texture2d<float> source [[texture(0)]], sampler source_sampler [[sampler(0)]]) {\n"
-    "  return source.sample(source_sampler, in.uv);\n"
-    "}\n"
-    "fragment float4 box_fragment(PresentVarying in [[stage_in]],\n"
-    "    texture2d<float, access::read> source [[texture(0)]],\n"
-    "    constant ScaleUniforms &u [[buffer(0)]]) {\n"
-    "  uint2 destination = uint2(u.destination_width, u.destination_height);\n"
-    "  uint2 p = min(uint2(in.position.xy), destination - 1u);\n"
-    "  float2 ratio = float2(u.source_width, u.source_height) / float2(destination);\n"
-    "  float2 lo = float2(p) * ratio, hi = float2(p + 1u) * ratio;\n"
-    "  uint2 begin = uint2(floor(lo));\n"
-    "  uint2 end = min(uint2(ceil(hi)), uint2(u.source_width, u.source_height));\n"
-    "  float4 color = 0.0; float weight = 0.0;\n"
-    "  for (uint y = begin.y; y < end.y; y++) {\n"
-    "    float wy = max(0.0, min(hi.y, float(y + 1u)) - max(lo.y, float(y)));\n"
-    "    for (uint x = begin.x; x < end.x; x++) {\n"
-    "      float wx = max(0.0, min(hi.x, float(x + 1u)) - max(lo.x, float(x)));\n"
-    "      float w = wx * wy; color += source.read(uint2(x, y)) * w; weight += w;\n"
-    "    }\n"
-    "  }\n"
-    "  return color / weight;\n"
-    "}\n"
-    "fragment float4 present_fragment(PresentVarying in [[stage_in]],\n"
-    "    texture2d<float> source [[texture(0)]],\n"
-    "    texture2d<float, access::read> gamma_lut [[texture(1)]],\n"
-    "    sampler source_sampler [[sampler(0)]],\n"
-    "    constant PresentUniforms &u [[buffer(0)]]) {\n"
-    "  float4 color = source.sample(source_sampler, in.uv);\n"
-    "  if (u.gamma_enabled) {\n"
-    "    uint3 i = uint3(clamp(floor(color.rgb * 255.0 + 0.5), 0.0, 255.0));\n"
-    "    color.r = gamma_lut.read(uint2(i.r, 0)).r;\n"
-    "    color.g = gamma_lut.read(uint2(i.g, 0)).g;\n"
-    "    color.b = gamma_lut.read(uint2(i.b, 0)).b;\n"
-    "  }\n"
-    "  return float4(color.rgb, 1.0);\n"
-    "}\n"
-    "vertex float4 clear_vertex(uint i [[vertex_id]], constant float &z [[buffer(0)]]) {\n"
-    "  const float2 p[3] = {float2(-1, -1), float2(3, -1), float2(-1, 3)};\n"
-    "  return float4(p[i], z, 1);\n"
-    "}\n"
-    "fragment float4 clear_color(constant float4 &c [[buffer(0)]]) { return c; }\n"
-    "fragment void clear_depth() {}\n";
 
 static int metal_fail(const char *format, ...)
 {
@@ -5517,11 +5170,81 @@ static void disable_legacy_fast_math(MTLCompileOptions *options)
 #pragma clang diagnostic pop
 }
 
+static int bind_shader_functions(id<MTLLibrary> library, int require_realistic)
+{
+    id<MTLFunction> vertex = [library newFunctionWithName:@"vertex_main"];
+    id<MTLFunction> color = [library newFunctionWithName:@"color_main"];
+    id<MTLFunction> texture = [library newFunctionWithName:@"texture_main"];
+    id<MTLFunction> extended_vertex =
+        [library newFunctionWithName:@"extended_vertex"];
+    id<MTLFunction> extended_fragment =
+        [library newFunctionWithName:@"extended_fragment"];
+    id<MTLFunction> realistic_water =
+        [library newFunctionWithName:@"realistic_water_fragment"];
+    id<MTLFunction> clear_vertex = [library newFunctionWithName:@"clear_vertex"];
+    id<MTLFunction> clear_color = [library newFunctionWithName:@"clear_color"];
+    id<MTLFunction> clear_depth = [library newFunctionWithName:@"clear_depth"];
+    id<MTLFunction> present_vertex =
+        [library newFunctionWithName:@"present_vertex"];
+    id<MTLFunction> present_resolve =
+        [library newFunctionWithName:@"present_resolve"];
+    id<MTLFunction> present_fragment =
+        [library newFunctionWithName:@"present_fragment"];
+    id<MTLFunction> scale = [library newFunctionWithName:@"scale_fragment"];
+    id<MTLFunction> box = [library newFunctionWithName:@"box_fragment"];
+    if (!vertex || !color || !texture || !extended_vertex ||
+        !extended_fragment || (require_realistic && !realistic_water) ||
+        !clear_vertex || !clear_color || !clear_depth || !present_vertex ||
+        !present_resolve || !present_fragment || !scale || !box)
+        return 0;
+    s_vertex_function = vertex;
+    s_color_function = color;
+    s_texture_function = texture;
+    s_extended_vertex_function = extended_vertex;
+    s_extended_fragment_function = extended_fragment;
+    s_realistic_water_fragment_function = realistic_water;
+    s_clear_vertex_function = clear_vertex;
+    s_clear_color_function = clear_color;
+    s_clear_depth_function = clear_depth;
+    s_present_vertex_function = present_vertex;
+    s_present_resolve_function = present_resolve;
+    s_present_fragment_function = present_fragment;
+    s_scale_function = scale;
+    s_box_function = box;
+    return 1;
+}
+
+static id<MTLLibrary> load_offline_shader_library(
+    const uint8_t *bytes, size_t size, NSError **error,
+    MetalPipelineStatus *status, int *entry_point_missing)
+{
+    dispatch_data_t data =
+        dispatch_data_create(bytes, size, NULL, ^{});
+    if (!data) {
+        *status = METAL_PIPELINE_STATUS_ALLOCATION_FAILED;
+        return nil;
+    }
+    id<MTLLibrary> library = [s_device newLibraryWithData:data error:error];
+    if (!library) {
+        *status = METAL_PIPELINE_STATUS_ARTIFACT_REJECTED;
+        return nil;
+    }
+    if (!bind_shader_functions(library, 1)) {
+        *entry_point_missing = 1;
+        *status = METAL_PIPELINE_STATUS_ARTIFACT_REJECTED;
+        return nil;
+    }
+    *status = METAL_PIPELINE_STATUS_OK;
+    return library;
+}
+
 static int initialize_metal(void)
 {
     NSError *error = nil;
     uint64_t library_hash = s_pipeline_diagnostic.enabled
-                          ? pipeline_key_hash(1, s_shader, sizeof s_shader - 1u)
+                          ? pipeline_key_hash(
+                                1, s_metal_shader_source,
+                                s_metal_shader_source_size)
                           : 0;
     if (!s_device)
         s_device = MTLCreateSystemDefaultDevice();
@@ -5532,64 +5255,121 @@ static int initialize_metal(void)
     s_queue = [s_device newCommandQueue];
     if (!s_queue)
         return metal_fail("could not create Metal command queue");
-    MTLCompileOptions *options = nil;
-    if (s_quincunx_approx) {
-        /* Keep the reference filter's float operation order. */
-        options = [MTLCompileOptions new];
-        if (!options) {
+    const uint8_t *offline_bytes = s_quincunx_approx
+                                  ? s_metal_shader_library_precise
+                                  : s_metal_shader_library_default;
+    size_t offline_size = s_quincunx_approx
+                        ? s_metal_shader_library_precise_size
+                        : s_metal_shader_library_default_size;
+#if defined(BW_METAL_TESTING)
+    static const uint8_t invalid_offline_library[] = {0};
+    if (s_test_fail_offline_library) {
+        offline_bytes = invalid_offline_library;
+        offline_size = sizeof invalid_offline_library;
+    }
+#endif
+    if (offline_size) {
+        MetalPipelineStatus load_status = METAL_PIPELINE_STATUS_ARTIFACT_REJECTED;
+        MetalPipelineTimer load_timer = pipeline_diagnostic_begin();
+        int entry_point_missing = 0;
+        s_shader_library = load_offline_shader_library(
+            offline_bytes, offline_size, &error, &load_status,
+            &entry_point_missing);
+        pipeline_diagnostic_finish(
+            METAL_PIPELINE_EVENT_LIBRARY_LOAD, library_hash, 0,
+            METAL_PIPELINE_ROLE_STARTUP, load_status, load_timer);
+        if (s_shader_library) {
+            if (s_pipeline_diagnostic.enabled)
+                s_pipeline_diagnostic.library_artifact_loaded = 1;
+        } else {
+            if (s_pipeline_diagnostic.enabled)
+                s_pipeline_diagnostic.library_rejections++;
+            fprintf(stderr,
+                    "[GPU-METAL] offline shader library rejected (%s); "
+                    "compiling source fallback\n",
+                    entry_point_missing ? "required entry point missing"
+                                        : metal_error_text(error));
+        }
+    } else {
+        if (s_pipeline_diagnostic.enabled)
+            s_pipeline_diagnostic.library_unavailable++;
+        pipeline_diagnostic_record_instant(
+            METAL_PIPELINE_EVENT_LIBRARY_LOAD, library_hash, 0,
+            METAL_PIPELINE_ROLE_STARTUP,
+            METAL_PIPELINE_STATUS_ARTIFACT_UNAVAILABLE);
+        fprintf(stderr,
+                "[GPU-METAL] offline shader library unavailable in this build; "
+                "compiling source fallback\n");
+    }
+    if (!s_shader_library) {
+        if (s_pipeline_diagnostic.enabled)
+            s_pipeline_diagnostic.library_fallbacks++;
+        NSString *source = [[NSString alloc]
+            initWithBytes:s_metal_shader_source
+                   length:s_metal_shader_source_size
+                 encoding:NSUTF8StringEncoding];
+        if (!source) {
             pipeline_diagnostic_finish(
                 METAL_PIPELINE_EVENT_LIBRARY_COMPILE, library_hash, 0,
                 METAL_PIPELINE_ROLE_STARTUP,
                 METAL_PIPELINE_STATUS_ALLOCATION_FAILED,
                 (MetalPipelineTimer){0,
                                      METAL_PIPELINE_TIMING_NOT_APPLICABLE});
-            return metal_fail("could not create precise Metal shader options");
+            return metal_fail("could not create Metal shader source");
         }
+        MTLCompileOptions *options = nil;
+        if (s_quincunx_approx) {
+            /* Keep the reference filter's float operation order. */
+            options = [MTLCompileOptions new];
+            if (!options) {
+                pipeline_diagnostic_finish(
+                    METAL_PIPELINE_EVENT_LIBRARY_COMPILE, library_hash, 0,
+                    METAL_PIPELINE_ROLE_STARTUP,
+                    METAL_PIPELINE_STATUS_ALLOCATION_FAILED,
+                    (MetalPipelineTimer){0,
+                                         METAL_PIPELINE_TIMING_NOT_APPLICABLE});
+                return metal_fail("could not create precise Metal shader options");
+            }
 #if __MAC_OS_X_VERSION_MAX_ALLOWED >= 150000 && \
     !(defined(BW_METAL_TESTING) && defined(BW_METAL_TEST_FORCE_LEGACY_MATH))
-        if (@available(macOS 15.0, *)) {
-            options.mathMode = MTLMathModeSafe;
-        } else {
-            disable_legacy_fast_math(options);
-        }
+            if (@available(macOS 15.0, *)) {
+                options.mathMode = MTLMathModeSafe;
+            } else {
+                disable_legacy_fast_math(options);
+            }
 #else
-        disable_legacy_fast_math(options);
+            disable_legacy_fast_math(options);
 #endif
+        }
+        error = nil;
+        MetalPipelineTimer library_timer = pipeline_diagnostic_begin();
+#if defined(BW_METAL_TESTING)
+        if (s_test_fail_source_library) {
+            s_shader_library = nil;
+        } else
+#endif
+        {
+            s_shader_library =
+                [s_device newLibraryWithSource:source options:options error:&error];
+        }
+        pipeline_diagnostic_finish(
+            METAL_PIPELINE_EVENT_LIBRARY_COMPILE, library_hash, 0,
+            METAL_PIPELINE_ROLE_STARTUP,
+            s_shader_library ? METAL_PIPELINE_STATUS_OK
+                             : METAL_PIPELINE_STATUS_METAL_FAILED,
+            library_timer);
+        if (!s_shader_library)
+            return metal_fail("shader compilation failed: %s",
+                              metal_error_text(error));
+        if (!bind_shader_functions(s_shader_library, 0))
+            return metal_fail("Metal shader entry point missing");
     }
-    MetalPipelineTimer library_timer = pipeline_diagnostic_begin();
-    s_shader_library =
-        [s_device newLibraryWithSource:@(s_shader) options:options error:&error];
-    pipeline_diagnostic_finish(
-        METAL_PIPELINE_EVENT_LIBRARY_COMPILE, library_hash, 0,
-        METAL_PIPELINE_ROLE_STARTUP,
-        s_shader_library ? METAL_PIPELINE_STATUS_OK
-                         : METAL_PIPELINE_STATUS_METAL_FAILED,
-        library_timer);
-    if (!s_shader_library)
-        return metal_fail("shader compilation failed: %s", metal_error_text(error));
-    s_vertex_function = [s_shader_library newFunctionWithName:@"vertex_main"];
-    s_color_function = [s_shader_library newFunctionWithName:@"color_main"];
-    s_texture_function = [s_shader_library newFunctionWithName:@"texture_main"];
-    s_extended_vertex_function = [s_shader_library newFunctionWithName:@"extended_vertex"];
-    s_extended_fragment_function =
-        [s_shader_library newFunctionWithName:@"extended_fragment"];
-    s_realistic_water_fragment_function =
-        [s_shader_library newFunctionWithName:@"realistic_water_fragment"];
-    s_clear_vertex_function = [s_shader_library newFunctionWithName:@"clear_vertex"];
-    s_clear_color_function = [s_shader_library newFunctionWithName:@"clear_color"];
-    s_clear_depth_function = [s_shader_library newFunctionWithName:@"clear_depth"];
-    s_present_vertex_function = [s_shader_library newFunctionWithName:@"present_vertex"];
-    s_present_resolve_function =
-        [s_shader_library newFunctionWithName:@"present_resolve"];
-    s_present_fragment_function =
-        [s_shader_library newFunctionWithName:@"present_fragment"];
-    s_scale_function = [s_shader_library newFunctionWithName:@"scale_fragment"];
-    s_box_function = [s_shader_library newFunctionWithName:@"box_fragment"];
     if (!s_vertex_function || !s_color_function || !s_texture_function ||
         !s_extended_vertex_function || !s_extended_fragment_function ||
-        !s_clear_vertex_function || !s_clear_color_function || !s_clear_depth_function ||
-        !s_present_vertex_function || !s_present_resolve_function ||
-        !s_present_fragment_function || !s_scale_function || !s_box_function)
+        !s_clear_vertex_function || !s_clear_color_function ||
+        !s_clear_depth_function || !s_present_vertex_function ||
+        !s_present_resolve_function || !s_present_fragment_function ||
+        !s_scale_function || !s_box_function)
         return metal_fail("Metal shader entry point missing");
     if (!s_realistic_water_fragment_function &&
         s_active_water_preset == BW_METAL_WATER_REALISTIC) {
@@ -6356,6 +6136,20 @@ void bw_metal_test_pipeline_diagnostic_snapshot(
         s_pipeline_diagnostic.whole_cache_resets;
     snapshot->cache_entry_high_water =
         s_pipeline_diagnostic.cache_entry_high_water;
+    snapshot->library_artifact_available =
+        BW_METAL_OFFLINE_SHADER_LIBRARIES;
+    snapshot->library_artifact_loaded =
+        s_pipeline_diagnostic.library_artifact_loaded;
+    snapshot->library_load_attempts =
+        s_pipeline_diagnostic.library_load.attempts;
+    snapshot->library_load_timed =
+        s_pipeline_diagnostic.library_load.timed;
+    snapshot->library_fallbacks =
+        s_pipeline_diagnostic.library_fallbacks;
+    snapshot->library_unavailable =
+        s_pipeline_diagnostic.library_unavailable;
+    snapshot->library_rejections =
+        s_pipeline_diagnostic.library_rejections;
     snapshot->library_attempts = s_pipeline_diagnostic.library.attempts;
     snapshot->library_timed = s_pipeline_diagnostic.library.timed;
     snapshot->specialization_attempts =
@@ -6410,6 +6204,18 @@ void bw_metal_test_pipeline_diagnostic_inject_cache_miss(uint64_t key_hash,
 void bw_metal_test_fail_next_pipeline_allocation(void)
 {
     s_test_fail_next_pipeline_allocation = 1;
+}
+
+void bw_metal_test_shader_library_failures(int offline_library,
+                                           int source_library)
+{
+    s_test_fail_offline_library = offline_library != 0;
+    s_test_fail_source_library = source_library != 0;
+}
+
+const char *bw_metal_test_shader_source_sha256(void)
+{
+    return s_metal_shader_source_sha256;
 }
 
 int bw_metal_test_pipeline_diagnostic_format_event(char *buffer, size_t size)

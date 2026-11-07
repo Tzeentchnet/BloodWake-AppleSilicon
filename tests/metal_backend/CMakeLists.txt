@@ -44,6 +44,17 @@ find_library(FOUNDATION_FRAMEWORK Foundation REQUIRED)
 find_library(METAL_FRAMEWORK Metal REQUIRED)
 find_library(QUARTZCORE_FRAMEWORK QuartzCore REQUIRED)
 find_package(Threads REQUIRED)
+find_package(Python3 3.10 REQUIRED COMPONENTS Interpreter)
+include("../../cmake/BwMetalShaders.cmake")
+
+set(BW_METAL_SHADER_SOURCE
+    "${CMAKE_CURRENT_LIST_DIR}/../../src/gpu/bw_metal_shaders.metal")
+set(BW_METAL_SHADER_GENERATED_DIR
+    "${CMAKE_CURRENT_BINARY_DIR}/metal_shaders")
+bw_prepare_metal_shaders(
+    BW_METAL_SHADER_DATA
+    "${BW_METAL_SHADER_SOURCE}"
+    "${BW_METAL_SHADER_GENERATED_DIR}")
 
 set(METAL_BACKEND_TEST_SOURCES
     test_main.c
@@ -54,6 +65,10 @@ set(METAL_BACKEND_TEST_SOURCES
     "${XBOXRECOMP_DIR}/src/kernel/nv2a_flip_hold.c")
 function(add_metal_backend_test_executable target)
     add_executable(${target} ${METAL_BACKEND_TEST_SOURCES})
+    bw_attach_metal_shaders(
+        ${target}
+        "${CMAKE_CURRENT_LIST_DIR}/../../src/gpu/bw_metal_backend.m"
+        "${BW_METAL_SHADER_DATA}")
     target_include_directories(${target} PRIVATE
         ../../src/gpu
         "${XBOXRECOMP_DIR}/src"
@@ -71,6 +86,8 @@ add_metal_backend_test_executable(bw_metal_backend_legacy_math_test)
 target_compile_definitions(bw_metal_backend_legacy_math_test PRIVATE BW_METAL_TEST_FORCE_LEGACY_MATH=1)
 
 enable_testing()
+add_test(NAME metal_shader-generator
+    COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_LIST_DIR}/test_embed_metal_shader.py")
 add_executable(bw_metal_shared_backing_test shared_backing_test.m)
 target_compile_options(bw_metal_shared_backing_test PRIVATE -fobjc-arc)
 target_link_libraries(bw_metal_shared_backing_test PRIVATE "${FOUNDATION_FRAMEWORK}" "${METAL_FRAMEWORK}")
@@ -106,6 +123,10 @@ foreach(case semaphore-release semaphore-concurrent visual
              pipeline-diagnostic-disabled pipeline-diagnostic-lifecycle
              pipeline-diagnostic-cache pipeline-diagnostic-report
              pipeline-diagnostic-failure pipeline-diagnostic-invalid
+             pipeline-diagnostic-library-selection
+             pipeline-diagnostic-library-precise
+             pipeline-diagnostic-library-fallback
+             pipeline-diagnostic-library-failure
              depth-draw stencil-draw polygon-offset polygon-offset-disabled polygon-offset-zero
              partial-color partial-color-masks partial-color-default-rect partial-clip partial-empty
              partial-depth partial-depth-seed partial-depth-empty partial-depth-unbound
@@ -218,6 +239,9 @@ foreach(case semaphore-release semaphore-concurrent visual
     add_test(NAME "metal_${case}" COMMAND bw_metal_backend_test "${case}")
     set_tests_properties("metal_${case}" PROPERTIES TIMEOUT 20)
 endforeach()
+
+set_tests_properties(metal_pipeline-diagnostic-library-precise PROPERTIES
+    ENVIRONMENT "BW_METAL_QUINCUNX_APPROX=1")
 
 add_test(NAME metal_cpu_write_counterexample
     COMMAND bw_metal_backend_test cpu-write-counterexample)

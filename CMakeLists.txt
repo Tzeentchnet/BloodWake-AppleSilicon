@@ -58,6 +58,9 @@ endif()
 # Build-time translators (tools/bw_ocean_xlate.py) run with the Python CMake
 # finds, or the one given as -DPython3_EXECUTABLE=... (no `py` launcher needed).
 find_package(Python3 3.10 REQUIRED COMPONENTS Interpreter)
+if(APPLE)
+    include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/BwMetalShaders.cmake")
+endif()
 
 # ── xboxrecomp toolkit ──────────────────────────────────────────
 #
@@ -218,7 +221,19 @@ endif()
 #   src/recomp/recomp_types.h        - register model, ICALL macros, MEM helpers
 
 if(APPLE)
+    set(BW_METAL_SHADER_SOURCE
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/gpu/bw_metal_shaders.metal")
+    set(BW_METAL_SHADER_GENERATED_DIR
+        "${CMAKE_CURRENT_BINARY_DIR}/metal_shaders")
+    bw_prepare_metal_shaders(
+        BW_METAL_SHADER_DATA
+        "${BW_METAL_SHADER_SOURCE}"
+        "${BW_METAL_SHADER_GENERATED_DIR}")
     add_executable(${PROJECT_NAME} ${GAME_SOURCES} ${RECOMP_GEN_SOURCES})
+    bw_attach_metal_shaders(
+        ${PROJECT_NAME}
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/gpu/bw_metal_backend.m"
+        "${BW_METAL_SHADER_DATA}")
     if(BW_EXPERIMENTAL_MACOS_KEYBOARD_HOOK)
         target_compile_definitions(${PROJECT_NAME} PRIVATE BW_EXPERIMENTAL_MACOS_KEYBOARD_HOOK=1)
     endif()
