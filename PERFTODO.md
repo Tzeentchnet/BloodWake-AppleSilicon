@@ -28,9 +28,9 @@ regression gate, not evidence for untested workloads.
 
 PERF-028's exact historical-band reproduction remains open; its retained
 attribution was sufficient for the requested continuation through the
-completed PERF-029 artifact contract. PERF-030 is implemented through the
-explicit source fallback, but real offline compilation/load validation awaits
-an Xcode Metal compiler unavailable on the current host.
+completed PERF-029 artifact contract. PERF-030 is complete: Xcode's Metal
+toolchain compiles both stable-library variants, real default/safe selection
+loads them without source fallback, and the explicit fallback remains tested.
 Presentation timing instrumentation and the workload/device protocol may
 proceed independently, but default pacing and deeper renderer work remain
 gated on their measurements.
@@ -72,7 +72,7 @@ temperature evidence when privileged telemetry is available.
 | PERF-027 | Reconcile product documentation and defaults | `[x]` | PERF-026 |
 | PERF-028 | Instrument Metal pipeline and cache lifecycle | `[~]` | PERF-027 |
 | PERF-029 | Define the native pipeline-artifact contract | `[x]` | PERF-028 |
-| PERF-030 | Compile stable Metal shaders offline | `[~]` | PERF-029 |
+| PERF-030 | Compile stable Metal shaders offline | `[x]` | PERF-029 |
 | PERF-031 | Add device-local trace-derived pipeline warm-up | `[ ]` | PERF-028, PERF-029, PERF-030 |
 | PERF-032 | Add asynchronous rare-miss compilation and bounded retention | `[ ]` | PERF-028, PERF-029, PERF-030 |
 | PERF-033 | Qualify cold-start pipeline behavior | `[ ]` | PERF-031, PERF-032 |
@@ -418,7 +418,7 @@ PERF-029 defines the artifact before implementation:
 
 PERF-030 through PERF-032 implement the measured path:
 
-- [ ] Compile the stable project-owned Metal source into an offline library
+- [x] Compile the stable project-owned Metal source into an offline library
   without changing shader entry points or math policy.
 - [ ] Preload validated local pipeline states before their first use in the
   traced workload.
@@ -434,9 +434,13 @@ source and generates default-math and safe-math embedded libraries when both
 Apple compiler tools are present. Missing or rejected libraries are reported
 and compile the identical source bytes synchronously. Generator, fallback,
 rejection, failure, sanitizer, full-suite, and production-build coverage pass.
-The current Command Line Tools installation has no `metal` or `metallib`, so a
-real offline library has not been generated or loaded and the first checklist
-item remains open.
+Xcode 27.2 with Metal Toolchain 27B47 compiles both real libraries. Default
+and safe-math selection tests load the selected library with one timed load,
+zero runtime source compilations, and zero fallback. The production executable
+also loaded the offline library in two private bounded Battle-seed attempts.
+Those attempts displayed the controller-reconnect overlay, so their frame
+maxima are not retained as exact-default performance evidence and do not
+advance PERF-033.
 
 PERF-033 exit gates:
 

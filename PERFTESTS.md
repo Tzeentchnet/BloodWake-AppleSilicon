@@ -521,32 +521,31 @@ compiles the identical source bytes. A failed source fallback remains a
 sticky backend failure. Pipeline lifecycle schema v2 reports library load,
 rejection/unavailability, fallback count, and source compilation separately.
 
-Four generator cases and seven focused backend/schema cases pass normally;
-the eight-case combined focused selection passes under ASan/UBSan with leak
-detection disabled. The complete Metal backend suite passes 354/354, strict
-Objective-C warnings pass, and the production synthetic-input target rebuilds
-through the source fallback. A deterministic fake toolchain also proves the
-offline CMake branch, paired embedding, rejection, and fallback behavior.
+The initial Command Line Tools validation exercised the explicit source
+fallback, while a deterministic fake toolchain proved the offline CMake branch,
+paired embedding, rejection, and fallback behavior. Real-toolchain validation
+then used Xcode 27.2 build 27B52, Metal Toolchain 27B47, and Apple metal
+32023.922. A fresh Release configuration reported that stable Metal shaders
+would be compiled offline, compiled both variants, embedded them, and built the
+backend test executable.
 
-This is not yet retained offline-runtime evidence. The selected Command Line
-Tools installation returns status 72 for `xcrun --find metal`, has no
-`metallib`, and has no full Xcode developer directory. Therefore no real
-`.metallib` was generated or successfully loaded, no cold boot was run against
-one, and PERF-030 remains partial. After installing/selecting Xcode, validate
-with:
+The default-math and safe-math selection cases both load the real selected
+library and assert one timed offline load, zero runtime source compilations,
+zero fallbacks, and zero rejections. The complete eight-case focused set passes
+normally and under ASan/UBSan with leak detection disabled. The complete Metal
+backend suite passes 354/354. Strict Objective-C warnings pass, and a
+reconfigured production synthetic-input target reports offline shader
+compilation and rebuilds successfully.
 
-```sh
-DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer \
-  xcrun --find metal
-DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer \
-  cmake -S tests/metal_backend -B build/test-metal-backend-offline \
-    -DCMAKE_BUILD_TYPE=Release
-DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer \
-  cmake --build build/test-metal-backend-offline --parallel
-DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer \
-  ctest --test-dir build/test-metal-backend-offline --output-on-failure \
-    -R '^metal_pipeline-diagnostic-library-(selection|precise)$'
-```
+Two private bounded production Battle-seed attempts provide runtime selection
+evidence only. Each reported an available and loaded offline library, one
+timed load (0.078 ms and 0.118 ms), zero runtime source compilations, zero
+fallbacks/rejections, zero dropped events, and zero timing, allocation, or
+Metal failures. The host had no physical controller and the title displayed
+its reconnect overlay, so neither attempt is retained as exact-default cold
+performance evidence; their frame maxima do not advance PERF-033. The logs,
+save data, relaunch record, event hashes, and other private artifacts remain
+outside the repository.
 
 The remaining implementation sequence is:
 

@@ -345,7 +345,15 @@ embeds the same source bytes for the explicit runtime compilation fallback.
 Set `BW_METAL_OFFLINE_SHADERS=OFF` only to exercise that fallback
 deliberately. Command Line Tools alone may not include the Metal compiler;
 select a full Xcode installation through `DEVELOPER_DIR` or `xcode-select` to
-build the offline libraries.
+build the offline libraries. Current Xcode releases may distribute that
+compiler as a separate component. After selecting Xcode, install and verify it
+with:
+
+```sh
+xcodebuild -downloadComponent metaltoolchain
+xcrun --find metal
+xcrun --find metallib
+```
 
 `--profile` enables the existing approximately 1 kHz native thread sampler;
 `--profile-from` and `--profile-to` bound its per-boot window. Fixed
