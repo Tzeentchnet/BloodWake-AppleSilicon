@@ -1677,6 +1677,12 @@ static void presentation_timing_bounded_test(void)
     CHECK(snapshot.events_dropped == 3);
 }
 
+static void timing_percentile_report_test(void)
+{
+    CHECK(bw_metal_test_timing_sample_capacity() == 60u * 60u * 61u);
+    bw_metal_test_timing_percentile_report();
+}
+
 static void presentation_timing_allocation_failure_test(void)
 {
     BwMetalPresentationTimingSnapshot snapshot;
@@ -7503,6 +7509,8 @@ int main(int argc, char **argv)
         presentation_timing_failure_test();
     else if (!strcmp(argv[1], "presentation-timing-bounded"))
         presentation_timing_bounded_test();
+    else if (!strcmp(argv[1], "timing-percentile-report"))
+        timing_percentile_report_test();
     else if (!strcmp(argv[1], "presentation-timing-allocation-failure"))
         presentation_timing_allocation_failure_test();
     else if (!strcmp(argv[1], "presentation-timing-stop"))

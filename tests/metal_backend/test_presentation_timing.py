@@ -70,7 +70,7 @@ PROHIBITED = (
 )
 
 
-def run_case(executable, case):
+def run_case_output(executable, case):
     environment = os.environ.copy()
     environment.pop("BW_METAL_FRAME_TIMING", None)
     environment.pop("BW_GPU_AUDIT", None)
@@ -98,7 +98,11 @@ def run_case(executable, case):
         serialized = json.dumps(report, sort_keys=True)
         for field in PROHIBITED:
             assert field not in serialized
-    return reports
+    return reports, result.stderr
+
+
+def run_case(executable, case):
+    return run_case_output(executable, case)[0]
 
 
 def summary(reports):
@@ -113,6 +117,21 @@ def main():
     executable = Path(sys.argv[1]).resolve(strict=True)
 
     assert run_case(executable, "presentation-timing-disabled") == []
+
+    timing_reports, timing_output = run_case_output(
+        executable, "timing-percentile-report"
+    )
+    assert timing_reports == []
+    assert (
+        "[GPU-METAL] frame timing percentile test: 100 intervals, "
+        "19.80 fps average, 51.00 ms median, 95.00 ms p95, "
+        "99.00 ms p99, 100.00 ms max"
+    ) in timing_output
+    assert (
+        "[GPU-METAL] GPU command timing percentile test: 100 frames, "
+        "50.50 ms mean, 51.00 ms median, 95.00 ms p95, "
+        "99.00 ms p99, 100.00 ms max"
+    ) in timing_output
 
     lifecycle = summary(run_case(executable, "presentation-timing-lifecycle"))
     assert lifecycle["events_recorded"] == 1
@@ -131,7 +150,9 @@ def main():
     assert paced["flip_releases"] == 2
     assert paced["ordering_failures"] == 0
 
-    report = run_case(executable, "presentation-timing-report")
+    report, _ = run_case_output(
+        executable, "presentation-timing-report"
+    )
     assert len(report) == 2
     assert report[0]["status"] == "presented"
     assert report[0]["display_target_status"] == (

@@ -137,7 +137,7 @@ foreach(case semaphore-release semaphore-concurrent visual
              presentation-timing-report presentation-timing-fractional
              presentation-timing-failure presentation-timing-bounded
              presentation-timing-allocation-failure presentation-timing-stop
-             presentation-timing-restart
+             presentation-timing-restart timing-percentile-report
              depth-draw stencil-draw polygon-offset polygon-offset-disabled polygon-offset-zero
              partial-color partial-color-masks partial-color-default-rect partial-clip partial-empty
              partial-depth partial-depth-seed partial-depth-empty partial-depth-unbound

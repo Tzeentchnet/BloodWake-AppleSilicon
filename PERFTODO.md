@@ -44,7 +44,11 @@ creation. Historical-band reproduction, input-latency/output-hash evidence,
 and a small submission-tail regression remain open. PERF-034 instrumentation
 now has representative actual-presentation evidence; the explicit presenter
 still exposes no display target timestamp, and the measured wall tails do not
-justify changing the default pacing path yet.
+justify changing the default pacing path yet. PERF-037 is complete at the
+definition/tooling level: six private workload slots, exact cold/warm/sustained
+run classes, the available-device inventory rule, evidence fields, and
+explicit gap states are frozen. Only the existing Battle control seed is
+currently populated; broader runtime collection remains PERF-038.
 
 Render scale, filtering, LOD, Retail draw coverage, quincunx behavior, and
 Retail-water defaults remain fixed. Continue collecting direct power and
@@ -90,7 +94,7 @@ temperature evidence when privileged telemetry is available.
 | PERF-034 | Instrument presentation and display timing | `[~]` | PERF-027 |
 | PERF-035 | Evaluate a gated `CAMetalDisplayLink` path | `[ ]` | PERF-034 |
 | PERF-036 | Qualify match-display pacing and latency | `[ ]` | PERF-035 |
-| PERF-037 | Define the broader workload and device matrix | `[ ]` | PERF-027 |
+| PERF-037 | Define the broader workload and device matrix | `[x]` | PERF-027 |
 | PERF-038 | Run broader Native 4x/60 qualification | `[ ]` | PERF-033, PERF-036, PERF-037 |
 | PERF-039 | Optimize a measured GPU-bound miss | `[!]` | PERF-038 |
 | PERF-040 | Requalify, reconcile defaults, and publish evidence | `[ ]` | PERF-033, PERF-036, PERF-038 |
@@ -589,18 +593,63 @@ current default and record the experiment as no-go.
 
 ### Broader qualification: PERF-037 and PERF-038
 
-- [ ] Define private seeds for representative geometry, particle, weather,
-  calm/storm water, shore, reflection, transition, and split-screen loads.
-- [ ] Include multiple missions, 30-60 minute sustained runs, cold and warm
-  windows, and every available Apple Silicon class.
-- [ ] Record FPS, wall/GPU median/p95/p99/max, submission latency, pipeline
-  events, drawable events, marker coverage, approximation flags, executable
-  hash, and direct power, temperature, sustained-clock, and memory evidence
-  where approved.
-- [ ] Report unavailable hardware or privileged telemetry as an evidence gap;
-  do not infer a pass from the Apple M5 result.
-- [ ] Preserve exact defaults and distinguish loading, transition, and
-  steady-state windows.
+PERF-037 freezes six semantic private-seed slots:
+
+- `BWQ-00-battle-control-1p`, the existing populated Battle control;
+- `BWQ-01-calm-reflection-1p`;
+- `BWQ-02-shore-geometry-1p`;
+- `BWQ-03-storm-particles-1p`;
+- `BWQ-04-transition-1p`; and
+- `BWQ-05-split-effects-2p`.
+
+The three mission slots must use distinct missions. The matrix requires two
+300-second process-cold boots, one immediate 300-second warm repeat, one
+30-minute run for every workload/device cell, and a 60-minute run for the
+mechanically worst valid 30-minute workload on each device. It inventories
+each approved physical Apple Silicon generation/tier combination separately;
+unavailable siblings are gaps, never inferred passes.
+
+Every cell keeps exact Native/auto defaults and separates frames 0-899,
+steady 300-frame windows, loading, transition, and first/middle/last sustained
+bands. It records FPS; wall, GPU, command, and submission
+median/p95/p99/max; correlated pipeline state and the bounded startup
+presentation sample; marker and correctness evidence; executable/configuration
+identity; and approved paired power, temperature, clock, and memory telemetry.
+Serial numbers, hardware UUIDs, user/host names, private paths, and raw
+retail-derived artifacts are excluded. Presentation causality for a later
+sustained maximum remains explicitly unavailable and returns to PERF-034
+rather than being inferred from the startup sample.
+
+Implementation evidence:
+
+- [x] Define private seed slots covering representative geometry, particles,
+  weather, calm/storm water, shore, reflection, transition, and split-screen.
+- [x] Define multiple missions, cold/warm windows, 30/60-minute run classes,
+  and every actually available Apple Silicon device class.
+- [x] Define exact controls, evidence fields, deterministic worst-workload
+  selection, thresholds, and stable explicit-unavailability states.
+- [x] Extend the bounded private runner from five minutes to one hour for a
+  single boot; reject longer deadlines.
+- [x] Extend each fixed diagnostic timing channel to 219,600 samples, retaining
+  the exact-default hour through 61 Hz without unbounded storage.
+- [x] Add nearest-rank p99 to bounded wall, GPU-command, and submission
+  reporters while retaining median, p95, and maximum.
+
+Validation passes 63/63 diagnostic-runner tests, both focused timing tests,
+the complete 376/376 Metal backend suite, and the synthetic-input production
+rebuild. No ownership or concurrent callback state changed.
+
+PERF-038 runtime gates:
+
+- [ ] Capture and validate the five missing private workload seeds and their
+  executable/device-compatible pipeline artifacts.
+- [ ] Run `C1`, `C2`, `W1`, and `S30` for every required workload/device cell
+  and `S60` for each device's deterministic worst valid `S30` workload.
+- [ ] Retain physical input-latency, output-hash, frame-order, marker, and
+  Metal-error comparisons for each applicable workload.
+- [ ] Retain approved paired power/temperature/clock/memory telemetry, or an
+  explicit privilege/sampler gap, without treating a gap as a pass.
+- [ ] Classify every miss before activating PERF-024 or PERF-039.
 
 ### Conditional headroom and closure: PERF-024, PERF-025, PERF-039, PERF-040
 

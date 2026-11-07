@@ -1010,6 +1010,40 @@ class MacosDiagnosticTests(unittest.TestCase):
         self.assertIn("0 received, 0 batch scopes, 0 rejected", output.getvalue())
         self.assertIn("zero observed ocean coverage", output.getvalue())
 
+    def test_cli_accepts_bounded_sustained_single_boot(self):
+        arguments = self.main_arguments() + [
+            "--seconds", str(diagnostic.MAX_RUN_SECONDS),
+        ]
+
+        def guest(_executable, output, _game_dir, _profile, seconds,
+                  _quincunx, _audit, **_kwargs):
+            self.assertEqual(seconds, diagnostic.MAX_RUN_SECONDS)
+            (output / "guest.log").write_bytes(b"no marker summary\n")
+            return 0
+
+        with mock.patch.object(diagnostic.sys, "platform", "darwin"), \
+             mock.patch.object(diagnostic, "ROOT", self.repository), \
+             mock.patch.object(diagnostic, "verify_prepared"), \
+             mock.patch.object(diagnostic, "toolkit_revision", return_value="pinned"), \
+             mock.patch.object(diagnostic, "verify_sandbox"), \
+             mock.patch.object(diagnostic, "run_guest", side_effect=guest):
+            self.assertEqual(diagnostic.main(arguments), 0)
+
+    def test_cli_rejects_unbounded_single_boot(self):
+        arguments = self.main_arguments() + [
+            "--seconds", str(diagnostic.MAX_RUN_SECONDS + 1),
+        ]
+        errors = io.StringIO()
+        with mock.patch.object(diagnostic.sys, "platform", "darwin"), \
+             contextlib.redirect_stderr(errors), \
+             self.assertRaises(SystemExit) as failure:
+            diagnostic.main(arguments)
+        self.assertEqual(failure.exception.code, 2)
+        self.assertIn(
+            f"--seconds must be between 1 and {diagnostic.MAX_RUN_SECONDS}",
+            errors.getvalue(),
+        )
+
     def test_water_benchmark_cli_propagates_and_reports(self):
         arguments = self.main_arguments() + [
             "--water-benchmark", "--edition", "remastered", "--gpu-audit",

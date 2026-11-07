@@ -134,6 +134,14 @@ This is still a development build:
   residual tails remain scene/OS scheduling candidates. The explicit
   presenter has no display target timestamp, so a pacing change is not yet
   justified.
+- The broader qualification contract now defines six private workload slots,
+  exact cold/warm/30-minute/60-minute run classes, deterministic worst-load
+  selection, available-device inventory, retained metrics, and explicit
+  hardware/telemetry gap states. The bounded runner supports a one-hour
+  single boot, fixed timing storage covers the exact-default hour through
+  61 Hz, and wall/GPU/submission reports include p99. Only the existing
+  Battle control slot is populated; this definition is not broader runtime
+  qualification.
 
 ## Current performance priorities
 
@@ -150,9 +158,10 @@ order:
    `CAMetalDisplayLink` path only if target-aligned evidence can distinguish
    the residual scene/OS scheduling tail and meets the PERF-036 acceptance
    thresholds.
-3. Qualify cold start, frame pacing, missions, split-screen, heavy effects,
-   long-duration behavior, and available Apple Silicon device classes with
-   direct power and temperature evidence where approved.
+3. Populate the five missing private PERF-037 workload slots, then run its
+   cold/warm/30-minute/60-minute matrix across every available Apple Silicon
+   class with paired direct power, temperature, clock, and memory evidence
+   where approved.
 4. Profile any failing workload. Port NV2A vertex programs to Metal only when
    a miss is demonstrably CPU-bound; use Metal counters to guide any
    additional GPU-pass work.

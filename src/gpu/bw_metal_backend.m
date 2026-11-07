@@ -40,7 +40,7 @@ extern uint64_t xbox_HostNowNs(void);
 #define METAL_MAX_DEPTH_STATES 128u
 #define METAL_MAX_COLOR_SURFACES 32u
 #define METAL_MAX_DEPTH_SURFACES 32u
-#define METAL_MAX_FRAME_SAMPLES 16384u
+#define METAL_MAX_FRAME_SAMPLES (60u * 60u * 61u)
 #define METAL_MAX_IN_FLIGHT 3u
 #define METAL_MAX_TARGET_SWITCHES_PER_SUBMISSION 8u
 #define METAL_INITIAL_VERTEX_UPLOAD (16u * 1024u * 1024u)
@@ -2070,11 +2070,13 @@ static void report_frame_times(const char *label, const uint64_t *samples, size_
     qsort(sorted, count, sizeof *sorted, compare_u64);
     uint64_t median = sorted[count / 2u];
     uint64_t p95 = sorted[((count * 95u + 99u) / 100u) - 1u];
+    uint64_t p99 = sorted[((count * 99u + 99u) / 100u) - 1u];
     fprintf(stderr,
             "[GPU-METAL] frame timing %s: %zu intervals, %.2f fps average, "
-            "%.2f ms median, %.2f ms p95, %.2f ms max\n",
+            "%.2f ms median, %.2f ms p95, %.2f ms p99, %.2f ms max\n",
             label, count, sum ? (double)count * 1e9 / (double)sum : 0.0,
-            (double)median / 1e6, (double)p95 / 1e6, (double)maximum / 1e6);
+            (double)median / 1e6, (double)p95 / 1e6,
+            (double)p99 / 1e6, (double)maximum / 1e6);
     free(sorted);
 }
 
@@ -2098,11 +2100,13 @@ static void report_duration_times(const char *kind, const char *label,
     qsort(sorted, count, sizeof *sorted, compare_u64);
     uint64_t median = sorted[count / 2u];
     uint64_t p95 = sorted[((count * 95u + 99u) / 100u) - 1u];
+    uint64_t p99 = sorted[((count * 99u + 99u) / 100u) - 1u];
     fprintf(stderr,
             "[GPU-METAL] %s timing %s: %zu frames, %.2f ms mean, "
-            "%.2f ms median, %.2f ms p95, %.2f ms max\n",
+            "%.2f ms median, %.2f ms p95, %.2f ms p99, %.2f ms max\n",
             kind, label, count, (double)sum / (double)count / 1e6,
-            (double)median / 1e6, (double)p95 / 1e6, (double)maximum / 1e6);
+            (double)median / 1e6, (double)p95 / 1e6,
+            (double)p99 / 1e6, (double)maximum / 1e6);
     free(sorted);
 }
 
@@ -7592,6 +7596,22 @@ void bw_metal_backend_stop(void)
 }
 
 #ifdef BW_METAL_TESTING
+size_t bw_metal_test_timing_sample_capacity(void)
+{
+    return METAL_MAX_FRAME_SAMPLES;
+}
+
+void bw_metal_test_timing_percentile_report(void)
+{
+    uint64_t samples[100];
+    for (size_t i = 0; i < 100u; i++)
+        samples[i] = (i + 1u) * UINT64_C(1000000);
+    report_frame_times("percentile test", samples, 100u);
+    report_duration_times(
+        "GPU command", "percentile test", samples, 100u
+    );
+}
+
 void bw_metal_test_set_async_display(int enabled, int defer_retirement)
 {
     s_test_async_display = enabled != 0;

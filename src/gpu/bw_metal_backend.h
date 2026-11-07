@@ -241,6 +241,8 @@ void bw_metal_test_pipeline_async_snapshot(
     BwMetalPipelineAsyncSnapshot *snapshot);
 void bw_metal_test_presentation_timing_snapshot(
     BwMetalPresentationTimingSnapshot *snapshot);
+size_t bw_metal_test_timing_sample_capacity(void);
+void bw_metal_test_timing_percentile_report(void);
 void bw_metal_test_pipeline_diagnostic_clear(void);
 void bw_metal_test_pipeline_diagnostic_inject_cache_miss(uint64_t key_hash,
                                                          uint32_t frame);

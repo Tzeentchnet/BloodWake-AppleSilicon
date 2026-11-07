@@ -1,7 +1,7 @@
 # Apple Silicon performance investigation
 
 Status: tracked performance record
-Last updated: 2026-11-06
+Last updated: 2026-11-07
 
 This document records the base-game frame-rate and efficiency investigation
 that temporarily takes priority over later modern-water visual work. The
@@ -63,7 +63,7 @@ The investigation added or exposed:
 - `BW_METAL_FRAME_TIMING=1`, independent of full GPU audit;
 - completed Metal command-buffer GPU durations;
 - host time spent waiting for command completion;
-- rolling 300-frame FPS, median, p95, and maximum reports;
+- rolling 300-frame FPS, median, p95, p99, and maximum reports;
 - fixed `--render-scale` and `--frame-cap` diagnostic controls;
 - native approximately 1 kHz profiling with optional caller attribution;
 - bounded private save and same-title launch seeding;
@@ -849,14 +849,149 @@ and its
 
 ### 3. Broader qualification
 
-The next matrix must cover representative geometry, effects, water, weather,
-shore, transition, and split-screen loads; multiple missions; 30-60 minute
-runs; and every available Apple Silicon class. It must retain cold and
-steady-state windows separately and record FPS, wall/GPU percentiles, maximum
-stall, submission latency, pipeline events, dropped drawables, approximation
-flags, executable hash, and direct power, temperature, sustained-clock, and
-memory evidence where approved. Missing device classes remain documented
-gaps rather than inferred passes.
+PERF-037 freezes the following matrix before any broader pass/fail claim.
+This is an implementation and collection contract, not PERF-038 runtime
+evidence. Public workload identifiers describe only a load class. Saves,
+relaunch records, traces, archives, logs, frames, and any retail-derived
+contents remain private.
+
+#### Private workload slots
+
+| Workload ID | Mode | Required coverage | Initial state |
+| --- | --- | --- | --- |
+| `BWQ-00-battle-control-1p` | One-player Battle | Existing representative control, geometry, ocean markers, reflection | Current private seed is available |
+| `BWQ-01-calm-reflection-1p` | One-player Battle | Calm water, reflection, open-water traversal | Seed capture required |
+| `BWQ-02-shore-geometry-1p` | Mission A | Dense shore, geometry, reflection, near/far transitions | Seed capture required |
+| `BWQ-03-storm-particles-1p` | Mission B | Storm water, weather, particles, combat effects | Seed capture required |
+| `BWQ-04-transition-1p` | Mission C | Loading and gameplay on both sides of one deterministic transition | Seed capture required |
+| `BWQ-05-split-effects-2p` | Two-player Battle | Split-screen, effects, geometry, water, two-view reflection | Seed capture required |
+
+Mission A, B, and C must be distinct missions; a single scene cannot fill
+multiple mission slots. A private seed is ready only when its owner-only save
+directory and same-title relaunch record pass the existing bounds and
+validation, two direct neutral-controller boots reach the named load without
+scripted/guided input, expected marker/view roles are nonzero and balanced,
+and rejection or fingerprint mismatch remains zero. Calibration may use
+guided input, scripts, audit, or frame dumps, but no such run is qualification
+evidence. Each workload gets a compatible device-local pipeline trace and
+preload artifact before timing; those artifacts remain private and
+executable/device specific.
+
+#### Per-workload run set
+
+Every workload/device cell uses the same executable and accepted
+Native/auto defaults: internal 4x selection, match-display pacing, Retail
+water, accepted quincunx approximation, audio enabled, and no render-scale or
+frame-cap override. Clean timing runs enable only bounded frame, pipeline, and
+presentation timing. They do not enable GPU audit, capture, profiling,
+guided input, or a synthetic script.
+
+| Run ID | Duration | Purpose |
+| --- | ---: | --- |
+| `C1`, `C2` | 300 seconds each | Two fresh process-cold boots in new private output directories |
+| `W1` | 300 seconds | Immediate same-seed warm repeat after `C2` |
+| `S30` | 1,800 seconds | Sustained run for every workload/device cell |
+| `S60` | 3,600 seconds | Sustained run for the worst valid `S30` workload on each device |
+| `T30`/`T60` | Match paired sustained run | Approved privileged telemetry companion; never substitutes for clean timing |
+
+The `S60` workload is selected mechanically by highest combined-GPU p95,
+then wall p95, then workload ID, so it cannot be cherry-picked. A new
+executable, OS build, device class, display mode, pipeline artifact, or
+product default invalidates reuse of an earlier cell. Process-cold means a
+new guest process and private output, not a claim that opaque OS/driver
+caches were cleared.
+
+Frame 0 through 899 is the cold/warm-up band. Steady state begins at frame
+900 and retains every consecutive 300-frame report. `BWQ-04` additionally
+labels pre-transition, loading, transition, and post-transition intervals;
+those intervals are never averaged into steady state. Sustained reports are
+also grouped into first, middle, and last ten-minute bands to expose drift.
+No frame, window, or run may be dropped merely because it is an outlier.
+
+#### Device axis
+
+Inventory every approved physical Apple Silicon machine by SoC generation,
+tier (`base`, `Pro`, `Max`, or `Ultra` as applicable), model identifier,
+unified-memory size, OS build, Metal device name, and active display cadence.
+Run every physical generation/tier combination that is actually available;
+do not infer results for an untested sibling, memory size, or GPU-core count.
+The checked-in record must exclude serial numbers, hardware UUIDs, host/user
+names, private paths, and raw `system_profiler` output.
+
+Use AC power, Low Power Mode off, a fixed display arrangement, no unrelated
+foreground workload, and the same pre-run idle policy. Record power source,
+display mode, and pre/post `pmset -g therm` status. An unavailable class is
+`unavailable_no_device`, not a pass.
+
+#### Retained record
+
+Each cell retains:
+
+- workload/run IDs, executable SHA-256, revision, edition, exact controls,
+  approximation flags, artifact compatibility/status, device class, memory,
+  OS build, display cadence, and start/end time;
+- completed-game FPS plus wall, combined-GPU, command, and submission
+  median/p95/p99/max for every 300-frame window;
+- maximum stall, correlated pipeline state, cache high-water/resets,
+  asynchronous scheduling/fallback, the fixed bounded presentation sample,
+  drawable/command status, and explicit unavailable timing;
+- marker, view-role, fingerprint, Metal-error, allocation/timing-error,
+  frame-order, input-latency, and output-hash evidence appropriate to the
+  workload; and
+- on the paired telemetry run, approved package/CPU/GPU power, temperature,
+  CPU/GPU frequency or limiting, and resident-memory/pressure samples.
+
+The timing reporter now emits nearest-rank p99 as well as median, p95, and
+maximum. The private runner accepts a bounded one-hour single boot, and each
+fixed timing channel retains 219,600 samples, enough for that exact-default
+hour through 61 Hz. `S30` and `S60` therefore do not require relaunch
+chaining or unbounded storage. If privileged telemetry is approved, sample
+`cpu_power,gpu_power,thermal` with `powermetrics` in a separate paired run and
+retain its machine-readable plist privately. Apple's tool warns that
+estimated power is not valid for cross-device comparisons, so use it only for
+within-device trends. If a sampler or privilege is unavailable, record
+`unavailable_privilege` or `unavailable_sampler`; do not replace direct
+evidence with an estimate.
+
+Detailed presentation records remain bounded to the first 512 events. They
+qualify cold/startup drawable and command behavior but are not evidence for a
+later sustained tail. If a retained long-run maximum requires presentation
+causality, report that phase as unavailable and return to the still-active
+PERF-034 sampling decision; do not infer a cause from the startup sample.
+
+#### Qualification rule
+
+Correctness gates are zero command/Metal failure, dropped drawable,
+marker rejection, fingerprint mismatch, malformed report, unexpected
+approximation, and output-hash or frame-order difference. A prewarmed run
+must have zero cache miss, asynchronous fallback, cache reset, or
+specialization/pipeline creation after frame 0. Physical input-latency
+companions remain required where neutral-controller runs cannot exercise an
+input.
+
+Every steady 300-frame window must retain 59.0-60.5 FPS, combined-GPU p95 at
+or below 16.67 ms, submission-latency p95 at or below 15.50 ms, and wall p95
+at or below 17.0 ms. Median, p99, and maximum remain mandatory review fields
+even when those gates pass. The sustained first/middle/last bands must show
+no thermal/performance warning, sustained-clock collapse, or monotonic memory
+growth. Any miss remains a named PERF-038 failure and activates CPU or GPU
+attribution only after the measured limiter is known.
+
+#### PERF-037 implementation validation
+
+- The 63 isolated diagnostic-runner tests pass, including exact acceptance of
+  3,600 seconds and rejection of 3,601 seconds.
+- The focused percentile-output and presentation-timing integration tests
+  pass 2/2. The controlled 1-100 ms sample proves nearest-rank
+  median/p95/p99/max output.
+- The complete Metal backend suite passes 376/376.
+- The synthetic-input production target rebuilds successfully with offline
+  Metal libraries.
+
+No ownership, callback, or concurrent reporting state changed, so no new
+sanitizer-specific ownership gate was activated. No 30- or 60-minute
+workload/device cell has been run; all such results remain PERF-038 runtime
+evidence rather than implementation evidence.
 
 ### 4. Conditional CPU and GPU headroom
 

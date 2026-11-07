@@ -139,7 +139,7 @@ test coverage are in [VALIDATION.md](VALIDATION.md).
   samples and staggered full verification. LRU eviction is bounded, and
   render-target writeback invalidates overlaps.
 - Added monotonic rolling frame-time reporting under `BW_GPU_AUDIT=1`,
-  including average FPS, median, p95, and maximum frame interval.
+  including average FPS, median, p95, p99, and maximum frame interval.
 - Removed the direct-present path's CPU gamma pass, second guest-memory read,
   and SDL streaming-texture upload. The executor's synchronous guest-sized
   writeback remains for snapshots and framebuffer dumps.

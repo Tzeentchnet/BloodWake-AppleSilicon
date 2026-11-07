@@ -254,6 +254,56 @@ Guided input and `--water-capture` are mutually exclusive because both own the
 framebuffer dump path. Frame dumps and interactive corrections make a guided
 run script-calibration evidence, not performance evidence.
 
+For a PERF-037/038 sustained cell, use the synthetic-input production
+executable only to expose a connected neutral controller. Start directly from
+the validated private save/relaunch seed, and do not add a script or guided
+input:
+
+```sh
+python3 tools/macos_diagnostic.py \
+  --exe build/bloodwake-native-synthetic-input/bloodwake \
+  --prepared-tree game/prepare \
+  --toolkit build/xboxrecomp \
+  --output-dir /private/BWQ-XX-device-S30 \
+  --seconds 1800 \
+  --edition remastered \
+  --quincunx-approx \
+  --experimental-keyboard-hook \
+  --frame-timing \
+  --pipeline-timing \
+  --pipeline-warmup /private/BWQ-XX-device.bwmpa \
+  --save-seed /private/BWQ-XX-save \
+  --launch-seed /private/BWQ-XX-relaunch.bin
+```
+
+Use `--seconds 3600` only for the matrix's deterministic `S60` workload.
+Longer single boots are rejected. Do not add a render-scale/frame-cap
+override, GPU audit, capture, or profile to a clean matrix run. The bounded
+timing reporters retain up to 219,600 samples per channel (the exact-default
+hour through 61 Hz) and emit median, p95, p99, and maximum values.
+
+Collect approved direct power/clock/thermal evidence in a separate paired
+`T30`/`T60` run so sampler overhead cannot replace the clean timing result.
+On the current toolchain, a five-second private plist sample uses:
+
+```sh
+sudo /usr/bin/powermetrics \
+  --sample-rate 5000 \
+  --sample-count 360 \
+  --samplers cpu_power,gpu_power,thermal \
+  --show-plimits \
+  --handle-invalid-values \
+  --format plist \
+  --output-file /private/BWQ-XX-device-T30-powermetrics.plist
+```
+
+Use 720 samples for `T60`. Retain the plist privately, record sampler/privilege
+unavailability explicitly, and do not compare `powermetrics` estimated power
+between devices. Safe public device metadata comes from `hw.model`,
+`hw.memsize`, the Apple chip name, OS build, and active display cadence; do
+not retain serial numbers, hardware UUIDs, host/user names, or raw
+`system_profiler` output.
+
 `--water-preset` strictly accepts `retail` or `realistic`, defaults to Retail,
 and discards inherited `BW_METAL_WATER` values. Realistic requires
 `--edition remastered`. After the run, the runner reports how many boots

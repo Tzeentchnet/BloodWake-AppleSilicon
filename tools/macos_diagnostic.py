@@ -25,6 +25,7 @@ TOOLKIT_COMMIT = "f0f8a461496a4f23d9b0aeaa284b8d70ba7ab82b"
 MAX_LOG_BYTES = 32 * 1024 * 1024
 MAX_RELAUNCH_BYTES = 16 + 260 + 3072
 MAX_RELAUNCH_BOOTS = 16
+MAX_RUN_SECONDS = 60 * 60
 MAX_SAVE_SEED_FILES = 4096
 MAX_SAVE_SEED_BYTES = 64 * 1024 * 1024
 SANDBOX = "/usr/bin/sandbox-exec"
@@ -1180,7 +1181,10 @@ def main(argv=None):
     parser.add_argument("--prepared-tree", required=True, help="verified preparation root")
     parser.add_argument("--toolkit", required=True, help="clean pinned toolkit checkout")
     parser.add_argument("--output-dir", required=True, help="new private directory outside the repository")
-    parser.add_argument("--seconds", type=int, default=45, help="single-boot deadline (1-300 seconds)")
+    parser.add_argument(
+        "--seconds", type=int, default=45,
+        help=f"single-boot deadline (1-{MAX_RUN_SECONDS} seconds)"
+    )
     parser.add_argument("--edition", choices=EDITIONS, default="original",
                         help="guest edition (default: original)")
     parser.add_argument("--quincunx-approx", action="store_true", help="opt into the unverified approximation")
@@ -1247,8 +1251,11 @@ def main(argv=None):
                         help="follow validated guest relaunches in separately sandboxed boots")
     parser.add_argument("--max-boots", type=int,
                         help="maximum boot count with --follow-relaunches (default 4, maximum 16)")
-    parser.add_argument("--total-seconds", type=int,
-                        help="total guest deadline with --follow-relaunches (default 300, maximum 3600)")
+    parser.add_argument(
+        "--total-seconds", type=int,
+        help=("total guest deadline with --follow-relaunches "
+              f"(default 300, maximum {MAX_RUN_SECONDS})")
+    )
     parser.add_argument(
         "--save-seed",
         help="copy a bounded private save directory into the isolated run"
@@ -1260,8 +1267,10 @@ def main(argv=None):
     args = parser.parse_args(argv)
     if sys.platform != "darwin":
         parser.error("this diagnostic requires macOS")
-    if not 1 <= args.seconds <= 300:
-        parser.error("--seconds must be between 1 and 300")
+    if not 1 <= args.seconds <= MAX_RUN_SECONDS:
+        parser.error(
+            f"--seconds must be between 1 and {MAX_RUN_SECONDS}"
+        )
     if args.synthetic_input and not args.experimental_keyboard_hook:
         parser.error("--synthetic-input requires --experimental-keyboard-hook")
     if args.synthetic_input_script and not args.experimental_keyboard_hook:
@@ -1324,8 +1333,11 @@ def main(argv=None):
         parser.error("--max-boots and --total-seconds require --follow-relaunches")
     if args.max_boots is not None and not 1 <= args.max_boots <= MAX_RELAUNCH_BOOTS:
         parser.error("--max-boots must be between 1 and 16")
-    if args.total_seconds is not None and not 1 <= args.total_seconds <= 3600:
-        parser.error("--total-seconds must be between 1 and 3600")
+    if (args.total_seconds is not None and
+            not 1 <= args.total_seconds <= MAX_RUN_SECONDS):
+        parser.error(
+            f"--total-seconds must be between 1 and {MAX_RUN_SECONDS}"
+        )
 
     output = None
     try:
