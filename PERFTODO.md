@@ -5,8 +5,10 @@ Last updated: 2026-11-06
 
 This tracker covers base-game frame rate, efficiency, and thermal work. The
 bounded ownership, 30 FPS closure, and representative sustained Native 4x/60
-target are complete without a quality reduction. Broader mission coverage,
-cold pipeline warm-up, and direct power/temperature telemetry remain open.
+target are complete without a quality reduction. The active continuation
+turns that post-warm-up Apple M5 result into a cold-smooth, frame-paced,
+broader-workload and broader-device claim before undertaking conditional
+vertex or GPU-pass work.
 
 ## Status legend
 
@@ -17,17 +19,19 @@ cold pipeline warm-up, and direct power/temperature telemetry remain open.
 
 ## Current objective
 
-Retain Native/auto 4x quality and the representative seeded Battle workload
-at a sustained 60 FPS. Fixed-4x, 120 FPS-cap qualification must produce two
-consecutive post-warm-up 300-frame windows at or above 60 FPS with combined
-render/present GPU median and p95 at or below 16.67 ms. Exact Native/auto,
-match-display qualification must produce two consecutive warm-qualified windows
-between 59.0 and 60.5 FPS, with wall median at or below 16.9 ms and the same
-GPU budget. Qualification starts with rolling reports emitted at or after
-presented frame 900; earlier reports and the guest relaunch transition remain
-reported cold-start/shutdown evidence, not steady-state qualification.
-This explicit boundary is necessary because the 59.94 Hz cap cannot average
-60.00 FPS after any cold compilation or loading stall.
+Preserve the accepted Native/auto 4x quality contract while removing
+pipeline-related cold hitches, attributing and tightening presentation tails,
+and qualifying representative missions, split-screen, long-duration runs, and
+available Apple Silicon classes. The accepted Battle baseline remains
+59.98-60.01 FPS with 14.87-15.26 ms combined-GPU p95 after warm-up; it is a
+regression gate, not evidence for untested workloads.
+
+PERF-028's exact historical-band reproduction remains open; its retained
+attribution was sufficient for the requested continuation through the
+completed PERF-029 artifact contract. PERF-030 is the next pipeline task.
+Presentation timing instrumentation and the workload/device protocol may
+proceed independently, but default pacing and deeper renderer work remain
+gated on their measurements.
 
 Render scale, filtering, LOD, Retail draw coverage, quincunx behavior, and
 Retail-water defaults remain fixed. Continue collecting direct power and
@@ -53,17 +57,30 @@ temperature evidence when privileged telemetry is available.
 | PERF-014 | Repeat clean scale matrix | `[x]` | PERF-011, PERF-013 |
 | PERF-015 | Collect controlled power and thermal evidence | `[~]` | PERF-014 |
 | PERF-016 | Choose product defaults | `[x]` | PERF-014, PERF-015 |
-| PERF-017 | Resume modern-water visual phases | `[ ]` | PERF-014 |
+| PERF-017 | Resume modern-water visual phases | `[ ]` | PERF-040 |
 | PERF-018 | Freeze the Native 4x/60 contract and baseline | `[x]` | PERF-016 |
 | PERF-019 | Instrument render-target feedback and quincunx cost | `[x]` | PERF-018 |
 | PERF-020 | Keep render-target feedback GPU-private | `[x]` | PERF-019 |
 | PERF-021 | Evaluate exact lower-read quincunx resolves | `[x]` | PERF-020 |
 | PERF-022 | Consolidate multi-target submissions | `[x]` | PERF-020 |
 | PERF-023 | Re-evaluate the bounded in-flight depth | `[x]` | PERF-022 |
-| PERF-024 | Attribute remaining CPU vertex/draw cost if broader workloads miss | `[!]` | PERF-023 |
+| PERF-024 | Attribute remaining CPU vertex/draw cost if broader workloads miss | `[!]` | PERF-023, PERF-038 |
 | PERF-025 | Port justified NV2A vertex programs to Metal | `[!]` | PERF-024 |
 | PERF-026 | Repeat Native 4x/60 acceptance matrix | `[x]` | PERF-023 |
 | PERF-027 | Reconcile product documentation and defaults | `[x]` | PERF-026 |
+| PERF-028 | Instrument Metal pipeline and cache lifecycle | `[~]` | PERF-027 |
+| PERF-029 | Define the native pipeline-artifact contract | `[x]` | PERF-028 |
+| PERF-030 | Compile stable Metal shaders offline | `[ ]` | PERF-029 |
+| PERF-031 | Add device-local trace-derived pipeline warm-up | `[ ]` | PERF-028, PERF-029, PERF-030 |
+| PERF-032 | Add asynchronous rare-miss compilation and bounded retention | `[ ]` | PERF-028, PERF-029, PERF-030 |
+| PERF-033 | Qualify cold-start pipeline behavior | `[ ]` | PERF-031, PERF-032 |
+| PERF-034 | Instrument presentation and display timing | `[ ]` | PERF-027 |
+| PERF-035 | Evaluate a gated `CAMetalDisplayLink` path | `[ ]` | PERF-034 |
+| PERF-036 | Qualify match-display pacing and latency | `[ ]` | PERF-035 |
+| PERF-037 | Define the broader workload and device matrix | `[ ]` | PERF-027 |
+| PERF-038 | Run broader Native 4x/60 qualification | `[ ]` | PERF-033, PERF-036, PERF-037 |
+| PERF-039 | Optimize a measured GPU-bound miss | `[!]` | PERF-038 |
+| PERF-040 | Requalify, reconcile defaults, and publish evidence | `[ ]` | PERF-033, PERF-036, PERF-038 |
 
 ## Completed investigation
 
@@ -366,6 +383,116 @@ steady-state command shape is one
 `render+target-switch+feedback+present+depth-copy` command per game frame.
 Cold windows still contain 296-330 ms shader/workload warm-up stalls and are
 retained as an explicit follow-up rather than silently discarded.
+
+## Highest-value follow-up: PERF-028 through PERF-040
+
+### Pipeline lifecycle and cold-start closure: PERF-028 through PERF-033
+
+PERF-028's exact historical-band reproduction remains open. PERF-029 is
+complete.
+
+- [x] Time stable-library compilation, function specialization, and render
+  pipeline creation separately.
+- [x] Count canonical-key cache hits, misses, high-water entries, and
+  whole-cache resets.
+- [x] Correlate each event with frame number, command role, and wall-frame
+  maximum on one time base.
+- [x] Emit hashes and aggregate timing only; do not serialize pipeline
+  descriptors, combiner words, retail traces, or generated archives.
+- [ ] Repeat two clean cold seeded boots and attribute every pipeline event
+  associated with the existing 296-330 ms maxima.
+
+PERF-029 defines the artifact before implementation:
+
+- [x] Version the backend ABI, stable shader hash, pipeline-key schema,
+  executable, OS, SDK, Metal feature level, and GPU family.
+- [x] Reject truncated, stale, incompatible, symlinked, or over-limit
+  artifacts explicitly.
+- [x] Keep trace-derived keys and compiled archives device-local and
+  uncommitted; project-owned offline shader output remains a normal build
+  artifact.
+- [x] Preserve runtime compilation as an explicit fallback when the selected
+  API, archive, or artifact is unavailable.
+
+PERF-030 through PERF-032 implement the measured path:
+
+- [ ] Compile the stable project-owned Metal source into an offline library
+  without changing shader entry points or math policy.
+- [ ] Preload validated local pipeline states before their first use in the
+  traced workload.
+- [ ] Compile an untraced specialization asynchronously and retain the exact
+  generic Retail pipeline until it is ready.
+- [ ] Propagate compilation failure explicitly and keep rendering exact;
+  never return success with a missing pipeline or stale state.
+- [ ] Replace whole-cache eviction only after PERF-028 proves the required
+  bounded retention policy.
+
+PERF-033 exit gates:
+
+- [ ] Two clean exact-default cold boots complete with zero renderer-thread
+  specialized-pipeline creation after the first seeded gameplay flip.
+- [ ] No retained 296-330 ms maximum is attributed to Metal library,
+  specialization, pipeline creation, archive load, or cache churn.
+- [ ] Steady-state FPS/GPU/submission percentiles, input latency, markers,
+  output hashes, and Metal error behavior do not regress.
+- [ ] Missing, stale, corrupt, and unsupported artifacts take the tested
+  explicit fallback.
+
+### Presentation pacing: PERF-034 through PERF-036
+
+- [ ] Correlate flip release, command commit/completion, drawable acquisition,
+  requested presentation, actual presentation, and display target timestamps.
+- [ ] Record fractional and variable display-rate changes rather than rounding
+  the display to an assumed fixed integer cadence.
+- [ ] Prove whether drawable wait, manual host pacing, command completion, OS
+  scheduling, or scene work causes the 17.06-17.46 ms wall p95.
+- [ ] If pacing is material, add an availability-gated
+  `CAMetalDisplayLink` match-display path with target timestamps and the
+  display-link-provided drawable.
+- [ ] Keep the existing bounded explicit-drawable path for vsync-off,
+  uncapped, unsupported, initialization-failure, and test configurations.
+- [ ] Drain owned submissions and preserve title flip timing before switching
+  pacing modes.
+
+PERF-036 accepts the new path only if two exact-default boots retain
+59.0-60.5 FPS, combined-GPU p95 at or below 16.67 ms, submission-latency p95
+at or below 15.50 ms, wall p95 at or below 17.0 ms, no new dropped drawable,
+and no material input-latency or frame-order regression. Otherwise retain the
+current default and record the experiment as no-go.
+
+### Broader qualification: PERF-037 and PERF-038
+
+- [ ] Define private seeds for representative geometry, particle, weather,
+  calm/storm water, shore, reflection, transition, and split-screen loads.
+- [ ] Include multiple missions, 30-60 minute sustained runs, cold and warm
+  windows, and every available Apple Silicon class.
+- [ ] Record FPS, wall/GPU median/p95/p99/max, submission latency, pipeline
+  events, drawable events, marker coverage, approximation flags, executable
+  hash, and direct power, temperature, sustained-clock, and memory evidence
+  where approved.
+- [ ] Report unavailable hardware or privileged telemetry as an evidence gap;
+  do not infer a pass from the Apple M5 result.
+- [ ] Preserve exact defaults and distinguish loading, transition, and
+  steady-state windows.
+
+### Conditional headroom and closure: PERF-024, PERF-025, PERF-039, PERF-040
+
+PERF-024/PERF-025 activate only for a CPU-bound matrix miss. Attribute vertex
+fetch, fixed-function transform/lighting, NV2A vertex-program interpretation,
+draw preparation, and submission before porting `draw_vsh`. Any Metal port
+must retain exact CPU comparison, bounded pipeline compilation, unsupported
+program fallback, and CXT_WRITE behavior.
+
+PERF-039 activates only for a GPU-bound miss. Use Metal/Xcode pass counters to
+distinguish vertex, fragment, texture-filtering, bandwidth, depth/stencil,
+feedback, copy, and presentation limits. Rejected lower-read quincunx
+variants, unbounded in-flight work, lower quality, and unevidenced MSAA are
+not candidates.
+
+PERF-040 repeats cold and warm acceptance after every activated conditional
+task, updates product defaults only from retained evidence, and blocks
+PERF-017 until the accepted base-performance envelope and remaining gaps are
+documented.
 
 ## Explicitly unsafe shortcuts
 

@@ -211,10 +211,12 @@ class MacosDiagnosticTests(unittest.TestCase):
         self.assertNotIn("RECOMP_AUDIO_HEADLESS_AUDIT", audio_audit)
         performance = diagnostic.diagnostic_env(
             self.root, self.prepared, 15, False, False, 4, 5,
-            frame_timing=True, profile_name="profile-002.txt",
+            frame_timing=True, pipeline_timing=True,
+            profile_name="profile-002.txt",
             profile_from=20.0, profile_to=40.0, profile_callers=True,
             render_scale="2.25", frame_cap=60)
         self.assertEqual(performance["BW_METAL_FRAME_TIMING"], "1")
+        self.assertEqual(performance["BW_METAL_PIPELINE_TIMING"], "1")
         self.assertEqual(performance["BW_PROFILE"],
                          str(self.root / "profile-002.txt"))
         self.assertEqual(performance["BW_PROFILE_FROM"], "20.0")
@@ -1097,7 +1099,8 @@ class MacosDiagnosticTests(unittest.TestCase):
 
     def test_performance_diagnostic_cli_propagates_options(self):
         arguments = self.main_arguments() + [
-            "--frame-timing", "--profile", "--profile-from", "5",
+            "--frame-timing", "--pipeline-timing",
+            "--profile", "--profile-from", "5",
             "--profile-to", "10", "--profile-callers", "--render-scale", "2.25",
             "--frame-cap", "60",
         ]
@@ -1105,6 +1108,7 @@ class MacosDiagnosticTests(unittest.TestCase):
         def guest(_executable, output, _game_dir, _profile, _seconds,
                   _quincunx, _audit, **kwargs):
             self.assertTrue(kwargs["frame_timing"])
+            self.assertTrue(kwargs["pipeline_timing"])
             self.assertTrue(kwargs["profile_enabled"])
             self.assertEqual(kwargs["profile_from"], 5.0)
             self.assertEqual(kwargs["profile_to"], 10.0)
@@ -1125,6 +1129,7 @@ class MacosDiagnosticTests(unittest.TestCase):
             result = diagnostic.main(arguments)
         self.assertEqual(result, 0)
         self.assertIn("frame timing: enabled", output.getvalue())
+        self.assertIn("pipeline timing: bounded JSONL enabled", output.getvalue())
         self.assertIn("sampling profile: enabled", output.getvalue())
         self.assertIn("render scale: 2.25", output.getvalue())
         self.assertIn("frame cap: 60", output.getvalue())

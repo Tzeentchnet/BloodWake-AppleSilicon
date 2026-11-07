@@ -6,10 +6,12 @@ Last updated: 2026-11-06
 This document records the base-game frame-rate and efficiency investigation
 that temporarily takes priority over later modern-water visual work. The
 Native 4x/30 closure and representative sustained Native 4x/60 continuation
-are complete at unchanged quality. It separates measured behavior from
+are complete at unchanged quality. The next program targets cold pipeline
+stalls, presentation pacing, broader workload/device qualification, and only
+then evidence-gated CPU or GPU headroom. It separates measured behavior from
 hypotheses and product-policy decisions. Retail-derived saves, launch records,
-profiles, logs, frames, and prepared game data remain private and must not be
-committed.
+pipeline traces and archives, profiles, logs, frames, and prepared game data
+remain private and must not be committed.
 
 ## Investigation goals
 
@@ -21,6 +23,13 @@ committed.
 5. Avoid silently reducing visual quality or changing frame-rate policy.
 6. Continue from the validated Native 4x/30 envelope to Native 4x/60 without
    reducing scale, filtering, LOD, draw coverage, or Retail-water behavior.
+7. Remove runtime pipeline-compilation hitches without weakening exact Retail
+   fallback or committing retail-derived pipeline artifacts.
+8. Attribute wall-frame tail latency before changing presentation pacing.
+9. Qualify cold start, broader missions, split-screen, long-duration behavior,
+   and available Apple Silicon device classes.
+10. Port CPU vertex work or optimize additional GPU passes only when a failing
+    workload and measured bottleneck justify the change.
 
 ## Workload and controls
 
@@ -377,6 +386,186 @@ The final executable SHA-256 is
 The complete 337-case Metal suite, seven focused ASan/UBSan ownership and
 feedback cases, and all 62 macOS presenter cases pass.
 
+## Highest-value continuation program
+
+The accepted result has only 1.41-1.80 ms of combined-GPU p95 headroom under
+16.67 ms, and exact-default wall p95 remains 17.06-17.46 ms. The next work
+therefore targets user-visible stalls and tail latency before speculative
+steady-state rewrites.
+
+### 1. Pipeline lifecycle, warm-up, and archives
+
+The backend currently compiles its stable Metal library from source and
+creates new function-constant specializations and render pipeline states
+synchronously. Its in-memory draw-pipeline cache also clears all entries when
+it reaches 128 states. The current evidence does not establish which
+operation caused each 296-330 ms maximum or whether the cache limit was
+reached, so instrumentation comes first.
+
+The first active task records:
+
+- stable-library compile time;
+- function-specialization and render-pipeline creation time;
+- canonical pipeline-key hashes, cache hits, misses, high-water count, and
+  whole-cache resets;
+- the frame and command role associated with each creation; and
+- a machine-readable cold-start summary that attributes every pipeline event
+  without serializing retail-derived state.
+
+#### PERF-028 implementation evidence
+
+`BW_METAL_PIPELINE_TIMING=1` is an exact-value, disabled-by-default opt-in.
+It uses the existing monotonic host clock and emits
+`bloodwake.metal-pipeline-lifecycle/v1` JSONL. Expensive events retain only a
+canonical-key hash, phase, duration or explicit timing state, frame, command
+role, wall-frame interval, and explicit operation status. Cache hits are
+aggregate-only so hot draws cannot displace cold misses. Storage is fixed at
+512 events and output at 64 summaries; overflow is counted. No descriptor,
+combiner word, function-constant value, texture identity, guest address, or
+other retail-derived field is formatted.
+
+Six focused cases cover the disabled and invalid switch, real library /
+specialization / pipeline classification, hit/miss/high-water/reset
+accounting, the 128-entry whole-cache reset, fixed storage, stable output,
+clock/allocation failure, and prohibited-field absence. All six pass normally
+and under ASan/UBSan with leak detection disabled. The complete Metal backend
+suite passes 343/343, and the isolated diagnostic runner passes 61/61.
+
+#### PERF-028 runtime evidence
+
+Two clean seeded exact-default Native/auto Battle boots used the same private
+save and validated same-title launch seed, Retail water, match-display pacing,
+and the accepted quincunx approximation. No GPU audit, capture, profile,
+render-scale override, or frame-cap override was present. Both selected 4x
+internally, reported zero rejected ocean markers, retained all 79 pipeline
+events with zero drops, and reported no timing, allocation, or Metal failure.
+The individual hash sequence and all logs remain private.
+
+| Metric | Cold boot 1 | Cold boot 2 |
+| --- | ---: | ---: |
+| Stable-library compile | 233.197 ms | 209.109 ms |
+| Function specialization | 24 attempts, 223.487 ms total | 24 attempts, 215.459 ms total |
+| Render-pipeline creation | 29 attempts, 333.387 ms total | 29 attempts, 323.634 ms total |
+| Draw-cache lifecycle | 738,606 hits, 25 misses | 745,516 hits, 25 misses |
+| Cache high-water / resets | 25 / 0 | 25 / 0 |
+| Maximum correlated wall frame | 272.507 ms at frame 1 | 267.984 ms at frame 10 |
+
+Boot 1's maximum contained two misses, two specializations, and two pipeline
+creations totaling 48.439 ms; a second 263.333 ms cold frame contained ten
+misses, nine specializations, and ten pipeline creations totaling 243.255 ms.
+Boot 2's maximum contained that same 10/9/10 event shape totaling 235.055 ms.
+Its frame-1 267.002 ms interval contained the two-miss event shape totaling
+47.378 ms. Thus one cold maximum in each run is predominantly synchronous
+specialization/pipeline work, while the other includes roughly 219-224 ms not
+spent in those measured Metal phases. Stable-library compilation occurs
+before the first correlated flip interval and contributes to boot latency,
+not these wall-frame maxima.
+
+The valid pair did not reproduce the historical 296-330 ms band, so the exact
+PERF-028 runtime exit item remains open rather than being inferred from the
+267.984-272.507 ms maxima. It does prove that the 128-entry reset policy is
+not involved: the repeatable working set reached only 25 entries and never
+reset. PERF-029 should therefore define strict compatibility and rejection
+metadata for the stable library and the repeatable device-local canonical-key
+set before any archive or warm-up implementation; it should not change cache
+retention policy on this evidence.
+
+#### PERF-029 implementation evidence
+
+PERF-029 adds the versioned
+`bloodwake.metal-pipeline-artifact/v1` compatibility envelope and validator.
+The fixed 176-byte little-endian header keys backend ABI, stable-shader
+SHA-256, pipeline-key schema, executable SHA-256, exact OS and build-SDK
+versions, Metal feature level, GPU family, artifact kind, payload size and
+entry count, and payload SHA-256. Total files are capped at 64 MiB and 4,096
+entries. The validator reads with fixed stack storage and does not create,
+load, or interpret a Metal library, trace payload, or binary archive.
+
+Only a fully compatible result selects an artifact. Missing, unsupported,
+truncated, trailing, malformed, stale, incompatible, symlinked,
+policy-rejected, over-limit, corrupt, and I/O results retain distinct stable
+status strings and select explicit runtime compilation. Stable-shader and
+executable hash mismatches are stale; ABI, key-schema, artifact-kind, OS, SDK,
+feature-level, and GPU-family mismatches are incompatible.
+
+Device-local validation requires an absolute `.bwmpa` path, `O_NOFOLLOW`, a
+private single-link regular file owned by the current user, exact declared
+length, payload-hash verification, and unchanged file metadata across the
+read. The envelope contains no descriptors, combiner words, function
+constants, texture identities, addresses, or raw retail-derived state.
+`.bwmpa` is ignored and blocked by the pre-commit guard. Project-owned offline
+shader output remains a normal build product outside this private envelope.
+
+Six focused compatibility, stale, incompatible, bounds/format, file-policy,
+and corruption cases pass normally and under ASan/UBSan with leak detection
+disabled. The complete Metal backend suite passes 349/349, and the production
+synthetic-input target rebuilds successfully. These are implementation
+results only: PERF-029 generated no runtime trace, key set, `.metallib`, or
+binary archive and changed no pipeline selection behavior.
+
+The remaining implementation sequence is:
+
+1. compile stable project-owned Metal source into an offline library;
+2. generate any trace-derived pipeline archive locally from the user's retail
+   execution and never commit or distribute it;
+3. preload validated local pipeline states before their first gameplay use;
+4. compile rare misses asynchronously while the exact generic Retail pipeline
+   remains available; and
+5. replace whole-cache eviction only if measured state pressure requires it.
+
+This follows Apple's current
+[Metal 4 compilation guidance](https://developer.apple.com/documentation/metal/using-the-metal-4-compilation-api),
+[pipeline-state creation APIs](https://developer.apple.com/documentation/metal/pipeline-state-creation),
+and
+[binary-archive workflow](https://developer.apple.com/documentation/metal/creating-binary-archives-from-device-built-pipeline-state-objects).
+The Metal 4 path is optional and availability-gated; the artifact contract
+must retain a supported fallback.
+
+### 2. Presentation pacing
+
+GPU p95 is under budget while wall p95 sometimes exceeds one 59.94 Hz display
+interval. That does not prove that the manual host clock is responsible.
+Before changing the default, record flip-release, command completion,
+drawable-wait, requested-present, and actual-present timestamps on one
+correlated time base.
+
+If pacing is material, evaluate a gated `CAMetalDisplayLink` path for
+match-display/vsync operation, driven by target presentation timestamps and
+the drawable supplied by the display link. Keep the existing bounded
+semaphore/explicit-drawable path for vsync-off, uncapped, unsupported, or
+failed initialization. Drain owned submissions before switching modes.
+Apple documents the timing model in
+[CAMetalDisplayLink](https://developer.apple.com/documentation/quartzcore/cametaldisplaylink)
+and its
+[Game Porting Toolkit frame-pacing guidance](https://github.com/apple/game-porting-toolkit/blob/main/game-porting-skills/skills/presenting-metal-drawables/references/frame-pacing.md).
+
+### 3. Broader qualification
+
+The next matrix must cover representative geometry, effects, water, weather,
+shore, transition, and split-screen loads; multiple missions; 30-60 minute
+runs; and every available Apple Silicon class. It must retain cold and
+steady-state windows separately and record FPS, wall/GPU percentiles, maximum
+stall, submission latency, pipeline events, dropped drawables, approximation
+flags, executable hash, and direct power, temperature, sustained-clock, and
+memory evidence where approved. Missing device classes remain documented
+gaps rather than inferred passes.
+
+### 4. Conditional CPU and GPU headroom
+
+Only a broader-matrix miss activates deeper renderer work:
+
+- For a CPU-bound miss, attribute fixed-function transform, vertex fetch,
+  vertex-program interpretation, draw preparation, and submission. Port the
+  existing `draw_vsh` contract to Metal only if vertex-program interpretation
+  is material, retaining exact CPU comparison, bounded compilation, and CPU
+  fallback for unsupported programs.
+- For a GPU-bound miss, use Metal/Xcode pass counters to distinguish vertex,
+  fragment, texture-filtering, bandwidth, depth/stencil, feedback, copy, and
+  presentation limits before changing a pass.
+
+The rejected lower-read quincunx variants, unbounded submissions, quality
+reductions, and unevidenced MSAA are not continuation candidates.
+
 ## Private evidence index
 
 The following local artifact directory names identify the retained evidence.
@@ -462,6 +651,9 @@ timing run. Run profiling separately.
     the 296-330 ms startup maxima are recorded rather than hidden.
 11. Direct package-power and temperature telemetry remains the open efficiency
    evidence item.
+12. Pipeline attribution and a private, versioned warm-up/archive contract are
+   the first follow-up; presentation pacing, broader qualification, and
+   conditional vertex/GPU work follow in that order.
 
 Related tracked documentation:
 

@@ -115,6 +115,14 @@ BwMetalWaterPreset bw_metal_backend_water_preset(void);
  * With BW_METAL_FRAME_TIMING=1, the backend reports monotonic wall-clock,
  * completed-command, exact command-reason, wait, submission-latency,
  * command-role, and feedback CPU statistics for rolling 300-frame windows.
+ * With BW_METAL_PIPELINE_TIMING=1, the backend emits bounded JSONL pipeline
+ * lifecycle diagnostics as event frames complete and at stop. The exact-value
+ * opt-in records at most 512
+ * library, cache-miss/reset, function-specialization, and render-pipeline
+ * events; cache hits remain aggregate-only. Records contain canonical-key
+ * hashes, durations, frame/command classifications, aggregate cache counters,
+ * wall-frame correlation, and explicit error states, never descriptors or
+ * retail-derived fields.
  * Up to 32 exact colour-surface descriptions are cached. Ordinary target
  * switches retain each touched private generation in the current submission;
  * presentation commits them together in queue order, while eight switches
@@ -145,6 +153,34 @@ int bw_metal_backend_start_for_test(void *guest_memory, size_t guest_size);
  * valid until the next start; start/stop must not race with another start. */
 const char *bw_metal_backend_error(void);
 void bw_metal_backend_stop(void);
+
+#if defined(BW_METAL_TESTING)
+typedef struct {
+    int enabled;
+    size_t event_count, event_capacity;
+    uint64_t events_dropped;
+    uint64_t cache_hits, cache_misses, whole_cache_resets;
+    unsigned cache_entry_high_water;
+    uint64_t library_attempts, library_timed;
+    uint64_t specialization_attempts, specialization_timed;
+    uint64_t pipeline_attempts, pipeline_timed;
+    uint64_t timing_unavailable, timing_non_monotonic;
+    uint64_t wall_timing_unavailable, wall_timing_non_monotonic;
+    uint64_t allocation_failures, metal_failures;
+    uint64_t wall_frame_intervals, wall_frame_max_ns;
+    uint32_t wall_frame_max_frame;
+    size_t events_on_wall_max;
+} BwMetalPipelineDiagnosticSnapshot;
+
+void bw_metal_test_pipeline_diagnostic_snapshot(
+    BwMetalPipelineDiagnosticSnapshot *snapshot);
+void bw_metal_test_pipeline_diagnostic_clear(void);
+void bw_metal_test_pipeline_diagnostic_inject_cache_miss(uint64_t key_hash,
+                                                         uint32_t frame);
+void bw_metal_test_fail_next_pipeline_allocation(void);
+int bw_metal_test_pipeline_diagnostic_format_event(char *buffer, size_t size);
+int bw_metal_test_pipeline_diagnostic_format_summary(char *buffer, size_t size);
+#endif
 
 #ifdef __cplusplus
 }

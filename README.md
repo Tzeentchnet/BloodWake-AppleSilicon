@@ -99,19 +99,48 @@ This is still a development build:
   with the headless audio sink, it completed three private boots and two
   validated relaunches, reached ocean rendering, and stopped at the configured
   boot limit. Default physical input and CoreAudio behavior are unchanged.
-- Bounded Metal ownership now keeps at most two submissions in flight, gives
-  mutable upload/readback resources to their submission, presents private
-  color generations without routine guest readback, and retains explicit
-  publication for snapshots, dumps, feedback, captures, and scale changes.
+- Bounded Metal ownership now keeps at most three submissions in flight,
+  gives mutable upload, feedback-resolve, and readback resources to their
+  submission, keeps exact tracked XRGB feedback GPU-private while guest bytes
+  remain unchanged, and lets safe target switches share one ordered command.
   Immutable NV2A texture-stage and combiner routing is specialized with Metal
-  function constants while material values remain dynamic. In two seeded
-  Battle runs, every explicit 4x 300-frame window averaged 32.08-36.14 FPS
-  with 27.90-29.34 ms wall medians. An exact Native/auto, match-display run
-  selected 2560x1920 and averaged 31.89-34.65 FPS with 28.75-29.92 ms
-  medians. The 30 FPS default-quality target is met without changing render
-  scale, filtering, LOD, or Retail-water defaults. Native 4x/60 is not
-  claimed. Direct package-power/temperature and formal visual-reference
-  measurements remain open.
+  function constants while material values remain dynamic. Two exact
+  Native/auto, match-display boots selected 2560x1920 and produced
+  post-warm-up windows at 59.98-60.01 FPS, 16.66-16.68 ms wall medians,
+  14.18-14.84 ms GPU medians, and 14.87-15.26 ms GPU p95. Two fixed-4x,
+  cap-120 boots independently produced consecutive post-warm-up windows above
+  60 FPS without changing scale, filtering, LOD, draw coverage, quincunx
+  behavior, or Retail-water defaults. Representative sustained Native 4x/60
+  is therefore claimed for the measured Apple M5 Battle workload. It is not
+  yet a universal locked-60 claim: exact-default wall p95 remains
+  17.06-17.46 ms, cold windows contain 296-330 ms shader/workload warm-up
+  stalls, and broader mission, device, power, temperature, and formal visual
+  coverage remain open.
+
+## Current performance priorities
+
+The steady-state representative target is closed. Work now proceeds in this
+order:
+
+1. Trace Metal library, function-specialization, pipeline-creation, cache-hit,
+   cache-miss, and cache-eviction timing; then move stable shaders to an
+   offline library and build a versioned, device-local pipeline warm-up and
+   archive path. Retail-derived traces and archives remain private.
+2. Measure drawable acquisition, flip release, command completion, and actual
+   presentation timestamps before evaluating a gated `CAMetalDisplayLink`
+   match-display path. The current path remains the fallback.
+3. Qualify cold start, frame pacing, missions, split-screen, heavy effects,
+   long-duration behavior, and available Apple Silicon device classes with
+   direct power and temperature evidence where approved.
+4. Profile any failing workload. Port NV2A vertex programs to Metal only when
+   a miss is demonstrably CPU-bound; use Metal counters to guide any
+   additional GPU-pass work.
+
+Lower scale, dynamic resolution, upscaling, frame generation, reduced
+filtering or LOD, changed Retail water, inexact quincunx, and unmeasured MSAA
+are not Native 4x/60 optimizations. The active dependency-gated work is in
+[PERFTODO.md](PERFTODO.md); measured evidence and rejected experiments are in
+[PERFTESTS.md](PERFTESTS.md).
 
 See [Apple Silicon status](docs/APPLE_SILICON_HANDOFF.md),
 [work completed](docs/WORK_COMPLETED.md), and
@@ -193,6 +222,8 @@ are in [BUILDING.md](docs/BUILDING.md).
   modding, quality, upstream, and water work plan
 - [METAL_QUALITY.md](docs/METAL_QUALITY.md) - LOD/filtering behavior, the
   realistic-water GPU benchmark, and the Metal MSAA go/no-go gate
+- [METAL_PIPELINE_ARTIFACT.md](docs/METAL_PIPELINE_ARTIFACT.md) - versioned
+  device-local Metal pipeline-artifact compatibility and rejection contract
 - [WATER_RENDERING.md](docs/WATER_RENDERING.md) - Blood Wake water simulation
   boundaries, three-pass Retail renderer, Metal shader inputs, and safe future
   work

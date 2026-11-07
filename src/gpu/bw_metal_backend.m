@@ -41,6 +41,10 @@ extern uint64_t xbox_HostNowNs(void);
 #define METAL_INITIAL_VERTEX_UPLOAD (16u * 1024u * 1024u)
 #define METAL_COLOR_XRGB_ZERO 0x4u
 #define METAL_COLOR_ARGB8 0x8u
+#define METAL_PIPELINE_EVENT_CAPACITY 512u
+#define METAL_PIPELINE_SUMMARY_CAPACITY 64u
+#define METAL_PIPELINE_REPORT_LINE_MAX 2048u
+#define METAL_PIPELINE_SCHEMA "bloodwake.metal-pipeline-lifecycle/v1"
 #if defined(BW_METAL_TESTING)
 #define METAL_WATER_BENCHMARK_WARMUP_FRAMES 1u
 #define METAL_WATER_BENCHMARK_SAMPLE_FRAMES 2u
@@ -119,6 +123,68 @@ enum {
     METAL_SHADER_REALISTIC_WATER,
     METAL_SHADER_DEPTH_ONLY,
 };
+
+typedef enum {
+    METAL_PIPELINE_EVENT_LIBRARY_COMPILE,
+    METAL_PIPELINE_EVENT_FUNCTION_SPECIALIZATION,
+    METAL_PIPELINE_EVENT_PIPELINE_CREATE,
+    METAL_PIPELINE_EVENT_CACHE_MISS,
+    METAL_PIPELINE_EVENT_CACHE_RESET,
+} MetalPipelineEventKind;
+
+typedef enum {
+    METAL_PIPELINE_ROLE_STARTUP,
+    METAL_PIPELINE_ROLE_RENDER,
+} MetalPipelineCommandRole;
+
+typedef enum {
+    METAL_PIPELINE_STATUS_OK,
+    METAL_PIPELINE_STATUS_ALLOCATION_FAILED,
+    METAL_PIPELINE_STATUS_METAL_FAILED,
+} MetalPipelineStatus;
+
+typedef enum {
+    METAL_PIPELINE_TIMING_NOT_APPLICABLE,
+    METAL_PIPELINE_TIMING_PENDING,
+    METAL_PIPELINE_TIMING_OK,
+    METAL_PIPELINE_TIMING_UNAVAILABLE,
+    METAL_PIPELINE_TIMING_NON_MONOTONIC,
+    METAL_PIPELINE_TIMING_NOT_COMPLETED,
+} MetalPipelineTimingStatus;
+
+typedef struct {
+    uint64_t start_ns;
+    MetalPipelineTimingStatus status;
+} MetalPipelineTimer;
+
+typedef struct {
+    uint64_t key_hash, duration_ns, wall_frame_ns;
+    uint32_t frame;
+    MetalPipelineEventKind kind;
+    MetalPipelineCommandRole role;
+    MetalPipelineStatus status;
+    MetalPipelineTimingStatus timing_status, wall_timing_status;
+} MetalPipelineEvent;
+
+typedef struct {
+    uint64_t attempts, timed, total_ns, max_ns;
+} MetalPipelineTimingAggregate;
+
+typedef struct {
+    int enabled, final_reported, summary_dirty;
+    MetalPipelineEvent events[METAL_PIPELINE_EVENT_CAPACITY];
+    size_t event_count, events_reported;
+    unsigned summaries_reported;
+    uint64_t events_dropped;
+    uint64_t cache_hits, cache_misses, whole_cache_resets;
+    unsigned cache_entry_high_water;
+    MetalPipelineTimingAggregate library, specialization, pipeline;
+    uint64_t timing_unavailable, timing_non_monotonic;
+    uint64_t wall_timing_unavailable, wall_timing_non_monotonic;
+    uint64_t allocation_failures, metal_failures;
+    uint64_t wall_frame_intervals, wall_frame_max_ns;
+    uint32_t wall_frame_max_frame;
+} MetalPipelineDiagnostic;
 
 typedef struct {
     uint32_t depth_test, depth_func, depth_write, stencil_enable;
@@ -313,6 +379,7 @@ static int s_water_reflect_test_failure;
 static int s_test_async_display;
 static int s_test_defer_retirement;
 static int s_test_fail_next_submission;
+static int s_test_fail_next_pipeline_allocation;
 #endif
 static id<MTLTexture> s_surface;
 static id<MTLTexture> s_inactive_texture;
@@ -356,6 +423,7 @@ static uint64_t s_quincunx_preparation_ns;
 static uint64_t s_gpu_command_timestamp_failures;
 static uint64_t s_last_flip_ns;
 static int s_frame_timing_enabled;
+static MetalPipelineDiagnostic s_pipeline_diagnostic;
 static int s_water_benchmark_enabled;
 static int s_water_benchmark_started;
 static int s_water_benchmark_complete;
@@ -388,6 +456,460 @@ static void set_draw_state(id<MTLRenderCommandEncoder> encoder,
 static int preserve_depth_surfaces(void);
 static int publish_all_dirty_color_surfaces(void);
 static int metal_fail(const char *format, ...);
+
+static uint64_t pipeline_key_hash(uint64_t domain, const void *bytes, size_t length)
+{
+    const uint64_t offset = UINT64_C(14695981039346656037);
+    const uint64_t prime = UINT64_C(1099511628211);
+    const uint8_t *data = bytes;
+    uint64_t hash = offset;
+    for (unsigned shift = 0; shift < 64; shift += 8) {
+        hash ^= (domain >> shift) & 0xFFu;
+        hash *= prime;
+    }
+    for (size_t i = 0; i < length; i++) {
+        hash ^= data[i];
+        hash *= prime;
+    }
+    return hash;
+}
+
+static void pipeline_diagnostic_reset(int enabled)
+{
+    memset(&s_pipeline_diagnostic, 0, sizeof s_pipeline_diagnostic);
+    s_pipeline_diagnostic.enabled = enabled != 0;
+    s_pipeline_diagnostic.summary_dirty = enabled != 0;
+}
+
+static const char *pipeline_event_kind_name(MetalPipelineEventKind kind)
+{
+    switch (kind) {
+    case METAL_PIPELINE_EVENT_LIBRARY_COMPILE: return "library_compile";
+    case METAL_PIPELINE_EVENT_FUNCTION_SPECIALIZATION:
+        return "function_specialization";
+    case METAL_PIPELINE_EVENT_PIPELINE_CREATE: return "pipeline_create";
+    case METAL_PIPELINE_EVENT_CACHE_MISS: return "cache_miss";
+    case METAL_PIPELINE_EVENT_CACHE_RESET: return "cache_reset";
+    }
+    return "invalid";
+}
+
+static const char *pipeline_role_name(MetalPipelineCommandRole role)
+{
+    switch (role) {
+    case METAL_PIPELINE_ROLE_STARTUP: return "startup";
+    case METAL_PIPELINE_ROLE_RENDER: return "render";
+    }
+    return "invalid";
+}
+
+static const char *pipeline_status_name(MetalPipelineStatus status)
+{
+    switch (status) {
+    case METAL_PIPELINE_STATUS_OK: return "ok";
+    case METAL_PIPELINE_STATUS_ALLOCATION_FAILED: return "allocation_failed";
+    case METAL_PIPELINE_STATUS_METAL_FAILED: return "metal_failed";
+    }
+    return "invalid";
+}
+
+static const char *pipeline_timing_status_name(MetalPipelineTimingStatus status)
+{
+    switch (status) {
+    case METAL_PIPELINE_TIMING_NOT_APPLICABLE: return "not_applicable";
+    case METAL_PIPELINE_TIMING_PENDING: return "pending";
+    case METAL_PIPELINE_TIMING_OK: return "ok";
+    case METAL_PIPELINE_TIMING_UNAVAILABLE: return "unavailable";
+    case METAL_PIPELINE_TIMING_NON_MONOTONIC: return "non_monotonic";
+    case METAL_PIPELINE_TIMING_NOT_COMPLETED: return "not_completed";
+    }
+    return "invalid";
+}
+
+static MetalPipelineTimingAggregate *pipeline_timing_aggregate(
+    MetalPipelineEventKind kind)
+{
+    switch (kind) {
+    case METAL_PIPELINE_EVENT_LIBRARY_COMPILE:
+        return &s_pipeline_diagnostic.library;
+    case METAL_PIPELINE_EVENT_FUNCTION_SPECIALIZATION:
+        return &s_pipeline_diagnostic.specialization;
+    case METAL_PIPELINE_EVENT_PIPELINE_CREATE:
+        return &s_pipeline_diagnostic.pipeline;
+    case METAL_PIPELINE_EVENT_CACHE_MISS:
+    case METAL_PIPELINE_EVENT_CACHE_RESET:
+        return NULL;
+    }
+    return NULL;
+}
+
+static void pipeline_diagnostic_note_status(MetalPipelineStatus status)
+{
+    if (status == METAL_PIPELINE_STATUS_ALLOCATION_FAILED)
+        s_pipeline_diagnostic.allocation_failures++;
+    else if (status == METAL_PIPELINE_STATUS_METAL_FAILED)
+        s_pipeline_diagnostic.metal_failures++;
+}
+
+static void pipeline_diagnostic_store(MetalPipelineEvent event)
+{
+    if (!s_pipeline_diagnostic.enabled)
+        return;
+    s_pipeline_diagnostic.final_reported = 0;
+    s_pipeline_diagnostic.summary_dirty = 1;
+    pipeline_diagnostic_note_status(event.status);
+    if (s_pipeline_diagnostic.event_count < METAL_PIPELINE_EVENT_CAPACITY) {
+        s_pipeline_diagnostic.events[s_pipeline_diagnostic.event_count++] = event;
+    } else {
+        s_pipeline_diagnostic.events_dropped++;
+    }
+}
+
+static MetalPipelineTimer pipeline_diagnostic_begin(void)
+{
+    MetalPipelineTimer timer = {0, METAL_PIPELINE_TIMING_NOT_APPLICABLE};
+    if (!s_pipeline_diagnostic.enabled)
+        return timer;
+    timer.start_ns = xbox_HostNowNs();
+    timer.status = timer.start_ns
+                 ? METAL_PIPELINE_TIMING_PENDING
+                 : METAL_PIPELINE_TIMING_UNAVAILABLE;
+    return timer;
+}
+
+static void pipeline_diagnostic_record_instant(
+    MetalPipelineEventKind kind, uint64_t key_hash, uint32_t frame,
+    MetalPipelineCommandRole role, MetalPipelineStatus status)
+{
+    if (!s_pipeline_diagnostic.enabled)
+        return;
+    pipeline_diagnostic_store((MetalPipelineEvent){
+        .key_hash = key_hash,
+        .frame = frame,
+        .kind = kind,
+        .role = role,
+        .status = status,
+        .timing_status = METAL_PIPELINE_TIMING_NOT_APPLICABLE,
+        .wall_timing_status = role == METAL_PIPELINE_ROLE_STARTUP
+                            ? METAL_PIPELINE_TIMING_NOT_APPLICABLE
+                            : METAL_PIPELINE_TIMING_PENDING,
+    });
+}
+
+static void pipeline_diagnostic_finish(
+    MetalPipelineEventKind kind, uint64_t key_hash, uint32_t frame,
+    MetalPipelineCommandRole role, MetalPipelineStatus status,
+    MetalPipelineTimer timer)
+{
+    if (!s_pipeline_diagnostic.enabled)
+        return;
+    MetalPipelineTimingAggregate *aggregate = pipeline_timing_aggregate(kind);
+    MetalPipelineTimingStatus timing_status = timer.status;
+    uint64_t duration = 0;
+    if (aggregate)
+        aggregate->attempts++;
+    if (timing_status == METAL_PIPELINE_TIMING_PENDING) {
+        uint64_t end = xbox_HostNowNs();
+        if (!end) {
+            timing_status = METAL_PIPELINE_TIMING_UNAVAILABLE;
+        } else if (end <= timer.start_ns) {
+            timing_status = METAL_PIPELINE_TIMING_NON_MONOTONIC;
+        } else {
+            timing_status = METAL_PIPELINE_TIMING_OK;
+            duration = end - timer.start_ns;
+        }
+    }
+    if (timing_status == METAL_PIPELINE_TIMING_OK && aggregate) {
+        aggregate->timed++;
+        if (UINT64_MAX - aggregate->total_ns >= duration)
+            aggregate->total_ns += duration;
+        if (duration > aggregate->max_ns)
+            aggregate->max_ns = duration;
+    } else if (timing_status == METAL_PIPELINE_TIMING_UNAVAILABLE) {
+        s_pipeline_diagnostic.timing_unavailable++;
+    } else if (timing_status == METAL_PIPELINE_TIMING_NON_MONOTONIC) {
+        s_pipeline_diagnostic.timing_non_monotonic++;
+    }
+    pipeline_diagnostic_store((MetalPipelineEvent){
+        .key_hash = key_hash,
+        .duration_ns = duration,
+        .frame = frame,
+        .kind = kind,
+        .role = role,
+        .status = status,
+        .timing_status = timing_status,
+        .wall_timing_status = role == METAL_PIPELINE_ROLE_STARTUP
+                            ? METAL_PIPELINE_TIMING_NOT_APPLICABLE
+                            : METAL_PIPELINE_TIMING_PENDING,
+    });
+}
+
+static void pipeline_diagnostic_cache_hit(void)
+{
+    if (s_pipeline_diagnostic.enabled) {
+        s_pipeline_diagnostic.cache_hits++;
+        s_pipeline_diagnostic.summary_dirty = 1;
+    }
+}
+
+static void pipeline_diagnostic_cache_miss(uint64_t key_hash)
+{
+    if (!s_pipeline_diagnostic.enabled)
+        return;
+    s_pipeline_diagnostic.cache_misses++;
+    s_pipeline_diagnostic.summary_dirty = 1;
+    pipeline_diagnostic_record_instant(
+        METAL_PIPELINE_EVENT_CACHE_MISS, key_hash, s_frame,
+        METAL_PIPELINE_ROLE_RENDER, METAL_PIPELINE_STATUS_OK);
+}
+
+static void pipeline_diagnostic_cache_reset(uint64_t key_hash)
+{
+    if (!s_pipeline_diagnostic.enabled)
+        return;
+    s_pipeline_diagnostic.whole_cache_resets++;
+    s_pipeline_diagnostic.summary_dirty = 1;
+    pipeline_diagnostic_record_instant(
+        METAL_PIPELINE_EVENT_CACHE_RESET, key_hash, s_frame,
+        METAL_PIPELINE_ROLE_RENDER, METAL_PIPELINE_STATUS_OK);
+}
+
+static void pipeline_diagnostic_cache_count(NSUInteger count)
+{
+    if (s_pipeline_diagnostic.enabled &&
+        count > s_pipeline_diagnostic.cache_entry_high_water) {
+        s_pipeline_diagnostic.cache_entry_high_water = (unsigned)count;
+        s_pipeline_diagnostic.summary_dirty = 1;
+    }
+}
+
+static void pipeline_diagnostic_emit_ready_events(void);
+static void pipeline_diagnostic_emit_summary(int final);
+
+static void pipeline_diagnostic_complete_frame(
+    uint32_t frame, uint64_t duration_ns, MetalPipelineTimingStatus status)
+{
+    if (!s_pipeline_diagnostic.enabled)
+        return;
+    if (status == METAL_PIPELINE_TIMING_OK) {
+        s_pipeline_diagnostic.wall_frame_intervals++;
+        if (duration_ns > s_pipeline_diagnostic.wall_frame_max_ns) {
+            s_pipeline_diagnostic.wall_frame_max_ns = duration_ns;
+            s_pipeline_diagnostic.wall_frame_max_frame = frame;
+        }
+    } else if (status == METAL_PIPELINE_TIMING_UNAVAILABLE) {
+        s_pipeline_diagnostic.wall_timing_unavailable++;
+    } else if (status == METAL_PIPELINE_TIMING_NON_MONOTONIC) {
+        s_pipeline_diagnostic.wall_timing_non_monotonic++;
+    }
+    s_pipeline_diagnostic.summary_dirty = 1;
+    for (size_t i = 0; i < s_pipeline_diagnostic.event_count; i++) {
+        MetalPipelineEvent *event = &s_pipeline_diagnostic.events[i];
+        if (event->frame != frame ||
+            event->wall_timing_status != METAL_PIPELINE_TIMING_PENDING)
+            continue;
+        event->wall_timing_status = status;
+        event->wall_frame_ns =
+            status == METAL_PIPELINE_TIMING_OK ? duration_ns : 0;
+    }
+    size_t reported = s_pipeline_diagnostic.events_reported;
+    pipeline_diagnostic_emit_ready_events();
+    if (s_pipeline_diagnostic.events_reported != reported || !(frame % 100u))
+        pipeline_diagnostic_emit_summary(0);
+}
+
+static int pipeline_diagnostic_format_event(
+    const MetalPipelineEvent *event, size_t sequence, char *buffer, size_t size)
+{
+    char duration[32], wall_duration[32];
+    if (!buffer || !size || !event)
+        return 0;
+    if (event->timing_status == METAL_PIPELINE_TIMING_OK)
+        snprintf(duration, sizeof duration, "%llu",
+                 (unsigned long long)event->duration_ns);
+    else
+        memcpy(duration, "null", sizeof "null");
+    if (event->wall_timing_status == METAL_PIPELINE_TIMING_OK)
+        snprintf(wall_duration, sizeof wall_duration, "%llu",
+                 (unsigned long long)event->wall_frame_ns);
+    else
+        memcpy(wall_duration, "null", sizeof "null");
+    int wall_max =
+        event->wall_timing_status == METAL_PIPELINE_TIMING_OK &&
+        event->frame == s_pipeline_diagnostic.wall_frame_max_frame &&
+        event->wall_frame_ns == s_pipeline_diagnostic.wall_frame_max_ns;
+    int written = snprintf(
+        buffer, size,
+        "{\"schema\":\"" METAL_PIPELINE_SCHEMA "\",\"record\":\"event\","
+        "\"sequence\":%zu,\"kind\":\"%s\",\"key_hash\":\"%016llx\","
+        "\"frame\":%u,\"command_role\":\"%s\",\"status\":\"%s\","
+        "\"timing_status\":\"%s\",\"duration_ns\":%s,"
+        "\"wall_timing_status\":\"%s\",\"wall_frame_ns\":%s,"
+        "\"wall_frame_max_so_far\":%s}",
+        sequence, pipeline_event_kind_name(event->kind),
+        (unsigned long long)event->key_hash, event->frame,
+        pipeline_role_name(event->role), pipeline_status_name(event->status),
+        pipeline_timing_status_name(event->timing_status), duration,
+        pipeline_timing_status_name(event->wall_timing_status), wall_duration,
+        wall_max ? "true" : "false");
+    return written >= 0 && (size_t)written < size;
+}
+
+static int pipeline_diagnostic_format_summary(char *buffer, size_t size)
+{
+    if (!buffer || !size)
+        return 0;
+    char max_frame[32], max_duration[32];
+    if (s_pipeline_diagnostic.wall_frame_intervals) {
+        snprintf(max_frame, sizeof max_frame, "%u",
+                 s_pipeline_diagnostic.wall_frame_max_frame);
+        snprintf(max_duration, sizeof max_duration, "%llu",
+                 (unsigned long long)s_pipeline_diagnostic.wall_frame_max_ns);
+    } else {
+        memcpy(max_frame, "null", sizeof "null");
+        memcpy(max_duration, "null", sizeof "null");
+    }
+    int written = snprintf(
+        buffer, size,
+        "{\"schema\":\"" METAL_PIPELINE_SCHEMA "\",\"record\":\"summary\","
+        "\"sequence\":%u,\"enabled\":%s,\"event_capacity\":%u,"
+        "\"events_recorded\":%zu,\"events_reported\":%zu,"
+        "\"events_dropped\":%llu,\"cache_hits\":%llu,\"cache_misses\":%llu,"
+        "\"cache_entry_high_water\":%u,\"cache_entry_limit\":%u,"
+        "\"whole_cache_resets\":%llu,"
+        "\"library_attempts\":%llu,\"library_timed\":%llu,"
+        "\"library_total_ns\":%llu,\"library_max_ns\":%llu,"
+        "\"specialization_attempts\":%llu,\"specialization_timed\":%llu,"
+        "\"specialization_total_ns\":%llu,\"specialization_max_ns\":%llu,"
+        "\"pipeline_attempts\":%llu,\"pipeline_timed\":%llu,"
+        "\"pipeline_total_ns\":%llu,\"pipeline_max_ns\":%llu,"
+        "\"wall_frame_intervals\":%llu,\"wall_frame_max_frame\":%s,"
+        "\"wall_frame_max_ns\":%s,\"timing_unavailable\":%llu,"
+        "\"timing_non_monotonic\":%llu,\"wall_timing_unavailable\":%llu,"
+        "\"wall_timing_non_monotonic\":%llu,\"allocation_failures\":%llu,"
+        "\"metal_failures\":%llu}",
+        s_pipeline_diagnostic.summaries_reported,
+        s_pipeline_diagnostic.enabled ? "true" : "false",
+        METAL_PIPELINE_EVENT_CAPACITY, s_pipeline_diagnostic.event_count,
+        s_pipeline_diagnostic.events_reported,
+        (unsigned long long)s_pipeline_diagnostic.events_dropped,
+        (unsigned long long)s_pipeline_diagnostic.cache_hits,
+        (unsigned long long)s_pipeline_diagnostic.cache_misses,
+        s_pipeline_diagnostic.cache_entry_high_water, METAL_MAX_PIPELINES,
+        (unsigned long long)s_pipeline_diagnostic.whole_cache_resets,
+        (unsigned long long)s_pipeline_diagnostic.library.attempts,
+        (unsigned long long)s_pipeline_diagnostic.library.timed,
+        (unsigned long long)s_pipeline_diagnostic.library.total_ns,
+        (unsigned long long)s_pipeline_diagnostic.library.max_ns,
+        (unsigned long long)s_pipeline_diagnostic.specialization.attempts,
+        (unsigned long long)s_pipeline_diagnostic.specialization.timed,
+        (unsigned long long)s_pipeline_diagnostic.specialization.total_ns,
+        (unsigned long long)s_pipeline_diagnostic.specialization.max_ns,
+        (unsigned long long)s_pipeline_diagnostic.pipeline.attempts,
+        (unsigned long long)s_pipeline_diagnostic.pipeline.timed,
+        (unsigned long long)s_pipeline_diagnostic.pipeline.total_ns,
+        (unsigned long long)s_pipeline_diagnostic.pipeline.max_ns,
+        (unsigned long long)s_pipeline_diagnostic.wall_frame_intervals,
+        max_frame, max_duration,
+        (unsigned long long)s_pipeline_diagnostic.timing_unavailable,
+        (unsigned long long)s_pipeline_diagnostic.timing_non_monotonic,
+        (unsigned long long)s_pipeline_diagnostic.wall_timing_unavailable,
+        (unsigned long long)s_pipeline_diagnostic.wall_timing_non_monotonic,
+        (unsigned long long)s_pipeline_diagnostic.allocation_failures,
+        (unsigned long long)s_pipeline_diagnostic.metal_failures);
+    return written >= 0 && (size_t)written < size;
+}
+
+static void pipeline_diagnostic_emit_ready_events(void)
+{
+    if (!s_pipeline_diagnostic.enabled)
+        return;
+    char line[METAL_PIPELINE_REPORT_LINE_MAX];
+    while (s_pipeline_diagnostic.events_reported <
+           s_pipeline_diagnostic.event_count) {
+        size_t i = s_pipeline_diagnostic.events_reported;
+        const MetalPipelineEvent *event = &s_pipeline_diagnostic.events[i];
+        if (event->wall_timing_status == METAL_PIPELINE_TIMING_PENDING)
+            break;
+        if (pipeline_diagnostic_format_event(event, i, line, sizeof line)) {
+            fprintf(stderr, "%s\n", line);
+        } else {
+            fprintf(stderr,
+                    "{\"schema\":\"" METAL_PIPELINE_SCHEMA "\","
+                    "\"record\":\"error\",\"sequence\":%zu,"
+                    "\"status\":\"format_failed\"}\n", i);
+        }
+        s_pipeline_diagnostic.events_reported++;
+    }
+}
+
+static void pipeline_diagnostic_emit_summary(int final)
+{
+    unsigned limit = final ? METAL_PIPELINE_SUMMARY_CAPACITY
+                           : METAL_PIPELINE_SUMMARY_CAPACITY - 1u;
+    if (!s_pipeline_diagnostic.enabled ||
+        !s_pipeline_diagnostic.summary_dirty ||
+        s_pipeline_diagnostic.summaries_reported >= limit)
+        return;
+    char line[METAL_PIPELINE_REPORT_LINE_MAX];
+    if (pipeline_diagnostic_format_summary(line, sizeof line)) {
+        fprintf(stderr, "%s\n", line);
+    } else {
+        fprintf(stderr,
+                "{\"schema\":\"" METAL_PIPELINE_SCHEMA "\","
+                "\"record\":\"error\",\"status\":\"summary_format_failed\"}\n");
+    }
+    s_pipeline_diagnostic.summaries_reported++;
+    s_pipeline_diagnostic.summary_dirty = 0;
+}
+
+static void pipeline_diagnostic_report(void)
+{
+    if (!s_pipeline_diagnostic.enabled || s_pipeline_diagnostic.final_reported)
+        return;
+    for (size_t i = s_pipeline_diagnostic.events_reported;
+         i < s_pipeline_diagnostic.event_count; i++)
+        if (s_pipeline_diagnostic.events[i].wall_timing_status ==
+            METAL_PIPELINE_TIMING_PENDING)
+            s_pipeline_diagnostic.events[i].wall_timing_status =
+                METAL_PIPELINE_TIMING_NOT_COMPLETED;
+    pipeline_diagnostic_emit_ready_events();
+    s_pipeline_diagnostic.summary_dirty = 1;
+    pipeline_diagnostic_emit_summary(1);
+    s_pipeline_diagnostic.final_reported = 1;
+}
+
+static MTLRenderPipelineDescriptor *new_pipeline_descriptor(void)
+{
+#if defined(BW_METAL_TESTING)
+    if (s_test_fail_next_pipeline_allocation) {
+        s_test_fail_next_pipeline_allocation = 0;
+        return nil;
+    }
+#endif
+    return [MTLRenderPipelineDescriptor new];
+}
+
+static id<MTLRenderPipelineState> create_render_pipeline_state(
+    MTLRenderPipelineDescriptor *descriptor, uint64_t key_hash, uint32_t frame,
+    MetalPipelineCommandRole role, NSError **error)
+{
+    if (!descriptor) {
+        pipeline_diagnostic_finish(
+            METAL_PIPELINE_EVENT_PIPELINE_CREATE, key_hash, frame, role,
+            METAL_PIPELINE_STATUS_ALLOCATION_FAILED,
+            (MetalPipelineTimer){0, METAL_PIPELINE_TIMING_NOT_APPLICABLE});
+        return nil;
+    }
+    MetalPipelineTimer timer = pipeline_diagnostic_begin();
+    id<MTLRenderPipelineState> state =
+        [s_device newRenderPipelineStateWithDescriptor:descriptor error:error];
+    pipeline_diagnostic_finish(
+        METAL_PIPELINE_EVENT_PIPELINE_CREATE, key_hash, frame, role,
+        state ? METAL_PIPELINE_STATUS_OK : METAL_PIPELINE_STATUS_METAL_FAILED,
+        timer);
+    return state;
+}
 
 static int valid_anisotropy(unsigned value)
 {
@@ -2583,7 +3105,8 @@ static int seed_depth_surface(BWMetalDepthSurface *depth)
 
 static id<MTLRenderPipelineState> partial_clear_pipeline(uint32_t color_flags, int has_depth)
 {
-    NSNumber *key = @((color_flags >> 4) | (has_depth ? 16u : 0u));
+    uint32_t key_value = (color_flags >> 4) | (has_depth ? 16u : 0u);
+    NSNumber *key = @(key_value);
     id<MTLRenderPipelineState> state = s_clear_pipelines[key];
     if (state)
         return state;
@@ -2591,9 +3114,14 @@ static id<MTLRenderPipelineState> partial_clear_pipeline(uint32_t color_flags, i
         s_clear_pipelines = [NSMutableDictionary new];
     if (!s_clear_pipelines)
         return metal_fail("could not create clear pipeline cache"), nil;
-    MTLRenderPipelineDescriptor *pipeline = [MTLRenderPipelineDescriptor new];
-    if (!pipeline)
+    uint64_t key_hash = s_pipeline_diagnostic.enabled
+                      ? pipeline_key_hash(4, &key_value, sizeof key_value) : 0;
+    MTLRenderPipelineDescriptor *pipeline = new_pipeline_descriptor();
+    if (!pipeline) {
+        (void)create_render_pipeline_state(
+            nil, key_hash, s_frame, METAL_PIPELINE_ROLE_RENDER, NULL);
         return metal_fail("could not create clear pipeline descriptor"), nil;
+    }
     pipeline.vertexFunction = s_clear_vertex_function;
     pipeline.fragmentFunction = color_flags ? s_clear_color_function : s_clear_depth_function;
     if (color_flags) {
@@ -2610,7 +3138,8 @@ static id<MTLRenderPipelineState> partial_clear_pipeline(uint32_t color_flags, i
         pipeline.stencilAttachmentPixelFormat = MTLPixelFormatDepth32Float_Stencil8;
     }
     NSError *error = nil;
-    state = [s_device newRenderPipelineStateWithDescriptor:pipeline error:&error];
+    state = create_render_pipeline_state(
+        pipeline, key_hash, s_frame, METAL_PIPELINE_ROLE_RENDER, &error);
     if (!state)
         return metal_fail("clear pipeline creation failed: %s", metal_error_text(error)), nil;
     s_clear_pipelines[key] = state;
@@ -2831,17 +3360,36 @@ static id<MTLRenderPipelineState> draw_pipeline(int shader_kind, const Nv2aRende
             if (key.blend_dst == 0x305u) dst_rgb = MTLBlendFactorOne;
         }
     }
+    uint64_t key_hash = s_pipeline_diagnostic.enabled
+                      ? pipeline_key_hash(3, &key, sizeof key) : 0;
     NSData *cache_key = [NSData dataWithBytes:&key length:sizeof key];
+    if (!cache_key)
+        return metal_fail("could not create draw pipeline cache key"), nil;
     id<MTLRenderPipelineState> state = s_pipelines[cache_key];
-    if (state)
+    if (state) {
+        pipeline_diagnostic_cache_hit();
         return state;
-    MTLRenderPipelineDescriptor *pipeline = [MTLRenderPipelineDescriptor new];
+    }
+    pipeline_diagnostic_cache_miss(key_hash);
+    MTLRenderPipelineDescriptor *pipeline = new_pipeline_descriptor();
+    if (!pipeline) {
+        (void)create_render_pipeline_state(
+            nil, key_hash, s_frame, METAL_PIPELINE_ROLE_RENDER, NULL);
+        return metal_fail("could not create draw pipeline descriptor"), nil;
+    }
     pipeline.vertexFunction = shader_kind >= METAL_SHADER_EXTENDED
                             ? s_extended_vertex_function : s_vertex_function;
     if (shader_kind == METAL_SHADER_EXTENDED && specialization) {
         MTLFunctionConstantValues *values = [MTLFunctionConstantValues new];
-        if (!values)
+        if (!values) {
+            pipeline_diagnostic_finish(
+                METAL_PIPELINE_EVENT_FUNCTION_SPECIALIZATION, key_hash, s_frame,
+                METAL_PIPELINE_ROLE_RENDER,
+                METAL_PIPELINE_STATUS_ALLOCATION_FAILED,
+                (MetalPipelineTimer){0,
+                                     METAL_PIPELINE_TIMING_NOT_APPLICABLE});
             return metal_fail("could not create extended shader constants"), nil;
+        }
         const uint32_t *constant_groups[] = {
             specialization->texture, specialization->stages, specialization->dot,
         };
@@ -2862,10 +3410,17 @@ static id<MTLRenderPipelineState> draw_pipeline(int shader_kind, const Nv2aRende
                                 type:MTLDataTypeUInt atIndex:46u + component];
         }
         NSError *function_error = nil;
+        MetalPipelineTimer specialization_timer = pipeline_diagnostic_begin();
         pipeline.fragmentFunction =
             [s_shader_library newFunctionWithName:@"extended_specialized_fragment"
                                    constantValues:values
                                             error:&function_error];
+        pipeline_diagnostic_finish(
+            METAL_PIPELINE_EVENT_FUNCTION_SPECIALIZATION, key_hash, s_frame,
+            METAL_PIPELINE_ROLE_RENDER,
+            pipeline.fragmentFunction ? METAL_PIPELINE_STATUS_OK
+                                      : METAL_PIPELINE_STATUS_METAL_FAILED,
+            specialization_timer);
         if (!pipeline.fragmentFunction)
             return metal_fail("extended shader specialization failed: %s",
                               metal_error_text(function_error)), nil;
@@ -2899,7 +3454,8 @@ static id<MTLRenderPipelineState> draw_pipeline(int shader_kind, const Nv2aRende
         attachment.alphaBlendOperation = key.fixed_alpha_zero ? MTLBlendOperationAdd : operation;
     }
     NSError *error = nil;
-    state = [s_device newRenderPipelineStateWithDescriptor:pipeline error:&error];
+    state = create_render_pipeline_state(
+        pipeline, key_hash, s_frame, METAL_PIPELINE_ROLE_RENDER, &error);
     if (!state && shader_kind == METAL_SHADER_REALISTIC_WATER) {
         fprintf(stderr,
                 "[GPU-METAL] realistic water pipeline creation failed: %s; "
@@ -2908,9 +3464,12 @@ static id<MTLRenderPipelineState> draw_pipeline(int shader_kind, const Nv2aRende
     }
     if (!state)
         return metal_fail("draw pipeline creation failed: %s", metal_error_text(error)), nil;
-    if (s_pipelines.count >= METAL_MAX_PIPELINES)
+    if (s_pipelines.count >= METAL_MAX_PIPELINES) {
+        pipeline_diagnostic_cache_reset(key_hash);
         [s_pipelines removeAllObjects];
+    }
     s_pipelines[cache_key] = state;
+    pipeline_diagnostic_cache_count(s_pipelines.count);
     return state;
 }
 
@@ -4805,7 +5364,8 @@ static void metal_flip(void)
         uint64_t now = xbox_HostNowNs();
         if (now && s_last_flip_ns && now > s_last_flip_ns &&
             s_frame_time_count < METAL_MAX_FRAME_SAMPLES) {
-            s_frame_times[s_frame_time_count++] = now - s_last_flip_ns;
+            uint64_t frame_duration = now - s_last_flip_ns;
+            s_frame_times[s_frame_time_count++] = frame_duration;
             if (s_frame_timing_enabled && s_frame_time_count >= 300u &&
                 !(s_frame_time_count % 100u))
                 report_frame_times("300-frame window",
@@ -4914,6 +5474,17 @@ static void metal_flip(void)
                 s_quincunx_preparation_ns = 0;
             }
         }
+        if (s_pipeline_diagnostic.enabled) {
+            MetalPipelineTimingStatus wall_status =
+                !now || !s_last_flip_ns ? METAL_PIPELINE_TIMING_UNAVAILABLE
+              : now <= s_last_flip_ns ? METAL_PIPELINE_TIMING_NON_MONOTONIC
+                                      : METAL_PIPELINE_TIMING_OK;
+            pipeline_diagnostic_complete_frame(
+                s_frame,
+                wall_status == METAL_PIPELINE_TIMING_OK
+                    ? now - s_last_flip_ns : 0,
+                wall_status);
+        }
         if (now)
             s_last_flip_ns = now;
         if (!direct_present())
@@ -4949,6 +5520,9 @@ static void disable_legacy_fast_math(MTLCompileOptions *options)
 static int initialize_metal(void)
 {
     NSError *error = nil;
+    uint64_t library_hash = s_pipeline_diagnostic.enabled
+                          ? pipeline_key_hash(1, s_shader, sizeof s_shader - 1u)
+                          : 0;
     if (!s_device)
         s_device = MTLCreateSystemDefaultDevice();
     if (!s_device)
@@ -4962,8 +5536,15 @@ static int initialize_metal(void)
     if (s_quincunx_approx) {
         /* Keep the reference filter's float operation order. */
         options = [MTLCompileOptions new];
-        if (!options)
+        if (!options) {
+            pipeline_diagnostic_finish(
+                METAL_PIPELINE_EVENT_LIBRARY_COMPILE, library_hash, 0,
+                METAL_PIPELINE_ROLE_STARTUP,
+                METAL_PIPELINE_STATUS_ALLOCATION_FAILED,
+                (MetalPipelineTimer){0,
+                                     METAL_PIPELINE_TIMING_NOT_APPLICABLE});
             return metal_fail("could not create precise Metal shader options");
+        }
 #if __MAC_OS_X_VERSION_MAX_ALLOWED >= 150000 && \
     !(defined(BW_METAL_TESTING) && defined(BW_METAL_TEST_FORCE_LEGACY_MATH))
         if (@available(macOS 15.0, *)) {
@@ -4975,8 +5556,15 @@ static int initialize_metal(void)
         disable_legacy_fast_math(options);
 #endif
     }
+    MetalPipelineTimer library_timer = pipeline_diagnostic_begin();
     s_shader_library =
         [s_device newLibraryWithSource:@(s_shader) options:options error:&error];
+    pipeline_diagnostic_finish(
+        METAL_PIPELINE_EVENT_LIBRARY_COMPILE, library_hash, 0,
+        METAL_PIPELINE_ROLE_STARTUP,
+        s_shader_library ? METAL_PIPELINE_STATUS_OK
+                         : METAL_PIPELINE_STATUS_METAL_FAILED,
+        library_timer);
     if (!s_shader_library)
         return metal_fail("shader compilation failed: %s", metal_error_text(error));
     s_vertex_function = [s_shader_library newFunctionWithName:@"vertex_main"];
@@ -5011,35 +5599,59 @@ static int initialize_metal(void)
         atomic_store_explicit(&s_requested_water_preset,
                               BW_METAL_WATER_RETAIL, memory_order_release);
     }
-    MTLRenderPipelineDescriptor *present_pipeline = [MTLRenderPipelineDescriptor new];
-    if (!present_pipeline)
+    uint32_t startup_key = 1;
+    uint64_t startup_hash = s_pipeline_diagnostic.enabled
+                          ? pipeline_key_hash(2, &startup_key, sizeof startup_key)
+                          : 0;
+    MTLRenderPipelineDescriptor *present_pipeline = new_pipeline_descriptor();
+    if (!present_pipeline) {
+        (void)create_render_pipeline_state(
+            nil, startup_hash, 0, METAL_PIPELINE_ROLE_STARTUP, NULL);
         return metal_fail("could not create presentation pipeline descriptor");
+    }
     present_pipeline.vertexFunction = s_present_vertex_function;
     present_pipeline.fragmentFunction = s_present_resolve_function;
     present_pipeline.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm;
     s_present_resolve_pipeline =
-        [s_device newRenderPipelineStateWithDescriptor:present_pipeline error:&error];
+        create_render_pipeline_state(
+            present_pipeline, startup_hash, 0,
+            METAL_PIPELINE_ROLE_STARTUP, &error);
     if (!s_present_resolve_pipeline)
         return metal_fail("presentation resolve pipeline creation failed: %s",
                           metal_error_text(error));
     present_pipeline.fragmentFunction = s_scale_function;
+    startup_key = 2;
+    startup_hash = s_pipeline_diagnostic.enabled
+                 ? pipeline_key_hash(2, &startup_key, sizeof startup_key) : 0;
     error = nil;
     s_scale_pipeline =
-        [s_device newRenderPipelineStateWithDescriptor:present_pipeline error:&error];
+        create_render_pipeline_state(
+            present_pipeline, startup_hash, 0,
+            METAL_PIPELINE_ROLE_STARTUP, &error);
     if (!s_scale_pipeline)
         return metal_fail("surface scaling pipeline creation failed: %s",
                           metal_error_text(error));
     present_pipeline.fragmentFunction = s_box_function;
+    startup_key = 3;
+    startup_hash = s_pipeline_diagnostic.enabled
+                 ? pipeline_key_hash(2, &startup_key, sizeof startup_key) : 0;
     error = nil;
     s_box_pipeline =
-        [s_device newRenderPipelineStateWithDescriptor:present_pipeline error:&error];
+        create_render_pipeline_state(
+            present_pipeline, startup_hash, 0,
+            METAL_PIPELINE_ROLE_STARTUP, &error);
     if (!s_box_pipeline)
         return metal_fail("surface box-filter pipeline creation failed: %s",
                           metal_error_text(error));
     present_pipeline.fragmentFunction = s_present_fragment_function;
+    startup_key = 4;
+    startup_hash = s_pipeline_diagnostic.enabled
+                 ? pipeline_key_hash(2, &startup_key, sizeof startup_key) : 0;
     error = nil;
     s_present_pipeline =
-        [s_device newRenderPipelineStateWithDescriptor:present_pipeline error:&error];
+        create_render_pipeline_state(
+            present_pipeline, startup_hash, 0,
+            METAL_PIPELINE_ROLE_STARTUP, &error);
     if (!s_present_pipeline)
         return metal_fail("presentation pipeline creation failed: %s",
                           metal_error_text(error));
@@ -5112,6 +5724,13 @@ static int start_with_regions(void *guest_memory, size_t low_size,
     s_guest = (uintptr_t)guest_memory;
     s_guest_regions[0] = (MetalGuestRegion){0, low_size};
     s_guest_regions[1] = (MetalGuestRegion){contig_va, contig_end};
+    {
+        const char *pipeline_timing = getenv("BW_METAL_PIPELINE_TIMING");
+        pipeline_diagnostic_reset(0);
+        if (pipeline_timing && strcmp(pipeline_timing, "1"))
+            return metal_fail("BW_METAL_PIPELINE_TIMING must be 1 when set");
+        pipeline_diagnostic_reset(pipeline_timing != NULL);
+    }
     {
         const char *vfx = getenv("BW_VFX");
         const char *af = getenv("BW_VFX_AF");
@@ -5246,6 +5865,7 @@ static int start_with_regions(void *guest_memory, size_t low_size,
     s_test_async_display = 0;
     s_test_defer_retirement = 0;
     s_test_fail_next_submission = 0;
+    s_test_fail_next_pipeline_allocation = 0;
 #endif
     s_water_benchmark_started = 0;
     s_water_benchmark_complete = 0;
@@ -5370,6 +5990,7 @@ int bw_metal_backend_start_for_test(void *guest_memory, size_t guest_size)
 void bw_metal_backend_stop(void)
 {
     (void)flush_commands();
+    pipeline_diagnostic_report();
     if (s_frame_timing_enabled)
         report_frame_times("all", s_frame_times, s_frame_time_count);
     size_t trailing = s_frame_time_count < 300u ? s_frame_time_count : 300u;
@@ -5717,5 +6338,105 @@ void bw_metal_test_water_capture(int *complete, unsigned *images,
         *images = s_water_capture_images;
     if (supported_frames)
         *supported_frames = s_water_capture_supported_frames;
+}
+
+void bw_metal_test_pipeline_diagnostic_snapshot(
+    BwMetalPipelineDiagnosticSnapshot *snapshot)
+{
+    if (!snapshot)
+        return;
+    memset(snapshot, 0, sizeof *snapshot);
+    snapshot->enabled = s_pipeline_diagnostic.enabled;
+    snapshot->event_count = s_pipeline_diagnostic.event_count;
+    snapshot->event_capacity = METAL_PIPELINE_EVENT_CAPACITY;
+    snapshot->events_dropped = s_pipeline_diagnostic.events_dropped;
+    snapshot->cache_hits = s_pipeline_diagnostic.cache_hits;
+    snapshot->cache_misses = s_pipeline_diagnostic.cache_misses;
+    snapshot->whole_cache_resets =
+        s_pipeline_diagnostic.whole_cache_resets;
+    snapshot->cache_entry_high_water =
+        s_pipeline_diagnostic.cache_entry_high_water;
+    snapshot->library_attempts = s_pipeline_diagnostic.library.attempts;
+    snapshot->library_timed = s_pipeline_diagnostic.library.timed;
+    snapshot->specialization_attempts =
+        s_pipeline_diagnostic.specialization.attempts;
+    snapshot->specialization_timed =
+        s_pipeline_diagnostic.specialization.timed;
+    snapshot->pipeline_attempts = s_pipeline_diagnostic.pipeline.attempts;
+    snapshot->pipeline_timed = s_pipeline_diagnostic.pipeline.timed;
+    snapshot->timing_unavailable =
+        s_pipeline_diagnostic.timing_unavailable;
+    snapshot->timing_non_monotonic =
+        s_pipeline_diagnostic.timing_non_monotonic;
+    snapshot->wall_timing_unavailable =
+        s_pipeline_diagnostic.wall_timing_unavailable;
+    snapshot->wall_timing_non_monotonic =
+        s_pipeline_diagnostic.wall_timing_non_monotonic;
+    snapshot->allocation_failures =
+        s_pipeline_diagnostic.allocation_failures;
+    snapshot->metal_failures = s_pipeline_diagnostic.metal_failures;
+    snapshot->wall_frame_intervals =
+        s_pipeline_diagnostic.wall_frame_intervals;
+    snapshot->wall_frame_max_ns =
+        s_pipeline_diagnostic.wall_frame_max_ns;
+    snapshot->wall_frame_max_frame =
+        s_pipeline_diagnostic.wall_frame_max_frame;
+    for (size_t i = 0; i < s_pipeline_diagnostic.event_count; i++) {
+        const MetalPipelineEvent *event = &s_pipeline_diagnostic.events[i];
+        if (event->wall_timing_status == METAL_PIPELINE_TIMING_OK &&
+            event->frame == s_pipeline_diagnostic.wall_frame_max_frame &&
+            event->wall_frame_ns == s_pipeline_diagnostic.wall_frame_max_ns)
+            snapshot->events_on_wall_max++;
+    }
+}
+
+void bw_metal_test_pipeline_diagnostic_clear(void)
+{
+    int enabled = s_pipeline_diagnostic.enabled;
+    pipeline_diagnostic_reset(enabled);
+}
+
+void bw_metal_test_pipeline_diagnostic_inject_cache_miss(uint64_t key_hash,
+                                                         uint32_t frame)
+{
+    if (!s_pipeline_diagnostic.enabled)
+        return;
+    s_pipeline_diagnostic.cache_misses++;
+    pipeline_diagnostic_record_instant(
+        METAL_PIPELINE_EVENT_CACHE_MISS, key_hash, frame,
+        METAL_PIPELINE_ROLE_RENDER, METAL_PIPELINE_STATUS_OK);
+}
+
+void bw_metal_test_fail_next_pipeline_allocation(void)
+{
+    s_test_fail_next_pipeline_allocation = 1;
+}
+
+int bw_metal_test_pipeline_diagnostic_format_event(char *buffer, size_t size)
+{
+    MetalPipelineEvent event = {
+        .key_hash = UINT64_C(0x0123456789abcdef),
+        .duration_ns = 1234,
+        .wall_frame_ns = 16666667,
+        .frame = 42,
+        .kind = METAL_PIPELINE_EVENT_FUNCTION_SPECIALIZATION,
+        .role = METAL_PIPELINE_ROLE_RENDER,
+        .status = METAL_PIPELINE_STATUS_OK,
+        .timing_status = METAL_PIPELINE_TIMING_OK,
+        .wall_timing_status = METAL_PIPELINE_TIMING_OK,
+    };
+    uint64_t saved_max_ns = s_pipeline_diagnostic.wall_frame_max_ns;
+    uint32_t saved_max_frame = s_pipeline_diagnostic.wall_frame_max_frame;
+    s_pipeline_diagnostic.wall_frame_max_ns = event.wall_frame_ns;
+    s_pipeline_diagnostic.wall_frame_max_frame = event.frame;
+    int result = pipeline_diagnostic_format_event(&event, 7, buffer, size);
+    s_pipeline_diagnostic.wall_frame_max_ns = saved_max_ns;
+    s_pipeline_diagnostic.wall_frame_max_frame = saved_max_frame;
+    return result;
+}
+
+int bw_metal_test_pipeline_diagnostic_format_summary(char *buffer, size_t size)
+{
+    return pipeline_diagnostic_format_summary(buffer, size);
 }
 #endif

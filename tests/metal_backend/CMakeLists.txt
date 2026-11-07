@@ -103,6 +103,9 @@ foreach(case semaphore-release semaphore-concurrent visual
              seed-order command-batching async-submission-ownership
              async-cpu-write-merge async-command-failure present-surface-reuse
              perspective blend color-mask alpha-test pipeline-cache cull full-rect depth-clear
+             pipeline-diagnostic-disabled pipeline-diagnostic-lifecycle
+             pipeline-diagnostic-cache pipeline-diagnostic-report
+             pipeline-diagnostic-failure pipeline-diagnostic-invalid
              depth-draw stencil-draw polygon-offset polygon-offset-disabled polygon-offset-zero
              partial-color partial-color-masks partial-color-default-rect partial-clip partial-empty
              partial-depth partial-depth-seed partial-depth-empty partial-depth-unbound
@@ -317,4 +320,15 @@ target_link_libraries(bw_metal_lod_test PRIVATE Threads::Threads)
 set_target_properties(bw_metal_lod_test PROPERTIES C_STANDARD 11 C_STANDARD_REQUIRED ON)
 foreach(case original default off fix-off override clamp named-off runtime concurrent)
     add_test(NAME "metal_lod_${case}" COMMAND bw_metal_lod_test "${case}")
+endforeach()
+
+add_executable(bw_metal_pipeline_artifact_test
+    test_pipeline_artifact.c ../../src/gpu/bw_metal_pipeline_artifact.c)
+target_include_directories(bw_metal_pipeline_artifact_test PRIVATE ../../src/gpu)
+set_target_properties(bw_metal_pipeline_artifact_test PROPERTIES
+    C_STANDARD 11 C_STANDARD_REQUIRED ON)
+foreach(case compatible stale incompatible bounds policy corrupt)
+    add_test(NAME "metal_pipeline-artifact-${case}"
+        COMMAND bw_metal_pipeline_artifact_test "${case}")
+    set_tests_properties("metal_pipeline-artifact-${case}" PROPERTIES TIMEOUT 30)
 endforeach()

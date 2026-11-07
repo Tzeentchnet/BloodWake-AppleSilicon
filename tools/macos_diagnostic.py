@@ -321,7 +321,8 @@ def diagnostic_env(output, game_dir, seconds, quincunx, audit, input_fd, output_
                    audio_audit=False, water_preset="retail",
                    water_benchmark=False, water_capture=False,
                    capture_stem="water-capture", guided_input=False,
-                   frame_timing=False, profile_name=None, profile_from=None,
+                   frame_timing=False, pipeline_timing=False,
+                   profile_name=None, profile_from=None,
                    profile_to=None, profile_callers=False, render_scale=None,
                    frame_cap=None):
     if (synthetic_input or synthetic_input_script) and not keyboard_hook:
@@ -432,6 +433,8 @@ def diagnostic_env(output, game_dir, seconds, quincunx, audit, input_fd, output_
         env["RECOMP_PB_REPORT_MS"] = "2000"
     if frame_timing:
         env["BW_METAL_FRAME_TIMING"] = "1"
+    if pipeline_timing:
+        env["BW_METAL_PIPELINE_TIMING"] = "1"
     if profile_name:
         env["BW_PROFILE"] = str(output / profile_name)
         if profile_from is not None:
@@ -522,7 +525,8 @@ def run_guest_once(executable, output, game_dir, profile, seconds, quincunx, aud
                    audio_audit=False, water_preset="retail",
                    water_benchmark=False, water_capture=False,
                    capture_stem="water-capture", guided_input=False,
-                   frame_timing=False, profile_name=None, profile_from=None,
+                   frame_timing=False, pipeline_timing=False,
+                   profile_name=None, profile_from=None,
                    profile_to=None, profile_callers=False, render_scale=None,
                    frame_cap=None):
     input_read = input_write = output_read = output_write = -1
@@ -548,7 +552,8 @@ def run_guest_once(executable, output, game_dir, profile, seconds, quincunx, aud
                              audit_name, keyboard_hook, synthetic_input, edition, disable_audio,
                              synthetic_input_script, audio_audit, water_preset,
                              water_benchmark, water_capture, capture_stem, guided_input,
-                             frame_timing, profile_name, profile_from, profile_to,
+                             frame_timing, pipeline_timing, profile_name,
+                             profile_from, profile_to,
                              profile_callers, render_scale, frame_cap)
         with open(output / log_name, "xb") as log:
             child = subprocess.Popen(
@@ -583,6 +588,7 @@ def run_guest(executable, output, game_dir, profile, seconds, quincunx, audit,
               disable_audio=False, synthetic_input_script=None, audio_audit=False,
               water_preset="retail", water_benchmark=False,
               water_capture=False, guided_input=False, frame_timing=False,
+              pipeline_timing=False,
               profile_enabled=False, profile_from=None, profile_to=None,
               profile_callers=False, render_scale=None, frame_cap=None,
               initial_launch=b""):
@@ -598,6 +604,7 @@ def run_guest(executable, output, game_dir, profile, seconds, quincunx, audit,
                                          water_capture=water_capture,
                                          guided_input=guided_input,
                                          frame_timing=frame_timing,
+                                         pipeline_timing=pipeline_timing,
                                          profile_name="profile.txt" if profile_enabled else None,
                                          profile_from=profile_from, profile_to=profile_to,
                                          profile_callers=profile_callers,
@@ -614,6 +621,7 @@ def run_guest_relaunches(executable, output, game_dir, profile, seconds, quincun
                          synthetic_input_script=None, audio_audit=False,
                          water_preset="retail", water_benchmark=False,
                          water_capture=False, guided_input=False, frame_timing=False,
+                         pipeline_timing=False,
                          profile_enabled=False, profile_from=None, profile_to=None,
                          profile_callers=False, render_scale=None, frame_cap=None,
                          initial_launch=b""):
@@ -636,6 +644,7 @@ def run_guest_relaunches(executable, output, game_dir, profile, seconds, quincun
             water_benchmark=water_benchmark, water_capture=water_capture,
             capture_stem=f"water-capture-{boot:03d}",
             guided_input=guided_input, frame_timing=frame_timing,
+            pipeline_timing=pipeline_timing,
             profile_name=f"profile-{boot:03d}.txt" if profile_enabled else None,
             profile_from=profile_from, profile_to=profile_to,
             profile_callers=profile_callers,
@@ -1155,6 +1164,10 @@ def main(argv=None):
         help="report Metal flip timing without enabling the full GPU audit"
     )
     parser.add_argument(
+        "--pipeline-timing", action="store_true",
+        help="report bounded Metal pipeline lifecycle JSONL"
+    )
+    parser.add_argument(
         "--profile", action="store_true",
         help="write the built-in native sampling profile without enabling GPU audit"
     )
@@ -1333,6 +1346,8 @@ def main(argv=None):
             print("Guided game frames:", output / "guided-frame-NNNNN.bmp")
         if args.frame_timing:
             print("Diagnostic frame timing: enabled without full GPU audit")
+        if args.pipeline_timing:
+            print("Diagnostic pipeline timing: bounded JSONL enabled")
         if args.profile:
             print("Diagnostic sampling profile: enabled")
         if args.render_scale is not None:
@@ -1368,6 +1383,7 @@ def main(argv=None):
                     water_capture=args.water_capture,
                     guided_input=args.guided_input_capture,
                     frame_timing=args.frame_timing,
+                    pipeline_timing=args.pipeline_timing,
                     profile_enabled=args.profile,
                     profile_from=args.profile_from, profile_to=args.profile_to,
                     profile_callers=args.profile_callers,
@@ -1389,6 +1405,7 @@ def main(argv=None):
                                    water_capture=args.water_capture,
                                    guided_input=args.guided_input_capture,
                                    frame_timing=args.frame_timing,
+                                   pipeline_timing=args.pipeline_timing,
                                    profile_enabled=args.profile,
                                    profile_from=args.profile_from,
                                    profile_to=args.profile_to,

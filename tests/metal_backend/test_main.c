@@ -43,6 +43,7 @@ static uint32_t s_ab_frame;
 static uint32_t s_fence_va;
 static int s_fence_register_enabled;
 static volatile uint32_t s_fence_register;
+static uint64_t s_host_now_ns, s_host_now_step;
 static int s_failed;
 static bw_edition_t s_edition = BW_ED_ORIGINAL;
 static int s_audit_enabled;
@@ -138,7 +139,13 @@ void xbox_FramebufferWindowPresent(uint32_t va, uint32_t pitch)
 void xbox_Nv2aFrameCounterFlip(void) {}
 int nv2a_pb_scan_in_call(void) { return 0; }
 uint32_t xbox_VblankCount(void) { return 0; }
-uint64_t xbox_HostNowNs(void) { return 0; }
+uint64_t xbox_HostNowNs(void)
+{
+    uint64_t now = s_host_now_ns;
+    if (now)
+        s_host_now_ns += s_host_now_step;
+    return now;
+}
 uint32_t xbox_Nv2aFrameCountersOwned(void) { return 0; }
 volatile uint32_t *xbox_Nv2aRegPtr(uint32_t offset)
 {
@@ -968,6 +975,8 @@ static void color_mask_test(void)
                      1, "blended colour mask", 0x00010001u);
 }
 
+static void extended_basic_test(void);
+
 static void pipeline_cache_test(void)
 {
     const uint32_t factors[] = {0, 1, 0x300, 0x301, 0x302, 0x303, 0x304, 0x305, 0x306};
@@ -992,6 +1001,146 @@ static void pipeline_cache_test(void)
     flip();
     expect_no_error();
     check_pixel_near(destination, 0, "pipeline cache eviction", 0);
+}
+
+static void pipeline_diagnostic_disabled_test(void)
+{
+    BwMetalPipelineDiagnosticSnapshot snapshot;
+    bw_metal_test_pipeline_diagnostic_snapshot(&snapshot);
+    CHECK(!snapshot.enabled);
+    CHECK(snapshot.event_count == 0);
+    CHECK(snapshot.cache_hits == 0);
+    CHECK(snapshot.cache_misses == 0);
+    CHECK(snapshot.library_attempts == 0);
+    CHECK(snapshot.specialization_attempts == 0);
+    CHECK(snapshot.pipeline_attempts == 0);
+}
+
+static void pipeline_diagnostic_lifecycle_test(void)
+{
+    BwMetalPipelineDiagnosticSnapshot snapshot;
+    extended_basic_test();
+    method(0x0358, 0x00010101u);
+    triangle(0xFF807060u);
+    draw(3);
+    flip();
+    expect_no_error();
+    bw_metal_test_pipeline_diagnostic_snapshot(&snapshot);
+    CHECK(snapshot.enabled);
+    CHECK(snapshot.library_attempts == 1);
+    CHECK(snapshot.library_timed == snapshot.library_attempts);
+    CHECK(snapshot.specialization_attempts >= 2);
+    CHECK(snapshot.specialization_timed == snapshot.specialization_attempts);
+    CHECK(snapshot.pipeline_attempts >= 6);
+    CHECK(snapshot.pipeline_timed == snapshot.pipeline_attempts);
+    CHECK(snapshot.cache_misses >= 2);
+    CHECK(snapshot.wall_frame_intervals >= 1);
+    CHECK(snapshot.wall_frame_max_ns > 0);
+    CHECK(snapshot.events_on_wall_max >= 3);
+    CHECK(snapshot.timing_unavailable == 0);
+    CHECK(snapshot.timing_non_monotonic == 0);
+}
+
+static void pipeline_diagnostic_cache_test(void)
+{
+    BwMetalPipelineDiagnosticSnapshot snapshot;
+    pipeline_cache_test();
+    draw(3);
+    flip();
+    expect_no_error();
+    bw_metal_test_pipeline_diagnostic_snapshot(&snapshot);
+    CHECK(snapshot.enabled);
+    CHECK(snapshot.cache_hits >= 1);
+    CHECK(snapshot.cache_misses == 130);
+    CHECK(snapshot.cache_entry_high_water == 128);
+    CHECK(snapshot.whole_cache_resets == 1);
+}
+
+static void pipeline_diagnostic_report_test(void)
+{
+    static const char expected_event[] =
+        "{\"schema\":\"bloodwake.metal-pipeline-lifecycle/v1\","
+        "\"record\":\"event\",\"sequence\":7,"
+        "\"kind\":\"function_specialization\","
+        "\"key_hash\":\"0123456789abcdef\",\"frame\":42,"
+        "\"command_role\":\"render\",\"status\":\"ok\","
+        "\"timing_status\":\"ok\",\"duration_ns\":1234,"
+        "\"wall_timing_status\":\"ok\",\"wall_frame_ns\":16666667,"
+        "\"wall_frame_max_so_far\":true}";
+    static const char expected_summary[] =
+        "{\"schema\":\"bloodwake.metal-pipeline-lifecycle/v1\","
+        "\"record\":\"summary\",\"sequence\":0,\"enabled\":true,"
+        "\"event_capacity\":512,\"events_recorded\":0,\"events_reported\":0,"
+        "\"events_dropped\":0,\"cache_hits\":0,"
+        "\"cache_misses\":0,\"cache_entry_high_water\":0,"
+        "\"cache_entry_limit\":128,\"whole_cache_resets\":0,"
+        "\"library_attempts\":0,\"library_timed\":0,\"library_total_ns\":0,"
+        "\"library_max_ns\":0,\"specialization_attempts\":0,"
+        "\"specialization_timed\":0,\"specialization_total_ns\":0,"
+        "\"specialization_max_ns\":0,\"pipeline_attempts\":0,"
+        "\"pipeline_timed\":0,\"pipeline_total_ns\":0,\"pipeline_max_ns\":0,"
+        "\"wall_frame_intervals\":0,\"wall_frame_max_frame\":null,"
+        "\"wall_frame_max_ns\":null,\"timing_unavailable\":0,"
+        "\"timing_non_monotonic\":0,\"wall_timing_unavailable\":0,"
+        "\"wall_timing_non_monotonic\":0,\"allocation_failures\":0,"
+        "\"metal_failures\":0}";
+    static const char *prohibited[] = {
+        "descriptor", "combiner", "function_constants", "retail",
+        "texture_identity", "address", "\"va\"",
+    };
+    char event[1024], summary[2048], too_small[32];
+    BwMetalPipelineDiagnosticSnapshot snapshot;
+    bw_metal_test_pipeline_diagnostic_clear();
+    CHECK(bw_metal_test_pipeline_diagnostic_format_event(event, sizeof event));
+    CHECK(!strcmp(event, expected_event));
+    CHECK(!bw_metal_test_pipeline_diagnostic_format_event(
+        too_small, sizeof too_small));
+    CHECK(bw_metal_test_pipeline_diagnostic_format_summary(
+        summary, sizeof summary));
+    CHECK(!strcmp(summary, expected_summary));
+    for (size_t i = 0; i < sizeof prohibited / sizeof prohibited[0]; i++) {
+        CHECK(!strstr(event, prohibited[i]));
+        CHECK(!strstr(summary, prohibited[i]));
+    }
+    for (uint64_t i = 0; i < 515; i++)
+        bw_metal_test_pipeline_diagnostic_inject_cache_miss(
+            UINT64_C(0x8000000000000000) | i, (uint32_t)i);
+    bw_metal_test_pipeline_diagnostic_snapshot(&snapshot);
+    CHECK(snapshot.event_capacity == 512);
+    CHECK(snapshot.event_count == snapshot.event_capacity);
+    CHECK(snapshot.events_dropped == 3);
+    CHECK(snapshot.cache_misses == 515);
+    CHECK(bw_metal_test_pipeline_diagnostic_format_summary(
+        summary, sizeof summary));
+    CHECK(strstr(summary, "\"events_recorded\":512"));
+    CHECK(strstr(summary, "\"events_dropped\":3"));
+    bw_metal_test_pipeline_diagnostic_clear();
+}
+
+static void pipeline_diagnostic_failure_test(void)
+{
+    BwMetalPipelineDiagnosticSnapshot snapshot;
+    bw_metal_test_pipeline_diagnostic_snapshot(&snapshot);
+    CHECK(snapshot.enabled);
+    CHECK(snapshot.library_attempts == 1);
+    CHECK(snapshot.pipeline_attempts == 4);
+    CHECK(snapshot.timing_unavailable ==
+          snapshot.library_attempts + snapshot.pipeline_attempts);
+    CHECK(snapshot.library_timed == 0);
+    CHECK(snapshot.pipeline_timed == 0);
+
+    bw_metal_test_pipeline_diagnostic_clear();
+    bw_metal_test_fail_next_pipeline_allocation();
+    triangle(0xFF102030u);
+    draw(3);
+    CHECK(bw_metal_backend_error() &&
+          strstr(bw_metal_backend_error(), "draw pipeline descriptor"));
+    bw_metal_test_pipeline_diagnostic_snapshot(&snapshot);
+    CHECK(snapshot.cache_misses == 1);
+    CHECK(snapshot.pipeline_attempts == 1);
+    CHECK(snapshot.pipeline_timed == 0);
+    CHECK(snapshot.allocation_failures == 1);
+    CHECK(snapshot.metal_failures == 0);
 }
 
 static void cull_test(void)
@@ -6451,6 +6600,7 @@ int main(int argc, char **argv)
     unsetenv("BW_METAL_WATER_CAPTURE_TRIGGER");
     unsetenv("BW_NATIVE_DIAGNOSTIC");
     unsetenv("BW_GPU_AUDIT");
+    unsetenv("BW_METAL_PIPELINE_TIMING");
     unsetenv("RECOMP_WINDOW_SCALE");
     if (!strcmp(argv[1], "render-scale-auto")) {
         setenv("BW_METAL_RENDER_SCALE", "auto", 1);
@@ -6522,6 +6672,18 @@ int main(int argc, char **argv)
         setenv("BW_METAL_WATER", "cinematic", 1);
     } else if (!strcmp(argv[1], "water-preset-original-env")) {
         setenv("BW_METAL_WATER", "realistic", 1);
+    } else if (!strcmp(argv[1], "pipeline-diagnostic-invalid")) {
+        setenv("BW_METAL_PIPELINE_TIMING", "true", 1);
+    } else if (strncmp(argv[1], "pipeline-diagnostic-",
+                       sizeof("pipeline-diagnostic-") - 1u) ||
+               !strcmp(argv[1], "pipeline-diagnostic-disabled")) {
+        /* No pipeline diagnostic setup. */
+    } else {
+        setenv("BW_METAL_PIPELINE_TIMING", "1", 1);
+        if (strcmp(argv[1], "pipeline-diagnostic-failure")) {
+            s_host_now_ns = UINT64_C(1000000000);
+            s_host_now_step = 1000;
+        }
     }
     setenv("BW_IMMEDIATE_PRESENT", "1", 1);
     memset(s_mem, 0, sizeof s_mem);
@@ -6571,6 +6733,14 @@ int main(int argc, char **argv)
               strstr(bw_metal_backend_error(),
                      !strcmp(argv[1], "water-preset-invalid")
                          ? "BW_METAL_WATER must be" : "requires Remastered"));
+        bw_metal_backend_stop();
+        return s_failed ? 1 : 0;
+    }
+    if (!strcmp(argv[1], "pipeline-diagnostic-invalid")) {
+        CHECK(!bw_metal_backend_start_for_test(s_mem, sizeof s_mem));
+        CHECK(bw_metal_backend_error() &&
+              strstr(bw_metal_backend_error(),
+                     "BW_METAL_PIPELINE_TIMING must be 1 when set"));
         bw_metal_backend_stop();
         return s_failed ? 1 : 0;
     }
@@ -6637,6 +6807,16 @@ int main(int argc, char **argv)
         alpha_test();
     else if (!strcmp(argv[1], "pipeline-cache"))
         pipeline_cache_test();
+    else if (!strcmp(argv[1], "pipeline-diagnostic-disabled"))
+        pipeline_diagnostic_disabled_test();
+    else if (!strcmp(argv[1], "pipeline-diagnostic-lifecycle"))
+        pipeline_diagnostic_lifecycle_test();
+    else if (!strcmp(argv[1], "pipeline-diagnostic-cache"))
+        pipeline_diagnostic_cache_test();
+    else if (!strcmp(argv[1], "pipeline-diagnostic-report"))
+        pipeline_diagnostic_report_test();
+    else if (!strcmp(argv[1], "pipeline-diagnostic-failure"))
+        pipeline_diagnostic_failure_test();
     else if (!strcmp(argv[1], "cull"))
         cull_test();
     else if (!strcmp(argv[1], "full-rect"))

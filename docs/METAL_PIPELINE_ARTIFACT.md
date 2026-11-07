@@ -1,0 +1,109 @@
+# Metal pipeline-artifact contract
+
+Status: PERF-029 compatibility contract
+
+This contract defines how later Metal pipeline warm-up work identifies and
+rejects local artifacts. It does not generate an offline `.metallib`, record
+pipeline keys, create or load a binary archive, prewarm a pipeline, or change
+runtime pipeline compilation. Those behaviors remain in PERF-030 through
+PERF-032.
+
+## Artifact classes
+
+Project-owned offline shader output is a normal build product. It is not a
+`.bwmpa` file and must not contain game-derived inputs.
+
+Trace-derived key sets and compiled binary archives are private, device-local
+`.bwmpa` files. They must live under an owner-controlled host cache directory,
+outside the source tree, prepared game tree, saves, and diagnostic output
+intended for publication. The repository ignores `.bwmpa` files and its
+pre-commit guard rejects them, but those safeguards do not replace correct
+private storage.
+
+The version-1 artifact kinds are:
+
+- `1`, trace-derived pipeline keys; and
+- `2`, a device-built Metal binary archive.
+
+PERF-029 defines and validates the common envelope only. It has no production
+writer and does not interpret either payload.
+
+## Version-1 envelope
+
+The envelope is exactly 176 bytes, uses little-endian integers, and precedes
+the payload. The total file is limited to 64 MiB and the declared entry count
+is limited to 4,096.
+
+| Offset | Bytes | Field | Version-1 rule |
+| ---: | ---: | --- | --- |
+| 0 | 8 | Magic | `BWMPA01` followed by NUL |
+| 8 | 4 | Format version | `1` |
+| 12 | 4 | Header bytes | `176` |
+| 16 | 4 | Artifact kind | Trace keys or binary archive |
+| 20 | 4 | Flags | Device-local bit only (`1`) |
+| 24 | 4 | Backend ABI | Exact match |
+| 28 | 4 | Pipeline-key schema | Exact match |
+| 32 | 32 | Stable shader SHA-256 | Exact source/build identity |
+| 64 | 32 | Executable SHA-256 | Exact executable identity |
+| 96 | 12 | OS major/minor/patch | Exact match |
+| 108 | 4 | SDK version | Exact build-SDK identity |
+| 112 | 4 | Metal feature level | Exact contract-defined capability level |
+| 116 | 4 | GPU family | Exact selected Metal GPU family |
+| 120 | 8 | Payload bytes | Nonzero and within the total-size limit |
+| 128 | 4 | Entry count | 1 through 4,096 |
+| 132 | 4 | Reserved | Zero |
+| 136 | 32 | Payload SHA-256 | Nonzero and verified before selection |
+| 168 | 8 | Reserved | Zero |
+
+Backend ABI and pipeline-key schema both start at version 1. Changing command
+ownership, artifact-facing backend semantics, or the canonical pipeline key
+layout requires the corresponding version to advance. The stable shader hash
+is SHA-256 over the exact project-owned stable shader bytes used by the build.
+The executable hash is SHA-256 over the executable that will consume the
+artifact. OS, SDK, feature-level, and GPU-family values are captured as
+explicit integers by the future producer and consumer; display names and
+device registry identifiers are not part of the key.
+
+The fixed envelope contains no pipeline descriptor, combiner word,
+function-constant value, texture identity, guest or host address, or raw
+retail-derived state. A future trace payload remains private and must define
+its own bounded encoding under the versioned pipeline-key schema. A future
+binary-archive payload remains opaque Metal data bound to the complete
+identity above.
+
+## Validation and fallback
+
+Validation requires an absolute `.bwmpa` path. The final path component must
+not be a symlink. The opened object must be a regular, single-link file owned
+by the current user with no group or other permissions. The validator uses
+`O_NOFOLLOW`, bounds the file before reading, reads without allocation,
+verifies the payload SHA-256, and confirms that file identity, size, mode,
+link count, and modification state did not change during validation.
+
+The stable machine-readable status values are:
+
+- `compatible`;
+- `invalid_argument`;
+- `unsupported_platform`;
+- `missing`;
+- `symlink_rejected`;
+- `policy_rejected`;
+- `io_error`;
+- `over_limit`;
+- `truncated`;
+- `trailing_data`;
+- `invalid_format`;
+- `stale`;
+- `incompatible`; and
+- `corrupt`.
+
+Shader-hash or executable-hash mismatches are `stale`. Backend ABI,
+pipeline-key schema, artifact kind, OS, SDK, Metal feature-level, or GPU-family
+mismatches are `incompatible`. Structural errors, truncation, trailing bytes,
+policy failures, and limits remain separately visible.
+
+Only `compatible` selects the artifact. Every other status selects explicit
+runtime compilation while retaining the rejection status for reporting.
+Absence of the selected Metal API is likewise `unsupported_platform` plus
+runtime compilation. A caller must never report artifact success after this
+fallback, hide a compilation failure, or return a missing pipeline.

@@ -328,6 +328,12 @@ guest execution.
 
 For a low-instrumentation performance run, use `--frame-timing` without
 `--gpu-audit`. It enables only the Metal completed-flip interval report.
+Add `--pipeline-timing` to opt into bounded
+`bloodwake.metal-pipeline-lifecycle/v1` JSONL. It sets the exact-value
+`BW_METAL_PIPELINE_TIMING=1` child switch, retains at most 512 expensive
+pipeline events and 64 summaries, and reports cache hits only in aggregate.
+The records contain canonical-key hashes and timing/classification data, not
+descriptors or retail-derived fields. Keep the resulting logs private.
 `--profile` enables the existing approximately 1 kHz native thread sampler;
 `--profile-from` and `--profile-to` bound its per-boot window. Fixed
 `--render-scale 1`, `2.25`, or `4` and `--frame-cap 30`, `60`, or `120` make
