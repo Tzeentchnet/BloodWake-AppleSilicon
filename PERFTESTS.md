@@ -547,15 +547,64 @@ performance evidence; their frame maxima do not advance PERF-033. The logs,
 save data, relaunch record, event hashes, and other private artifacts remain
 outside the repository.
 
+#### PERF-031 implementation evidence
+
+PERF-031 defines the kind-1 trace payload under pipeline-key schema version 1.
+Each canonical key is exactly 57 little-endian 32-bit words (228 bytes);
+records are bytewise sorted, unique, and capped at 128 entries to match the
+unchanged draw-pipeline cache limit. Encoding and decoding use fixed storage.
+Capture is disabled by default and records only successful draw states when
+`BW_METAL_PIPELINE_TRACE_OUTPUT` names a bounded absolute `.bwmpa` path.
+Frame-boundary writes use an owner-only temporary file, payload digest,
+`fsync`, and atomic replacement inside an owner-controlled directory.
+
+`BW_METAL_PIPELINE_WARMUP` validates the PERF-029 envelope and identity,
+reads at most the fixed trace bound, verifies ordering and key semantics before
+creating any state, then preloads every state before the first draw. A missing,
+stale, corrupt, over-limit, malformed, semantically invalid, allocation-failed,
+or Metal-failed artifact emits one bounded aggregate
+`bloodwake.metal-pipeline-warmup/v1` status and retains synchronous runtime
+creation. Partial preload is cleared on failure. Reports contain only statuses
+and aggregate counts, never paths, keys, descriptors, combiner words, function
+constants, texture identities, or addresses. The current 128-entry whole-cache
+policy is unchanged.
+
+Four deterministic payload cases, seven artifact-envelope/I/O cases, two
+direct backend switch cases, and one multi-process capture/load/rejection
+integration case pass (14/14) normally and under ASan/UBSan with leak detection
+disabled. The integration case covers compatible preload hits, missing,
+stale, corrupt, semantically invalid, forced allocation failure, owner-policy
+write failure, bounded 128-entry capture, stable JSON shape, and prohibited
+field absence. The macOS diagnostic runner suite passes 61/61, strict C and
+Objective-C warning builds pass, the complete Metal backend suite passes
+362/362, and the production target rebuilds with real offline shader
+libraries.
+
+A private no-controller production smoke pair exercised the runner path only.
+The first bounded run wrote a private mode-0600, single-link artifact with 15
+entries, zero drops, two successful atomic updates, and no write failure. The
+second run validated and preloaded all 15 states; its lifecycle aggregate
+contained the four fixed startup pipelines plus 15 preload creations and 14
+startup specializations, followed by 1,073,994 draw-cache hits and zero misses.
+The title remained paused behind its reconnect-controller overlay, so this is
+capture/preload mechanics evidence, not representative gameplay, cold-maxima,
+or performance evidence. All artifacts and key contents remain private and
+uncommitted.
+
+PERF-031 deliberately preloads validated canonical keys and does not yet create
+an opaque Metal binary archive. PERF-033 cold qualification can determine
+whether startup preload time warrants the separately contract-defined kind-2
+archive; it must not be added speculatively or shipped from retail-derived
+data.
+
 The remaining implementation sequence is:
 
-1. compile stable project-owned Metal source into an offline library;
-2. generate any trace-derived pipeline archive locally from the user's retail
-   execution and never commit or distribute it;
-3. preload validated local pipeline states before their first gameplay use;
-4. compile rare misses asynchronously while the exact generic Retail pipeline
+1. compile rare misses asynchronously while the exact generic Retail pipeline
    remains available; and
-5. replace whole-cache eviction only if measured state pressure requires it.
+2. replace whole-cache eviction only if measured state pressure requires it;
+3. capture a representative gameplay trace with a connected controller; and
+4. qualify cold behavior and evaluate a kind-2 Metal binary archive only if
+   measured startup preload time requires it.
 
 This follows Apple's current
 [Metal 4 compilation guidance](https://developer.apple.com/documentation/metal/using-the-metal-4-compilation-api),

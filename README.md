@@ -122,10 +122,10 @@ This is still a development build:
 The steady-state representative target is closed. Work now proceeds in this
 order:
 
-1. Build the versioned, device-local pipeline warm-up and archive path on the
-   now-validated stable offline Metal libraries. Missing or rejected libraries
-   retain explicit source compilation. Retail-derived traces and archives
-   remain private.
+1. Add asynchronous exact handling for rare pipeline misses on the validated
+   offline-library and device-local trace warm-up path. Missing or rejected
+   artifacts retain synchronous runtime creation. Retail-derived traces and
+   archives remain private.
 2. Measure drawable acquisition, flip release, command completion, and actual
    presentation timestamps before evaluating a gated `CAMetalDisplayLink`
    match-display path. The current path remains the fallback.

@@ -317,13 +317,65 @@ static int corrupt_test(const char *path)
     return 1;
 }
 
+static int io_test(const char *directory, const char *path, const char *executable)
+{
+    uint8_t payload[sizeof s_payload], digest[32];
+    BwMetalPipelineArtifactMetadata metadata = sample_metadata();
+    BwMetalPipelineArtifactResult result;
+    BwMetalPipelineArtifactStatus status;
+    struct stat state;
+    size_t payload_size = 0;
+    CHECK(bw_metal_pipeline_artifact_path_is_valid(path));
+    CHECK(!bw_metal_pipeline_artifact_path_is_valid("relative.bwmpa"));
+    status = bw_metal_pipeline_artifact_write_path(
+        path, metadata.kind, &metadata.identity, s_payload, sizeof s_payload,
+        metadata.entry_count);
+    CHECK(status == BW_METAL_PIPELINE_ARTIFACT_OK);
+    CHECK(stat(path, &state) == 0);
+    CHECK((state.st_mode & 0777u) == 0600u);
+    result = bw_metal_pipeline_artifact_read_path(
+        path, metadata.kind, &metadata.identity,
+        payload, sizeof payload, &payload_size);
+    CHECK(result.status == BW_METAL_PIPELINE_ARTIFACT_OK);
+    CHECK(payload_size == sizeof s_payload);
+    CHECK(!memcmp(payload, s_payload, sizeof payload));
+    payload[0] ^= 1u;
+    status = bw_metal_pipeline_artifact_write_path(
+        path, metadata.kind, &metadata.identity, payload, sizeof payload,
+        metadata.entry_count);
+    CHECK(status == BW_METAL_PIPELINE_ARTIFACT_OK);
+    memset(payload, 0, sizeof payload);
+    result = bw_metal_pipeline_artifact_read_path(
+        path, metadata.kind, &metadata.identity,
+        payload, sizeof payload - 1u, &payload_size);
+    CHECK(result.status == BW_METAL_PIPELINE_ARTIFACT_LIMIT);
+    CHECK(payload_size == 0);
+    CHECK(bw_metal_pipeline_artifact_sha256_file(executable, digest) ==
+          BW_METAL_PIPELINE_ARTIFACT_OK);
+    CHECK(memcmp(digest, (uint8_t[32]){0}, sizeof digest));
+    CHECK(unlink(path) == 0);
+    CHECK(symlink(executable, path) == 0);
+    CHECK(bw_metal_pipeline_artifact_write_path(
+              path, metadata.kind, &metadata.identity,
+              s_payload, sizeof s_payload, metadata.entry_count) ==
+          BW_METAL_PIPELINE_ARTIFACT_SYMLINK);
+    CHECK(unlink(path) == 0);
+    CHECK(chmod(directory, 0755) == 0);
+    CHECK(bw_metal_pipeline_artifact_write_path(
+              path, metadata.kind, &metadata.identity,
+              s_payload, sizeof s_payload, metadata.entry_count) ==
+          BW_METAL_PIPELINE_ARTIFACT_POLICY);
+    CHECK(chmod(directory, 0700) == 0);
+    return 1;
+}
+
 int main(int argc, char **argv)
 {
     char directory[] = "/tmp/bw-metal-artifact-XXXXXX";
     char path[1024];
     int ok = 0;
     if (argc != 2 || !mkdtemp(directory)) {
-        fprintf(stderr, "usage: %s <compatible|stale|incompatible|bounds|policy|corrupt>\n",
+        fprintf(stderr, "usage: %s <compatible|stale|incompatible|bounds|policy|corrupt|io>\n",
                 argv[0]);
         return 2;
     }
@@ -340,6 +392,8 @@ int main(int argc, char **argv)
         ok = policy_test(directory, path);
     else if (!strcmp(argv[1], "corrupt"))
         ok = corrupt_test(path);
+    else if (!strcmp(argv[1], "io"))
+        ok = io_test(directory, path, argv[0]);
     if (access(path, F_OK) == 0)
         (void)unlink(path);
     if (rmdir(directory) != 0)

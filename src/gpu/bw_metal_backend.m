@@ -3,6 +3,7 @@
 #import <QuartzCore/CAMetalLayer.h>
 #import <dispatch/dispatch.h>
 
+#include <mach-o/dyld.h>
 #include <float.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -20,6 +21,8 @@
 #include "bw_metal_backend.h"
 #include "bw_backend_sync.h"
 #include "bw_gamma.h"
+#include "bw_metal_pipeline_artifact.h"
+#include "bw_metal_pipeline_trace.h"
 #include "bw_metal_shader_data.inc"
 #include "../bw_edition.h"
 #include "d3d/d3d8_swizzle.h"
@@ -47,6 +50,9 @@ extern uint64_t xbox_HostNowNs(void);
 #define METAL_PIPELINE_SUMMARY_CAPACITY 64u
 #define METAL_PIPELINE_REPORT_LINE_MAX 2048u
 #define METAL_PIPELINE_SCHEMA "bloodwake.metal-pipeline-lifecycle/v2"
+#define METAL_PIPELINE_WARMUP_SCHEMA "bloodwake.metal-pipeline-warmup/v1"
+#define METAL_PIPELINE_WARMUP_REPORT_CAPACITY 16u
+#define METAL_PIPELINE_FEATURE_LEVEL 1u
 #if defined(BW_METAL_TESTING)
 #define METAL_WATER_BENCHMARK_WARMUP_FRAMES 1u
 #define METAL_WATER_BENCHMARK_SAMPLE_FRAMES 2u
@@ -104,14 +110,7 @@ typedef struct {
     uint32_t dot[4];
 } MetalExtendedUniforms;
 
-typedef struct {
-    uint32_t textured, color_mask, fixed_alpha_zero;
-    uint32_t blend_enable, blend_src, blend_dst, blend_eq;
-    uint32_t depth_attachment;
-    uint32_t specialized;
-    uint32_t texture[4], stages[4], dot[4];
-    uint32_t combiner[8][4], final[2], alpha[2];
-} MetalPipelineKey;
+typedef BwMetalPipelineTraceKey MetalPipelineKey;
 
 typedef struct {
     uint32_t texture[4], stages[4], dot[4];
@@ -192,6 +191,30 @@ typedef struct {
     uint64_t wall_frame_intervals, wall_frame_max_ns;
     uint32_t wall_frame_max_frame;
 } MetalPipelineDiagnostic;
+
+typedef enum {
+    METAL_PIPELINE_WARMUP_NOT_CHECKED,
+    METAL_PIPELINE_WARMUP_PAYLOAD_OK,
+    METAL_PIPELINE_WARMUP_PAYLOAD_INVALID,
+    METAL_PIPELINE_WARMUP_KEY_INVALID,
+    METAL_PIPELINE_WARMUP_PIPELINE_FAILED,
+} MetalPipelineWarmupPayloadStatus;
+
+typedef struct {
+    char load_path[PATH_MAX], trace_path[PATH_MAX];
+    BwMetalPipelineArtifactIdentity identity;
+    BwMetalPipelineArtifactStatus identity_status, load_artifact_status;
+    BwMetalPipelineArtifactStatus trace_write_status;
+    BwMetalPipelineTraceStatus load_trace_status;
+    MetalPipelineWarmupPayloadStatus load_payload_status;
+    MetalPipelineKey trace_keys[BW_METAL_PIPELINE_TRACE_MAX_ENTRIES];
+    size_t load_entries, preloaded_entries, trace_entries;
+    uint64_t trace_entries_dropped;
+    uint64_t trace_write_attempts, trace_write_successes;
+    uint64_t trace_write_failures;
+    unsigned trace_reports;
+    int identity_ready, trace_dirty, trace_disabled, final_reported;
+} MetalPipelineWarmup;
 
 typedef struct {
     uint32_t depth_test, depth_func, depth_write, stencil_enable;
@@ -351,6 +374,7 @@ static uint64_t s_guest_publication_bytes;
 static uint64_t s_queue_saturation_waits;
 static uint64_t s_queue_saturation_wait_ns;
 static unsigned s_queue_depth_high_water;
+static MetalPipelineWarmup s_pipeline_warmup;
 static NSMutableDictionary<NSData *, id<MTLRenderPipelineState>> *s_pipelines;
 static NSMutableDictionary<NSNumber *, id<MTLRenderPipelineState>> *s_clear_pipelines;
 static NSMutableDictionary<NSData *, BWMetalColorSurface *> *s_color_surfaces;
@@ -387,6 +411,7 @@ static int s_test_async_display;
 static int s_test_defer_retirement;
 static int s_test_fail_next_submission;
 static int s_test_fail_next_pipeline_allocation;
+static int s_test_fail_warmup_pipeline;
 static int s_test_fail_offline_library;
 static int s_test_fail_source_library;
 #endif
@@ -907,6 +932,231 @@ static void pipeline_diagnostic_report(void)
     s_pipeline_diagnostic.summary_dirty = 1;
     pipeline_diagnostic_emit_summary(1);
     s_pipeline_diagnostic.final_reported = 1;
+}
+
+static const char *pipeline_warmup_payload_status_string(
+    MetalPipelineWarmupPayloadStatus status)
+{
+    switch (status) {
+    case METAL_PIPELINE_WARMUP_NOT_CHECKED: return "not_checked";
+    case METAL_PIPELINE_WARMUP_PAYLOAD_OK: return "compatible";
+    case METAL_PIPELINE_WARMUP_PAYLOAD_INVALID: return "invalid_payload";
+    case METAL_PIPELINE_WARMUP_KEY_INVALID: return "invalid_key";
+    case METAL_PIPELINE_WARMUP_PIPELINE_FAILED: return "pipeline_failed";
+    default: return "unknown_status";
+    }
+}
+
+static void pipeline_warmup_report_load(void)
+{
+    if (!s_pipeline_warmup.load_path[0])
+        return;
+    fprintf(stderr,
+            "{\"schema\":\"" METAL_PIPELINE_WARMUP_SCHEMA "\","
+            "\"record\":\"load\",\"artifact_status\":\"%s\","
+            "\"payload_status\":\"%s\",\"entries\":%zu,"
+            "\"preloaded\":%zu,\"runtime_fallback\":%s}\n",
+            bw_metal_pipeline_artifact_status_string(
+                s_pipeline_warmup.load_artifact_status),
+            pipeline_warmup_payload_status_string(
+                s_pipeline_warmup.load_payload_status),
+            s_pipeline_warmup.load_entries,
+            s_pipeline_warmup.preloaded_entries,
+            s_pipeline_warmup.load_payload_status ==
+                    METAL_PIPELINE_WARMUP_PAYLOAD_OK
+                ? "false" : "true");
+}
+
+static void pipeline_warmup_report_trace(int final)
+{
+    unsigned limit = final ? METAL_PIPELINE_WARMUP_REPORT_CAPACITY
+                           : METAL_PIPELINE_WARMUP_REPORT_CAPACITY - 1u;
+    if (!s_pipeline_warmup.trace_path[0] ||
+        s_pipeline_warmup.trace_reports >= limit ||
+        (final && s_pipeline_warmup.final_reported))
+        return;
+    const char *status = s_pipeline_warmup.trace_write_attempts
+                       ? bw_metal_pipeline_artifact_status_string(
+                             s_pipeline_warmup.trace_write_status)
+                       : s_pipeline_warmup.identity_ready
+                             ? "not_written" : "identity_unavailable";
+    fprintf(stderr,
+            "{\"schema\":\"" METAL_PIPELINE_WARMUP_SCHEMA "\","
+            "\"record\":\"trace\",\"status\":\"%s\",\"entries\":%zu,"
+            "\"entries_dropped\":%llu,\"write_attempts\":%llu,"
+            "\"write_successes\":%llu,\"write_failures\":%llu,"
+            "\"final\":%s}\n",
+            status, s_pipeline_warmup.trace_entries,
+            (unsigned long long)s_pipeline_warmup.trace_entries_dropped,
+            (unsigned long long)s_pipeline_warmup.trace_write_attempts,
+            (unsigned long long)s_pipeline_warmup.trace_write_successes,
+            (unsigned long long)s_pipeline_warmup.trace_write_failures,
+            final ? "true" : "false");
+    s_pipeline_warmup.trace_reports++;
+    if (final)
+        s_pipeline_warmup.final_reported = 1;
+}
+
+static int configure_pipeline_warmup(void)
+{
+    const char *load = getenv("BW_METAL_PIPELINE_WARMUP");
+    const char *trace = getenv("BW_METAL_PIPELINE_TRACE_OUTPUT");
+    memset(&s_pipeline_warmup, 0, sizeof s_pipeline_warmup);
+    s_pipeline_warmup.identity_status =
+        BW_METAL_PIPELINE_ARTIFACT_UNSUPPORTED;
+    s_pipeline_warmup.load_artifact_status =
+        BW_METAL_PIPELINE_ARTIFACT_MISSING;
+    s_pipeline_warmup.trace_write_status =
+        BW_METAL_PIPELINE_ARTIFACT_MISSING;
+    s_pipeline_warmup.load_trace_status =
+        BW_METAL_PIPELINE_TRACE_ARGUMENT;
+    if (load) {
+        if (!bw_metal_pipeline_artifact_path_is_valid(load))
+            return metal_fail(
+                "BW_METAL_PIPELINE_WARMUP must be a bounded absolute .bwmpa path");
+        memcpy(s_pipeline_warmup.load_path, load, strlen(load) + 1u);
+    }
+    if (trace) {
+        if (!bw_metal_pipeline_artifact_path_is_valid(trace))
+            return metal_fail(
+                "BW_METAL_PIPELINE_TRACE_OUTPUT must be a bounded absolute .bwmpa path");
+        memcpy(s_pipeline_warmup.trace_path, trace, strlen(trace) + 1u);
+    }
+    if (s_pipeline_warmup.load_path[0] &&
+        !strcmp(s_pipeline_warmup.load_path,
+                s_pipeline_warmup.trace_path))
+        return metal_fail(
+            "BW_METAL_PIPELINE_WARMUP and BW_METAL_PIPELINE_TRACE_OUTPUT must name different files");
+    return 1;
+}
+
+static int decode_hex_digest(
+    const char *text,
+    uint8_t digest[BW_METAL_PIPELINE_ARTIFACT_DIGEST_BYTES])
+{
+    if (!text || strlen(text) != BW_METAL_PIPELINE_ARTIFACT_DIGEST_BYTES * 2u)
+        return 0;
+    for (size_t i = 0; i < BW_METAL_PIPELINE_ARTIFACT_DIGEST_BYTES; i++) {
+        unsigned value = 0;
+        for (size_t nibble = 0; nibble < 2; nibble++) {
+            unsigned char c = (unsigned char)text[i * 2u + nibble];
+            unsigned digit = c >= '0' && c <= '9' ? c - '0'
+                           : c >= 'a' && c <= 'f' ? c - 'a' + 10u
+                                                 : 16u;
+            if (digit >= 16u)
+                return 0;
+            value = value * 16u + digit;
+        }
+        digest[i] = (uint8_t)value;
+    }
+    return 1;
+}
+
+static uint32_t pipeline_gpu_family(void)
+{
+    if (@available(macOS 10.15, *))
+        for (uint32_t family = 1011u; family >= 1001u; family--)
+            if ([s_device supportsFamily:(MTLGPUFamily)family])
+                return family;
+    return 0;
+}
+
+static BwMetalPipelineArtifactStatus pipeline_warmup_build_identity(void)
+{
+    char executable[PATH_MAX], resolved[PATH_MAX];
+    uint32_t executable_size = sizeof executable;
+    NSOperatingSystemVersion version;
+    BwMetalPipelineArtifactIdentity *identity = &s_pipeline_warmup.identity;
+    memset(identity, 0, sizeof *identity);
+    identity->backend_abi = BW_METAL_PIPELINE_BACKEND_ABI_VERSION;
+    identity->pipeline_key_schema = BW_METAL_PIPELINE_KEY_SCHEMA_VERSION;
+    if (!decode_hex_digest(s_metal_shader_source_sha256,
+                           identity->stable_shader_sha256))
+        return BW_METAL_PIPELINE_ARTIFACT_FORMAT;
+    if (_NSGetExecutablePath(executable, &executable_size) != 0)
+        return BW_METAL_PIPELINE_ARTIFACT_LIMIT;
+    if (!realpath(executable, resolved))
+        return BW_METAL_PIPELINE_ARTIFACT_IO;
+    BwMetalPipelineArtifactStatus status =
+        bw_metal_pipeline_artifact_sha256_file(
+            resolved, identity->executable_sha256);
+    if (status != BW_METAL_PIPELINE_ARTIFACT_OK)
+        return status;
+    version = NSProcessInfo.processInfo.operatingSystemVersion;
+    if (version.majorVersion <= 0 || version.minorVersion < 0 ||
+        version.patchVersion < 0)
+        return BW_METAL_PIPELINE_ARTIFACT_UNSUPPORTED;
+    identity->os_major = (uint32_t)version.majorVersion;
+    identity->os_minor = (uint32_t)version.minorVersion;
+    identity->os_patch = (uint32_t)version.patchVersion;
+    identity->sdk_version = __MAC_OS_X_VERSION_MAX_ALLOWED;
+    identity->metal_feature_level = METAL_PIPELINE_FEATURE_LEVEL;
+    identity->gpu_family = pipeline_gpu_family();
+    return identity->gpu_family ? BW_METAL_PIPELINE_ARTIFACT_OK
+                                : BW_METAL_PIPELINE_ARTIFACT_UNSUPPORTED;
+}
+
+static void pipeline_trace_record(const MetalPipelineKey *key)
+{
+    if (!s_pipeline_warmup.trace_path[0] ||
+        !s_pipeline_warmup.identity_ready ||
+        s_pipeline_warmup.trace_disabled)
+        return;
+    for (size_t i = 0; i < s_pipeline_warmup.trace_entries; i++)
+        if (!memcmp(&s_pipeline_warmup.trace_keys[i], key, sizeof *key))
+            return;
+    if (s_pipeline_warmup.trace_entries >=
+        BW_METAL_PIPELINE_TRACE_MAX_ENTRIES) {
+        s_pipeline_warmup.trace_entries_dropped++;
+        return;
+    }
+    s_pipeline_warmup.trace_keys[s_pipeline_warmup.trace_entries++] = *key;
+    s_pipeline_warmup.trace_dirty = 1;
+}
+
+static void pipeline_trace_flush(int final)
+{
+    uint8_t payload[BW_METAL_PIPELINE_TRACE_MAX_PAYLOAD_BYTES];
+    size_t payload_size;
+    BwMetalPipelineTraceStatus trace_status;
+    if (!s_pipeline_warmup.trace_path[0])
+        return;
+    if (s_pipeline_warmup.trace_dirty &&
+        s_pipeline_warmup.identity_ready &&
+        !s_pipeline_warmup.trace_disabled) {
+        payload_size = bw_metal_pipeline_trace_payload_size(
+            s_pipeline_warmup.trace_entries);
+        trace_status = bw_metal_pipeline_trace_encode(
+            s_pipeline_warmup.trace_keys,
+            s_pipeline_warmup.trace_entries,
+            payload, payload_size);
+        s_pipeline_warmup.trace_write_attempts++;
+        if (trace_status == BW_METAL_PIPELINE_TRACE_OK) {
+            s_pipeline_warmup.trace_write_status =
+                bw_metal_pipeline_artifact_write_path(
+                    s_pipeline_warmup.trace_path,
+                    BW_METAL_PIPELINE_ARTIFACT_TRACE_KEYS,
+                    &s_pipeline_warmup.identity,
+                    payload, payload_size,
+                    (uint32_t)s_pipeline_warmup.trace_entries);
+        } else {
+            s_pipeline_warmup.trace_write_status =
+                trace_status == BW_METAL_PIPELINE_TRACE_LIMIT
+                    ? BW_METAL_PIPELINE_ARTIFACT_LIMIT
+                    : BW_METAL_PIPELINE_ARTIFACT_FORMAT;
+        }
+        if (s_pipeline_warmup.trace_write_status ==
+            BW_METAL_PIPELINE_ARTIFACT_OK) {
+            s_pipeline_warmup.trace_write_successes++;
+            s_pipeline_warmup.trace_dirty = 0;
+        } else {
+            s_pipeline_warmup.trace_write_failures++;
+            s_pipeline_warmup.trace_disabled = 1;
+        }
+        pipeline_warmup_report_trace(final);
+    }
+    if (final)
+        pipeline_warmup_report_trace(1);
 }
 
 static MTLRenderPipelineDescriptor *new_pipeline_descriptor(void)
@@ -2969,31 +3219,81 @@ static int blend_operation(uint32_t equation, MTLBlendOperation *result)
     return 1;
 }
 
-static id<MTLRenderPipelineState> draw_pipeline(int shader_kind, const Nv2aRenderState *rs,
-                                                int has_depth,
-                                                const MetalExtendedSpecialization *specialization)
+static int valid_pipeline_blend_factor(uint32_t factor)
 {
-    int depth_only = shader_kind == METAL_SHADER_DEPTH_ONLY;
-    MetalPipelineKey key = {
-        .textured = (uint32_t)shader_kind,
-        .color_mask = depth_only ? 0u : rs->color_mask & 0x01010101u,
-        .fixed_alpha_zero = !depth_only &&
-                            (bw_backend_reg(0x0208u) & 0xFu) == METAL_COLOR_XRGB_ZERO,
-        .blend_enable = !depth_only && rs->blend_enable != 0,
-        .blend_src = !depth_only && rs->blend_enable ? rs->blend_src : 0,
-        .blend_dst = !depth_only && rs->blend_enable ? rs->blend_dst : 0,
-        .blend_eq = !depth_only && rs->blend_enable ? rs->blend_eq : 0,
-        .depth_attachment = has_depth != 0,
-    };
-    if (specialization) {
-        key.specialized = 1;
-        memcpy(key.texture, specialization->texture, sizeof key.texture);
-        memcpy(key.stages, specialization->stages, sizeof key.stages);
-        memcpy(key.dot, specialization->dot, sizeof key.dot);
-        memcpy(key.combiner, specialization->combiner, sizeof key.combiner);
-        memcpy(key.final, specialization->final, sizeof key.final);
-        memcpy(key.alpha, specialization->alpha, sizeof key.alpha);
+    switch (factor) {
+    case 0:
+    case 1:
+    case 0x300:
+    case 0x301:
+    case 0x302:
+    case 0x303:
+    case 0x304:
+    case 0x305:
+    case 0x306:
+    case 0x307:
+    case 0x308:
+    case 0x8001:
+    case 0x8002:
+    case 0x8003:
+    case 0x8004:
+        return 1;
+    default:
+        return 0;
     }
+}
+
+static int valid_pipeline_blend_operation(uint32_t equation)
+{
+    return equation == 0 || equation == 0x8006u || equation == 0x8007u ||
+           equation == 0x8008u || equation == 0x800Au ||
+           equation == 0x800Bu;
+}
+
+static int pipeline_key_valid(const MetalPipelineKey *key)
+{
+    static const uint32_t zero_specialization[
+        sizeof(((MetalPipelineKey *)0)->texture) / sizeof(uint32_t) +
+        sizeof(((MetalPipelineKey *)0)->stages) / sizeof(uint32_t) +
+        sizeof(((MetalPipelineKey *)0)->dot) / sizeof(uint32_t) +
+        sizeof(((MetalPipelineKey *)0)->combiner) / sizeof(uint32_t) +
+        sizeof(((MetalPipelineKey *)0)->final) / sizeof(uint32_t) +
+        sizeof(((MetalPipelineKey *)0)->alpha) / sizeof(uint32_t)] = {0};
+    if (!key || key->textured > METAL_SHADER_DEPTH_ONLY ||
+        key->color_mask & ~0x01010101u ||
+        key->fixed_alpha_zero > 1u || key->blend_enable > 1u ||
+        key->depth_attachment > 1u || key->specialized > 1u)
+        return 0;
+    if (key->textured == METAL_SHADER_DEPTH_ONLY &&
+        (key->color_mask || key->fixed_alpha_zero || key->blend_enable))
+        return 0;
+    if (!key->blend_enable &&
+        (key->blend_src || key->blend_dst || key->blend_eq))
+        return 0;
+    if (key->blend_enable &&
+        (!valid_pipeline_blend_factor(key->blend_src) ||
+         !valid_pipeline_blend_factor(key->blend_dst) ||
+         key->blend_dst == 0x308u ||
+         !valid_pipeline_blend_operation(key->blend_eq)))
+        return 0;
+    if (key->specialized && key->textured != METAL_SHADER_EXTENDED)
+        return 0;
+    if (!key->specialized &&
+        memcmp(key->texture, zero_specialization,
+               sizeof zero_specialization))
+        return 0;
+    return 1;
+}
+
+static id<MTLRenderPipelineState> draw_pipeline_for_key(
+    const MetalPipelineKey *key_value,
+    uint32_t frame,
+    MetalPipelineCommandRole role,
+    int runtime)
+{
+    MetalPipelineKey key = *key_value;
+    int shader_kind = (int)key.textured;
+    int depth_only = shader_kind == METAL_SHADER_DEPTH_ONLY;
     MTLBlendFactor src_rgb, dst_rgb, src_alpha, dst_alpha;
     MTLBlendOperation operation;
     if (key.blend_enable) {
@@ -3017,34 +3317,42 @@ static id<MTLRenderPipelineState> draw_pipeline(int shader_kind, const Nv2aRende
                       ? pipeline_key_hash(3, &key, sizeof key) : 0;
     NSData *cache_key = [NSData dataWithBytes:&key length:sizeof key];
     if (!cache_key)
-        return metal_fail("could not create draw pipeline cache key"), nil;
+        return runtime
+             ? metal_fail("could not create draw pipeline cache key"), nil
+             : nil;
     id<MTLRenderPipelineState> state = s_pipelines[cache_key];
     if (state) {
-        pipeline_diagnostic_cache_hit();
+        if (runtime)
+            pipeline_diagnostic_cache_hit();
         return state;
     }
-    pipeline_diagnostic_cache_miss(key_hash);
+    if (runtime)
+        pipeline_diagnostic_cache_miss(key_hash);
     MTLRenderPipelineDescriptor *pipeline = new_pipeline_descriptor();
     if (!pipeline) {
         (void)create_render_pipeline_state(
-            nil, key_hash, s_frame, METAL_PIPELINE_ROLE_RENDER, NULL);
-        return metal_fail("could not create draw pipeline descriptor"), nil;
+            nil, key_hash, frame, role, NULL);
+        return runtime
+             ? metal_fail("could not create draw pipeline descriptor"), nil
+             : nil;
     }
     pipeline.vertexFunction = shader_kind >= METAL_SHADER_EXTENDED
                             ? s_extended_vertex_function : s_vertex_function;
-    if (shader_kind == METAL_SHADER_EXTENDED && specialization) {
+    if (shader_kind == METAL_SHADER_EXTENDED && key.specialized) {
         MTLFunctionConstantValues *values = [MTLFunctionConstantValues new];
         if (!values) {
             pipeline_diagnostic_finish(
-                METAL_PIPELINE_EVENT_FUNCTION_SPECIALIZATION, key_hash, s_frame,
-                METAL_PIPELINE_ROLE_RENDER,
+                METAL_PIPELINE_EVENT_FUNCTION_SPECIALIZATION, key_hash, frame,
+                role,
                 METAL_PIPELINE_STATUS_ALLOCATION_FAILED,
                 (MetalPipelineTimer){0,
                                      METAL_PIPELINE_TIMING_NOT_APPLICABLE});
-            return metal_fail("could not create extended shader constants"), nil;
+            return runtime
+                 ? metal_fail("could not create extended shader constants"), nil
+                 : nil;
         }
         const uint32_t *constant_groups[] = {
-            specialization->texture, specialization->stages, specialization->dot,
+            key.texture, key.stages, key.dot,
         };
         for (NSUInteger group = 0; group < 3; group++)
             for (NSUInteger component = 0; component < 4; component++)
@@ -3053,13 +3361,13 @@ static id<MTLRenderPipelineState> draw_pipeline(int shader_kind, const Nv2aRende
                                  atIndex:group * 4u + component];
         for (NSUInteger stage = 0; stage < 8; stage++)
             for (NSUInteger component = 0; component < 4; component++)
-                [values setConstantValue:&specialization->combiner[stage][component]
+                [values setConstantValue:&key.combiner[stage][component]
                                     type:MTLDataTypeUInt
                                  atIndex:12u + stage * 4u + component];
         for (NSUInteger component = 0; component < 2; component++) {
-            [values setConstantValue:&specialization->final[component]
+            [values setConstantValue:&key.final[component]
                                 type:MTLDataTypeUInt atIndex:44u + component];
-            [values setConstantValue:&specialization->alpha[component]
+            [values setConstantValue:&key.alpha[component]
                                 type:MTLDataTypeUInt atIndex:46u + component];
         }
         NSError *function_error = nil;
@@ -3069,14 +3377,16 @@ static id<MTLRenderPipelineState> draw_pipeline(int shader_kind, const Nv2aRende
                                    constantValues:values
                                             error:&function_error];
         pipeline_diagnostic_finish(
-            METAL_PIPELINE_EVENT_FUNCTION_SPECIALIZATION, key_hash, s_frame,
-            METAL_PIPELINE_ROLE_RENDER,
+            METAL_PIPELINE_EVENT_FUNCTION_SPECIALIZATION, key_hash, frame,
+            role,
             pipeline.fragmentFunction ? METAL_PIPELINE_STATUS_OK
                                       : METAL_PIPELINE_STATUS_METAL_FAILED,
             specialization_timer);
         if (!pipeline.fragmentFunction)
-            return metal_fail("extended shader specialization failed: %s",
-                              metal_error_text(function_error)), nil;
+            return runtime
+                 ? metal_fail("extended shader specialization failed: %s",
+                              metal_error_text(function_error)), nil
+                 : nil;
     } else {
         pipeline.fragmentFunction =
             shader_kind == METAL_SHADER_REALISTIC_WATER ? s_realistic_water_fragment_function
@@ -3108,15 +3418,19 @@ static id<MTLRenderPipelineState> draw_pipeline(int shader_kind, const Nv2aRende
     }
     NSError *error = nil;
     state = create_render_pipeline_state(
-        pipeline, key_hash, s_frame, METAL_PIPELINE_ROLE_RENDER, &error);
+        pipeline, key_hash, frame, role, &error);
     if (!state && shader_kind == METAL_SHADER_REALISTIC_WATER) {
-        fprintf(stderr,
-                "[GPU-METAL] realistic water pipeline creation failed: %s; "
-                "using retail water\n", metal_error_text(error));
+        if (runtime)
+            fprintf(stderr,
+                    "[GPU-METAL] realistic water pipeline creation failed: %s; "
+                    "using retail water\n", metal_error_text(error));
         return nil;
     }
     if (!state)
-        return metal_fail("draw pipeline creation failed: %s", metal_error_text(error)), nil;
+        return runtime
+             ? metal_fail("draw pipeline creation failed: %s",
+                          metal_error_text(error)), nil
+             : nil;
     if (s_pipelines.count >= METAL_MAX_PIPELINES) {
         pipeline_diagnostic_cache_reset(key_hash);
         [s_pipelines removeAllObjects];
@@ -3124,6 +3438,107 @@ static id<MTLRenderPipelineState> draw_pipeline(int shader_kind, const Nv2aRende
     s_pipelines[cache_key] = state;
     pipeline_diagnostic_cache_count(s_pipelines.count);
     return state;
+}
+
+static id<MTLRenderPipelineState> draw_pipeline(
+    int shader_kind,
+    const Nv2aRenderState *rs,
+    int has_depth,
+    const MetalExtendedSpecialization *specialization)
+{
+    int depth_only = shader_kind == METAL_SHADER_DEPTH_ONLY;
+    MetalPipelineKey key = {
+        .textured = (uint32_t)shader_kind,
+        .color_mask = depth_only ? 0u : rs->color_mask & 0x01010101u,
+        .fixed_alpha_zero = !depth_only &&
+                            (bw_backend_reg(0x0208u) & 0xFu) ==
+                                METAL_COLOR_XRGB_ZERO,
+        .blend_enable = !depth_only && rs->blend_enable != 0,
+        .blend_src = !depth_only && rs->blend_enable ? rs->blend_src : 0,
+        .blend_dst = !depth_only && rs->blend_enable ? rs->blend_dst : 0,
+        .blend_eq = !depth_only && rs->blend_enable ? rs->blend_eq : 0,
+        .depth_attachment = has_depth != 0,
+    };
+    if (specialization) {
+        key.specialized = 1;
+        memcpy(key.texture, specialization->texture, sizeof key.texture);
+        memcpy(key.stages, specialization->stages, sizeof key.stages);
+        memcpy(key.dot, specialization->dot, sizeof key.dot);
+        memcpy(key.combiner, specialization->combiner, sizeof key.combiner);
+        memcpy(key.final, specialization->final, sizeof key.final);
+        memcpy(key.alpha, specialization->alpha, sizeof key.alpha);
+    }
+    id<MTLRenderPipelineState> state = draw_pipeline_for_key(
+        &key, s_frame, METAL_PIPELINE_ROLE_RENDER, 1);
+    if (state)
+        pipeline_trace_record(&key);
+    return state;
+}
+
+static void pipeline_warmup_load(void)
+{
+    uint8_t payload[BW_METAL_PIPELINE_TRACE_MAX_PAYLOAD_BYTES];
+    MetalPipelineKey keys[BW_METAL_PIPELINE_TRACE_MAX_ENTRIES];
+    size_t payload_size = 0;
+    BwMetalPipelineArtifactResult result;
+    if (!s_pipeline_warmup.load_path[0])
+        return;
+    if (!s_pipeline_warmup.identity_ready) {
+        s_pipeline_warmup.load_artifact_status =
+            s_pipeline_warmup.identity_status;
+        pipeline_warmup_report_load();
+        return;
+    }
+    result = bw_metal_pipeline_artifact_read_path(
+        s_pipeline_warmup.load_path,
+        BW_METAL_PIPELINE_ARTIFACT_TRACE_KEYS,
+        &s_pipeline_warmup.identity,
+        payload, sizeof payload, &payload_size);
+    s_pipeline_warmup.load_artifact_status = result.status;
+    if (result.status != BW_METAL_PIPELINE_ARTIFACT_OK) {
+        pipeline_warmup_report_load();
+        return;
+    }
+    s_pipeline_warmup.load_entries = result.metadata.entry_count;
+    s_pipeline_warmup.load_trace_status =
+        bw_metal_pipeline_trace_decode(
+            payload, payload_size, result.metadata.entry_count,
+            keys, sizeof keys / sizeof keys[0]);
+    if (s_pipeline_warmup.load_trace_status !=
+        BW_METAL_PIPELINE_TRACE_OK) {
+        s_pipeline_warmup.load_payload_status =
+            METAL_PIPELINE_WARMUP_PAYLOAD_INVALID;
+        pipeline_warmup_report_load();
+        return;
+    }
+    for (size_t i = 0; i < s_pipeline_warmup.load_entries; i++)
+        if (!pipeline_key_valid(&keys[i])) {
+            s_pipeline_warmup.load_payload_status =
+                METAL_PIPELINE_WARMUP_KEY_INVALID;
+            pipeline_warmup_report_load();
+            return;
+        }
+#if defined(BW_METAL_TESTING)
+    if (s_test_fail_warmup_pipeline) {
+        s_test_fail_next_pipeline_allocation = 1;
+        s_test_fail_warmup_pipeline = 0;
+    }
+#endif
+    for (size_t i = 0; i < s_pipeline_warmup.load_entries; i++) {
+        if (!draw_pipeline_for_key(
+                &keys[i], 0, METAL_PIPELINE_ROLE_STARTUP, 0)) {
+            [s_pipelines removeAllObjects];
+            s_pipeline_warmup.preloaded_entries = 0;
+            s_pipeline_warmup.load_payload_status =
+                METAL_PIPELINE_WARMUP_PIPELINE_FAILED;
+            pipeline_warmup_report_load();
+            return;
+        }
+        s_pipeline_warmup.preloaded_entries++;
+    }
+    s_pipeline_warmup.load_payload_status =
+        METAL_PIPELINE_WARMUP_PAYLOAD_OK;
+    pipeline_warmup_report_load();
 }
 
 static id<MTLDepthStencilState> draw_depth_state(const Nv2aRenderState *rs, int has_depth)
@@ -5138,6 +5553,8 @@ static void metal_flip(void)
                     ? now - s_last_flip_ns : 0,
                 wall_status);
         }
+        if (s_pipeline_warmup.trace_path[0])
+            pipeline_trace_flush(0);
         if (now)
             s_last_flip_ns = now;
         if (!direct_present())
@@ -5250,6 +5667,17 @@ static int initialize_metal(void)
         s_device = MTLCreateSystemDefaultDevice();
     if (!s_device)
         return metal_fail("no Metal device");
+    if (s_pipeline_warmup.load_path[0] ||
+        s_pipeline_warmup.trace_path[0]) {
+        s_pipeline_warmup.identity_status =
+            pipeline_warmup_build_identity();
+        s_pipeline_warmup.identity_ready =
+            s_pipeline_warmup.identity_status ==
+                BW_METAL_PIPELINE_ARTIFACT_OK;
+        if (!s_pipeline_warmup.identity_ready &&
+            s_pipeline_warmup.trace_path[0])
+            pipeline_warmup_report_trace(0);
+    }
     if (s_present_layer && s_present_layer.device != s_device)
         return metal_fail("direct presenter and backend use different Metal devices");
     s_queue = [s_device newCommandQueue];
@@ -5438,6 +5866,7 @@ static int initialize_metal(void)
     s_pipelines = [NSMutableDictionary new];
     if (!s_pipelines)
         return metal_fail("could not create draw pipeline cache");
+    pipeline_warmup_load();
     MTLSamplerDescriptor *sampler = [MTLSamplerDescriptor new];
     sampler.minFilter = MTLSamplerMinMagFilterNearest;
     sampler.magFilter = MTLSamplerMinMagFilterNearest;
@@ -5511,6 +5940,8 @@ static int start_with_regions(void *guest_memory, size_t low_size,
             return metal_fail("BW_METAL_PIPELINE_TIMING must be 1 when set");
         pipeline_diagnostic_reset(pipeline_timing != NULL);
     }
+    if (!configure_pipeline_warmup())
+        return 0;
     {
         const char *vfx = getenv("BW_VFX");
         const char *af = getenv("BW_VFX_AF");
@@ -5770,6 +6201,7 @@ int bw_metal_backend_start_for_test(void *guest_memory, size_t guest_size)
 void bw_metal_backend_stop(void)
 {
     (void)flush_commands();
+    pipeline_trace_flush(1);
     pipeline_diagnostic_report();
     if (s_frame_timing_enabled)
         report_frame_times("all", s_frame_times, s_frame_time_count);
@@ -6184,6 +6616,41 @@ void bw_metal_test_pipeline_diagnostic_snapshot(
     }
 }
 
+void bw_metal_test_pipeline_warmup_snapshot(
+    BwMetalPipelineWarmupSnapshot *snapshot)
+{
+    if (!snapshot)
+        return;
+    memset(snapshot, 0, sizeof *snapshot);
+    snapshot->load_enabled = s_pipeline_warmup.load_path[0] != '\0';
+    snapshot->trace_enabled = s_pipeline_warmup.trace_path[0] != '\0';
+    snapshot->identity_ready = s_pipeline_warmup.identity_ready;
+    snapshot->load_compatible =
+        s_pipeline_warmup.load_payload_status ==
+            METAL_PIPELINE_WARMUP_PAYLOAD_OK;
+    snapshot->runtime_fallback =
+        s_pipeline_warmup.load_path[0] &&
+        !snapshot->load_compatible;
+    snapshot->load_artifact_status =
+        s_pipeline_warmup.load_artifact_status;
+    snapshot->load_payload_status =
+        s_pipeline_warmup.load_payload_status;
+    snapshot->trace_write_status =
+        s_pipeline_warmup.trace_write_status;
+    snapshot->load_entries = s_pipeline_warmup.load_entries;
+    snapshot->preloaded_entries =
+        s_pipeline_warmup.preloaded_entries;
+    snapshot->trace_entries = s_pipeline_warmup.trace_entries;
+    snapshot->trace_entries_dropped =
+        s_pipeline_warmup.trace_entries_dropped;
+    snapshot->trace_write_attempts =
+        s_pipeline_warmup.trace_write_attempts;
+    snapshot->trace_write_successes =
+        s_pipeline_warmup.trace_write_successes;
+    snapshot->trace_write_failures =
+        s_pipeline_warmup.trace_write_failures;
+}
+
 void bw_metal_test_pipeline_diagnostic_clear(void)
 {
     int enabled = s_pipeline_diagnostic.enabled;
@@ -6204,6 +6671,11 @@ void bw_metal_test_pipeline_diagnostic_inject_cache_miss(uint64_t key_hash,
 void bw_metal_test_fail_next_pipeline_allocation(void)
 {
     s_test_fail_next_pipeline_allocation = 1;
+}
+
+void bw_metal_test_fail_warmup_pipeline(void)
+{
+    s_test_fail_warmup_pipeline = 1;
 }
 
 void bw_metal_test_shader_library_failures(int offline_library,

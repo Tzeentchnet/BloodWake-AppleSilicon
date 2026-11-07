@@ -9,6 +9,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
+#include <stdio.h>
 #include <string.h>
 #include <sys/stat.h>
 #include <sys/types.h>
@@ -163,7 +164,7 @@ static BwMetalPipelineArtifactStatus decode_header(
     return metadata_status(metadata);
 }
 
-static int valid_path(const char *path)
+int bw_metal_pipeline_artifact_path_is_valid(const char *path)
 {
     static const char suffix[] = ".bwmpa";
     size_t length;
@@ -178,6 +179,12 @@ static int private_regular_file(int fd, struct stat *st)
 {
     return fstat(fd, st) == 0 && S_ISREG(st->st_mode) &&
            st->st_uid == geteuid() && !(st->st_mode & 077u) && st->st_nlink == 1;
+}
+
+static int private_regular_state(const struct stat *st)
+{
+    return S_ISREG(st->st_mode) && st->st_uid == geteuid() &&
+           !(st->st_mode & 077u) && st->st_nlink == 1;
 }
 
 static int read_exact_at(int fd, uint8_t *bytes, size_t size, off_t offset)
@@ -231,13 +238,18 @@ static BwMetalPipelineArtifactStatus identity_status(
 
 static BwMetalPipelineArtifactStatus payload_status(
     int fd,
-    const BwMetalPipelineArtifactMetadata *metadata)
+    const BwMetalPipelineArtifactMetadata *metadata,
+    uint8_t *payload,
+    size_t payload_capacity)
 {
     uint8_t buffer[16384];
     uint8_t digest[BW_METAL_PIPELINE_ARTIFACT_DIGEST_BYTES];
     CC_SHA256_CTX context;
     uint64_t left = metadata->payload_bytes;
     off_t offset = BW_METAL_PIPELINE_ARTIFACT_HEADER_BYTES;
+    size_t copied = 0;
+    if (payload && metadata->payload_bytes > payload_capacity)
+        return BW_METAL_PIPELINE_ARTIFACT_LIMIT;
     if (!CC_SHA256_Init(&context))
         return BW_METAL_PIPELINE_ARTIFACT_IO;
     while (left) {
@@ -245,6 +257,10 @@ static BwMetalPipelineArtifactStatus payload_status(
         if (!read_exact_at(fd, buffer, chunk, offset) ||
             !CC_SHA256_Update(&context, buffer, (CC_LONG)chunk))
             return BW_METAL_PIPELINE_ARTIFACT_IO;
+        if (payload) {
+            memcpy(payload + copied, buffer, chunk);
+            copied += chunk;
+        }
         left -= chunk;
         offset += (off_t)chunk;
     }
@@ -263,10 +279,13 @@ BwMetalPipelineArtifactDisposition bw_metal_pipeline_artifact_disposition(
         : BW_METAL_PIPELINE_ARTIFACT_COMPILE_RUNTIME;
 }
 
-BwMetalPipelineArtifactResult bw_metal_pipeline_artifact_validate_path(
+static BwMetalPipelineArtifactResult read_path(
     const char *path,
     BwMetalPipelineArtifactKind expected_kind,
-    const BwMetalPipelineArtifactIdentity *expected_identity)
+    const BwMetalPipelineArtifactIdentity *expected_identity,
+    uint8_t *payload,
+    size_t payload_capacity,
+    size_t *payload_size)
 {
     uint8_t header[BW_METAL_PIPELINE_ARTIFACT_HEADER_BYTES];
     BwMetalPipelineArtifactResult result;
@@ -278,7 +297,10 @@ BwMetalPipelineArtifactResult bw_metal_pipeline_artifact_validate_path(
     memset(&result, 0, sizeof result);
     result.status = BW_METAL_PIPELINE_ARTIFACT_ARGUMENT;
     result.disposition = BW_METAL_PIPELINE_ARTIFACT_COMPILE_RUNTIME;
-    if (!valid_path(path) || !valid_kind(expected_kind) ||
+    if (payload_size)
+        *payload_size = 0;
+    if (!bw_metal_pipeline_artifact_path_is_valid(path) ||
+        !valid_kind(expected_kind) ||
         !valid_identity(expected_identity))
         return result;
 #if !defined(O_NOFOLLOW) || !defined(O_CLOEXEC)
@@ -338,7 +360,7 @@ BwMetalPipelineArtifactResult bw_metal_pipeline_artifact_validate_path(
     status = identity_status(&metadata.identity, expected_identity);
     if (status != BW_METAL_PIPELINE_ARTIFACT_OK)
         goto out;
-    status = payload_status(fd, &metadata);
+    status = payload_status(fd, &metadata, payload, payload_capacity);
     if (status != BW_METAL_PIPELINE_ARTIFACT_OK)
         goto out;
     if (fstat(fd, &after) != 0 || !same_file_state(&before, &after)) {
@@ -353,7 +375,232 @@ out:
     }
     result.status = status;
     result.disposition = bw_metal_pipeline_artifact_disposition(status);
+    if (status == BW_METAL_PIPELINE_ARTIFACT_OK && payload_size)
+        *payload_size = (size_t)metadata.payload_bytes;
     return result;
+#endif
+}
+
+BwMetalPipelineArtifactResult bw_metal_pipeline_artifact_validate_path(
+    const char *path,
+    BwMetalPipelineArtifactKind expected_kind,
+    const BwMetalPipelineArtifactIdentity *expected_identity)
+{
+    return read_path(path, expected_kind, expected_identity, NULL, 0, NULL);
+}
+
+BwMetalPipelineArtifactResult bw_metal_pipeline_artifact_read_path(
+    const char *path,
+    BwMetalPipelineArtifactKind expected_kind,
+    const BwMetalPipelineArtifactIdentity *expected_identity,
+    void *payload,
+    size_t payload_capacity,
+    size_t *payload_size)
+{
+    BwMetalPipelineArtifactResult result;
+    if (!payload || !payload_capacity || !payload_size) {
+        memset(&result, 0, sizeof result);
+        result.status = BW_METAL_PIPELINE_ARTIFACT_ARGUMENT;
+        result.disposition = BW_METAL_PIPELINE_ARTIFACT_COMPILE_RUNTIME;
+        if (payload_size)
+            *payload_size = 0;
+        return result;
+    }
+    return read_path(path, expected_kind, expected_identity,
+                     payload, payload_capacity, payload_size);
+}
+
+BwMetalPipelineArtifactStatus bw_metal_pipeline_artifact_sha256_file(
+    const char *path,
+    uint8_t digest[BW_METAL_PIPELINE_ARTIFACT_DIGEST_BYTES])
+{
+    uint8_t buffer[16384];
+    CC_SHA256_CTX context;
+    struct stat before, after;
+    int fd;
+    if (!path || !*path || !digest)
+        return BW_METAL_PIPELINE_ARTIFACT_ARGUMENT;
+#if !defined(O_NOFOLLOW) || !defined(O_CLOEXEC)
+    return BW_METAL_PIPELINE_ARTIFACT_UNSUPPORTED;
+#else
+    fd = open(path, O_RDONLY | O_NOFOLLOW | O_CLOEXEC | O_NONBLOCK);
+    if (fd < 0)
+        return errno == ELOOP ? BW_METAL_PIPELINE_ARTIFACT_SYMLINK
+                              : BW_METAL_PIPELINE_ARTIFACT_IO;
+    if (fstat(fd, &before) != 0 || !S_ISREG(before.st_mode) ||
+        !CC_SHA256_Init(&context)) {
+        close(fd);
+        return BW_METAL_PIPELINE_ARTIFACT_IO;
+    }
+    for (;;) {
+        ssize_t count = read(fd, buffer, sizeof buffer);
+        if (count < 0 && errno == EINTR)
+            continue;
+        if (count < 0 ||
+            (count > 0 &&
+             !CC_SHA256_Update(&context, buffer, (CC_LONG)count))) {
+            close(fd);
+            return BW_METAL_PIPELINE_ARTIFACT_IO;
+        }
+        if (!count)
+            break;
+    }
+    if (!CC_SHA256_Final(digest, &context) ||
+        fstat(fd, &after) != 0 || !same_file_state(&before, &after) ||
+        close(fd) != 0)
+        return BW_METAL_PIPELINE_ARTIFACT_IO;
+    return BW_METAL_PIPELINE_ARTIFACT_OK;
+#endif
+}
+
+static int write_exact(int fd, const uint8_t *bytes, size_t size)
+{
+    while (size) {
+        ssize_t count = write(fd, bytes, size);
+        if (count < 0 && errno == EINTR)
+            continue;
+        if (count <= 0)
+            return 0;
+        bytes += (size_t)count;
+        size -= (size_t)count;
+    }
+    return 1;
+}
+
+BwMetalPipelineArtifactStatus bw_metal_pipeline_artifact_write_path(
+    const char *path,
+    BwMetalPipelineArtifactKind kind,
+    const BwMetalPipelineArtifactIdentity *identity,
+    const void *payload,
+    size_t payload_bytes,
+    uint32_t entry_count)
+{
+    BwMetalPipelineArtifactMetadata metadata;
+    uint8_t header[BW_METAL_PIPELINE_ARTIFACT_HEADER_BYTES];
+    char directory[PATH_MAX], basename[NAME_MAX + 1u];
+    char temporary[NAME_MAX + 1u];
+    const char *slash;
+    struct stat directory_state, target_state, temporary_state;
+    BwMetalPipelineArtifactStatus status;
+    size_t directory_length, basename_length;
+    int directory_fd = -1, fd = -1, temporary_created = 0;
+    if (!bw_metal_pipeline_artifact_path_is_valid(path) ||
+        !valid_kind(kind) || !valid_identity(identity) || !payload ||
+        !payload_bytes || !entry_count)
+        return BW_METAL_PIPELINE_ARTIFACT_ARGUMENT;
+    if (payload_bytes >
+            BW_METAL_PIPELINE_ARTIFACT_MAX_BYTES -
+                BW_METAL_PIPELINE_ARTIFACT_HEADER_BYTES ||
+        entry_count > BW_METAL_PIPELINE_ARTIFACT_MAX_ENTRIES)
+        return BW_METAL_PIPELINE_ARTIFACT_LIMIT;
+    slash = strrchr(path, '/');
+    if (!slash || !slash[1])
+        return BW_METAL_PIPELINE_ARTIFACT_ARGUMENT;
+    directory_length = slash == path ? 1u : (size_t)(slash - path);
+    basename_length = strlen(slash + 1);
+    if (directory_length >= sizeof directory ||
+        !basename_length || basename_length > NAME_MAX - 32u)
+        return BW_METAL_PIPELINE_ARTIFACT_LIMIT;
+    memcpy(directory, path, directory_length);
+    directory[directory_length] = '\0';
+    memcpy(basename, slash + 1, basename_length + 1u);
+    memset(&metadata, 0, sizeof metadata);
+    metadata.kind = kind;
+    metadata.flags = BW_METAL_PIPELINE_ARTIFACT_DEVICE_LOCAL;
+    metadata.identity = *identity;
+    metadata.payload_bytes = payload_bytes;
+    metadata.entry_count = entry_count;
+    bw_metal_pipeline_artifact_sha256(payload, payload_bytes,
+                                      metadata.payload_sha256);
+    status = bw_metal_pipeline_artifact_encode_header(
+        &metadata, header, sizeof header);
+    if (status != BW_METAL_PIPELINE_ARTIFACT_OK)
+        return status;
+#if !defined(O_NOFOLLOW) || !defined(O_CLOEXEC) || !defined(O_DIRECTORY) || \
+    !defined(AT_SYMLINK_NOFOLLOW)
+    return BW_METAL_PIPELINE_ARTIFACT_UNSUPPORTED;
+#else
+    directory_fd = open(directory,
+                        O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+    if (directory_fd < 0)
+        return errno == ELOOP ? BW_METAL_PIPELINE_ARTIFACT_SYMLINK
+                              : BW_METAL_PIPELINE_ARTIFACT_IO;
+    if (fstat(directory_fd, &directory_state) != 0 ||
+        !S_ISDIR(directory_state.st_mode) ||
+        directory_state.st_uid != geteuid() ||
+        (directory_state.st_mode & 077u)) {
+        status = BW_METAL_PIPELINE_ARTIFACT_POLICY;
+        goto out;
+    }
+    if (fstatat(directory_fd, basename, &target_state,
+                AT_SYMLINK_NOFOLLOW) == 0) {
+        if (S_ISLNK(target_state.st_mode)) {
+            status = BW_METAL_PIPELINE_ARTIFACT_SYMLINK;
+            goto out;
+        }
+        if (!private_regular_state(&target_state)) {
+            status = BW_METAL_PIPELINE_ARTIFACT_POLICY;
+            goto out;
+        }
+    } else if (errno != ENOENT) {
+        status = BW_METAL_PIPELINE_ARTIFACT_IO;
+        goto out;
+    }
+    status = BW_METAL_PIPELINE_ARTIFACT_IO;
+    for (unsigned attempt = 0; attempt < 16u; attempt++) {
+        int written = snprintf(temporary, sizeof temporary,
+                               "%s.tmp.%ld.%u", basename,
+                               (long)getpid(), attempt);
+        if (written < 0 || (size_t)written >= sizeof temporary) {
+            status = BW_METAL_PIPELINE_ARTIFACT_LIMIT;
+            goto out;
+        }
+        fd = openat(directory_fd, temporary,
+                    O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC,
+                    0600);
+        if (fd >= 0) {
+            temporary_created = 1;
+            break;
+        }
+        if (errno != EEXIST) {
+            status = errno == ELOOP ? BW_METAL_PIPELINE_ARTIFACT_SYMLINK
+                                    : BW_METAL_PIPELINE_ARTIFACT_IO;
+            goto out;
+        }
+    }
+    if (fd < 0)
+        goto out;
+    if (fchmod(fd, 0600) != 0 ||
+        !write_exact(fd, header, sizeof header) ||
+        !write_exact(fd, payload, payload_bytes) ||
+        fsync(fd) != 0 ||
+        fstat(fd, &temporary_state) != 0 ||
+        !private_regular_state(&temporary_state)) {
+        status = BW_METAL_PIPELINE_ARTIFACT_IO;
+        goto out;
+    }
+    if (close(fd) != 0) {
+        fd = -1;
+        status = BW_METAL_PIPELINE_ARTIFACT_IO;
+        goto out;
+    }
+    fd = -1;
+    if (renameat(directory_fd, temporary, directory_fd, basename) != 0 ||
+        fsync(directory_fd) != 0) {
+        status = BW_METAL_PIPELINE_ARTIFACT_IO;
+        goto out;
+    }
+    temporary_created = 0;
+    status = BW_METAL_PIPELINE_ARTIFACT_OK;
+out:
+    if (fd >= 0)
+        close(fd);
+    if (temporary_created)
+        unlinkat(directory_fd, temporary, 0);
+    if (directory_fd >= 0 && close(directory_fd) != 0 &&
+        status == BW_METAL_PIPELINE_ARTIFACT_OK)
+        status = BW_METAL_PIPELINE_ARTIFACT_IO;
+    return status;
 #endif
 }
 

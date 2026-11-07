@@ -123,6 +123,15 @@ BwMetalWaterPreset bw_metal_backend_water_preset(void);
  * canonical-key hashes, durations, frame/command classifications, aggregate
  * cache counters, wall-frame correlation, artifact selection/fallback state,
  * and explicit errors, never descriptors or retail-derived fields.
+ * BW_METAL_PIPELINE_TRACE_OUTPUT may name a bounded absolute .bwmpa path to
+ * opt into capture of at most 128 successful canonical draw keys. The backend
+ * writes a deterministic owner-only device-local artifact atomically at frame
+ * boundaries. BW_METAL_PIPELINE_WARMUP may name such an artifact to validate
+ * and preload its exact states before the first draw. Both options are unset
+ * by default. Missing, stale, corrupt, invalid, or failed warm-up data emits
+ * bounded bloodwake.metal-pipeline-warmup/v1 aggregate JSONL and uses the
+ * unchanged synchronous runtime path. Reports never contain paths, keys,
+ * descriptors, function constants, addresses, or texture identities.
  * Up to 32 exact colour-surface descriptions are cached. Ordinary target
  * switches retain each touched private generation in the current submission;
  * presentation commits them together in queue order, while eight switches
@@ -175,12 +184,25 @@ typedef struct {
     size_t events_on_wall_max;
 } BwMetalPipelineDiagnosticSnapshot;
 
+typedef struct {
+    int load_enabled, trace_enabled, identity_ready;
+    int load_compatible, runtime_fallback;
+    int load_artifact_status, load_payload_status, trace_write_status;
+    size_t load_entries, preloaded_entries, trace_entries;
+    uint64_t trace_entries_dropped;
+    uint64_t trace_write_attempts, trace_write_successes;
+    uint64_t trace_write_failures;
+} BwMetalPipelineWarmupSnapshot;
+
 void bw_metal_test_pipeline_diagnostic_snapshot(
     BwMetalPipelineDiagnosticSnapshot *snapshot);
+void bw_metal_test_pipeline_warmup_snapshot(
+    BwMetalPipelineWarmupSnapshot *snapshot);
 void bw_metal_test_pipeline_diagnostic_clear(void);
 void bw_metal_test_pipeline_diagnostic_inject_cache_miss(uint64_t key_hash,
                                                          uint32_t frame);
 void bw_metal_test_fail_next_pipeline_allocation(void);
+void bw_metal_test_fail_warmup_pipeline(void);
 void bw_metal_test_shader_library_failures(int offline_library,
                                            int source_library);
 const char *bw_metal_test_shader_source_sha256(void);

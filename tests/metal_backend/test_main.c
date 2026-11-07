@@ -15,6 +15,7 @@
 #include "bw_metal_backend.h"
 #include "bw_backend_sync.h"
 #include "bw_gpu_audit.h"
+#include "bw_metal_pipeline_artifact.h"
 #include "d3d/d3d8_swizzle.h"
 #include "../../src/bw_edition.h"
 
@@ -1203,6 +1204,109 @@ static void pipeline_diagnostic_library_fallback_test(void)
     triangle(0xFF807060u);
     draw(3);
     flip();
+    expect_no_error();
+}
+
+static void pipeline_warmup_workload(void)
+{
+    triangle(0xFF807060u);
+    method(0x0358, 0x01010101u);
+    draw(3);
+    method(0x0358, 0x00010101u);
+    draw(3);
+    flip();
+    expect_no_error();
+}
+
+static void pipeline_warmup_disabled_test(void)
+{
+    BwMetalPipelineWarmupSnapshot snapshot;
+    bw_metal_test_pipeline_warmup_snapshot(&snapshot);
+    CHECK(!snapshot.load_enabled);
+    CHECK(!snapshot.trace_enabled);
+    CHECK(!snapshot.identity_ready);
+    CHECK(!snapshot.load_entries);
+    CHECK(!snapshot.preloaded_entries);
+    CHECK(!snapshot.trace_entries);
+    CHECK(!snapshot.trace_write_attempts);
+}
+
+static void pipeline_warmup_capture_test(int expect_failure)
+{
+    BwMetalPipelineWarmupSnapshot snapshot;
+    pipeline_warmup_workload();
+    bw_metal_test_pipeline_warmup_snapshot(&snapshot);
+    CHECK(!snapshot.load_enabled);
+    CHECK(snapshot.trace_enabled);
+    CHECK(snapshot.identity_ready);
+    CHECK(snapshot.trace_entries == 2);
+    CHECK(snapshot.trace_entries_dropped == 0);
+    CHECK(snapshot.trace_write_attempts == 1);
+    CHECK(snapshot.trace_write_successes == (uint64_t)!expect_failure);
+    CHECK(snapshot.trace_write_failures == (uint64_t)expect_failure);
+    CHECK(snapshot.trace_write_status ==
+          (expect_failure ? BW_METAL_PIPELINE_ARTIFACT_POLICY
+                          : BW_METAL_PIPELINE_ARTIFACT_OK));
+    expect_no_error();
+}
+
+static void pipeline_warmup_capture_bounded_test(void)
+{
+    BwMetalPipelineWarmupSnapshot snapshot;
+    pipeline_cache_test();
+    bw_metal_test_pipeline_warmup_snapshot(&snapshot);
+    CHECK(snapshot.trace_enabled);
+    CHECK(snapshot.identity_ready);
+    CHECK(snapshot.trace_entries == 128);
+    CHECK(snapshot.trace_entries_dropped >= 1);
+    CHECK(snapshot.trace_write_attempts == 1);
+    CHECK(snapshot.trace_write_successes == 1);
+    CHECK(snapshot.trace_write_failures == 0);
+    expect_no_error();
+}
+
+static void pipeline_warmup_load_test(void)
+{
+    BwMetalPipelineWarmupSnapshot warmup;
+    BwMetalPipelineDiagnosticSnapshot before, after;
+    bw_metal_test_pipeline_warmup_snapshot(&warmup);
+    CHECK(warmup.load_enabled);
+    CHECK(warmup.identity_ready);
+    CHECK(warmup.load_artifact_status ==
+          BW_METAL_PIPELINE_ARTIFACT_OK);
+    CHECK(warmup.load_compatible);
+    CHECK(!warmup.runtime_fallback);
+    CHECK(warmup.load_entries == 2);
+    CHECK(warmup.preloaded_entries == 2);
+    bw_metal_test_pipeline_diagnostic_snapshot(&before);
+    pipeline_warmup_workload();
+    bw_metal_test_pipeline_diagnostic_snapshot(&after);
+    CHECK(after.pipeline_attempts == before.pipeline_attempts);
+    CHECK(after.specialization_attempts == before.specialization_attempts);
+    CHECK(after.cache_misses == before.cache_misses);
+    CHECK(after.cache_hits >= before.cache_hits + 2);
+    expect_no_error();
+}
+
+static void pipeline_warmup_fallback_test(
+    BwMetalPipelineArtifactStatus expected_status,
+    int artifact_compatible)
+{
+    BwMetalPipelineWarmupSnapshot warmup;
+    BwMetalPipelineDiagnosticSnapshot before, after;
+    bw_metal_test_pipeline_warmup_snapshot(&warmup);
+    CHECK(warmup.load_enabled);
+    CHECK(warmup.identity_ready);
+    CHECK(warmup.load_artifact_status == expected_status);
+    CHECK(!warmup.load_compatible);
+    CHECK(warmup.runtime_fallback);
+    CHECK(!warmup.preloaded_entries);
+    CHECK((warmup.load_entries != 0) == artifact_compatible);
+    bw_metal_test_pipeline_diagnostic_snapshot(&before);
+    pipeline_warmup_workload();
+    bw_metal_test_pipeline_diagnostic_snapshot(&after);
+    CHECK(after.cache_misses == before.cache_misses + 2);
+    CHECK(after.pipeline_attempts == before.pipeline_attempts + 2);
     expect_no_error();
 }
 
@@ -6748,6 +6852,16 @@ int main(int argc, char **argv)
             s_host_now_step = 1000;
         }
     }
+    if (!strncmp(argv[1], "pipeline-warmup-",
+                 sizeof("pipeline-warmup-") - 1u)) {
+        setenv("BW_METAL_PIPELINE_TIMING", "1", 1);
+        s_host_now_ns = UINT64_C(1000000000);
+        s_host_now_step = 1000;
+        if (!strcmp(argv[1], "pipeline-warmup-invalid"))
+            setenv("BW_METAL_PIPELINE_WARMUP", "relative.bwmpa", 1);
+        if (!strcmp(argv[1], "pipeline-warmup-pipeline-failure"))
+            bw_metal_test_fail_warmup_pipeline();
+    }
     if (!strcmp(argv[1], "pipeline-diagnostic-library-fallback") ||
         !strcmp(argv[1], "pipeline-diagnostic-library-failure"))
         bw_metal_test_shader_library_failures(
@@ -6808,6 +6922,14 @@ int main(int argc, char **argv)
         CHECK(bw_metal_backend_error() &&
               strstr(bw_metal_backend_error(),
                      "BW_METAL_PIPELINE_TIMING must be 1 when set"));
+        bw_metal_backend_stop();
+        return s_failed ? 1 : 0;
+    }
+    if (!strcmp(argv[1], "pipeline-warmup-invalid")) {
+        CHECK(!bw_metal_backend_start_for_test(s_mem, sizeof s_mem));
+        CHECK(bw_metal_backend_error() &&
+              strstr(bw_metal_backend_error(),
+                     "BW_METAL_PIPELINE_WARMUP must be"));
         bw_metal_backend_stop();
         return s_failed ? 1 : 0;
     }
@@ -6903,6 +7025,29 @@ int main(int argc, char **argv)
         pipeline_diagnostic_library_selection_test();
     else if (!strcmp(argv[1], "pipeline-diagnostic-library-fallback"))
         pipeline_diagnostic_library_fallback_test();
+    else if (!strcmp(argv[1], "pipeline-warmup-disabled"))
+        pipeline_warmup_disabled_test();
+    else if (!strcmp(argv[1], "pipeline-warmup-capture"))
+        pipeline_warmup_capture_test(0);
+    else if (!strcmp(argv[1], "pipeline-warmup-capture-failure"))
+        pipeline_warmup_capture_test(1);
+    else if (!strcmp(argv[1], "pipeline-warmup-capture-bounded"))
+        pipeline_warmup_capture_bounded_test();
+    else if (!strcmp(argv[1], "pipeline-warmup-load"))
+        pipeline_warmup_load_test();
+    else if (!strcmp(argv[1], "pipeline-warmup-missing"))
+        pipeline_warmup_fallback_test(
+            BW_METAL_PIPELINE_ARTIFACT_MISSING, 0);
+    else if (!strcmp(argv[1], "pipeline-warmup-corrupt"))
+        pipeline_warmup_fallback_test(
+            BW_METAL_PIPELINE_ARTIFACT_CORRUPT, 0);
+    else if (!strcmp(argv[1], "pipeline-warmup-stale"))
+        pipeline_warmup_fallback_test(
+            BW_METAL_PIPELINE_ARTIFACT_STALE, 0);
+    else if (!strcmp(argv[1], "pipeline-warmup-invalid-key") ||
+             !strcmp(argv[1], "pipeline-warmup-pipeline-failure"))
+        pipeline_warmup_fallback_test(
+            BW_METAL_PIPELINE_ARTIFACT_OK, 1);
     else if (!strcmp(argv[1], "cull"))
         cull_test();
     else if (!strcmp(argv[1], "full-rect"))

@@ -324,7 +324,8 @@ def diagnostic_env(output, game_dir, seconds, quincunx, audit, input_fd, output_
                    frame_timing=False, pipeline_timing=False,
                    profile_name=None, profile_from=None,
                    profile_to=None, profile_callers=False, render_scale=None,
-                   frame_cap=None):
+                   frame_cap=None, pipeline_trace_name=None,
+                   pipeline_warmup=None):
     if (synthetic_input or synthetic_input_script) and not keyboard_hook:
         raise ValueError("synthetic input requires the experimental keyboard hook")
     if synthetic_input and synthetic_input_script:
@@ -388,6 +389,14 @@ def diagnostic_env(output, game_dir, seconds, quincunx, audit, input_fd, output_
                 raise ValueError("render scale must be auto or 0.5 through 10")
     if frame_cap not in (None, 30, 60, 120):
         raise ValueError("frame cap must be 30, 60, or 120")
+    if pipeline_trace_name and (
+            Path(pipeline_trace_name).name != pipeline_trace_name or
+            not pipeline_trace_name.endswith(".bwmpa")):
+        raise ValueError("pipeline trace output name is invalid")
+    if pipeline_warmup is not None:
+        warmup = Path(pipeline_warmup)
+        if not warmup.is_absolute() or warmup.suffix != ".bwmpa":
+            raise ValueError("pipeline warm-up input must be an absolute .bwmpa path")
     env = {
         "PATH": "/usr/bin:/bin:/usr/sbin:/sbin",
         "HOME": str(output / "home"),
@@ -435,6 +444,10 @@ def diagnostic_env(output, game_dir, seconds, quincunx, audit, input_fd, output_
         env["BW_METAL_FRAME_TIMING"] = "1"
     if pipeline_timing:
         env["BW_METAL_PIPELINE_TIMING"] = "1"
+    if pipeline_trace_name:
+        env["BW_METAL_PIPELINE_TRACE_OUTPUT"] = str(output / pipeline_trace_name)
+    if pipeline_warmup is not None:
+        env["BW_METAL_PIPELINE_WARMUP"] = str(pipeline_warmup)
     if profile_name:
         env["BW_PROFILE"] = str(output / profile_name)
         if profile_from is not None:
@@ -528,7 +541,8 @@ def run_guest_once(executable, output, game_dir, profile, seconds, quincunx, aud
                    frame_timing=False, pipeline_timing=False,
                    profile_name=None, profile_from=None,
                    profile_to=None, profile_callers=False, render_scale=None,
-                   frame_cap=None):
+                   frame_cap=None, pipeline_trace_name=None,
+                   pipeline_warmup=None):
     input_read = input_write = output_read = output_write = -1
     child = None
     try:
@@ -554,7 +568,8 @@ def run_guest_once(executable, output, game_dir, profile, seconds, quincunx, aud
                              water_benchmark, water_capture, capture_stem, guided_input,
                              frame_timing, pipeline_timing, profile_name,
                              profile_from, profile_to,
-                             profile_callers, render_scale, frame_cap)
+                             profile_callers, render_scale, frame_cap,
+                             pipeline_trace_name, pipeline_warmup)
         with open(output / log_name, "xb") as log:
             child = subprocess.Popen(
                 [SANDBOX, "-p", profile, str(executable), "--bw-native-child"],
@@ -591,7 +606,8 @@ def run_guest(executable, output, game_dir, profile, seconds, quincunx, audit,
               pipeline_timing=False,
               profile_enabled=False, profile_from=None, profile_to=None,
               profile_callers=False, render_scale=None, frame_cap=None,
-              initial_launch=b""):
+              initial_launch=b"", pipeline_trace=False,
+              pipeline_warmup=None):
     result, relaunch, _ = run_guest_once(executable, output, game_dir, profile,
                                          seconds, quincunx, audit, launch=initial_launch,
                                          keyboard_hook=keyboard_hook,
@@ -608,7 +624,11 @@ def run_guest(executable, output, game_dir, profile, seconds, quincunx, audit,
                                          profile_name="profile.txt" if profile_enabled else None,
                                          profile_from=profile_from, profile_to=profile_to,
                                          profile_callers=profile_callers,
-                                         render_scale=render_scale, frame_cap=frame_cap)
+                                         render_scale=render_scale, frame_cap=frame_cap,
+                                         pipeline_trace_name=(
+                                             "pipeline-trace.bwmpa"
+                                             if pipeline_trace else None),
+                                         pipeline_warmup=pipeline_warmup)
     if relaunch:
         (output / "relaunch.bin").write_bytes(relaunch)
         print("Guest requested a relaunch; request saved privately, not executed")
@@ -624,7 +644,8 @@ def run_guest_relaunches(executable, output, game_dir, profile, seconds, quincun
                          pipeline_timing=False,
                          profile_enabled=False, profile_from=None, profile_to=None,
                          profile_callers=False, render_scale=None, frame_cap=None,
-                         initial_launch=b""):
+                         initial_launch=b"", pipeline_trace=False,
+                         pipeline_warmup=None):
     deadline = time.monotonic() + total_seconds
     log_remaining = MAX_LOG_BYTES
     launch = initial_launch
@@ -648,7 +669,11 @@ def run_guest_relaunches(executable, output, game_dir, profile, seconds, quincun
             profile_name=f"profile-{boot:03d}.txt" if profile_enabled else None,
             profile_from=profile_from, profile_to=profile_to,
             profile_callers=profile_callers,
-            render_scale=render_scale, frame_cap=frame_cap)
+            render_scale=render_scale, frame_cap=frame_cap,
+            pipeline_trace_name=(
+                f"pipeline-trace-{boot:03d}.bwmpa"
+                if pipeline_trace else None),
+            pipeline_warmup=pipeline_warmup)
         completed_boots = boot
         log_remaining -= log_size
         if relaunch:
@@ -1168,6 +1193,14 @@ def main(argv=None):
         help="report bounded Metal pipeline lifecycle JSONL"
     )
     parser.add_argument(
+        "--pipeline-trace", action="store_true",
+        help="write a bounded private canonical-key .bwmpa artifact"
+    )
+    parser.add_argument(
+        "--pipeline-warmup",
+        help="preload a validated private canonical-key .bwmpa artifact"
+    )
+    parser.add_argument(
         "--profile", action="store_true",
         help="write the built-in native sampling profile without enabling GPU audit"
     )
@@ -1305,6 +1338,26 @@ def main(argv=None):
             raise ValueError("prepared disc must be inside the prepared tree")
         if not (game_dir / "default.xbe").is_file():
             raise ValueError("prepared disc is missing default.xbe")
+        pipeline_warmup = None
+        if args.pipeline_warmup:
+            warmup_input = Path(args.pipeline_warmup).expanduser()
+            if warmup_input.is_symlink():
+                raise ValueError("pipeline warm-up input must not be a symlink")
+            pipeline_warmup = warmup_input.resolve(strict=True)
+            warmup_state = pipeline_warmup.stat()
+            if (not pipeline_warmup.is_file() or
+                    pipeline_warmup.suffix != ".bwmpa" or
+                    warmup_state.st_uid != os.geteuid() or
+                    stat.S_IMODE(warmup_state.st_mode) & 0o077 or
+                    warmup_state.st_nlink != 1):
+                raise ValueError(
+                    "pipeline warm-up input must be a private owner-only .bwmpa file"
+                )
+            if any(overlaps(pipeline_warmup, protected)
+                   for protected in (ROOT, prepared, toolkit)):
+                raise ValueError(
+                    "pipeline warm-up input must be outside protected trees"
+                )
         initial_launch = b""
         save_seed = None
         if args.save_seed:
@@ -1348,6 +1401,10 @@ def main(argv=None):
             print("Diagnostic frame timing: enabled without full GPU audit")
         if args.pipeline_timing:
             print("Diagnostic pipeline timing: bounded JSONL enabled")
+        if args.pipeline_trace:
+            print("Diagnostic pipeline trace: private bounded artifact enabled")
+        if pipeline_warmup is not None:
+            print("Diagnostic pipeline warm-up: private artifact enabled")
         if args.profile:
             print("Diagnostic sampling profile: enabled")
         if args.render_scale is not None:
@@ -1388,7 +1445,9 @@ def main(argv=None):
                     profile_from=args.profile_from, profile_to=args.profile_to,
                     profile_callers=args.profile_callers,
                     render_scale=args.render_scale, frame_cap=args.frame_cap,
-                    initial_launch=initial_launch)
+                    initial_launch=initial_launch,
+                    pipeline_trace=args.pipeline_trace,
+                    pipeline_warmup=pipeline_warmup)
                 result = relaunch_result.guest_status
                 completed_boots = relaunch_result.completed_boots
                 boot_limit_reached = relaunch_result.boot_limit_reached
@@ -1412,7 +1471,9 @@ def main(argv=None):
                                    profile_callers=args.profile_callers,
                                    render_scale=args.render_scale,
                                    frame_cap=args.frame_cap,
-                                   initial_launch=initial_launch)
+                                   initial_launch=initial_launch,
+                                   pipeline_trace=args.pipeline_trace,
+                                   pipeline_warmup=pipeline_warmup)
                 completed_boots = 1
         finally:
             changed = snapshot_tree(prepared) != baseline

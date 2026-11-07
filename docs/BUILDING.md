@@ -355,6 +355,25 @@ xcrun --find metal
 xcrun --find metallib
 ```
 
+Pipeline trace capture and warm-up are private opt-ins. The diagnostic runner
+keeps generated artifacts inside its owner-only output directory:
+
+```sh
+python3 tools/macos_diagnostic.py ... --pipeline-timing --pipeline-trace
+python3 tools/macos_diagnostic.py ... --pipeline-timing \
+  --pipeline-warmup /absolute/private/pipeline-trace.bwmpa
+```
+
+The first command writes `pipeline-trace.bwmpa` (or a numbered file when
+following relaunches). The second requires an existing owner-only, single-link
+regular `.bwmpa` file outside the repository, prepared tree, and toolkit.
+Capture retains at most 128 canonical keys and writes atomically at frame
+boundaries. Warm-up validates the executable, stable shader, OS, SDK, Metal
+feature level, GPU family, payload digest, and key schema before preloading.
+Missing or rejected data emits bounded
+`bloodwake.metal-pipeline-warmup/v1` aggregate JSONL and uses unchanged
+synchronous runtime creation. Keep all `.bwmpa` files private and uncommitted.
+
 `--profile` enables the existing approximately 1 kHz native thread sampler;
 `--profile-from` and `--profile-to` bound its per-boot window. Fixed
 `--render-scale 1`, `2.25`, or `4` and `--frame-cap 30`, `60`, or `120` make

@@ -84,6 +84,12 @@ void bw_metal_pipeline_artifact_sha256(const void *bytes,
                                        size_t size,
                                        uint8_t digest[BW_METAL_PIPELINE_ARTIFACT_DIGEST_BYTES]);
 
+BwMetalPipelineArtifactStatus bw_metal_pipeline_artifact_sha256_file(
+    const char *path,
+    uint8_t digest[BW_METAL_PIPELINE_ARTIFACT_DIGEST_BYTES]);
+
+int bw_metal_pipeline_artifact_path_is_valid(const char *path);
+
 /*
  * Validation never loads a Metal library or archive. Every rejection retains
  * an explicit status and requests runtime compilation; callers must report the
@@ -93,6 +99,22 @@ BwMetalPipelineArtifactResult bw_metal_pipeline_artifact_validate_path(
     const char *path,
     BwMetalPipelineArtifactKind expected_kind,
     const BwMetalPipelineArtifactIdentity *expected_identity);
+
+BwMetalPipelineArtifactResult bw_metal_pipeline_artifact_read_path(
+    const char *path,
+    BwMetalPipelineArtifactKind expected_kind,
+    const BwMetalPipelineArtifactIdentity *expected_identity,
+    void *payload,
+    size_t payload_capacity,
+    size_t *payload_size);
+
+BwMetalPipelineArtifactStatus bw_metal_pipeline_artifact_write_path(
+    const char *path,
+    BwMetalPipelineArtifactKind kind,
+    const BwMetalPipelineArtifactIdentity *identity,
+    const void *payload,
+    size_t payload_bytes,
+    uint32_t entry_count);
 
 BwMetalPipelineArtifactDisposition bw_metal_pipeline_artifact_disposition(
     BwMetalPipelineArtifactStatus status);

@@ -31,6 +31,9 @@ attribution was sufficient for the requested continuation through the
 completed PERF-029 artifact contract. PERF-030 is complete: Xcode's Metal
 toolchain compiles both stable-library variants, real default/safe selection
 loads them without source fallback, and the explicit fallback remains tested.
+PERF-031 is complete: bounded private canonical-key traces are written
+atomically, compatibility-validated, and preloaded before first use while
+every rejection retains synchronous runtime creation.
 Presentation timing instrumentation and the workload/device protocol may
 proceed independently, but default pacing and deeper renderer work remain
 gated on their measurements.
@@ -73,7 +76,7 @@ temperature evidence when privileged telemetry is available.
 | PERF-028 | Instrument Metal pipeline and cache lifecycle | `[~]` | PERF-027 |
 | PERF-029 | Define the native pipeline-artifact contract | `[x]` | PERF-028 |
 | PERF-030 | Compile stable Metal shaders offline | `[x]` | PERF-029 |
-| PERF-031 | Add device-local trace-derived pipeline warm-up | `[ ]` | PERF-028, PERF-029, PERF-030 |
+| PERF-031 | Add device-local trace-derived pipeline warm-up | `[x]` | PERF-028, PERF-029, PERF-030 |
 | PERF-032 | Add asynchronous rare-miss compilation and bounded retention | `[ ]` | PERF-028, PERF-029, PERF-030 |
 | PERF-033 | Qualify cold-start pipeline behavior | `[ ]` | PERF-031, PERF-032 |
 | PERF-034 | Instrument presentation and display timing | `[ ]` | PERF-027 |
@@ -420,7 +423,7 @@ PERF-030 through PERF-032 implement the measured path:
 
 - [x] Compile the stable project-owned Metal source into an offline library
   without changing shader entry points or math policy.
-- [ ] Preload validated local pipeline states before their first use in the
+- [x] Preload validated local pipeline states before their first use in the
   traced workload.
 - [ ] Compile an untraced specialization asynchronously and retain the exact
   generic Retail pipeline until it is ready.
@@ -441,6 +444,23 @@ also loaded the offline library in two private bounded Battle-seed attempts.
 Those attempts displayed the controller-reconnect overlay, so their frame
 maxima are not retained as exact-default performance evidence and do not
 advance PERF-033.
+
+PERF-031 records at most 128 successful canonical draw keys in a deterministic
+little-endian kind-1 `.bwmpa` payload, matching the unchanged 128-state cache
+limit. Capture is opt-in, writes only to an owner-controlled directory through
+an atomic owner-only file replacement, and emits bounded aggregate status
+without paths or key contents. Warm-up validates the complete PERF-029
+identity, payload digest, fixed key schema, ordering, uniqueness, and semantic
+fields before creating any state. A missing, stale, corrupt, malformed,
+unsupported, or failed artifact clears any partial preload and uses the exact
+synchronous runtime path.
+
+A private production smoke pair without a physical controller captured and
+preloaded 15 paused-renderer states. The preload run reported all 15 compatible
+states loaded before use, then more than one million cache hits and zero
+misses. Because the title remained paused behind its reconnect overlay, those
+artifacts are not representative gameplay traces, their frame timings are not
+retained, and PERF-033 remains open.
 
 PERF-033 exit gates:
 

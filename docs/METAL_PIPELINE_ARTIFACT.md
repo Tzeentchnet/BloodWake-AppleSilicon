@@ -1,6 +1,6 @@
 # Metal pipeline-artifact contract
 
-Status: PERF-029 compatibility contract
+Status: PERF-029 compatibility contract and PERF-031 trace-key payload
 
 This contract defines how later Metal pipeline warm-up work identifies and
 rejects local artifacts. It does not record pipeline keys, create or load a
@@ -33,8 +33,39 @@ The version-1 artifact kinds are:
 - `1`, trace-derived pipeline keys; and
 - `2`, a device-built Metal binary archive.
 
-PERF-029 defines and validates the common envelope only. It has no production
-writer and does not interpret either payload.
+PERF-029 defines and validates the common envelope. PERF-031 adds the
+production writer, kind-1 trace-key payload, and bounded preload consumer.
+Kind 2 remains contract-defined but is not produced or loaded.
+
+## Trace-key payload
+
+Kind 1 uses pipeline-key schema version 1. Its payload is a sequence of
+fixed 228-byte records. Every record contains 57 little-endian 32-bit words:
+
+| Words | Field |
+| ---: | --- |
+| 0 | Shader classification |
+| 1 | Canonical color-write mask |
+| 2 | Fixed-alpha-zero classification |
+| 3-6 | Blend enable, source, destination, and operation |
+| 7 | Depth-attachment classification |
+| 8 | Specialized-function classification |
+| 9-12 | Four canonical texture-stage words |
+| 13-16 | Four canonical stage-routing words |
+| 17-20 | Four canonical dot-product words |
+| 21-52 | Eight groups of four canonical combiner words |
+| 53-54 | Two final-combiner words |
+| 55-56 | Two alpha-test words |
+
+Records are sorted by their encoded bytes and must be strictly increasing, so
+duplicates and noncanonical ordering are rejected. The payload size must equal
+the envelope entry count times 228. PERF-031 further caps kind-1 artifacts at
+128 entries (29,184 payload bytes), matching the unchanged draw-pipeline cache
+limit even though the common envelope permits 4,096 entries for future kinds.
+
+These words are retail-derived state. They are never emitted in logs,
+diagnostic JSON, source files, or committed artifacts. They exist only in the
+explicitly requested private device-local `.bwmpa` file.
 
 ## Version-1 envelope
 
@@ -115,3 +146,26 @@ runtime compilation while retaining the rejection status for reporting.
 Absence of the selected Metal API is likewise `unsupported_platform` plus
 runtime compilation. A caller must never report artifact success after this
 fallback, hide a compilation failure, or return a missing pipeline.
+
+## Capture, preload, and reporting
+
+`BW_METAL_PIPELINE_TRACE_OUTPUT` opts into kind-1 capture. It accepts only a
+bounded absolute `.bwmpa` path. Successful draw keys are deduplicated in fixed
+storage and persisted at frame boundaries. The parent directory must be owned
+by the current user with no group or other permissions. Writes use a new
+mode-0600, single-link regular temporary file, `fsync`, and atomic replacement;
+symlinked or nonprivate targets are rejected. Capture never changes pipeline
+creation or cache retention.
+
+`BW_METAL_PIPELINE_WARMUP` opts into preload. The backend verifies the full
+envelope, executable/device identity, digest, fixed payload shape, ordering,
+uniqueness, and semantic key fields before creating any state. It then creates
+all states before the first draw. Any load, decode, allocation, specialization,
+or pipeline failure clears partial preload and uses the unchanged synchronous
+runtime path.
+
+Both switches are unset by default. They may name different files only.
+Reporting is bounded to `bloodwake.metal-pipeline-warmup/v1` JSONL with
+artifact status and aggregate entry/write/preload counts. It never includes a
+path, key, descriptor, combiner word, function constant, texture identity, or
+address.

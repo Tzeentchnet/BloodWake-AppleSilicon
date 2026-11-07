@@ -59,6 +59,8 @@ bw_prepare_metal_shaders(
 set(METAL_BACKEND_TEST_SOURCES
     test_main.c
     ../../src/gpu/bw_metal_backend.m
+    ../../src/gpu/bw_metal_pipeline_artifact.c
+    ../../src/gpu/bw_metal_pipeline_trace.c
     ../../src/toolkit_patches/kernel/nv2a_pb_exec.c
     ../../src/toolkit_patches/kernel/nv2a_vsh_interp.c
     "${XBOXRECOMP_DIR}/src/kernel/nv2a_combiner.c"
@@ -127,6 +129,7 @@ foreach(case semaphore-release semaphore-concurrent visual
              pipeline-diagnostic-library-precise
              pipeline-diagnostic-library-fallback
              pipeline-diagnostic-library-failure
+             pipeline-warmup-disabled pipeline-warmup-invalid
              depth-draw stencil-draw polygon-offset polygon-offset-disabled polygon-offset-zero
              partial-color partial-color-masks partial-color-default-rect partial-clip partial-empty
              partial-depth partial-depth-seed partial-depth-empty partial-depth-unbound
@@ -243,6 +246,12 @@ endforeach()
 set_tests_properties(metal_pipeline-diagnostic-library-precise PROPERTIES
     ENVIRONMENT "BW_METAL_QUINCUNX_APPROX=1")
 
+add_test(NAME metal_pipeline-warmup-integration
+    COMMAND "${Python3_EXECUTABLE}"
+            "${CMAKE_CURRENT_LIST_DIR}/test_pipeline_warmup.py"
+            "$<TARGET_FILE:bw_metal_backend_test>")
+set_tests_properties(metal_pipeline-warmup-integration PROPERTIES TIMEOUT 120)
+
 add_test(NAME metal_cpu_write_counterexample
     COMMAND bw_metal_backend_test cpu-write-counterexample)
 set_tests_properties(metal_cpu_write_counterexample PROPERTIES
@@ -351,8 +360,19 @@ add_executable(bw_metal_pipeline_artifact_test
 target_include_directories(bw_metal_pipeline_artifact_test PRIVATE ../../src/gpu)
 set_target_properties(bw_metal_pipeline_artifact_test PROPERTIES
     C_STANDARD 11 C_STANDARD_REQUIRED ON)
-foreach(case compatible stale incompatible bounds policy corrupt)
+foreach(case compatible stale incompatible bounds policy corrupt io)
     add_test(NAME "metal_pipeline-artifact-${case}"
         COMMAND bw_metal_pipeline_artifact_test "${case}")
     set_tests_properties("metal_pipeline-artifact-${case}" PROPERTIES TIMEOUT 30)
+endforeach()
+
+add_executable(bw_metal_pipeline_trace_test
+    test_pipeline_trace.c ../../src/gpu/bw_metal_pipeline_trace.c)
+target_include_directories(bw_metal_pipeline_trace_test PRIVATE ../../src/gpu)
+set_target_properties(bw_metal_pipeline_trace_test PROPERTIES
+    C_STANDARD 11 C_STANDARD_REQUIRED ON)
+foreach(case deterministic roundtrip bounds format)
+    add_test(NAME "metal_pipeline-trace-${case}"
+        COMMAND bw_metal_pipeline_trace_test "${case}")
+    set_tests_properties("metal_pipeline-trace-${case}" PROPERTIES TIMEOUT 30)
 endforeach()

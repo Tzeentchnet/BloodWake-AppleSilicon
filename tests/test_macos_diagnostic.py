@@ -107,6 +107,8 @@ class MacosDiagnosticTests(unittest.TestCase):
                                          "BW_METAL_WATER": "realistic",
                                          "BW_METAL_WATER_BENCHMARK": "1",
                                          "BW_METAL_WATER_CAPTURE_TRIGGER": "/unsafe",
+                                         "BW_METAL_PIPELINE_WARMUP": "/unsafe",
+                                         "BW_METAL_PIPELINE_TRACE_OUTPUT": "/unsafe",
                                          "RECOMP_FB_DUMP": "/unsafe",
                                          "RECOMP_FB_DUMP_FLIPS": "1",
                                          "BW_HEADLESS_AUDIO_AUDIT": "1",
@@ -130,6 +132,8 @@ class MacosDiagnosticTests(unittest.TestCase):
         self.assertNotIn("BW_METAL_WATER", env)
         self.assertNotIn("BW_METAL_WATER_BENCHMARK", env)
         self.assertNotIn("BW_METAL_WATER_CAPTURE_TRIGGER", env)
+        self.assertNotIn("BW_METAL_PIPELINE_WARMUP", env)
+        self.assertNotIn("BW_METAL_PIPELINE_TRACE_OUTPUT", env)
         self.assertNotIn("RECOMP_FB_DUMP", env)
         self.assertNotIn("RECOMP_FB_DUMP_FLIPS", env)
         self.assertEqual(env["BW_SETTINGS"], "none")
@@ -214,7 +218,9 @@ class MacosDiagnosticTests(unittest.TestCase):
             frame_timing=True, pipeline_timing=True,
             profile_name="profile-002.txt",
             profile_from=20.0, profile_to=40.0, profile_callers=True,
-            render_scale="2.25", frame_cap=60)
+            render_scale="2.25", frame_cap=60,
+            pipeline_trace_name="pipeline-trace-002.bwmpa",
+            pipeline_warmup=self.root / "warmup.bwmpa")
         self.assertEqual(performance["BW_METAL_FRAME_TIMING"], "1")
         self.assertEqual(performance["BW_METAL_PIPELINE_TIMING"], "1")
         self.assertEqual(performance["BW_PROFILE"],
@@ -224,10 +230,26 @@ class MacosDiagnosticTests(unittest.TestCase):
         self.assertEqual(performance["BW_PROFILE_CALLERS"], "1")
         self.assertEqual(performance["BW_METAL_RENDER_SCALE"], "2.25")
         self.assertEqual(performance["BW_HIFPS"], "60")
+        self.assertEqual(
+            performance["BW_METAL_PIPELINE_TRACE_OUTPUT"],
+            str(self.root / "pipeline-trace-002.bwmpa")
+        )
+        self.assertEqual(
+            performance["BW_METAL_PIPELINE_WARMUP"],
+            str(self.root / "warmup.bwmpa")
+        )
         with self.assertRaisesRegex(ValueError, "requires audio to remain enabled"):
             diagnostic.diagnostic_env(
                 self.root, self.prepared, 15, False, False, 4, 5,
                 disable_audio=True, audio_audit=True)
+        with self.assertRaisesRegex(ValueError, "trace output name is invalid"):
+            diagnostic.diagnostic_env(
+                self.root, self.prepared, 15, False, False, 4, 5,
+                pipeline_trace_name="../trace.bwmpa")
+        with self.assertRaisesRegex(ValueError, "absolute .bwmpa"):
+            diagnostic.diagnostic_env(
+                self.root, self.prepared, 15, False, False, 4, 5,
+                pipeline_warmup="relative.bwmpa")
         with self.assertRaisesRegex(ValueError, "edition must be original or remastered"):
             diagnostic.diagnostic_env(
                 self.root, self.prepared, 15, False, False, 4, 5, edition="Remastered")
@@ -1098,8 +1120,12 @@ class MacosDiagnosticTests(unittest.TestCase):
         self.assertIn("guided-frame-NNNNN.bmp", output.getvalue())
 
     def test_performance_diagnostic_cli_propagates_options(self):
+        warmup = self.root / "warmup.bwmpa"
+        warmup.write_bytes(b"private synthetic warmup")
+        warmup.chmod(0o600)
         arguments = self.main_arguments() + [
             "--frame-timing", "--pipeline-timing",
+            "--pipeline-trace", "--pipeline-warmup", str(warmup),
             "--profile", "--profile-from", "5",
             "--profile-to", "10", "--profile-callers", "--render-scale", "2.25",
             "--frame-cap", "60",
@@ -1109,6 +1135,8 @@ class MacosDiagnosticTests(unittest.TestCase):
                   _quincunx, _audit, **kwargs):
             self.assertTrue(kwargs["frame_timing"])
             self.assertTrue(kwargs["pipeline_timing"])
+            self.assertTrue(kwargs["pipeline_trace"])
+            self.assertEqual(kwargs["pipeline_warmup"], warmup)
             self.assertTrue(kwargs["profile_enabled"])
             self.assertEqual(kwargs["profile_from"], 5.0)
             self.assertEqual(kwargs["profile_to"], 10.0)
@@ -1130,6 +1158,10 @@ class MacosDiagnosticTests(unittest.TestCase):
         self.assertEqual(result, 0)
         self.assertIn("frame timing: enabled", output.getvalue())
         self.assertIn("pipeline timing: bounded JSONL enabled", output.getvalue())
+        self.assertIn("pipeline trace: private bounded artifact enabled",
+                      output.getvalue())
+        self.assertIn("pipeline warm-up: private artifact enabled",
+                      output.getvalue())
         self.assertIn("sampling profile: enabled", output.getvalue())
         self.assertIn("render scale: 2.25", output.getvalue())
         self.assertIn("frame cap: 60", output.getvalue())

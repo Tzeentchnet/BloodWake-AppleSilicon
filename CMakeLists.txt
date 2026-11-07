@@ -167,6 +167,7 @@ set(GAME_SOURCES
     src/bw_ocean_native.c
     src/gpu/bw_metal_backend.m
     src/gpu/bw_metal_pipeline_artifact.c
+    src/gpu/bw_metal_pipeline_trace.c
     src/gpu/bw_gpu_audit.c
     src/gpu/bw_ab.c
     src/gpu/bw_gamma.c
