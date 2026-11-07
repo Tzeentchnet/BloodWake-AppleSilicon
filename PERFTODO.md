@@ -37,11 +37,14 @@ every rejection retains synchronous runtime creation.
 PERF-032 is complete: compatible preloads enable bounded asynchronous
 compilation for untraced specializations while the exact generic pipeline
 renders; failures remain explicit and callback ownership is drained at stop.
-PERF-034 instrumentation is implemented and validated, including bounded
-runtime streaming, but remains active: the no-controller production smoke
-reached only the paused reconnect overlay, and its real presented callbacks
-reported no usable actual or display-target timestamp. Default pacing and
-deeper renderer work remain gated on representative measurements.
+PERF-033 is active: a controller-free private Battle trace captured all 25
+observed states, and two clean exact-default seeded boots preloaded all 25
+with zero cache misses, asynchronous work, or post-frame-zero pipeline
+creation. Historical-band reproduction, input-latency/output-hash evidence,
+and a small submission-tail regression remain open. PERF-034 instrumentation
+now has representative actual-presentation evidence; the explicit presenter
+still exposes no display target timestamp, and the measured wall tails do not
+justify changing the default pacing path yet.
 
 Render scale, filtering, LOD, Retail draw coverage, quincunx behavior, and
 Retail-water defaults remain fixed. Continue collecting direct power and
@@ -83,7 +86,7 @@ temperature evidence when privileged telemetry is available.
 | PERF-030 | Compile stable Metal shaders offline | `[x]` | PERF-029 |
 | PERF-031 | Add device-local trace-derived pipeline warm-up | `[x]` | PERF-028, PERF-029, PERF-030 |
 | PERF-032 | Add asynchronous rare-miss compilation and bounded retention | `[x]` | PERF-028, PERF-029, PERF-030 |
-| PERF-033 | Qualify cold-start pipeline behavior | `[ ]` | PERF-031, PERF-032 |
+| PERF-033 | Qualify cold-start pipeline behavior | `[~]` | PERF-031, PERF-032 |
 | PERF-034 | Instrument presentation and display timing | `[~]` | PERF-027 |
 | PERF-035 | Evaluate a gated `CAMetalDisplayLink` path | `[ ]` | PERF-034 |
 | PERF-036 | Qualify match-display pacing and latency | `[ ]` | PERF-035 |
@@ -490,15 +493,40 @@ a pre-existing `-Wcomment` error in the pinned toolkit's `kernel.h`. No
 no-controller result is treated as gameplay or cold-performance evidence;
 PERF-033 remains open.
 
+The diagnostic keyboard bridge now provides a neutral connected controller
+without requiring a physical pad. Live guided input was used only to calibrate
+additional spaced A confirmations in the deterministic menu script. A fresh
+direct seed then ran with no scripted or guided input, captured 25 canonical
+states across 273,229 validated Battle scopes, and produced a complete private
+artifact with zero drops.
+
+Two subsequent exact-default Native/auto boots used that same private
+save/relaunch seed and compatible artifact. Both preloaded all 25 states,
+reported zero cache misses, zero asynchronous scheduling/fallback, zero
+whole-cache resets, and no function-specialization or pipeline-creation event
+after frame 0. Their retained wall maxima were 227.223 ms and 225.080 ms at
+frame 1, with no Metal, allocation, non-monotonic timing, marker-rejection, or
+malformed-report failure. The one pre-first-flip wall correlation per boot
+remained explicitly unavailable. They retained 281,832 and 258,621 validated
+Battle scopes.
+
+Selected consecutive post-frame-900 windows remained within the 59.0-60.5 FPS
+and 16.67 ms GPU budgets: 59.66-60.17 FPS, 16.60-16.74 ms wall medians,
+14.56-14.79 ms GPU medians, and 15.48-15.79 ms GPU p95. Wall p95 was
+17.32-17.95 ms and submission p95 was 15.67-15.80 ms, so the prior wall and
+submission tails are not declared non-regressed. No physical input-latency or
+output-hash comparison was collected. The historical 296-330 ms band also
+did not reproduce, so its attribution item remains open.
+
 PERF-033 exit gates:
 
-- [ ] Two clean exact-default cold boots complete with zero renderer-thread
+- [x] Two clean exact-default cold boots complete with zero renderer-thread
   specialized-pipeline creation after the first seeded gameplay flip.
 - [ ] No retained 296-330 ms maximum is attributed to Metal library,
   specialization, pipeline creation, archive load, or cache churn.
 - [ ] Steady-state FPS/GPU/submission percentiles, input latency, markers,
   output hashes, and Metal error behavior do not regress.
-- [ ] Missing, stale, corrupt, and unsupported artifacts take the tested
+- [x] Missing, stale, corrupt, and unsupported artifacts take the tested
   explicit fallback.
 
 ### Presentation pacing: PERF-034 through PERF-036
@@ -524,19 +552,24 @@ under ASan/UBSan, and under ThreadSanitizer. The complete Metal backend suite
 passes 375/375, strict C and Objective-C validation pass, and the production
 offline-library target rebuilds.
 
-A private exact-default production smoke retained four paused-renderer
-events before the controller overlay stopped producing new flips. All four
-acquired a drawable, completed their command, and invoked the presented
-callback with no ordering, JSON, or privacy failure. All four returned an
-unavailable actual presentation time, and the explicit presenter had no
-display target timestamp. This proves callback mechanics and explicit failure
-reporting only. It does not provide display cadence, gameplay pacing, or
-causal evidence for the 17.06-17.46 ms wall p95, so the first three runtime
-items below remain open.
+A private exact-default paused-renderer smoke first validated callback and
+explicit-unavailability mechanics. The later seeded Battle pair retained 512
+events per run. It reported 507 and 508 actual presentations, exact
+16.667 ms median intervals, variable 33.333/50.000 ms missed-present
+intervals, and no malformed or command-completion failure. Every explicit
+presenter record still reported its display target unavailable.
+
+Drawable acquisition reached no 5 ms tail in either retained gameplay sample,
+and the existing manual hold exceeded 8 ms on only one and two wall-tail
+frames. Command completion and missed actual presents contributed to the
+second run's cold tail, while most 17 ms wall tails had neither a long
+drawable wait, long hold, 16 ms command completion, nor missed present. Exact
+target timestamps remain necessary to separate residual scene/OS scheduling,
+so causal attribution and a display-link change remain gated.
 
 - [ ] Correlate flip release, command commit/completion, drawable acquisition,
   requested presentation, actual presentation, and display target timestamps.
-- [ ] Record fractional and variable display-rate changes rather than rounding
+- [x] Record fractional and variable display-rate changes rather than rounding
   the display to an assumed fixed integer cadence.
 - [ ] Prove whether drawable wait, manual host pacing, command completion, OS
   scheduling, or scene work causes the 17.06-17.46 ms wall p95.

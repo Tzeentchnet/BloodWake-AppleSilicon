@@ -712,12 +712,114 @@ callback, streaming, and explicit-unavailability mechanics only. The title
 was paused without a physical controller, so none of these phase durations
 are retained as gameplay pacing or PERF-034 causal evidence.
 
-The remaining implementation sequence is:
+#### Controller-free workload calibration
 
-1. capture a representative gameplay trace with a connected controller;
-2. qualify cold behavior; and
-3. evaluate a kind-2 Metal binary archive only if
-   measured startup preload time requires it.
+The existing diagnostic keyboard bridge presents a connected neutral title
+controller without a physical gamepad. Live guided input was allowed
+alongside the deterministic poll-epoch script only for script calibration.
+The user-observed missing confirmations became six additional spaced A steps
+at the one-player script tail. Guided frame dumps and manual commands are
+never retained as performance evidence.
+
+The revised script and bridge pass all 11 input-integration tests normally,
+under ASan/UBSan, and under ThreadSanitizer. All 61 isolated diagnostic-runner
+tests pass. A calibration run reached 72,729 validated marked Battle scopes
+with balanced lit/reflection/foam counts and zero rejection or fingerprint
+mismatch.
+
+The first validated relaunch and private save from that run were then used
+directly with the neutral bridge, no script, no guided input, and no physical
+controller. A 90-second trace run reached 273,229 validated Battle scopes,
+captured all 25 observed canonical states with zero drops, and emitted no
+scripted or guided input event. Its artifact and every log, save, relaunch
+record, key, fingerprint, and capture remain private.
+
+#### PERF-033 seeded runtime evidence
+
+Two clean direct seeded boots used the same executable, Native/auto 4x,
+match-display pacing, Retail water, accepted quincunx approximation, audio,
+private save/relaunch seed, and compatible 25-state artifact. Neither enabled
+GPU audit, capture, profiling, guided input, synthetic script input,
+render-scale override, or frame-cap override.
+
+Both validated and preloaded all 25 states. Each performed the four fixed
+startup pipeline creations plus 25 preload creations and 24 startup
+specializations at frame 0. No later specialization or pipeline creation
+occurred. Both reported zero cache misses, asynchronous schedules/fallbacks,
+whole-cache resets, allocation failures, Metal failures, malformed reports,
+or rejected markers. The one library-load event before the first correlated
+flip retained an explicitly unavailable wall interval in each boot.
+
+| Metric | Cold boot 1 | Cold boot 2 |
+| --- | ---: | ---: |
+| Offline library load | 0.082 ms | 0.088 ms |
+| Startup specialization | 24 / 191.553 ms | 24 / 192.632 ms |
+| Startup pipeline creation | 29 / 328.293 ms | 29 / 328.971 ms |
+| Preloaded / runtime misses | 25 / 0 | 25 / 0 |
+| Last retained cache hits / high-water / resets | 648,217 / 25 / 0 | 612,626 / 25 / 0 |
+| Post-frame-zero specialization/pipeline events | 0 | 0 |
+| Retained wall maximum | 227.223 ms, frame 1 | 225.080 ms, frame 1 |
+| Validated marked Battle scopes | 281,832 | 258,621 |
+
+The runs did not reproduce the historical 296-330 ms band. No retained cold
+maximum contained a library load, specialization, pipeline creation, archive
+operation, cache miss, or reset after the first flip. This closes the measured
+renderer-thread pipeline-work gate but does not retroactively attribute the
+unreproduced historical band.
+
+The selected consecutive qualification windows were:
+
+| Metric | Cold boot 1, frames 1200/1500 | Cold boot 2, frames 1800/2100 |
+| --- | ---: | ---: |
+| Completed-game FPS | 60.08-60.11 | 59.66-60.17 |
+| Wall median | 16.62 ms | 16.60-16.74 ms |
+| Wall p95 | 17.43-17.63 ms | 17.32-17.95 ms |
+| Combined GPU median | 14.76-14.79 ms | 14.56-14.57 ms |
+| Combined GPU p95 | 15.48-15.52 ms | 15.55-15.79 ms |
+| Submission-latency p95 | 15.67-15.78 ms | 15.69-15.80 ms |
+
+The FPS, wall median, and GPU budgets pass. Boot 2's earlier windows warmed
+from 51.82 FPS / 17.65 ms GPU p95 at frame 900 to the selected pair. Wall p95
+still exceeds 17 ms, and submission p95 is 0.17-0.30 ms above the prior
+15.50 ms upper baseline. No physical input-latency or output-hash comparison
+was collected. PERF-033 therefore remains active rather than claiming that
+all steady-state behavior is non-regressed. Existing focused tests continue
+to prove explicit synchronous fallback for missing, stale, corrupt, and
+unsupported artifacts.
+
+#### PERF-034 representative presentation evidence
+
+The same clean boots each retained the first 512 presentation events. All 512
+commands completed. Actual presentation was available for 507 and 508
+records; five and four remained explicitly unavailable. Consecutive actual
+presentation medians were exactly 16.667 ms. Boot 1's actual p95/max were
+16.671/33.334 ms, while boot 2's colder sample was
+33.333/50.000 ms. Fractional and variable cadence is therefore retained
+without rounding. All 1,024 display-target fields remained explicitly
+unavailable under `presentDrawable:`.
+
+After excluding each frame-zero cold maximum and intervals above 50 ms, 147
+and 372 retained wall intervals exceeded 17 ms. None had drawable acquisition
+of 5 ms or more. Only one and two had an 8 ms manual hold; seven and 91 had
+command completion of at least 16 ms; five and 62 coincided with an actual
+presentation interval of at least 25 ms. The remaining 135 and 237 had none
+of those measured conditions. Actual-present interval had the strongest
+measured correlation with the retained wall interval (0.610 and 0.430), while
+command completion was material only in the colder second run.
+
+Thus drawable acquisition and the current manual host hold are not the
+general 17 ms tail source. Cold command/GPU completion and missed display
+intervals contributed in boot 2, but most residual tails remain consistent
+with scene work or OS scheduling that the explicit presenter cannot separate
+without a target timestamp. This evidence does not justify changing the
+default pacing path or claiming PERF-034 causal closure.
+
+The remaining PERF-033 evidence is:
+
+1. reproduce or explicitly retire the historical 296-330 ms band;
+2. retain input-latency and output-hash comparisons; and
+3. resolve the small wall/submission-tail difference before declaring
+   steady-state non-regression.
 
 This follows Apple's current
 [Metal 4 compilation guidance](https://developer.apple.com/documentation/metal/using-the-metal-4-compilation-api),
@@ -806,6 +908,9 @@ They live outside the repository and must remain uncommitted:
 - `runtime-native-4x60-consolidated-fixed4-001`
 - `runtime-native-4x60-consolidated-fixed4-002`
 - `runtime-perf034-paused-002`
+- `runtime-perf033-seeded-trace-001`
+- `runtime-perf033-seeded-cold-001`
+- `runtime-perf033-seeded-cold-002`
 
 ## Reproduction template
 
@@ -830,6 +935,13 @@ python3 tools/macos_diagnostic.py \
 
 Do not add GPU audit, BMP capture, menu automation, or profiling to a clean
 timing run. Run profiling separately.
+
+For the controller-free PERF-033 exact-default path, omit the scale/cap
+overrides, use `--seconds 90 --pipeline-timing`, and add
+`--pipeline-warmup /private/compatible-trace.bwmpa`. The experimental keyboard
+hook supplies only the connected neutral controller; do not add a synthetic
+script or guided input when starting directly from the validated Battle
+relaunch seed.
 
 ## Conclusions
 

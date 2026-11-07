@@ -201,6 +201,15 @@ class MacosDiagnosticTests(unittest.TestCase):
                          str(self.root / "guided-pad.txt"))
         self.assertEqual(guided["RECOMP_FB_DUMP"],
                          str(self.root / "guided-frame-"))
+        guided_scripted = diagnostic.diagnostic_env(
+            self.root, self.prepared, 15, False, False, 4, 5,
+            keyboard_hook=True, guided_input=True, edition="remastered",
+            synthetic_input_script="remastered-boot-menu-to-gameplay-v1")
+        self.assertEqual(
+            guided_scripted["BW_SYNTHETIC_INPUT_SCRIPT"],
+            "remastered-boot-menu-to-gameplay-v1")
+        self.assertEqual(guided_scripted["BW_MACOS_GUIDED_INPUT"],
+                         str(self.root / "guided-pad.txt"))
         self.assertEqual(guided["RECOMP_PB_REPORT_MS"], "2000")
         audio_disabled = diagnostic.diagnostic_env(
             self.root, self.prepared, 15, False, False, 4, 5,
@@ -1097,11 +1106,18 @@ class MacosDiagnosticTests(unittest.TestCase):
         self.assertIn("Diagnostic audio: disabled", output.getvalue())
 
     def test_guided_input_capture_cli_propagates_private_paths(self):
-        arguments = self.main_arguments() + ["--guided-input-capture"]
+        arguments = self.main_arguments() + [
+            "--guided-input-capture", "--edition", "remastered",
+            "--experimental-keyboard-hook", "--synthetic-input-script",
+            "remastered-boot-menu-to-gameplay-v1",
+        ]
 
         def guest(_executable, output, _game_dir, _profile, _seconds,
                   _quincunx, _audit, **kwargs):
             self.assertTrue(kwargs["guided_input"])
+            self.assertEqual(
+                kwargs["synthetic_input_script"],
+                "remastered-boot-menu-to-gameplay-v1")
             self.assertTrue((output / "guided-pad.txt").is_file())
             (output / "guest.log").write_bytes(b"no marker summary\n")
             return 0

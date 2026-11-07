@@ -330,7 +330,8 @@ def diagnostic_env(output, game_dir, seconds, quincunx, audit, input_fd, output_
         raise ValueError("synthetic input requires the experimental keyboard hook")
     if synthetic_input and synthetic_input_script:
         raise ValueError("legacy synthetic input and a synthetic input script are mutually exclusive")
-    if guided_input and (keyboard_hook or synthetic_input or synthetic_input_script):
+    if guided_input and (
+            synthetic_input or (keyboard_hook and not synthetic_input_script)):
         raise ValueError("guided input cannot use the experimental keyboard input path")
     if synthetic_input_script not in (None, *SYNTHETIC_INPUT_SCRIPTS):
         raise ValueError("unknown synthetic input script")
@@ -1268,8 +1269,8 @@ def main(argv=None):
     if args.synthetic_input and args.synthetic_input_script:
         parser.error("--synthetic-input and --synthetic-input-script are mutually exclusive")
     if args.guided_input_capture and (
-            args.experimental_keyboard_hook or args.synthetic_input or
-            args.synthetic_input_script):
+            args.synthetic_input or
+            (args.experimental_keyboard_hook and not args.synthetic_input_script)):
         parser.error(
             "--guided-input-capture cannot use the experimental keyboard input path"
         )

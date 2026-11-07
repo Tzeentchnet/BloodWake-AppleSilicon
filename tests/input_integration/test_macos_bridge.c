@@ -256,6 +256,12 @@ static void synthetic_script_test(uint32_t handle, uint32_t second)
         {180, 4, 0, 1, 0},
         {180, 4, 0, 1, 0},
         {240, 4, 0, 1, 0},
+        {180, 4, 0, 1, 0},
+        {180, 4, 0, 1, 0},
+        {180, 4, 0, 1, 0},
+        {180, 4, 0, 1, 0},
+        {180, 4, 0, 1, 0},
+        {180, 4, 0, 1, 0},
     };
     static const ExpectedScriptStep expected_two_player[] = {
         {600, 30, XBOX_GAMEPAD_START, 0, 0, 0},

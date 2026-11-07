@@ -79,6 +79,12 @@ static const BwScriptStep s_gameplay_script_steps[] = {
     {180, 4, BW_SCRIPT_A, BW_SCRIPT_PAD_ONE},
     {180, 4, BW_SCRIPT_A, BW_SCRIPT_PAD_ONE},
     {240, 4, BW_SCRIPT_A, BW_SCRIPT_PAD_ONE},
+    {180, 4, BW_SCRIPT_A, BW_SCRIPT_PAD_ONE},
+    {180, 4, BW_SCRIPT_A, BW_SCRIPT_PAD_ONE},
+    {180, 4, BW_SCRIPT_A, BW_SCRIPT_PAD_ONE},
+    {180, 4, BW_SCRIPT_A, BW_SCRIPT_PAD_ONE},
+    {180, 4, BW_SCRIPT_A, BW_SCRIPT_PAD_ONE},
+    {180, 4, BW_SCRIPT_A, BW_SCRIPT_PAD_ONE},
 };
 static const BwScriptStep s_split_script_steps[] = {
     {600, 30, BW_SCRIPT_START, BW_SCRIPT_PAD_ONE},

@@ -98,7 +98,10 @@ This is still a development build:
   diagnostic-only menu-to-gameplay navigation without OS keystrokes. Combined
   with the headless audio sink, it completed three private boots and two
   validated relaunches, reached ocean rendering, and stopped at the configured
-  boot limit. Default physical input and CoreAudio behavior are unchanged.
+  boot limit. Its spaced confirmation tail has now been calibrated without a
+  physical controller. A private guided-pad channel can run alongside the
+  script for calibration only; default physical input and CoreAudio behavior
+  are unchanged.
 - Bounded Metal ownership now keeps at most three submissions in flight,
   gives mutable upload, feedback-resolve, and readback resources to their
   submission, keeps exact tracked XRGB feedback GPU-private while guest bytes
@@ -116,22 +119,37 @@ This is still a development build:
   17.06-17.46 ms, cold windows contain 296-330 ms shader/workload warm-up
   stalls, and broader mission, device, power, temperature, and formal visual
   coverage remain open.
+- A controller-free private Battle trace captured 25 canonical pipeline states
+  across 273,229 validated scopes. Two direct exact-default seeded boots
+  preloaded all 25 and reported zero misses, asynchronous work, cache resets,
+  or specialization/pipeline creation after frame 0. Their cold maxima fell
+  to 225.080-227.223 ms. Selected post-frame-900 windows reached
+  59.66-60.17 FPS with 15.48-15.79 ms GPU p95, but wall p95 remained
+  17.32-17.95 ms and submission p95 15.67-15.80 ms. Input latency, output
+  hashes, and the historical 296-330 ms band remain open.
+- Representative presentation telemetry retained 507-508 actual presentation
+  times per boot with exact fractional intervals. Drawable acquisition and
+  the manual host hold were not the general 17 ms tail source; cold command
+  completion and missed display intervals contributed in one run, while most
+  residual tails remain scene/OS scheduling candidates. The explicit
+  presenter has no display target timestamp, so a pacing change is not yet
+  justified.
 
 ## Current performance priorities
 
 The steady-state representative target is closed. Work now proceeds in this
 order:
 
-1. Qualify two clean cold exact-default gameplay boots with the validated
-   offline-library, device-local preload, and exact asynchronous rare-miss
-   path. Missing or rejected artifacts retain synchronous runtime creation.
-   Retail-derived traces and archives remain private.
-2. Obtain representative gameplay evidence from the new bounded presentation
-   telemetry before evaluating a gated `CAMetalDisplayLink` match-display
-   path. A paused-renderer smoke validated real drawable, command-completion,
-   presented-callback, and explicit-unavailability handling, but supplied no
-   usable actual-present or display-target timestamp. The current path remains
-   the fallback.
+1. Close the remaining PERF-033 gates: reproduce or retire the historical
+   296-330 ms band, compare input latency and output hashes, and resolve the
+   small submission-tail difference. Runtime pipeline creation is already
+   removed from the measured seeded workload. Retail-derived traces and
+   archives remain private.
+2. Keep the explicit presenter as the default. Representative telemetry now
+   supplies actual-present intervals but no target timestamp; evaluate a gated
+   `CAMetalDisplayLink` path only if target-aligned evidence can distinguish
+   the residual scene/OS scheduling tail and meets the PERF-036 acceptance
+   thresholds.
 3. Qualify cold start, frame pacing, missions, split-screen, heavy effects,
    long-duration behavior, and available Apple Silicon device classes with
    direct power and temperature evidence where approved.

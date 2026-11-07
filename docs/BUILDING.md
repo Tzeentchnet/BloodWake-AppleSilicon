@@ -233,12 +233,17 @@ The script emits distinct Xbox-equivalent Start, D-pad Down, and A
 press/release packets on guest polling epochs, rejects unknown names, and
 releases state on completion, focus loss, and shutdown. Reaching `--max-boots`
 is intentionally reported as a non-success outcome even though aggregate
-marker/fingerprint evidence is still printed.
+marker/fingerprint evidence is still printed. Its one-player tail includes
+spaced A confirmations calibrated from the controller-free Remastered
+relaunch path.
 
 For menu timing that has not yet been made deterministic, use
-`--guided-input-capture` instead of the experimental keyboard hook or a
-synthetic script. The runner exposes two private title-level pads, reads live
-commands appended to `<output-dir>/guided-pad.txt`, and refreshes
+`--guided-input-capture`. It may run alone or alongside the deterministic
+synthetic script while calibrating that script; it remains incompatible with
+the legacy held synthetic input and water capture. Scripted and guided states
+are merged, so a command can supply a missing confirmation without restarting
+the boot. The runner exposes two private title-level pads, reads live commands
+appended to `<output-dir>/guided-pad.txt`, and refreshes
 numbered `<output-dir>/guided-frame-NNNNN.bmp` images from the game framebuffer
 every two seconds. This captures only the game picture, not the desktop.
 Commands use the toolkit live-pad syntax, for example `start:500`, `a:250`,
@@ -246,7 +251,8 @@ Commands use the toolkit live-pad syntax, for example `start:500`, `a:250`,
 time, plus physical Start/D-pad/A/B press and release transitions, so a
 successful guided pass can be converted into a deterministic script.
 Guided input and `--water-capture` are mutually exclusive because both own the
-framebuffer dump path.
+framebuffer dump path. Frame dumps and interactive corrections make a guided
+run script-calibration evidence, not performance evidence.
 
 `--water-preset` strictly accepts `retail` or `realistic`, defaults to Retail,
 and discards inherited `BW_METAL_WATER` values. Realistic requires
