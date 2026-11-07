@@ -83,7 +83,7 @@ This is still a development build:
   audible.
 - USB gamepads, physical-controller support, and broad mission, save, FMV,
   and edition coverage are incomplete.
-- Current regression results include 375/375 Metal backend tests, all 62
+- Current regression results include 376/376 Metal backend tests, all 62
   presenter CTest entries (including the real-window AppKit case in the
   current WindowServer session), 35/35 MMIO host tests, 8/8 normal and ASan/UBSan
   macOS host tests, 11/11 input integration tests, 6/6 APU/audio tests,
@@ -120,20 +120,25 @@ This is still a development build:
   stalls, and broader mission, device, power, temperature, and formal visual
   coverage remain open.
 - A controller-free private Battle trace captured 25 canonical pipeline states
-  across 273,229 validated scopes. Two direct exact-default seeded boots
-  preloaded all 25 and reported zero misses, asynchronous work, cache resets,
-  or specialization/pipeline creation after frame 0. Their cold maxima fell
-  to 225.080-227.223 ms. Selected post-frame-900 windows reached
-  59.66-60.17 FPS with 15.48-15.79 ms GPU p95, but wall p95 remained
-  17.32-17.95 ms and submission p95 15.67-15.80 ms. Input latency, output
-  hashes, and the historical 296-330 ms band remain open.
-- Representative presentation telemetry retained 507-508 actual presentation
-  times per boot with exact fractional intervals. Drawable acquisition and
-  the manual host hold were not the general 17 ms tail source; cold command
-  completion and missed display intervals contributed in one run, while most
-  residual tails remain scene/OS scheduling candidates. The explicit
-  presenter has no display target timestamp, so a pacing change is not yet
-  justified.
+  with the current executable across 276,381 validated scopes. Two direct
+  exact-default seeded boots preloaded all 25 and reported zero misses,
+  asynchronous work, cache resets, or specialization/pipeline creation after
+  frame 0. Their cold maxima were 232.569-239.077 ms. No retained current-path
+  run reproduced the historical 296-330 ms band, so it is retired without
+  retroactive attribution. A warm repeat recovered to 59.95-60.03 FPS and
+  15.39-15.40 ms GPU p95, but wall p95 reached 17.07 ms and submission p95
+  remained 15.60-15.62 ms. Static exact hashes and complete Battle
+  draw-fingerprint overlap support rendering continuity, but dynamic captures
+  were not frame-aligned and no physical controller was available; those
+  strict correctness/latency gates remain incomplete.
+- Refreshed presentation telemetry retained 509 actual presentation times per
+  boot with exact fractional intervals. Drawable acquisition and the manual
+  host hold were not the general 17 ms tail source; command completion and
+  missed display intervals remain measured contributors while residual
+  scene/OS scheduling cannot be separated. The explicit presenter has no
+  display target timestamp. Current evidence does not justify a
+  `CAMetalDisplayLink` path, so that evaluation is a documented no-go and the
+  explicit presenter remains unchanged.
 - The broader qualification contract now defines six private workload slots,
   exact cold/warm/30-minute/60-minute run classes, deterministic worst-load
   selection, available-device inventory, retained metrics, and explicit
@@ -145,26 +150,23 @@ This is still a development build:
 
 ## Current performance priorities
 
-The steady-state representative target is closed. Work now proceeds in this
-order:
+The steady-state representative target is closed, and all currently
+executable continuation decisions are recorded:
 
-1. Close the remaining PERF-033 gates: reproduce or retire the historical
-   296-330 ms band, compare input latency and output hashes, and resolve the
-   small submission-tail difference. Runtime pipeline creation is already
-   removed from the measured seeded workload. Retail-derived traces and
-   archives remain private.
-2. Keep the explicit presenter as the default. Representative telemetry now
-   supplies actual-present intervals but no target timestamp; evaluate a gated
-   `CAMetalDisplayLink` path only if target-aligned evidence can distinguish
-   the residual scene/OS scheduling tail and meets the PERF-036 acceptance
-   thresholds.
-3. Populate the five missing private PERF-037 workload slots, then run its
-   cold/warm/30-minute/60-minute matrix across every available Apple Silicon
-   class with paired direct power, temperature, clock, and memory evidence
-   where approved.
-4. Profile any failing workload. Port NV2A vertex programs to Metal only when
-   a miss is demonstrably CPU-bound; use Metal counters to guide any
-   additional GPU-pass work.
+1. PERF-028 is complete. Runtime pipeline creation is removed from the
+   measured seeded workload, and repeated current-path runs retire the
+   unreproduced historical cold band without inventing an old attribution.
+   Retail-derived traces and archives remain private.
+2. PERF-033 and PERF-036 are bounded no-go results, not passes. Strict
+   wall/submission thresholds still miss, dynamic Battle output hashes are
+   not frame-aligned, and physical input latency is unavailable.
+3. Keep the explicit presenter as the default. PERF-035 found no measured
+   basis for a `CAMetalDisplayLink` implementation; target-time causality
+   remains explicitly unavailable instead of inferred.
+4. PERF-038 remains blocked until its PERF-033/PERF-036 prerequisites pass,
+   five additional private workload seeds exist, and required hardware/input/
+   telemetry gaps can be collected. Profile CPU or GPU work only after a
+   valid matrix cell identifies that limiter.
 
 Lower scale, dynamic resolution, upscaling, frame generation, reduced
 filtering or LOD, changed Retail water, inexact quincunx, and unmeasured MSAA

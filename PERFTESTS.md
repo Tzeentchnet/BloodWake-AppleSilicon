@@ -811,15 +811,129 @@ Thus drawable acquisition and the current manual host hold are not the
 general 17 ms tail source. Cold command/GPU completion and missed display
 intervals contributed in boot 2, but most residual tails remain consistent
 with scene work or OS scheduling that the explicit presenter cannot separate
-without a target timestamp. This evidence does not justify changing the
-default pacing path or claiming PERF-034 causal closure.
+without a target timestamp.
 
-The remaining PERF-033 evidence is:
+#### PERF-033 refreshed current-executable evidence
 
-1. reproduce or explicitly retire the historical 296-330 ms band;
-2. retain input-latency and output-hash comparisons; and
-3. resolve the small wall/submission-tail difference before declaring
-   steady-state non-regression.
+The final qualification refresh used executable SHA-256
+`7448d6033ccfe58f0341ce8c4f06e7b41339f20262f5c4ea573deb39a7724c43`,
+the original validated direct Battle relaunch, and its byte-identical private
+save snapshot. All traces, saves, relaunch records, logs, fingerprints, and
+frames remain owner-private and outside the repository.
+
+The first attempt started from the post-run relaunch and reached only 2,354
+unscoped markers, so it failed the workload gate and is excluded. The valid
+refresh started from the original calibration relaunch and retained the
+following evidence:
+
+| Metric | Trace capture | Cold preload 1 | Cold preload 2 | Warm repeat |
+| --- | ---: | ---: | ---: | ---: |
+| Compatible entries | 25 captured | 25 loaded | 25 loaded | 25 loaded |
+| Runtime misses | 25 | 0 | 0 | 0 |
+| Cache resets | 0 | 0 | 0 | 0 |
+| Post-frame-zero specialization/pipeline events | 24/25 | 0/0 | 0/0 | 0/0 |
+| Retained wall maximum | 272.721 ms | 232.569 ms | 239.077 ms | 228.506 ms |
+| Maximum frame | 1 | 1 | 1 | 1 |
+| Validated marked scopes | 276,381 | 277,215 | 277,713 | 276,051 |
+| Event drops / allocation / timing / Metal failure | 0/0/0/0 | 0/0/0/0 | 0/0/0/0 | 0/0/0/0 |
+
+The private trace is an owner-only 5,876-byte, 25-entry artifact. Its capture
+reported 706,556 cache hits, 25 misses, a high-water count of 25, and no
+whole-cache reset. The two clean preloaded boots reported 670,555 and 708,336
+cache hits, zero miss, and high-water 25. Neither scheduled asynchronous work
+or used a generic fallback. Cold boot 1 stopped with one marked view in
+progress at the bounded process boundary; cold boot 2 was balanced. Both had
+zero marker rejection.
+
+The longer warm request still ended at the title's own relaunch rather than
+the runner's 300-second bound and retained ten complete rolling windows. Its
+final three windows measured 59.95-60.03 FPS, 16.98-17.07 ms wall p95, and
+15.39-15.40 ms combined-GPU p95. The final two submission-p95 values were
+15.60 and 15.62 ms. This is materially closer to the accepted baseline than
+the earlier 15.67-15.80 ms evidence, but it still fails the exact 15.50 ms
+PERF-036 gate; the 17.07 ms wall p95 also fails the exact 17.0 ms gate.
+
+Across the original instrumented pair, the earlier preloaded pair, the
+refreshed trace, the refreshed preloaded pair, and this warm repeat, no
+retained maximum reached 296 ms. The historical 296-330 ms band is therefore
+retired as unreproduced for the validated current path. This closes
+PERF-028's collection decision without claiming to know which old,
+non-reproduced work caused those historical samples.
+
+#### PERF-033 correctness companion
+
+Correctness collection was isolated from performance runs. A current
+scripted/guided capture shared four exact private framebuffer hashes with the
+earlier executable, including three at the same capture index. Local review
+classified all four as mission/UI screens rather than Battle gameplay, so
+they are retained as static rendering evidence only.
+
+Two direct neutral-controller Battle companions then used matching private
+seeds and GPU audit:
+
+| Metric | Earlier-source executable | Current executable |
+| --- | ---: | ---: |
+| Private host-timed BMPs | 10 | 10 |
+| Validated marked scopes | 264,777 | 270,685 |
+| Fingerprinted marked batches | 278,094 | 282,639 |
+| Distinct metadata fingerprints | 17 | 18 |
+| Fingerprint overflow / within-scope mismatch | 0 / 0 | 0 / 0 |
+
+All 17 earlier metadata fingerprints appeared in the current run; the current
+run observed one additional fingerprint. Counts differ because the bounded
+runs retained different numbers of frames. No private fingerprint value is
+published. These are stable draw-metadata fingerprints, not final
+framebuffer hashes.
+
+The 10+10 host-timed Battle captures had zero exact cross-run hash match
+because capture time did not select the same simulated frame. A second
+bounded comparison used the existing four-frame supported-water capture in
+each executable. It completed all four 1280x480 frames in each run with zero
+partial sequence, marker rejection, fingerprint overflow, or mismatch, but
+the time-evolving title-demo scene again had zero exact cross-run hash match.
+Local review confirmed changing animation/simulation phase rather than a
+static aligned frame. Neither comparison is converted into an output-hash
+pass.
+
+No physical controller was available. Guided-command timestamps and the
+neutral diagnostic bridge do not measure physical input-to-present latency,
+so input latency remains `unavailable_no_device`, not an inferred pass.
+Together, the exact static matches, complete fingerprint-set overlap, and
+zero marker/Metal error support rendering continuity, but the strict dynamic
+output-hash and physical-latency gates remain incomplete.
+
+#### PERF-034/PERF-035 pacing decision and PERF-036 result
+
+The refreshed current-executable cold pair each retained 512 bounded
+presentation records. All 512 commands completed in both runs. Each retained
+509 actual presentation timestamps and three explicit actual-time
+unavailability records. Consecutive actual-present intervals measured:
+
+| Metric | Cold preload 1 | Cold preload 2 |
+| --- | ---: | ---: |
+| Median | 16.667 ms | 16.667 ms |
+| p95 | 16.672 ms | 16.667 ms |
+| Maximum | 50.000 ms | 33.334 ms |
+| Display targets available | 0/512 | 0/512 |
+
+Cold preload 1 contained six drawable acquisitions at or above 5 ms, while
+cold preload 2 contained none. Both retained variable actual-present cadence.
+The earlier correlated pair already showed that drawable acquisition and the
+manual host hold were not the general wall-tail source; current evidence does
+not reverse that conclusion. Every direct-present record still reports
+`unavailable_explicit_presenter` for the display target.
+
+PERF-034 is therefore complete as bounded instrumentation and an explicit
+decision record, not as invented target-time data. PERF-035 is a no-go:
+current evidence does not show manual pacing as a material limiter, so an
+availability-gated `CAMetalDisplayLink` path is not implemented. The explicit
+presenter remains unchanged.
+
+PERF-036 also records a no-go acceptance result. FPS and combined-GPU p95
+pass in the recovered warm windows, but wall p95 reaches 17.07 ms,
+submission-latency p95 remains 15.60-15.62 ms, and physical input latency is
+unavailable. The current presenter is retained; no default, rendering,
+submission-ownership, in-flight-depth, quincunx, or fallback behavior changes.
 
 This follows Apple's current
 [Metal 4 compilation guidance](https://developer.apple.com/documentation/metal/using-the-metal-4-compilation-api),

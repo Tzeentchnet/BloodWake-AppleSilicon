@@ -178,10 +178,28 @@ test coverage are in [VALIDATION.md](VALIDATION.md).
   Native/auto boots produced post-warm-up windows at 59.98-60.01 FPS,
   16.66-16.68 ms wall medians, 14.18-14.84 ms GPU medians, and
   14.87-15.26 ms GPU p95. Two fixed-4x/cap-120 boots independently produced
-  consecutive windows above 60 FPS. Cold 296-330 ms startup stalls remain
-  documented as pipeline/workload warm-up.
-- Passed 337/337 Metal backend tests, seven focused ownership/publication
-  cases under ASan/UBSan, and 62/62 macOS presenter tests.
+  consecutive windows above 60 FPS. The original qualification retained
+  296-330 ms historical startup stalls for follow-up.
+- Added bounded pipeline lifecycle attribution, offline stable Metal
+  libraries, compatible owner-private canonical-key traces, synchronous
+  device-local preload, and exact generic fallback during bounded
+  asynchronous rare-miss compilation. A refreshed 25-state Battle artifact
+  produced zero runtime miss or post-frame-zero pipeline creation in two
+  exact-default cold boots. Repeated current-path runs did not reproduce the
+  historical 296-330 ms band, so it is retired without retroactive
+  attribution.
+- Added bounded actual-presentation telemetry on the existing monotonic clock.
+  Representative evidence excluded drawable wait and the manual host hold as
+  the general wall-tail cause. Because direct presentation exposes no target
+  timestamp and pacing was not shown material, `CAMetalDisplayLink` remains a
+  documented no-go and the explicit presenter is unchanged.
+- Defined the six-slot cold/warm/30-minute/60-minute broader qualification
+  matrix and extended fixed timing storage through one exact-default hour.
+  Runtime collection remains blocked by strict wall/submission, physical
+  input, workload-seed, hardware, and privileged-telemetry gaps.
+- Passed 376/376 Metal backend tests after the latest implementation changes,
+  focused pipeline/presentation sanitizer coverage, and 63/63 isolated
+  diagnostic-runner tests.
 
 ## Input
 
