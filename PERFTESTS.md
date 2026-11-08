@@ -1105,6 +1105,12 @@ within-device trends. If a sampler or privilege is unavailable, record
 `unavailable_privilege` or `unavailable_sampler`; do not replace direct
 evidence with an estimate.
 
+The current host has no controlled ambient instrument. A noninteractive
+privilege check reports that a password is required, so direct package-power,
+temperature, and energy-per-completed-frame evidence remains
+`unavailable_privilege`/`unavailable_dependency`. These states are gaps, not
+passes, and no privileged sample is inferred from `pmset -g therm`.
+
 Detailed presentation records remain bounded to the first 512 events. They
 qualify cold/startup drawable and command behavior but are not evidence for a
 later sustained tail. If a retained long-run maximum requires presentation

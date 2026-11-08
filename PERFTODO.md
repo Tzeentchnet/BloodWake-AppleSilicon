@@ -79,7 +79,7 @@ temperature evidence when privileged telemetry is available.
 | PERF-012 | Preserve explicit synchronization boundaries | `[x]` | PERF-010, PERF-011 |
 | PERF-013 | Add asynchronous ownership tests | `[x]` | PERF-009, PERF-010, PERF-012 |
 | PERF-014 | Repeat clean scale matrix | `[x]` | PERF-011, PERF-013 |
-| PERF-015 | Collect controlled power and thermal evidence | `[~]` | PERF-014 |
+| PERF-015 | Collect controlled power and thermal evidence | `[!]` | PERF-014 |
 | PERF-016 | Choose product defaults | `[x]` | PERF-014, PERF-015 |
 | PERF-017 | Resume modern-water visual phases | `[ ]` | PERF-040 |
 | PERF-018 | Freeze the Native 4x/60 contract and baseline | `[x]` | PERF-016 |
@@ -283,14 +283,20 @@ Validation gates:
 
 ### Thermal and power evidence
 
-- [ ] Record ambient and a controlled cold starting machine state.
+- [!] Record ambient and a controlled cold starting machine state.
 - [x] Interleave final scale order and avoid attributing scene/process variance
   to throttling.
-- [ ] Collect direct package-power and temperature telemetry if available.
+- [!] Collect direct package-power and temperature telemetry if available.
 - [x] Record that post-matrix `pmset -g therm` reports no thermal or
   performance warning.
 - [x] Distinguish scene progression from time-under-load.
-- [ ] Compare energy per completed frame, not FPS alone.
+- [!] Compare energy per completed frame, not FPS alone.
+
+These are retained evidence gaps, not completed checks. No controlled ambient
+instrument is available, and noninteractive privilege validation reports that
+a password is required, so direct `powermetrics` remains
+`unavailable_privilege`. Energy per completed frame remains
+`unavailable_dependency` until approved direct power samples exist.
 
 ### Success interpretation
 
