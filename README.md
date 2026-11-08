@@ -115,10 +115,9 @@ This is still a development build:
   60 FPS without changing scale, filtering, LOD, draw coverage, quincunx
   behavior, or Retail-water defaults. Representative sustained Native 4x/60
   is therefore claimed for the measured Apple M5 Battle workload. It is not
-  yet a universal locked-60 claim: exact-default wall p95 remains
-  17.06-17.46 ms, cold windows contain 296-330 ms shader/workload warm-up
-  stalls, and broader mission, device, power, temperature, and formal visual
-  coverage remain open.
+  yet a universal locked-60 claim: refreshed exact-default wall and submission
+  p95 still miss their strict gates, while broader mission, device, power,
+  temperature, physical-latency, and formal visual coverage remain open.
 - A controller-free private Battle trace captured 25 canonical pipeline states
   with the current executable across 276,381 validated scopes. Two direct
   exact-default seeded boots preloaded all 25 and reported zero misses,

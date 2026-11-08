@@ -1253,13 +1253,14 @@ relaunch seed.
 9. Exact lower-read quincunx rewrites are measured no-go variants; the
    original 36-read loop remains both exact and faster on the representative
    Apple M5 workload.
-10. Cold pipeline/workload warm-up and broader mission pacing remain open;
-    the 296-330 ms startup maxima are recorded rather than hidden.
+10. Current preloaded cold boots perform no post-frame-zero pipeline creation
+   and repeatedly do not reproduce the historical 296-330 ms band; that band
+   is retired for the current path without inventing an old attribution.
 11. Direct package-power and temperature telemetry remains the open efficiency
    evidence item.
-12. Pipeline attribution and a private, versioned warm-up/archive contract are
-   the first follow-up; presentation pacing, broader qualification, and
-   conditional vertex/GPU work follow in that order.
+12. Presentation pacing is a measured no-go. Broader qualification remains
+   dependency-blocked, and conditional vertex/GPU work activates only after
+   a valid broader-matrix miss identifies the limiter.
 
 Related tracked documentation:
 

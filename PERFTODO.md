@@ -405,8 +405,9 @@ boots reached 59.36-100.78 FPS and 60.33-100.10 FPS across all reported
 windows; both produced consecutive post-warm-up windows above 60 FPS. The
 steady-state command shape is one
 `render+target-switch+feedback+present+depth-copy` command per game frame.
-Cold windows still contain 296-330 ms shader/workload warm-up stalls and are
-retained as an explicit follow-up rather than silently discarded.
+Those qualification cold windows contained 296-330 ms startup maxima and
+retained them for explicit follow-up rather than silently discarding them;
+PERF-028 later retired that unreproduced historical band for the current path.
 
 ## Highest-value follow-up: PERF-028 through PERF-040
 
@@ -481,7 +482,7 @@ preloaded 15 paused-renderer states. The preload run reported all 15 compatible
 states loaded before use, then more than one million cache hits and zero
 misses. Because the title remained paused behind its reconnect overlay, those
 artifacts are not representative gameplay traces, their frame timings are not
-retained, and PERF-033 remains open.
+retained, and PERF-033 remained open at that checkpoint.
 
 PERF-032 activates only after a fully compatible PERF-031 preload. An untraced
 specialized miss immediately uses the existing exact generic extended shader
@@ -503,7 +504,7 @@ offline-library target rebuilds. The changed strict-C test translation unit
 compiles cleanly; the aggregate warning target is currently blocked later by
 a pre-existing `-Wcomment` error in the pinned toolkit's `kernel.h`. No
 no-controller result is treated as gameplay or cold-performance evidence;
-PERF-033 remains open.
+PERF-033 remained open at that checkpoint.
 
 The diagnostic keyboard bridge now provides a neutral connected controller
 without requiring a physical pad. Live guided input was used only to calibrate
