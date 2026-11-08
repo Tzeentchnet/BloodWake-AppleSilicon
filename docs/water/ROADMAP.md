@@ -2,7 +2,8 @@
 
 Updated 2026-11-05.
 
-This is the implementation tracker for [the modern water plan](NEWWATER.md).
+This is the implementation tracker for
+[the modern water plan](MODERNIZATION.md).
 It records dependencies, completion evidence, and the difference between
 protocol groundwork and runtime-validated behavior.
 
@@ -61,8 +62,10 @@ Runtime validation status:
   and activated Metal private reflection depth.
 - Split-screen/view-1 validation remains deferred and does not block
   single-player visual work.
-- Later modern-water visual phases are paused while base runtime efficiency is
-  prioritized; their dependencies and acceptance gates remain below.
+- Later modern-water visual phases are paused while cold pipeline behavior,
+  presentation pacing, broader Native 4x/60 qualification, and any measured
+  conditional headroom work are completed; their dependencies and acceptance
+  gates remain below.
 
 Validation completed for this implementation:
 
@@ -78,7 +81,7 @@ Validation completed for this implementation:
 
 | ID | Status | Task | Depends on | Exit condition |
 | --- | --- | --- | --- | --- |
-| NW-000 | `[x]` | Write the source-grounded architecture plan | None | `NEWWATER.md` exists and links resolve |
+| NW-000 | `[x]` | Write the source-grounded architecture plan | None | `MODERNIZATION.md` exists and links resolve |
 | NW-001 | `[x]` | Define typed water marker events | NW-000 | Versioned begin/end/lit/reflection/foam encoding exists |
 | NW-002 | `[x]` | Propagate pass/view identity through the executor | NW-001 | Extended batches receive validated semantic data |
 | NW-003 | `[x]` | Preserve legacy marker and shader behavior | NW-001 | Legacy lit events and current Realistic tests pass |
@@ -100,7 +103,7 @@ Validation completed for this implementation:
 ### Marker and executor foundation
 
 - [x] Reserve a distinct water-event operation in
-  [`src/bw_draw_marker.h`](src/bw_draw_marker.h).
+  [`src/bw_draw_marker.h`](../../src/bw_draw_marker.h).
 - [x] Encode protocol version, event type, and four-view payload in one marker
   byte.
 - [x] Accept the old ocean-draw marker only at its exact legacy version.

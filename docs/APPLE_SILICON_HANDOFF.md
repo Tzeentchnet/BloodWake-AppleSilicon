@@ -241,24 +241,70 @@ rejected even when set to `0`.
 
 ## Next priorities
 
-### 1. Preserve the playable path
+### 1. Remove cold pipeline stalls
 
-- Keep the user-confirmed menu and in-game path covered by repeatable retail
-  diagnostics.
-- Compare private menu and gameplay frames against a trustworthy reference.
-- Continue representative active-gameplay sampling beyond the validated Battle
-  seed, reporting FPS, median, p95, maximum stalls, resolution, and enabled
-  approximations.
+- Instrument stable-library compilation, function specialization, render
+  pipeline creation, cache hits/misses, high-water count, and whole-cache
+  resets before selecting an implementation.
+- Move project-owned stable shaders to an offline Metal library after the
+  instrumentation can separate that cost from specialized pipeline work.
+- Define a versioned artifact contract covering the backend ABI, shader and
+  executable hashes, key schema, OS, SDK, feature level, and GPU family.
+- Generate trace-derived warm-up keys and archives only on the user's device.
+  Retail-derived traces, descriptors, and compiled archives remain private and
+  uncommitted.
+- Preload validated local states and compile rare misses asynchronously while
+  retaining the exact generic Retail path. Missing, stale, corrupt, or
+  unsupported artifacts must take an explicit tested fallback.
+- Qualify two clean cold boots with no synchronous specialized-pipeline
+  creation after the first seeded gameplay flip and no retained
+  pipeline-attributed 296-330 ms maximum.
+
+### 2. Tighten presentation pacing
+
+- Correlate flip release, command completion, drawable acquisition, requested
+  presentation, actual presentation, and display target timestamps before
+  changing the default.
+- Determine whether manual host pacing, drawable waits, OS scheduling, or
+  scene work causes the current 17.06-17.46 ms wall p95.
+- If pacing is material, evaluate an availability-gated
+  `CAMetalDisplayLink` match-display path driven by target presentation
+  timestamps. Preserve the current bounded explicit-drawable path for
+  vsync-off, uncapped, unsupported, failure, and test configurations.
+- Reject the experiment if it misses the tracked FPS/GPU/wall/submission and
+  input-latency gates in
+  [the performance roadmap](performance/ROADMAP.md).
+
+### 3. Generalize the Native 4x/60 claim
+
+- Define private seeds for multiple missions and representative geometry,
+  particle, weather, calm/storm water, shore, reflection, transition, and
+  split-screen loads.
+- Run cold and warm 30-60 minute qualifications on every available Apple
+  Silicon class; report unavailable hardware as a gap.
+- Record FPS, wall/GPU median/p95/p99/max, submission and presentation
+  latency, pipeline events, dropped drawables, resolution, enabled
+  approximations, and executable hash.
 - Collect approved direct package-power, temperature, sustained-clock, and
-  memory evidence; `pmset` reported no warning after the final matrix but
-  cannot provide energy-per-frame data.
-- Investigate remaining cross-scene frame-pacing jitter without weakening
-  correctness or silently skipping unsupported work.
-- Investigate asynchronous or trace-derived specialized-pipeline warm-up so
-  cold seeded launches no longer contain 296-330 ms compilation/loading
-  stalls; keep cold and steady-state evidence separate.
+  memory evidence. `pmset` reported no warning after the final Battle matrix
+  but cannot provide energy-per-frame data.
+- Keep the user-confirmed menu and in-game path covered by repeatable retail
+  diagnostics and compare private frames against a trustworthy reference.
 
-### 2. Validate the new runtime controls
+### 4. Unlock only measured CPU or GPU headroom
+
+- Profile a broader-matrix miss before changing the renderer.
+- For a CPU-bound miss, attribute fixed-function transform/lighting, vertex
+  fetch, NV2A vertex-program interpretation, draw preparation, and submission.
+  Port `draw_vsh` to Metal only if the interpreter is material and preserve
+  exact CPU comparison and fallback.
+- For a GPU-bound miss, use Metal/Xcode pass counters to distinguish vertex,
+  fragment, filtering, bandwidth, depth/stencil, feedback, copy, and
+  presentation limits.
+- Do not revisit rejected lower-read quincunx variants, raise in-flight depth,
+  reduce quality, or add MSAA without new evidence.
+
+### 5. Validate the new runtime controls
 
 - Exercise F1 open/close, failed saves, live LOD/filtering, restart-pending
   values, and gameplay mouse capture through menus, gameplay, pause, mission
@@ -268,7 +314,7 @@ rejected even when set to `0`.
 - Capture oblique water/cliff comparisons and GPU timing for each anisotropy
   choice.
 
-### 3. Complete evidence-gated roadmap research
+### 6. Complete evidence-gated roadmap research
 
 - Inventory menu state and control rectangles before adding point-and-click
   activation; never infer click targets from framebuffer colour alone.
@@ -284,7 +330,7 @@ rejected even when set to `0`.
 - Run the MSAA matrix in [METAL_QUALITY.md](METAL_QUALITY.md); keep the setting
   unavailable if the measured benefit does not justify it.
 
-### 4. Complete input, audio, and device lifecycles
+### 7. Complete input, audio, and device lifecycles
 
 - Obtain hands-on confirmation of audible output, channel balance, latency,
   underruns, and sustained gameplay with the new APU path.
@@ -294,7 +340,7 @@ rejected even when set to `0`.
 - Add physical-controller validation only after the remaining USB contracts
   are safe.
 
-### 5. Broaden product coverage
+### 8. Broaden product coverage
 
 - Validate saves across a fresh process.
 - Determine whether representative missions require FMV and implement or

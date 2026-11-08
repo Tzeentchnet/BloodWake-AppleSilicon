@@ -1270,7 +1270,7 @@ relaunch seed.
 
 Related tracked documentation:
 
-- [Validation evidence](docs/VALIDATION.md)
-- [Metal quality and policy](docs/METAL_QUALITY.md)
-- [Build and diagnostic workflow](docs/BUILDING.md)
-- [Native feature roadmap](docs/NATIVE_FEATURE_ROADMAP.md)
+- [Validation evidence](../VALIDATION.md)
+- [Metal quality and policy](../METAL_QUALITY.md)
+- [Build and diagnostic workflow](../BUILDING.md)
+- [Native feature roadmap](../NATIVE_FEATURE_ROADMAP.md)

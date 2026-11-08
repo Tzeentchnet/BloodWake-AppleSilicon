@@ -1,185 +1,12 @@
 # Blood Wake Recomp for Apple Silicon
 
-An experimental native macOS/Apple Silicon fork of
+A native macOS/Apple Silicon fork of
 [Blood Wake Recomp](https://github.com/minimalice92/bloodwake-recomp), built
 with [xboxrecomp](https://github.com/sp00nznet/xboxrecomp) and a Metal
 renderer. It runs a user-provided retail copy of Blood Wake through static
 recompilation.
 
 This project is not affiliated with the game's or hardware's rights holders.
-
-## Current status
-
-The current arm64 build boots into the game and has been user-confirmed for
-menu navigation and interactive play. The current verified direct-Metal
-configuration uses 4x scaling to render into 2560x1920 private colour and
-depth targets, then presents at 2560x1920. The guest framebuffer contract
-remains 640x480, but that is not the current internal rendering or
-presentation resolution.
-
-This is still a development build:
-
-- The Metal path now presents directly through `CAMetalLayer` and can render
-  into private, output-scaled colour and depth targets. The latest interactive
-  4x run reached 3,963 post-relaunch flips and 1,747,600 draws, then exited
-  normally when the window closed. No sticky Metal or command-buffer error
-  was logged.
-- The game-specific keyboard bridge and Metal quincunx approximation require
-  explicit build or runtime opt-ins.
-- F1 now opens a native settings panel. It applies proven-live LOD, Metal
-  filtering, the optional realistic-water preset, and mouse controls through
-  subsystem-owned callbacks, labels restart-required choices, and disables
-  unsupported Metal settings with a reason.
-- A versioned in-stream marker now identifies validated ocean submissions and
-  is copied into executor batches without changing retail rendering. The
-  protocol can now represent water-view begin/end plus lit, reflection, and
-  foam draws and persistent pass runs, carries pass/view identity separately
-  from fingerprints, and still accepts the old lit marker. Validated
-  Remastered wrappers now bracket each title ocean view and every lit,
-  reflection, and foam submission group; Original and invalid contexts execute
-  the title body without markers. A post-fix one-player Battle run recorded
-  186,893 scopes for each pass, 2,915 balanced view-0 pairs, zero rejection,
-  and clean fingerprints. Metal private reflection depth also activated with
-  no fallback, and the 337-test Metal suite passes. Split-screen/view-1
-  validation is deferred. Earlier lit-only diagnostics observed
-  41,348 markers and 512 clean scopes in one four-boot run; a later
-  deterministic run observed 12,670 markers, 154 clean scopes, and 297
-  fingerprinted batches across 10 aggregate hashes with no rejection,
-  overflow, or within-scope mismatch. Representative calm/storm, lighting,
-  shore, split-screen, reflection, and wake coverage remains outstanding.
-  Remastered now also has an experimental, default-off
-  realistic-water preset. It selects a separate Metal fragment pipeline only
-  for supported marked ocean batches, preserves retail alpha, and falls back
-  per batch; Retail remains the exact default for every unmarked or
-  unsupported draw. A private four-boot scripted run activated the preset on
-  real ocean batches with no observed fallback or Metal error. A later
-  diagnostic-only same-scene ABBA capture completed two independent
-  100-Retail/100-Realistic GPU samples. Realistic increased water-containing
-  command-buffer mean time by 4.548%-4.822%, median by 1.865%-3.570%, and p95
-  by 7.787%-10.092% in that exercised scene. This is not isolated shader cost
-  or a visual-quality judgment. Initial hands-on review found the treatment
-  almost identical to Retail, and separate bounded captures were not
-  sufficiently phase-aligned for pixel A/B evidence. The dedicated
-  [water-rendering dossier](docs/WATER_RENDERING.md) explains why the current
-  pass-1-only treatment is subtle, maps the title's later Retail reflection
-  and foam passes, and defines mechanics-safe next steps. The preset remains
-  experimental and default-off. A fail-closed MSAA evidence tool records
-  memory, timing,
-  correctness, and visual-review gates. This Apple M5 reports
-  2x/4x/8x capability and passes the standalone color/depth/resolve smoke
-  path, but Metal MSAA remains unsupported.
-- Optional gameplay mouse input supports sensitivity, inversion, response,
-  steering/aim stick selection, and hold/toggle relative capture. Native
-  point-and-click menu hitboxes are still a planned reverse-engineering task.
-- The quincunx approximation is not verified against NV2A hardware.
-- Native guest audio now uses deferred same-thread APU MMIO dispatch and SDL
-  output. Its dispatch, startup, failure, and shutdown paths have synthetic
-  and sanitizer coverage. A recorded CoreAudio run reached 427,500 APU DSP
-  frames and 53,436 EP output frames with no SDL underrun or deferred-dispatch
-  error logged. Audible correctness and output quality have not yet been
-  explicitly confirmed. A diagnostic-only headless sink can preserve guest
-  audio timing when CoreAudio is unavailable; it retains no samples, reports
-  aggregate signal/cadence/queue metrics, and never claims that sound is
-  audible.
-- USB gamepads, physical-controller support, and broad mission, save, FMV,
-  and edition coverage are incomplete.
-- Current regression results include 376/376 Metal backend tests, all 62
-  presenter CTest entries (including the real-window AppKit case in the
-  current WindowServer session), 35/35 MMIO host tests, 8/8 normal and ASan/UBSan
-  macOS host tests, 11/11 input integration tests, 6/6 APU/audio tests,
-  13/13 support tests, and 100/100 concurrent APU restore stress runs. The
-  complete Python suite passes 136/136.
-- A post-roadmap 30-second isolated retail boot reached its configured limit
-  with direct Metal at 2560x1920, native audio/DSP activity, 1,490 audited
-  flips, 4,503 draws, 1,252,771 vertices, unchanged input trees/executable,
-  and no sticky Metal error. This is automated integration evidence, not a
-  hands-on F1/mouse/quality or audible-output check.
-- A built-in poll-epoch Remastered script now provides deterministic,
-  diagnostic-only menu-to-gameplay navigation without OS keystrokes. Combined
-  with the headless audio sink, it completed three private boots and two
-  validated relaunches, reached ocean rendering, and stopped at the configured
-  boot limit. Its spaced confirmation tail has now been calibrated without a
-  physical controller. A private guided-pad channel can run alongside the
-  script for calibration only; default physical input and CoreAudio behavior
-  are unchanged.
-- Bounded Metal ownership now keeps at most three submissions in flight,
-  gives mutable upload, feedback-resolve, and readback resources to their
-  submission, keeps exact tracked XRGB feedback GPU-private while guest bytes
-  remain unchanged, and lets safe target switches share one ordered command.
-  Immutable NV2A texture-stage and combiner routing is specialized with Metal
-  function constants while material values remain dynamic. Two exact
-  Native/auto, match-display boots selected 2560x1920 and produced
-  post-warm-up windows at 59.98-60.01 FPS, 16.66-16.68 ms wall medians,
-  14.18-14.84 ms GPU medians, and 14.87-15.26 ms GPU p95. Two fixed-4x,
-  cap-120 boots independently produced consecutive post-warm-up windows above
-  60 FPS without changing scale, filtering, LOD, draw coverage, quincunx
-  behavior, or Retail-water defaults. Representative sustained Native 4x/60
-  is therefore claimed for the measured Apple M5 Battle workload. It is not
-  yet a universal locked-60 claim: refreshed exact-default wall and submission
-  p95 still miss their strict gates, while broader mission, device, power,
-  temperature, physical-latency, and formal visual coverage remain open.
-- A controller-free private Battle trace captured 25 canonical pipeline states
-  with the current executable across 276,381 validated scopes. Two direct
-  exact-default seeded boots preloaded all 25 and reported zero misses,
-  asynchronous work, cache resets, or specialization/pipeline creation after
-  frame 0. Their cold maxima were 232.569-239.077 ms. No retained current-path
-  run reproduced the historical 296-330 ms band, so it is retired without
-  retroactive attribution. A warm repeat recovered to 59.95-60.03 FPS and
-  15.39-15.40 ms GPU p95, but wall p95 reached 17.07 ms and submission p95
-  remained 15.60-15.62 ms. Static exact hashes and complete Battle
-  draw-fingerprint overlap support rendering continuity. A bounded diagnostic
-  now captures exactly four presented guest-flip indexes, but identical-binary
-  repeats proved that the direct Battle seed itself changes camera/boat/
-  simulation state across boots. Its exact dynamic output hash is explicitly
-  unavailable rather than mislabeled a regression or pass. No physical
-  controller was available, so that latency gate also remains incomplete.
-- Refreshed presentation telemetry retained 509 actual presentation times per
-  boot with exact fractional intervals. Drawable acquisition and the manual
-  host hold were not the general 17 ms tail source; command completion and
-  missed display intervals remain measured contributors while residual
-  scene/OS scheduling cannot be separated. The explicit presenter has no
-  display target timestamp. Current evidence does not justify a
-  `CAMetalDisplayLink` path, so that evaluation is a documented no-go and the
-  explicit presenter remains unchanged.
-- The broader qualification contract now defines six private workload slots,
-  exact cold/warm/30-minute/60-minute run classes, deterministic worst-load
-  selection, available-device inventory, retained metrics, and explicit
-  hardware/telemetry gap states. The bounded runner supports a one-hour
-  single boot, fixed timing storage covers the exact-default hour through
-  61 Hz, and wall/GPU/submission reports include p99. Only the existing
-  Battle control slot is populated; this definition is not broader runtime
-  qualification.
-
-## Current performance priorities
-
-The steady-state representative target is closed, and all currently
-executable continuation decisions are recorded:
-
-1. PERF-028 is complete. Runtime pipeline creation is removed from the
-   measured seeded workload, and repeated current-path runs retire the
-   unreproduced historical cold band without inventing an old attribution.
-   Retail-derived traces and archives remain private.
-2. PERF-033 and PERF-036 are bounded no-go results, not passes. Strict
-   wall/submission thresholds still miss, the direct Battle seed is
-   nondeterministic under indexed same-binary capture, and physical input
-   latency is unavailable.
-3. Keep the explicit presenter as the default. PERF-035 found no measured
-   basis for a `CAMetalDisplayLink` implementation; target-time causality
-   remains explicitly unavailable instead of inferred.
-4. PERF-038 remains blocked until its PERF-033/PERF-036 prerequisites pass,
-   five additional private workload seeds exist, and required hardware/input/
-   telemetry gaps can be collected. Profile CPU or GPU work only after a
-   valid matrix cell identifies that limiter.
-
-Lower scale, dynamic resolution, upscaling, frame generation, reduced
-filtering or LOD, changed Retail water, inexact quincunx, and unmeasured MSAA
-are not Native 4x/60 optimizations. The active dependency-gated work is in
-[PERFTODO.md](PERFTODO.md); measured evidence and rejected experiments are in
-[PERFTESTS.md](PERFTESTS.md).
-
-See [Apple Silicon status](docs/APPLE_SILICON_HANDOFF.md),
-[work completed](docs/WORK_COMPLETED.md), and
-[validation](docs/VALIDATION.md) for details.
 
 ## Requirements
 
@@ -193,7 +20,7 @@ See [Apple Silicon status](docs/APPLE_SILICON_HANDOFF.md),
 
 The repository does not include or download the game.
 
-## Prepare and build
+## Quick start
 
 From the repository root:
 
@@ -240,46 +67,17 @@ BW_METAL_RENDER_SCALE=auto \
 ./build/bloodwake-macos/bloodwake
 ```
 
-Detailed preparation, alternate install, diagnostic, and Windows instructions
-are in [BUILDING.md](docs/BUILDING.md).
-
-## Documentation
-
-- [BUILDING.md](docs/BUILDING.md) - build, run, and diagnostic instructions
-- [APPLE_SILICON_HANDOFF.md](docs/APPLE_SILICON_HANDOFF.md) - current status
-  and remaining priorities
-- [WORK_COMPLETED.md](docs/WORK_COMPLETED.md) - implementation history
-- [VALIDATION.md](docs/VALIDATION.md) - performance evidence, tests, and
-  integrity checks
-- [SETTINGS.md](docs/SETTINGS.md) - runtime and edition settings
-- [UPSTREAM_ISSUES.md](docs/UPSTREAM_ISSUES.md) - portability findings
-- [NATIVE_FEATURE_ROADMAP.md](docs/NATIVE_FEATURE_ROADMAP.md) - F1, mouse,
-  modding, quality, upstream, and water work plan
-- [METAL_QUALITY.md](docs/METAL_QUALITY.md) - LOD/filtering behavior, the
-  realistic-water GPU benchmark, and the Metal MSAA go/no-go gate
-- [METAL_PIPELINE_ARTIFACT.md](docs/METAL_PIPELINE_ARTIFACT.md) - versioned
-  device-local Metal pipeline-artifact compatibility and rejection contract
-- [WATER_RENDERING.md](docs/WATER_RENDERING.md) - Blood Wake water simulation
-  boundaries, three-pass Retail renderer, Metal shader inputs, and safe future
-  work
-- [NEWWATER.md](NEWWATER.md) - modern water architecture and phased
-  implementation plan
-- [NEWWATER_TODO.md](NEWWATER_TODO.md) - dependency-aware modern water task
-  tracker and validation status
-- [LIGHTING_RENDERING.md](docs/LIGHTING_RENDERING.md) - current title/NV2A/
-  Metal lighting path, available shader semantics, and staged real-time
-  lighting, PBR, and renderer-replacement options
-- [GPU_CAPTURE.md](docs/GPU_CAPTURE.md) - synthetic capture fixture
-- [GUEST_MEMORY_INVENTORY.md](docs/GUEST_MEMORY_INVENTORY.md) - memory-access
-  inventory
+Detailed preparation, alternate installation, diagnostic, and Windows
+instructions are in [BUILDING.md](docs/BUILDING.md).
 
 ## Privacy and legal
 
-Keep disc images, unpacked files, generated C, binaries, saves, logs, and
-captures private. Do not commit or share game-derived material. See
-[LEGAL.md](LEGAL.md) and [CONTRIBUTING.md](CONTRIBUTING.md).
+Keep disc images, unpacked files, generated C, binaries, saves, logs, traces,
+archives, and captures private. Do not commit or share game-derived material.
+See [CONTRIBUTING.md](CONTRIBUTING.md) for contribution and takedown guidance.
 
 Blood Wake is by Stormfront Studios and was published by Microsoft Game
 Studios. This fork builds on Blood Wake Recomp, xboxrecomp, and xemu. See
-[CREDITS.md](CREDITS.md), [NOTICE.md](NOTICE.md), [LICENSE](LICENSE), and
-[LICENSES/](LICENSES/) for attribution and licence details.
+[credits and acknowledgements](docs/CREDITS.md), [NOTICE.md](NOTICE.md),
+[LICENSE](LICENSE), and [LICENSES/](LICENSES/) for attribution and licence
+details.

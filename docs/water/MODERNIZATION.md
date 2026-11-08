@@ -9,7 +9,7 @@ Black Flag is a perceptual quality target, not a promise to reproduce its
 implementation, assets, or exact appearance.
 
 Implementation progress and dependencies are tracked in
-[NEWWATER_TODO.md](NEWWATER_TODO.md).
+[ROADMAP.md](ROADMAP.md).
 
 Phase 0 and the first pass-aware parity item are complete. The marker protocol
 and executor support one-shot draws, persistent pass runs, balanced view
@@ -22,17 +22,19 @@ authoritative scene depth; focused lifecycle, fallback, sanitizer, and full
 333-test Metal coverage pass.
 
 The later Black Flag-style resource, shader, optical-volume, SSR, foam, and
-geometry phases remain preserved in this plan but are paused while base-game
-Apple Silicon efficiency and sustained frame rate take priority.
+geometry phases remain preserved in this plan but are paused while the
+highest-value Native 4x/60 continuation removes cold pipeline stalls,
+qualifies presentation pacing and broader workloads/devices, and establishes
+the accepted headroom available to each visual phase.
 
 The plan is grounded in:
 
-- [the authoritative water rendering map](docs/WATER_RENDERING.md);
-- [the lighting and renderer modernization map](docs/LIGHTING_RENDERING.md);
-- [the current Metal quality evidence](docs/METAL_QUALITY.md);
-- [the settings contract](docs/SETTINGS.md);
-- [the validation record](docs/VALIDATION.md); and
-- [the current Apple Silicon status](README.md).
+- [the authoritative water rendering map](../WATER_RENDERING.md);
+- [the lighting and renderer modernization map](../LIGHTING_RENDERING.md);
+- [the current Metal quality evidence](../METAL_QUALITY.md);
+- [the settings contract](../SETTINGS.md);
+- [the validation record](../VALIDATION.md); and
+- [the current Apple Silicon status](../CURRENT_STATUS.md).
 
 ## Executive decision
 
@@ -727,18 +729,18 @@ documentation that it changes.
 
 | Surface | Planned responsibility |
 | --- | --- |
-| [`src/bw_draw_marker.h`](src/bw_draw_marker.h) | Versioned water view/pass event encoding. |
-| [`src/bw_hifps_hooks.c`](src/bw_hifps_hooks.c) | Existing validated lit-tile marker and mechanics-safe render boundary. |
-| [`src/bw_ocean_native.c`](src/bw_ocean_native.c) | Pass diagnostics, render-patch evidence, and optional semantic render geometry source. |
-| [`src/toolkit_patches/kernel/nv2a_pb_exec.c`](src/toolkit_patches/kernel/nv2a_pb_exec.c) | Marker lifetime, pass/view state, raw marked-ocean attribute audit, and semantic batch construction. |
-| [`src/toolkit_patches/kernel/bw_backend_ext.h`](src/toolkit_patches/kernel/bw_backend_ext.h) | Keep exact `BwXBatch`; add a separate versioned water view/draw contract and callback. |
-| [`src/gpu/bw_metal_backend.m`](src/gpu/bw_metal_backend.m) | Frame-resource ownership, atomic modern state machine, water pipelines, private targets, composition, and diagnostics. |
-| [`src/gpu/bw_metal_backend.h`](src/gpu/bw_metal_backend.h) | Modern preset/quality API and explicit capability/failure reporting. |
-| [`src/gpu/bw_d3d11.c`](src/gpu/bw_d3d11.c) | Reference for the private-depth `OCEAN_REFLECT_SINGLE` behavior. |
-| [`src/bw_settings.c`](src/bw_settings.c) | Retail/Enhanced/Modern choices, compatibility migration, support state, and apply timing. |
-| [`tests/metal_backend/test_main.c`](tests/metal_backend/test_main.c) | Shader, resource, fallback, pass, quality, and state-machine coverage. |
-| [`tests/hook_portability/test_markers.c`](tests/hook_portability/test_markers.c) | Guest marker encoding and register/state preservation. |
-| [`tests/hook_portability/test_ocean.c`](tests/hook_portability/test_ocean.c) | Render-only ocean boundary and fallback coverage. |
+| [`src/bw_draw_marker.h`](../../src/bw_draw_marker.h) | Versioned water view/pass event encoding. |
+| [`src/bw_hifps_hooks.c`](../../src/bw_hifps_hooks.c) | Existing validated lit-tile marker and mechanics-safe render boundary. |
+| [`src/bw_ocean_native.c`](../../src/bw_ocean_native.c) | Pass diagnostics, render-patch evidence, and optional semantic render geometry source. |
+| [`src/toolkit_patches/kernel/nv2a_pb_exec.c`](../../src/toolkit_patches/kernel/nv2a_pb_exec.c) | Marker lifetime, pass/view state, raw marked-ocean attribute audit, and semantic batch construction. |
+| [`src/toolkit_patches/kernel/bw_backend_ext.h`](../../src/toolkit_patches/kernel/bw_backend_ext.h) | Keep exact `BwXBatch`; add a separate versioned water view/draw contract and callback. |
+| [`src/gpu/bw_metal_backend.m`](../../src/gpu/bw_metal_backend.m) | Frame-resource ownership, atomic modern state machine, water pipelines, private targets, composition, and diagnostics. |
+| [`src/gpu/bw_metal_backend.h`](../../src/gpu/bw_metal_backend.h) | Modern preset/quality API and explicit capability/failure reporting. |
+| [`src/gpu/bw_d3d11.c`](../../src/gpu/bw_d3d11.c) | Reference for the private-depth `OCEAN_REFLECT_SINGLE` behavior. |
+| [`src/bw_settings.c`](../../src/bw_settings.c) | Retail/Enhanced/Modern choices, compatibility migration, support state, and apply timing. |
+| [`tests/metal_backend/test_main.c`](../../tests/metal_backend/test_main.c) | Shader, resource, fallback, pass, quality, and state-machine coverage. |
+| [`tests/hook_portability/test_markers.c`](../../tests/hook_portability/test_markers.c) | Guest marker encoding and register/state preservation. |
+| [`tests/hook_portability/test_ocean.c`](../../tests/hook_portability/test_ocean.c) | Render-only ocean boundary and fallback coverage. |
 
 The modern shader and resource manager will become too large to remain one
 branch inside `extended_shade`. After the semantic prototype is proven,

@@ -18,7 +18,7 @@ private and must not be committed.
 | Adjustable LOD | Implemented | Validate 1x-8x visually in both editions; Original remains fixed at 1x. |
 | Metal filtering | Implemented | Collect oblique water/cliff comparisons and GPU timings for 1x/4x/8x/16x. |
 | Metal MSAA | No-go; synthetic smoke complete | Apple M5 passes 2x/4x/8x synthetic color/depth/resolve, but game-scene attachment ownership and the controlled visual/GPU-time/memory matrix are still required. |
-| Base Metal performance | Three-submission ownership, GPU-private feedback, multi-target consolidation, and combiner specialization validated; representative Native/auto 4x is display-limited near 60 FPS after cold warm-up | Retain current quality defaults; broaden mission/pacing coverage, investigate cold pipeline warm-up, and collect direct package-power/temperature evidence. |
+| Base Metal performance | Three-submission ownership, GPU-private feedback, multi-target consolidation, and combiner specialization validated; representative Native/auto 4x is display-limited near 60 FPS after cold warm-up | Attribute and remove cold pipeline stalls, measure presentation tails, qualify broader workloads/devices, then port vertex work or optimize GPU passes only for a measured miss. |
 | Lighting and renderer modernization | Current path and options mapped | Inventory representative fixed-function, vertex-program, light, material, and shadow use; then pilot an explicitly marked opaque fixed-function family with a semantic Metal lighting contract. |
 | Upstream fixes | Registry/source parity verified; Metal distant-water reflection depth ported | Re-run the offline parity checker whenever upstream changes and retain explicit fallback coverage for the Metal private-depth path. |
 | Realistic water | Three pass boundaries and private reflection depth validated in representative gameplay; base-performance budget now measured | Resume refraction, absorption, SSR, foam, and modern composition through the separate visual plan with per-phase performance gates. |
@@ -144,6 +144,29 @@ at 59.98-60.01 FPS with 14.18-14.84 ms GPU medians and
 14.87-15.26 ms GPU p95. Earlier rolling reports remain separately reported
 cold shader/workload warm-up evidence; qualification starts with reports
 emitted at or after presented frame 900.
+
+### Highest-value performance continuation
+
+The representative result closes feasibility, not product-wide qualification.
+The ordered continuation is:
+
+1. instrument library compilation, function specialization, pipeline
+   creation, cache pressure, and cold maxima;
+2. move stable shaders offline and add a versioned, device-local,
+   trace-derived warm-up/archive path with asynchronous exact fallback;
+3. correlate flip, command, drawable, and presentation timestamps before
+   evaluating a gated `CAMetalDisplayLink` match-display path;
+4. qualify multiple missions, split-screen, heavy effects, long-duration
+   behavior, and every available Apple Silicon class with direct efficiency
+   evidence where approved; and
+5. activate the existing Metal `draw_vsh` opportunity or counter-guided GPU
+   work only for a measured broader-matrix miss.
+
+Retail-derived pipeline traces and archives remain private. Lower scale,
+dynamic resolution, upscaling, frame generation, reduced quality, inexact
+quincunx, and unevidenced MSAA do not count as Native 4x/60 work. The
+dependency-gated implementation and acceptance criteria are in
+[the performance roadmap](performance/ROADMAP.md).
 
 Metal MSAA remains explicitly unsupported. The memory lower bounds, required
 surface/resolve ownership, and go/no-go measurements are in

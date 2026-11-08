@@ -768,11 +768,11 @@ Native/auto envelope.
 
 Related local record:
 
-- [Performance investigation](PERFTESTS.md)
+- [Performance evidence](EVIDENCE.md)
 
 Related tracked documentation:
 
-- [Modern water tracker](NEWWATER_TODO.md)
-- [Validation evidence](docs/VALIDATION.md)
-- [Metal quality and policy](docs/METAL_QUALITY.md)
-- [Build and diagnostic workflow](docs/BUILDING.md)
+- [Modern water tracker](../water/ROADMAP.md)
+- [Validation evidence](../VALIDATION.md)
+- [Metal quality and policy](../METAL_QUALITY.md)
+- [Build and diagnostic workflow](../BUILDING.md)

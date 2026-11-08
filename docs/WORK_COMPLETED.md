@@ -2,7 +2,7 @@
 
 Updated 2026-11-06. This document records implemented Apple Silicon work.
 Current status and remaining work are in
-[APPLE_SILICON_HANDOFF.md](APPLE_SILICON_HANDOFF.md); measured results and
+[CURRENT_STATUS.md](CURRENT_STATUS.md); measured results and
 test coverage are in [VALIDATION.md](VALIDATION.md).
 
 ## Native runtime and presentation

@@ -3,7 +3,7 @@
 Updated 2026-11-05. This document records measured behavior and regression
 coverage. Implementation history is in
 [WORK_COMPLETED.md](WORK_COMPLETED.md), and current priorities are in
-[APPLE_SILICON_HANDOFF.md](APPLE_SILICON_HANDOFF.md).
+[CURRENT_STATUS.md](CURRENT_STATUS.md).
 
 ## Playable retail run
 
