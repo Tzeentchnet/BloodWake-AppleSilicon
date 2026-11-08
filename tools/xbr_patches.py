@@ -1,6 +1,6 @@
-"""Run-time fixes for known xboxrecomp v0.16.0 bugs (D-010, docs/TOOLKIT_ISSUES.md).
+"""Run-time fixes for known xboxrecomp v0.17.0 bugs (D-010, docs/TOOLKIT_ISSUES.md).
 
-The toolkit checkout stays exactly v0.16.0, and preflight and the runner both
+The toolkit checkout stays exactly v0.17.0, and preflight and the runner both
 check that. These fixes are applied in memory, only inside our own pipeline
 runs. Each one refuses to apply unless the toolkit code it fixes is exactly the
 code it was written against (a SHA-256 of that function's source). So a
@@ -43,7 +43,7 @@ def _tk2_target():
 
 def _tk2_apply(original):
     """TK-2: an FCMOVcc that reads CF must make its function declare and
-    compute _cf, exactly as a CMOVcc does. v0.16.0's check only matches
+    compute _cf, exactly as a CMOVcc does. v0.17.0's check only matches
     mnemonics starting "cmov", so `sub ...; fcmovnb ...` lifted to `!_cf`
     with _cf never declared (compile error C2065)."""
     from tools.recomp.translator import FunctionTranslator
@@ -58,35 +58,18 @@ def _tk2_apply(original):
 
 
 # TK-33 (agent X1, 2026-10-27; docs/remaster/x1_loading_crash.md): one-operand
-# MUL/IMUL/DIV/IDIV lifted at their real width. Every edition (a port bug).
+# DIV/IDIV lifted at their real width. v0.17 fixed narrow MUL/IMUL upstream,
+# while its division path still assumes EDX:EAX and a 32-bit divisor.
 
 # ── The C this fix emits ─────────────────────────────────────
 #
 # SRC is the operand as the lifter formats it (LO8(ebx), MEM8(ebp + -20),
-# LO16(ecx), ...). It is read into a temporary first: `imul al`, `mul dl`,
-# `div dh` and `div dx` all name a register the instruction also writes.
+# LO16(ecx), ...). It is read into a temporary first: `div dh` and `div dx`
+# name a register the instruction also writes.
 # Division by zero and quotient overflow (#DE on hardware) are left as the
 # 32-bit lifting already leaves them: unchecked.
 
 _TEMPLATES = {
-    ("imul", 1): ("{ int32_t _mx_s = (int8_t)(SRC);"
-                  " int32_t _mx_p = (int32_t)(int8_t)LO8(eax) * _mx_s;"
-                  " eax = (eax & 0xFFFF0000u) | ((uint32_t)_mx_p & 0xFFFFu); }"
-                  "  /* imul r/m8: AX = AL * src; EDX untouched (TK-33) */"),
-    ("mul", 1): ("{ uint32_t _mx_s = (uint8_t)(SRC);"
-                 " uint32_t _mx_p = (uint32_t)LO8(eax) * _mx_s;"
-                 " eax = (eax & 0xFFFF0000u) | (_mx_p & 0xFFFFu); }"
-                 "  /* mul r/m8: AX = AL * src; EDX untouched (TK-33) */"),
-    ("imul", 2): ("{ int32_t _mx_s = (int16_t)(SRC);"
-                  " int32_t _mx_p = (int32_t)(int16_t)LO16(eax) * _mx_s;"
-                  " eax = (eax & 0xFFFF0000u) | ((uint32_t)_mx_p & 0xFFFFu);"
-                  " edx = (edx & 0xFFFF0000u) | (((uint32_t)_mx_p >> 16) & 0xFFFFu); }"
-                  "  /* imul r/m16: DX:AX = AX * src (TK-33) */"),
-    ("mul", 2): ("{ uint32_t _mx_s = (uint16_t)(SRC);"
-                 " uint32_t _mx_p = (uint32_t)LO16(eax) * _mx_s;"
-                 " eax = (eax & 0xFFFF0000u) | (_mx_p & 0xFFFFu);"
-                 " edx = (edx & 0xFFFF0000u) | (_mx_p >> 16); }"
-                 "  /* mul r/m16: DX:AX = AX * src (TK-33) */"),
     ("div", 1): ("{ uint32_t _mx_s = (uint8_t)(SRC);"
                  " uint32_t _mx_n = eax & 0xFFFFu;"
                  " uint32_t _mx_q = _mx_n / _mx_s, _mx_r = _mx_n % _mx_s;"
@@ -127,22 +110,6 @@ def _narrow(mnemonic, ops):
 
 # ── xbr_patches entries ──────────────────────────────────────
 
-def _tk33_imul_target():
-    from tools.recomp.lifter import Lifter
-    return Lifter.__dict__["_lift_imul"]
-
-
-def _tk33_imul_apply(original):
-    from tools.recomp.lifter import Lifter
-
-    def _lift_imul(self, insn, ops):
-        return _narrow("imul", ops) or original(self, insn, ops)
-
-    _lift_imul.__doc__ = original.__doc__
-    _lift_imul.xbr_fix = "TK-33"
-    Lifter._lift_imul = _lift_imul
-
-
 def _tk33_muldiv_target():
     from tools.recomp.lifter import Lifter
     return Lifter.__dict__["_lift_muldiv"]
@@ -163,19 +130,13 @@ FIXES = [
     {"id": "TK-2",
      "what": "fcmov after add/sub/shift: declare and compute _cf (toolkit misses fcmov in its carry check)",
      "target": "tools.recomp.translator.FunctionTranslator._function_needs_cf",
-     "sha256": "b6a9c1f02866c4b79d7795e7b3786d5d3be605356e91d89bbd08014423890ab0",
+     "sha256": "77d52263f28bb1ddf522c9140de397e3af9a2b4f6a4cccd819d60892aaa6bc1e",
      "get": _tk2_target,
      "apply": _tk2_apply},
     {"id": "TK-33",
-     "what": "one-operand imul r/m8, r/m16 at their own width (v0.16.0 lifts them as EDX:EAX = EAX*src)",
-     "target": "tools.recomp.lifter.Lifter._lift_imul",
-     "sha256": "1bba046e154f227cd7c4c3dd6b72626ce5600d9102755bd4f01d91f3c428d8e5",
-     "get": _tk33_imul_target,
-     "apply": _tk33_imul_apply},
-    {"id": "TK-33b",
-     "what": "one-operand mul/div/idiv r/m8, r/m16 at their own width (same bug as TK-33)",
+     "what": "one-operand div/idiv r/m8, r/m16 at their own width (v0.17.0 still assumes EDX:EAX and 32-bit src)",
      "target": "tools.recomp.lifter.Lifter._lift_muldiv",
-     "sha256": "1dd6c5ba8621df535e59d1b43c51ac1ccef591af809ff3610b048138e693ddd4",
+     "sha256": "7ab8281a459ad31b9595e0213e4b20b8ccd1f3218a3bad7c366982db706ff2c2",
      "get": _tk33_muldiv_target,
      "apply": _tk33_muldiv_apply},
 ]

@@ -1,5 +1,5 @@
---- build/xboxrecomp/src/video/fb_present_sdl.c	2026-10-28 18:09:59
-+++ src/toolkit_patches/video/fb_present_sdl.c	2026-11-05 22:20:42
+--- xboxrecomp/src/video/fb_present_sdl.c
++++ src/toolkit_patches/video/fb_present_sdl.c
 @@ -14,20 +14,21 @@
   * window) it opens the window, starts the guest on a pthread with at least
   * the main thread's stack and, on macOS, its QoS, and pumps events and
@@ -29,8 +29,8 @@
 + * lifted code and its detached workers cannot be stopped mid-flight.
   *
   * Knobs: RECOMP_PRESENT_VSYNC=0 presents without waiting for the display;
-  * RECOMP_WINDOW_SCALE=<n> sizes the window (default 2).
-@@ -35,21 +36,37 @@
+  * RECOMP_WINDOW_SCALE=<n> sizes the window (default 2);
+@@ -36,20 +37,37 @@
  #if !defined(_WIN32)
  
  #include <SDL.h>
@@ -48,6 +48,7 @@
  
  #include "video_player.h"
  #include "keyboard_sdl.h"     /* src/input: keys into the pad stand-in */
+ #include "xinput_xbox.h"
 +#include "../bw_runtime_lifecycle.h"
 +#include "../../gpu/bw_gamma.h"
 +#if defined(__APPLE__)
@@ -64,12 +65,10 @@
  extern ptrdiff_t xbox_GetMemoryOffset(void);
 +extern void *xbox_GetMemoryBase(void);
 +extern size_t xbox_GetMappedSize(void);
- extern void xbox_InputSetMainPump(int on);   /* src/input/xinput_device.c */
--extern int  xbox_InputAnyOpen(void);
  
  #define FB_W 640u
  #define FB_H 480u
-@@ -59,10 +76,10 @@
+@@ -59,10 +77,10 @@
  struct fb_slot {
      uint8_t *px;
      size_t   cap;
@@ -82,7 +81,7 @@
  #define FBWIN_SDL_SUBSYSTEMS \
      (SDL_INIT_VIDEO | SDL_INIT_EVENTS | SDL_INIT_GAMECONTROLLER)
  
-@@ -70,12 +87,19 @@
+@@ -70,12 +88,19 @@
  static int             s_back = 0, s_ready = 1, s_front = 2;
  static uint64_t        s_ready_seq;          /* frames published */
  static pthread_mutex_t s_lock = PTHREAD_MUTEX_INITIALIZER;
@@ -106,7 +105,7 @@
  /* Counted at the flip, read once a second for the title bar. */
  static uint64_t s_flips;
  static uint32_t s_frame_draws;
-@@ -89,23 +113,38 @@
+@@ -89,23 +114,38 @@
  
  void xbox_FramebufferWindowSet(uint32_t fb_va, uint32_t pitch)
  {
@@ -151,7 +150,7 @@
      pthread_mutex_lock(&s_lock);
      {
          int t = s_ready;
-@@ -114,19 +153,49 @@
+@@ -114,19 +154,49 @@
          s_ready_seq++;
      }
      pthread_mutex_unlock(&s_lock);
@@ -211,7 +210,7 @@
  static void present_copy(uint32_t fb_va, uint32_t pitch)
  {
      struct fb_slot *s = &s_slot[s_back];
-@@ -134,40 +203,242 @@
+@@ -134,40 +204,242 @@
      uint32_t bpp = pitch / FB_W, y;
      size_t need;
  
@@ -244,8 +243,8 @@
 +    if (bpp == 4)
 +        bw_gamma_apply_xrgb((uint32_t *)s->px, (size_t)FB_W * FB_H);
 +    publish(bpp, FB_W, FB_H);
-+}
-+
+ }
+ 
 +#if defined(__APPLE__)
 +static _Atomic int s_metal_expected;
 +static _Atomic int s_metal_direct;
@@ -308,8 +307,8 @@
 +                                  (mach_vm_size_t)bytes,
 +                                  (mach_vm_address_t)(uintptr_t)dst,
 +                                  &copied) == KERN_SUCCESS && copied == bytes;
- }
- 
++}
++
 +/* Numeric mapping bounds do not guarantee that the current pages are
 + * readable. Mach copies fail cleanly if guest protection changes underneath
 + * a snapshot. Padding is not read, even when it contains inaccessible pages. */
@@ -466,7 +465,7 @@
  static char s_title[128] = "Xbox Recomp";
  
  void xbox_FramebufferWindowSetTitle(const uint16_t *name, int max_chars)
-@@ -198,7 +469,9 @@
+@@ -198,7 +470,9 @@
      }
      if (o) {
          buf[o] = 0;
@@ -476,7 +475,7 @@
      }
  }
  
-@@ -211,25 +484,33 @@
+@@ -211,25 +485,33 @@
  /* ── The guest thread ─────────────────────────────────────────────────── */
  
  static int (*s_guest_main)(void);
@@ -513,7 +512,7 @@
      struct rlimit rl;
      size_t stack = 64u << 20;
      int rc;
-@@ -240,8 +521,14 @@
+@@ -240,8 +522,14 @@
              && rl.rlim_cur > stack)
          stack = (size_t)rl.rlim_cur;
  
@@ -530,7 +529,7 @@
  #if defined(__APPLE__)
      /* Same scheduling class as the thread it replaces, so moving the guest
       * off the main thread does not move it to the efficiency cores. */
-@@ -253,12 +540,9 @@
+@@ -253,12 +541,9 @@
              pthread_attr_set_qos_class_np(&attr, qos, rel);
      }
  #endif
@@ -545,7 +544,7 @@
  }
  
  /* ── The window, on the process main thread ───────────────────────────── */
-@@ -269,16 +553,108 @@
+@@ -269,16 +554,108 @@
      return e && *e && *e != '0';
  }
  
@@ -565,7 +564,7 @@
 +    fflush(stderr);
 +    _exit(1);
 +}
-+
+ 
 +static void check_present_error(void)
 +{
 +    int error = atomic_load_explicit(&s_present_error, memory_order_acquire);
@@ -582,7 +581,7 @@
 +        _exit(1);
 +    }
 +}
- 
++
 +#if defined(__APPLE__)
 +static void release_guest_input(Uint32 window_id)
 +{
@@ -662,7 +661,7 @@
      /* Ctrl-C and SIGTERM keep their default meaning; SDL would turn them
       * into an SDL_QUIT that a headless run never reads. Set before the
       * headless return: audio and input start SDL subsystems there too. */
-@@ -295,85 +671,189 @@
+@@ -295,10 +672,16 @@
  
      SDL_SetHint(SDL_HINT_RENDER_SCALE_QUALITY, "nearest");
      if (SDL_Init(FBWIN_SDL_SUBSYSTEMS) != 0) {
@@ -679,9 +678,13 @@
 +                driver ? driver : "unavailable");
 +        goto startup_failed;
 +    }
+     /* Honor the same fullscreen environment setting as the Windows presenter. */
+     Uint32 window_flags = SDL_WINDOW_RESIZABLE | SDL_WINDOW_ALLOW_HIGHDPI;
+     if (env_on("RECOMP_FULLSCREEN"))
+@@ -307,78 +690,176 @@
      win = SDL_CreateWindow(s_title, SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
                             (int)FB_W * scale, (int)FB_H * scale,
-                            SDL_WINDOW_RESIZABLE | SDL_WINDOW_ALLOW_HIGHDPI);
+                            window_flags);
 -    ren = win ? SDL_CreateRenderer(win, -1,
 -                                   vsync ? SDL_RENDERER_PRESENTVSYNC : 0)
 -              : NULL;
@@ -899,7 +902,7 @@
          pthread_mutex_lock(&s_lock);
          seq = s_ready_seq;
          if (seq != shown_seq) {
-@@ -387,42 +867,47 @@
+@@ -392,42 +873,47 @@
              shown_seq = seq;
              px = s_slot[s_front].px;
              bpp = s_slot[s_front].bpp;
@@ -967,7 +970,7 @@
                       t_title ? (double)(f - flips_title) * 1000.0 / (double)(now - t_title)
                               : 0.0,
                       (unsigned)__atomic_load_n(&s_frame_draws, __ATOMIC_RELAXED));
-@@ -430,32 +915,51 @@
+@@ -435,32 +921,51 @@
              t_title = now;
              flips_title = f;
          }

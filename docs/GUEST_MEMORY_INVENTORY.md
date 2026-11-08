@@ -58,7 +58,7 @@ build outputs may also be missing.
   other extra files and directories cause failure. This does not re-run the
   lifter or prove the origin of any other input.
 * The toolkit must be the checkout root, at pinned commit
-  `f0f8a461496a4f23d9b0aeaa284b8d70ba7ab82b`, with a clean Git status.
+  `343b6d8901723b37ce568b2418c5df4e1fe1d223`, with a clean Git status.
   Every scanned toolkit source is additionally compared byte-for-byte to its
   pinned Git blob, and the complete source file set is checked, including
   ignored files. Archive-only toolkit installations are not supported.

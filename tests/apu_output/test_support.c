@@ -21,6 +21,7 @@ void test_set_phys_ram_page(uint32_t page, uint8_t named)
 ptrdiff_t xbox_GetMemoryOffset(void) { return (ptrdiff_t)(uintptr_t)guest_base; }
 const volatile uint8_t *xbox_ContiguousPageMap(void) { return page_map; }
 const volatile uint8_t *xbox_PhysRamNameMap(void) { return page_map; }
+int xbox_PhysRamNamedAt(uint32_t pa) { return page_map[pa >> 12] != 0; }
 const volatile uint8_t *bw_PhysLastTranslationMap(void) { return page_map; }
 uint32_t xbox_ContiguousAllocatedBytes(void) { return 0; }
 

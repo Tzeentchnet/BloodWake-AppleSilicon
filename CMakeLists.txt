@@ -83,22 +83,13 @@ if(MSVC)
     string(APPEND CMAKE_EXE_LINKER_FLAGS_RELEASE " /DEBUG /OPT:REF /OPT:ICF")
 endif()
 
-# The toolkit's top-level non-Windows build unconditionally selects its OpenGL
-# D3D8 renderer and libepoxy. The native host uses the project's Metal backend
-# instead, so bring in the other runtime libraries without that renderer.
+# The native host uses the project's Metal backend. xboxrecomp v0.17 makes its
+# bundled D3D8 renderer optional, so use the normal component integration with
+# that renderer disabled rather than synthesizing a dummy xbox_d3d8 target.
 if(APPLE)
     find_package(SDL2 2.0.14 REQUIRED)
-    add_subdirectory("${XBOXRECOMP_DIR}/src/platform" "${CMAKE_BINARY_DIR}/xboxrecomp/src/platform")
-    add_subdirectory("${XBOXRECOMP_DIR}/src/kernel" "${CMAKE_BINARY_DIR}/xboxrecomp/src/kernel")
-    add_library(xbox_d3d8 INTERFACE)
-    target_include_directories(xbox_d3d8 INTERFACE "${XBOXRECOMP_DIR}/src/d3d")
-    foreach(_component audio apu nv2a usb input video)
-        add_subdirectory("${XBOXRECOMP_DIR}/src/${_component}"
-                         "${CMAKE_BINARY_DIR}/xboxrecomp/src/${_component}")
-    endforeach()
-    add_library(xboxrecomp INTERFACE)
-    target_link_libraries(xboxrecomp INTERFACE
-        xbox_kernel xbox_dsound xbox_input xbox_usb xbox_apu xbox_nv2a xbox_video)
+    set(XBOXRECOMP_BUILD_D3D8 OFF)
+    add_subdirectory(${XBOXRECOMP_DIR} ${CMAKE_BINARY_DIR}/xboxrecomp)
 else()
     # Preserve the upstream Windows toolkit and all of its runtime libraries.
     add_subdirectory(${XBOXRECOMP_DIR} ${CMAKE_BINARY_DIR}/xboxrecomp)
@@ -299,6 +290,7 @@ if(APPLE)
     target_include_directories(${PROJECT_NAME} PRIVATE
         "${CMAKE_CURRENT_SOURCE_DIR}/src/gpu"
         "${XBOXRECOMP_DIR}/src"
+        "${XBOXRECOMP_DIR}/src/d3d"
         "${XBOXRECOMP_DIR}/src/kernel")
     target_link_libraries(${PROJECT_NAME} PRIVATE
         "${BW_APPKIT_FRAMEWORK}" "${BW_FOUNDATION_FRAMEWORK}" "${BW_METAL_FRAMEWORK}"
@@ -383,7 +375,7 @@ endfunction()
 # TK-13: OHCI resolved heap buffers named by MmGetPhysicalAddress into the
 # contiguous window, so the pad's input reports never reached the game.
 bw_carried_patch(xbox_usb "src/usb/ohci.c"
-                 "df8e1c265db219b58c4d3e632d694d9da5fc81ff99d636dc2cb176e03ab02ea9")
+                 "640cd338c6fb6f1347cf7377429219989c22e4d46532bb0a193066fee3597723")
 
 # Test input: live pad lines starting with '!' take effect at once instead of
 # queueing behind a 200 ms release (tools/bw_autopilot2.py). Not a toolkit bug;
@@ -392,9 +384,13 @@ bw_carried_patch(xbox_usb "src/usb/usb_gamepad.c"
                  "36a29f6c38739bf1b8aa31f299fef483f1d0cc6fe03ef1e65c46de80ae512424")
 
 if(APPLE)
-    # SDL controller hotplug wrapper includes the pinned source by name.
+    # v0.17 serializes controller state with SDL's joystick lock, but its guest
+    # polling thread can still enumerate SDL2-compat's device-list cache while
+    # the main thread handles hotplug. Keep discovery in the SDL event pump.
     bw_carried_patch(xbox_input "src/input/xinput_device.c"
-                     "dba2708b822e5269748558e0d55898082d7478197324b52a56bd9224409ec05f")
+                     "3a6192fbe452d89a695025c9ab86c0b49ffa69a00f2ce9ce7cf794ea95a99deb")
+    # Keep the macOS mouse bridge and drive controller hotplug discovery from
+    # the presenter's main-thread event pump.
     bw_carried_patch(xbox_input "src/input/keyboard_sdl.c"
                      "4c3d0c320f1e678fa3a1ae9db1052affe32f2ebe03489e14871a02af13e18bbe")
     bw_carried_patch(xbox_input "src/input/keyboard.c"
@@ -405,11 +401,11 @@ if(APPLE)
         "${XBOXRECOMP_DIR}/src/input")
 endif()
 
-# TK-14: the APU's sequencer sample-limit tick (ISTS bit 3) fires every 2048
-# samples; Blood Wake's DirectSound answers each one with a hardware restart,
-# leaving periods of silence in the audio ~20 times a second.
+# APU standalone host integration and downstream audio diagnostics. v0.17
+# preserves queued frames across the title's short sequencer restart, so the
+# former TK-14 sample-limit interrupt suppression is no longer carried.
 bw_carried_patch(xbox_apu "src/apu/apu_core.c"
-                 "c15d0b1a599f220d662d85f3a45f141cd128acecb383fba6fa03ce9479331b46")
+                 "8d55ae0e734475e74a8ed130fa13a7898e6239b9619f89edd96e6b0110d6d1ce")
 
 # TK-16: the stubbed DSP's mixdown (every mixbin at unity, even bins left, odd
 # bins right). Diagnostics first (BW_APU_BINSTAT).
@@ -423,7 +419,7 @@ bw_carried_patch(xbox_apu "src/apu/apu_dsp.c"
 bw_carried_patch(xbox_kernel "src/kernel/kernel_memory.c"
                  "caf09aa153563e0b8ddf55be27eb31beca450e3d6906926375d1b0b4f47e87d0")
 bw_carried_patch(xbox_apu "src/apu/apu_vp.c"
-                 "f3690aaf836eb5584b0c8e100bd1650c051c7c8d92ce25ad7a5f35a76f60b894")
+                 "6e6916de6cee30424f11a4e51229a46368773c30b720da406a706eb2d59ce14e")
 
 # Remastered surround (D-016, docs/day1/D2.md part 3): a 6-channel (5.1)
 # source voice when the device has 6+ channels; stereo exactly as before
@@ -441,26 +437,26 @@ endif()
 # everything its CPU combiner path reads (src/toolkit_patches/kernel/
 # bw_backend_ext.h), so the back end can draw the register combiners.
 bw_carried_patch(xbox_kernel "src/kernel/nv2a_pb_exec.c"
-                 "407369da9e1447c1a5dea9af343fd66877cb31e85a86cda30768f47b2625d573")
+                 "d0671693d5d41ea71b3ac2ff631268d7ce19858ce10fad7289a6d33463c40552")
 
 # Point sprites: the vertex-program interpreter hands out the program's point
 # size (oPts), which it computed and dropped, so the executor can draw points
 # as sprites (both renderers dropped every point; BW_GPU_AUDIT, 2026-10-27).
 bw_carried_patch(xbox_kernel "src/kernel/nv2a_vsh_interp.c"
-                 "d1e1085b5ca3ed7afad5500e7e6c06b0f918545321f8b85e0a73b9e11933eb35")
+                 "af72a7f90beee744ebb34e70bbf14fd7f79bbe117f241dea7aae2d7f1272ed8a")
 
 # The NV2A thread's loop ended each pass with Sleep(0), holding a whole core
 # between frames; it now naps when idle and the KickOff replacement wakes it
 # (src/bw_wait.c, bw_ack_idle / bw_ack_kick; BW_ACK_NAP=0 restores the spin).
 bw_carried_patch(xbox_kernel "src/kernel/xbox_memory_layout.c"
-                 "9b62ad9fc0f1c6061faea61f71d2a58ee01d27b3e487e01601e8d44a251cea3d")
+                 "e61aab614c3eb77069bd84c0129b6e042337d6e075ba20a244644f3e0a9543d5")
 
 # TK-38: the segment scan lost commands at every pushbuffer ring wrap (it
 # guessed the ring's ends from the PUTs seen) and cut methods whose parameters
 # ran past PUT. The ring walk follows the JUMP and keeps the split method
 # (BW_PB_RINGWALK=0 restores the old scan; BW_PB_SEGSTAT=1 counts).
 bw_carried_patch(xbox_kernel "src/kernel/nv2a_pb_scan.c"
-                 "a365519c4c96b5e75a9a2e57eed74ecd0521129eae42fba3ce24c5176fccec90")
+                 "81edf44a0165f522e0395fca07775fa4e4a0dcd7b2fc573314fa12ec10450300")
 
 # D-012: the GP/EP DSPs on xemu's DSP56300 interpreter (vendored in
 # src/xemu_dsp, xemu v0.8.139, GPL-2.0-or-later), switched on with
@@ -473,7 +469,7 @@ target_link_libraries(xbox_apu PUBLIC bw_xemu_dsp)
 # before their mutex and exit event existed (BW_THREAD_SUSPEND=0 restores).
 # Also the D3 wait/handle diagnostics ([BWD3] lines; BW_D3_DIAG=0 silences).
 bw_carried_patch(xbox_kernel "src/kernel/kernel_bridge.c"
-                 "a065bdd6d96791f546e849d3d7b752e17a93a002f61234e36d1388a98b2de3b0")
+                 "6bb3cb58c1edb84525a13afc9ad24af0f51ebb53d53ee760d2b421d57c260beb")
 if(APPLE)
     target_sources(xbox_kernel PRIVATE
         "${CMAKE_CURRENT_SOURCE_DIR}/src/bw_posix_guest_mem.c"
@@ -484,11 +480,11 @@ endif()
 # frame window is a child of the launcher's host window, so the game's
 # self-reboots no longer open a new window each.
 bw_carried_patch(xbox_video "src/video/fb_present.c"
-                 "f0a3f553ccf4afc2e1bcfc1020030bfe76a1fc584caefc3d2367ba87f8ed9782")
+                 "ab93d83a3ad4122e388137676778944891a7d8c56cca3eafc76eb12efaca10e6")
 
 if(APPLE)
     bw_carried_patch(xbox_video "src/video/fb_present_sdl.c"
-                     "0a047f77977654eed6e6dd9164f37102144aab234470bd0bf2362addc9f2a66c")
+                     "61fa4711b3965b65ef3b80bbb71fb47a4b50ecbef454009d340ec83e5eaf4b12")
 endif()
 
 option(BW_ICALL_FEEDBACK "Record indirect-call targets (icall_targets.dump)" ON)

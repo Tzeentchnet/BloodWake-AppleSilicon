@@ -44,7 +44,19 @@ static uint32_t s_tot_calls;
 /* Executing is opt-in separately from surveying: a survey is read-only, while
  * the executor writes to guest memory. */
 extern void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param);
+extern int nv2a_pb_exec_constant_word(uint32_t method, uint32_t param);
 extern void nv2a_pb_exec_report(void);
+
+/* One word to the executor. SET_TRANSFORM_CONSTANT words, the bulk of a
+ * skinning title's stream, take the executor's short path (see
+ * nv2a_pb_exec_constant_word). */
+static void exec_word(uint32_t subch, uint32_t method, uint32_t param)
+{
+    if (subch == 0 && method >= 0x0B80u && method < 0x0C00u
+            && nv2a_pb_exec_constant_word(method, param))
+        return;
+    nv2a_pb_exec_method(subch, method, param);
+}
 static int s_exec_enabled = -1;
 static int s_scan_enabled = -1;
 
@@ -62,7 +74,7 @@ static void bw_pb_exec(uint32_t subch, uint32_t m, uint32_t param)
     } else if (m == 0x0100 && (param >> 16) == 0xB1D3u) {
         s_bw_nops_tagged++;
     }
-    nv2a_pb_exec_method(subch, m, param);
+    exec_word(subch, m, param);
 }
 
 /* Clears the NV2A request bits (xbox_memory_layout.c); called every 256

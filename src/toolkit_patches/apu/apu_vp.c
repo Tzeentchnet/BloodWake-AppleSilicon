@@ -2522,6 +2522,7 @@ static void voice_process(MCPXAPUState *d,
     bool stereo = voice_get_mask(d, v, NV_PAVS_VOICE_CFG_FMT,
                                  NV_PAVS_VOICE_CFG_FMT_STEREO) != 0;
     unsigned int channels = stereo ? 2 : 1;
+    unsigned int output_channels = channels;
     bool paused = voice_get_mask(d, v, NV_PAVS_VOICE_PAR_STATE,
                                  NV_PAVS_VOICE_PAR_STATE_PAUSED) != 0;
 
@@ -2813,6 +2814,7 @@ static void voice_process(MCPXAPUState *d,
                 hrtf_filter_process(&s_bw_cal_f[v], samples, cal);
             }
             hrtf_filter_process(&d->vp.filters[v].hrtf, samples, samples);
+            output_channels = 2;
             if (bw_cal_on())
                 for (int i = 0; i < NUM_SAMPLES_PER_FRAME; i++) {
                     s_bw_cal_tk[0] += w * cal[i][0] * cal[i][0];
@@ -2823,7 +2825,7 @@ static void voice_process(MCPXAPUState *d,
             bw_ears = 1;
         }
     }
-    static int ears_mode = -1;          /* 0 one ear, 1 ears, 2 ears mirrored */
+    static int ears_mode = -1;          /* 0 upstream, 1 ears, 2 ears mirrored */
     {
         if (ears_mode < 0) {
             /* TK-18, a port fix in every edition (docs/day1/D2.md part 3):
@@ -2833,8 +2835,8 @@ static void voice_process(MCPXAPUState *d,
              * out louder on the right (lateral position vs L/R balance,
              * correlation -0.26 to -0.82, run 20261027-033644-r6-gpu-D2-
              * earsdir), so channel 1 is the left ear. BW_APU_HRTF_EARS=0 is
-             * the toolkit's one ear to every slot (xemu's too); =mirror the
-             * first, mirrored mapping. */
+             * v0.17's alternating output-channel mapping; =mirror tests the
+             * opposite game-specific mapping. */
             const char *e = getenv("BW_APU_HRTF_EARS");
             ears_mode = 1;
             if (e && *e)
@@ -2842,7 +2844,7 @@ static void voice_process(MCPXAPUState *d,
             fprintf(stderr, "[APU] BW 3D voices: %s (BW_APU_HRTF_EARS)\n",
                     ears_mode == 1 ? "left and right ears to their own slots (TK-18)"
                     : ears_mode == 2 ? "ears mirrored (test)"
-                    : "one ear to every 3D slot (the toolkit's)");
+                    : "upstream alternating output channels");
         }
         if (!ears_mode)
             bw_ears = 0;
@@ -2869,8 +2871,7 @@ static void voice_process(MCPXAPUState *d,
         f->gain_prev[b] = g;
         for (int i = 0; i < NUM_SAMPLES_PER_FRAME; i++) {
             /* TK-18 (Blood Wake carried patch): a mono 3D voice's HRTF
-             * output is two ears, but b % channels read the left one into
-             * every bin, so 3D effects sat in the middle. Its first four
+             * output is two ears. Its first four
              * slots are the 3D submix bins (SET_HRTF_SUBMIXES; Blood Wake:
              * 6, 8, 7, 9 -- DirectSound's XTLK front-left, back-left,
              * front-right, back-right), so slots 0-1 take the left ear and
@@ -2878,7 +2879,7 @@ static void voice_process(MCPXAPUState *d,
              * the filter's channel 1 is the left ear: measured, above). */
             int ch = (bw_ears && b < 4)
                 ? ((b < 2) == (ears_mode == 1) ? 1 : 0)
-                : (int)(b % channels);
+                : (int)(b % output_channels);
             /* APU audit A3: a 3D voice's non-HRTF slots take its own
              * (room-filtered) signal, not an ear */
             float x = (bw_room_ok && b >= 4) ? bw_room[i] : samples[i][ch];

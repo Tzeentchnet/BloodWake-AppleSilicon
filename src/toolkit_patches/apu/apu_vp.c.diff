@@ -1321,7 +1321,7 @@
          int active = voice_get_mask(d, v, NV_PAVS_VOICE_PAR_STATE,
                                      NV_PAVS_VOICE_PAR_STATE_ACTIVE_VOICE);
          return active ? 0 : -1;
-@@ -1443,6 +2547,15 @@
+@@ -1444,6 +2548,15 @@
                                          NV_PAVS_VOICE_CFG_ENV0_EF_PITCHSCALE);
      float rate = 1.0f / powf(2.0f, (p + ps * 32 * ef_value) / 4096.0f);
      dbg->rate = rate;
@@ -1337,7 +1337,7 @@
  
      /* Step amplitude envelope */
      float ea_value = voice_step_envelope(
-@@ -1471,6 +2584,16 @@
+@@ -1472,6 +2585,16 @@
          }
          bool clear_mix = voice_get_mask(d, v, NV_PAVS_VOICE_CFG_FMT,
                                          NV_PAVS_VOICE_CFG_FMT_CLEAR_MIX) != 0;
@@ -1354,7 +1354,7 @@
          if (clear_mix) {
              memset(&mixbins[mp_bin][0], 0, sizeof(mixbins[0]));
          }
-@@ -1480,8 +2603,11 @@
+@@ -1481,8 +2604,11 @@
              int active = voice_get_mask(d, v, NV_PAVS_VOICE_PAR_STATE,
                                          NV_PAVS_VOICE_PAR_STATE_ACTIVE_VOICE);
              if (!active) return;
@@ -1368,7 +1368,7 @@
              if (count < 0) break;
              /* An active voice that keeps producing nothing is an underrun,
               * not a reason to spin. Asking it again at once cannot change the
-@@ -1532,6 +2658,39 @@
+@@ -1533,6 +2659,39 @@
          dbg->bin[i] = (uint8_t)bin[i];
          dbg->vol[i] = vol[i];
      }
@@ -1408,7 +1408,7 @@
      if (s_vstat_on > 0) {
          s_vstat[v].ea = ea_value;
          s_vstat[v].rate = rate;
-@@ -1539,11 +2698,12 @@
+@@ -1540,11 +2699,12 @@
          s_vstat[v].bin0 = (uint8_t)bin[0]; s_vstat[v].bin1 = (uint8_t)bin[1];
      }
  
@@ -1422,7 +1422,7 @@
      bool lpf = false;
      if (v < MCPX_HW_MAX_3D_VOICES) {
          lpf = (fmode == 1);
-@@ -1564,9 +2724,69 @@
+@@ -1565,9 +2725,69 @@
              setup_svf(filter, fc_f, q_f, F_LP);
              for (int i = 0; i < NUM_SAMPLES_PER_FRAME; i++) {
                  samples[i][ch] = run_svf(filter, samples[i][ch]);
@@ -1492,7 +1492,7 @@
      }
  
      /* HRTF processing for 3D voices. RECOMP_APU_HRTF=0 turns it off: it is
-@@ -1576,14 +2796,57 @@
+@@ -1577,15 +2797,58 @@
          const char *e = getenv("RECOMP_APU_HRTF");
          hrtf_on = !(e && e[0] == '0');
      }
@@ -1513,6 +1513,7 @@
 +                hrtf_filter_process(&s_bw_cal_f[v], samples, cal);
 +            }
              hrtf_filter_process(&d->vp.filters[v].hrtf, samples, samples);
+             output_channels = 2;
 +            if (bw_cal_on())
 +                for (int i = 0; i < NUM_SAMPLES_PER_FRAME; i++) {
 +                    s_bw_cal_tk[0] += w * cal[i][0] * cal[i][0];
@@ -1523,7 +1524,7 @@
 +            bw_ears = 1;
          }
      }
-+    static int ears_mode = -1;          /* 0 one ear, 1 ears, 2 ears mirrored */
++    static int ears_mode = -1;          /* 0 upstream, 1 ears, 2 ears mirrored */
 +    {
 +        if (ears_mode < 0) {
 +            /* TK-18, a port fix in every edition (docs/day1/D2.md part 3):
@@ -1533,8 +1534,8 @@
 +             * out louder on the right (lateral position vs L/R balance,
 +             * correlation -0.26 to -0.82, run 20261027-033644-r6-gpu-D2-
 +             * earsdir), so channel 1 is the left ear. BW_APU_HRTF_EARS=0 is
-+             * the toolkit's one ear to every slot (xemu's too); =mirror the
-+             * first, mirrored mapping. */
++             * v0.17's alternating output-channel mapping; =mirror tests the
++             * opposite game-specific mapping. */
 +            const char *e = getenv("BW_APU_HRTF_EARS");
 +            ears_mode = 1;
 +            if (e && *e)
@@ -1542,7 +1543,7 @@
 +            fprintf(stderr, "[APU] BW 3D voices: %s (BW_APU_HRTF_EARS)\n",
 +                    ears_mode == 1 ? "left and right ears to their own slots (TK-18)"
 +                    : ears_mode == 2 ? "ears mirrored (test)"
-+                    : "one ear to every 3D slot (the toolkit's)");
++                    : "upstream alternating output channels");
 +        }
 +        if (!ears_mode)
 +            bw_ears = 0;
@@ -1550,14 +1551,14 @@
  
      /* Mix into bins */
      for (int b = 0; b < 8; b++) {
-@@ -1605,7 +2868,21 @@
+@@ -1607,8 +2870,20 @@
          float step = (g - g0) / NUM_SAMPLES_PER_FRAME;
          f->gain_prev[b] = g;
          for (int i = 0; i < NUM_SAMPLES_PER_FRAME; i++) {
--            mixbins[bin[b]][i] += (g0 + step * (i + 1)) * samples[i][b % channels];
+-            mixbins[bin[b]][i] +=
+-                (g0 + step * (i + 1)) * samples[i][b % output_channels];
 +            /* TK-18 (Blood Wake carried patch): a mono 3D voice's HRTF
-+             * output is two ears, but b % channels read the left one into
-+             * every bin, so 3D effects sat in the middle. Its first four
++             * output is two ears. Its first four
 +             * slots are the 3D submix bins (SET_HRTF_SUBMIXES; Blood Wake:
 +             * 6, 8, 7, 9 -- DirectSound's XTLK front-left, back-left,
 +             * front-right, back-right), so slots 0-1 take the left ear and
@@ -1565,7 +1566,7 @@
 +             * the filter's channel 1 is the left ear: measured, above). */
 +            int ch = (bw_ears && b < 4)
 +                ? ((b < 2) == (ears_mode == 1) ? 1 : 0)
-+                : (int)(b % channels);
++                : (int)(b % output_channels);
 +            /* APU audit A3: a 3D voice's non-HRTF slots take its own
 +             * (room-filtered) signal, not an ear */
 +            float x = (bw_room_ok && b >= 4) ? bw_room[i] : samples[i][ch];
@@ -1573,7 +1574,7 @@
          }
      }
      d->vp.filters[v].gain_valid = true;
-@@ -1668,6 +2945,9 @@
+@@ -1671,6 +2946,9 @@
  void mcpx_apu_vp_frame(MCPXAPUState *d,
                          float mixbins[NUM_MIXBINS][NUM_SAMPLES_PER_FRAME])
  {
@@ -1583,7 +1584,7 @@
      memset(d->vp.sample_buf, 0, sizeof(d->vp.sample_buf));
  
      for (int list = 0; list < 3; list++) {
-@@ -1685,6 +2965,8 @@
+@@ -1688,6 +2966,8 @@
              }
  
              uint16_t v = (uint16_t)d->regs[current];
@@ -1592,7 +1593,7 @@
              d->regs[next] = voice_get_mask(d, v, NV_PAVS_VOICE_TAR_PITCH_LINK,
                                 NV_PAVS_VOICE_TAR_PITCH_LINK_NEXT_VOICE_HANDLE);
  
-@@ -1706,9 +2988,12 @@
+@@ -1709,9 +2989,12 @@
              d->regs[current] = d->regs[next];
          }
      }

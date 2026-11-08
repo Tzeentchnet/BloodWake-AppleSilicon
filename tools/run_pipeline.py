@@ -50,7 +50,7 @@ import sys
 import time
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-PINNED_COMMIT = "f0f8a461496a4f23d9b0aeaa284b8d70ba7ab82b"   # xboxrecomp v0.16.0 (D-002)
+PINNED_COMMIT = "343b6d8901723b37ce568b2418c5df4e1fe1d223"   # xboxrecomp v0.17.0 (D-002)
 STEPS = ["parse", "disasm", "funcid", "abi", "ghidra", "recomp", "doctor", "metrics"]
 
 
@@ -201,7 +201,7 @@ def main(argv=None):
     ap.add_argument("--extra-sections", default=None,
                     help="passed to tools.disasm, e.g. DOLBY (use when disasm warns about unswept code)")
     ap.add_argument("--allow-other-toolkit", action="store_true",
-                    help="run even if the toolkit is not at the pinned v0.16.0 commit")
+                    help="run even if the toolkit is not at the pinned v0.17.0 commit")
     ap.add_argument("--icall", action="store_true",
                     help="use the indirect-call feedback in analysis/icall/ (tools/bw_icall.py): "
                          "seeds for disasm, per-site targets for recomp")
@@ -248,13 +248,13 @@ def main(argv=None):
     r = Runner(a)
     head = r.manifest["toolkit"]["commit"]
     if head != PINNED_COMMIT:
-        msg = "toolkit HEAD is %s, not the pinned v0.16.0 (%s)" % (head, PINNED_COMMIT[:7])
+        msg = "toolkit HEAD is %s, not the pinned v0.17.0 (%s)" % (head, PINNED_COMMIT[:7])
         if not a.allow_other_toolkit:
-            print("ERROR: " + msg + ". Check out v0.16.0 or pass --allow-other-toolkit.", file=sys.stderr)
+            print("ERROR: " + msg + ". Check out v0.17.0 or pass --allow-other-toolkit.", file=sys.stderr)
             return 2
         r.flag(msg)
     if r.manifest["toolkit"]["dirty_tracked"]:
-        r.flag("toolkit has modified tracked files -- results may not match a clean v0.16.0")
+        r.flag("toolkit has modified tracked files -- results may not match a clean v0.17.0")
     if not r.manifest["host"]["capstone"]:
         print("ERROR: capstone is not installed for %s (pip install capstone==5.0.9)" % sys.executable,
               file=sys.stderr)
@@ -436,7 +436,7 @@ def main(argv=None):
                 r.manifest["toolkit_fixes"] = []
                 rc, _ = r.run(step, [py, "-m", "tools.recomp"] + recomp_args)
             else:
-                # D-010: known v0.16.0 bugs fixed in memory. The toolkit files stay untouched,
+                # D-010: remaining v0.17.0 lifter bugs fixed in memory. The toolkit files stay untouched,
                 # and the wrapper refuses to run if the code it fixes has changed.
                 sys.path.insert(0, os.path.join(REPO, "tools"))
                 import xbr_patches

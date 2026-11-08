@@ -673,8 +673,13 @@ static LONG CALLBACK ac97_write_veh(PEXCEPTION_POINTERS ep)
     return EXCEPTION_CONTINUE_SEARCH;
 }
 
-#if !defined(_WIN32) && defined(__aarch64__)
+#if !defined(_WIN32) && (defined(__aarch64__) \
+        || (defined(__x86_64__) && defined(__linux__)))
+#if defined(__aarch64__)
 #include "../platform/mmio_decode_a64.h"
+#else
+#include "../platform/mmio_decode_x86_64.h"
+#endif
 #include <sys/mman.h>
 
 #if defined(__APPLE__)
@@ -862,11 +867,52 @@ static void ac97_posix_disarm(void)
     g_ac97_page = NULL;
 }
 #else
+static size_t g_ac97_hsize;
+
+static uint64_t ac97_posix_rd(void *dev, uint32_t off, int size)
+{
+    uint64_t v = 0;
+    memcpy(&v, (char *)dev + off, size > 8 ? 8 : size);
+    return v;
+}
+
+static void ac97_posix_wr(void *dev, uint32_t off, uint64_t v, int size)
+{
+    memcpy((char *)dev + off, &v, size > 8 ? 8 : size);
+}
+
+/* The generic Linux trap temporarily opens the page while it emulates one
+ * store. Apple uses the shared-alias implementation above so its signal
+ * handler never changes protections or takes a process-wide lock. */
+static volatile int g_ac97_posix_lock;
+
 int xbox_Ac97PosixFault(void *ucv, uintptr_t fault)
 {
-    (void)ucv;
-    (void)fault;
-    return 0;
+    int ok;
+
+    if (!g_ac97_page || fault < (uintptr_t)g_ac97_page
+            || fault >= (uintptr_t)g_ac97_page + g_ac97_hsize)
+        return 0;
+    while (__atomic_exchange_n(&g_ac97_posix_lock, 1, __ATOMIC_ACQUIRE))
+        ;
+    if (mprotect(g_ac97_page, g_ac97_hsize, PROT_READ | PROT_WRITE) != 0) {
+        __atomic_store_n(&g_ac97_posix_lock, 0, __ATOMIC_RELEASE);
+        return 0;
+    }
+#if defined(__aarch64__)
+    ok = mmio_emulate_a64((ucontext_t *)ucv,
+                          (uint32_t)(fault - (uintptr_t)g_ac97_page),
+                          g_ac97_page, ac97_posix_rd, ac97_posix_wr);
+#else
+    ok = mmio_emulate_x86_64((ucontext_t *)ucv,
+                             (uint32_t)(fault - (uintptr_t)g_ac97_page),
+                             g_ac97_page, ac97_posix_rd, ac97_posix_wr);
+#endif
+    if (ok)
+        ac97_clear_reset_bits();
+    mprotect(g_ac97_page, g_ac97_hsize, PROT_READ);
+    __atomic_store_n(&g_ac97_posix_lock, 0, __ATOMIC_RELEASE);
+    return ok;
 }
 #endif /* __APPLE__ */
 #endif
@@ -941,6 +987,27 @@ static int ac97_arm_write_trap(void)
                     " (shared alias; channel reset completes on write)\n",
             XBOX_MCPX_BASE + AC97_NABM_OFFSET);
     return 1;
+#elif defined(__aarch64__) || (defined(__x86_64__) && defined(__linux__))
+    long host_page = sysconf(_SC_PAGESIZE);
+
+    if (host_page <= 0 || (uint64_t)host_page > UINT32_MAX) {
+        fprintf(stderr, "  AC97: cannot determine the host page size;"
+                        " refusing AC97 initialization\n");
+        return 0;
+    }
+    g_ac97_page = (char *)g_mcpx_memory + AC97_NABM_OFFSET;
+    g_ac97_hsize = (size_t)host_page < AC97_TRAP_BYTES
+                 ? AC97_TRAP_BYTES : (size_t)host_page;
+    if (mprotect(g_ac97_page, g_ac97_hsize, PROT_READ) != 0) {
+        g_ac97_page = NULL;
+        fprintf(stderr, "  AC97: could not arm the bus-master write trap;"
+                        " a channel reset will spin\n");
+        return 0;
+    }
+    fprintf(stderr, "  AC97: bus-master writes trapped at 0x%08X"
+                    " (POSIX; channel reset completes on write)\n",
+            XBOX_MCPX_BASE + AC97_NABM_OFFSET);
+    return 1;
 #else
     fprintf(stderr, "  AC97: safe bus-master write trapping is unavailable"
                     " on this host\n");
@@ -1010,18 +1077,19 @@ int xbox_VehMmioFault(void *exception_pointers)
     return 0;
 }
 #else
-#if defined(__aarch64__)
+#if defined(__aarch64__) || (defined(__x86_64__) && defined(__linux__))
 extern bool apu_hook_handle_mmio_posix(void *ucv, uintptr_t fault_addr,
                                        uint32_t fault_xbox_va, int is_write);
 #endif
 
-/* POSIX: service a captured fault in ordinary thread context. APU and OHCI
- * callbacks can use locks, condition variables and stdio, so this dispatcher
- * must not be called directly from a signal handler. AC'97 alone has a
- * signal-safe entry point, xbox_Ac97PosixFault. */
+/* POSIX fault dispatch: APU, then AC'97, then OHCI. Blood Wake's Apple
+ * handler services captured APU/OHCI faults in ordinary thread context
+ * because those callbacks use locks and stdio; its AC'97 alias callback is
+ * signal-safe. The upstream Linux arm64/x86-64 handlers call this entry from
+ * their SA_SIGINFO handler. */
 int xbox_PosixMmioFault(void *ucv, uintptr_t fault)
 {
-#if defined(__aarch64__)
+#if defined(__aarch64__) || (defined(__x86_64__) && defined(__linux__))
     uint32_t va;
 
     if (!mmio_fault_va(fault, &va))
@@ -3948,7 +4016,9 @@ static int g_heap_alloc_count = 0;
  * in bump order, so index order is address order and coalescing is a
  * neighbour check. */
 #define XBOX_HEAP_MAX_BLOCKS 65536
-static struct { uint32_t addr; uint32_t size; uint8_t free; }
+/* `named`: MmGetPhysicalAddress was given an address inside this live block
+ * (xbox_PhysNoteRamName); cleared whenever the block is handed out or freed. */
+static struct { uint32_t addr; uint32_t size; uint8_t free; uint8_t named; }
     g_heap_blocks[XBOX_HEAP_MAX_BLOCKS];
 static int g_heap_block_count = 0;
 
@@ -4003,7 +4073,7 @@ static int heap_insert_free(int at, uint32_t addr, uint32_t size)
     }
     g_heap_blocks[at].addr = addr;
     g_heap_blocks[at].size = size;
-    g_heap_blocks[at].free = 1;
+    g_heap_blocks[at].free = 1; g_heap_blocks[at].named = 0;
     return 1;
 }
 
@@ -4029,7 +4099,7 @@ static uint32_t heap_carve_free(uint32_t size, uint32_t alignment)
             i++;        /* the taken piece moved up one slot */
         g_heap_blocks[i].addr = start;
         g_heap_blocks[i].size = size;
-        g_heap_blocks[i].free = 0;
+        g_heap_blocks[i].free = 0; g_heap_blocks[i].named = 0;
         if (back && !heap_insert_free(i + 1, start + size, back))
             g_heap_blocks[i].size += back;   /* table full: keep it attached */
         memset((void *)((uintptr_t)start + g_memory_offset), 0, size);
@@ -4580,10 +4650,69 @@ uint32_t xbox_ContiguousInUseBytes(void)
  * The marks alone do not pin a mapping for the duration of a device transfer. */
 static volatile uint8_t g_phys_ram_named[CONTIG_PAGES];
 
+/* The heap block holding `va`, live or free, or -1 when none does. Index
+ * order is address order (empty slots keep the address they had), so the
+ * search finds the last slot starting at or below `va` and steps back over
+ * empty ones. Caller holds g_heap_lock (shared is enough). */
+static int heap_block_at(uint32_t va)
+{
+    int lo = 0, hi = g_heap_block_count - 1, at = -1;
+    while (lo <= hi) {
+        int mid = lo + (hi - lo) / 2;
+        if (g_heap_blocks[mid].addr <= va) {
+            at = mid;
+            lo = mid + 1;
+        } else {
+            hi = mid - 1;
+        }
+    }
+    for (; at >= 0; at--) {
+        if (!g_heap_blocks[at].size)
+            continue;
+        return (uint64_t)va < (uint64_t)g_heap_blocks[at].addr + g_heap_blocks[at].size ? at : -1;
+    }
+    return -1;
+}
+
 void xbox_PhysNoteRamName(uint32_t va)
 {
-    if (va >= XBOX_HEAP_BASE && va < XBOX_HEAP_TOP && va < XBOX_CONTIG_SIZE)
+    if (va >= XBOX_HEAP_BASE && va < XBOX_HEAP_TOP && va < XBOX_CONTIG_SIZE) {
+        int i;
         bw_shared_u8_store(&g_phys_ram_named[va / CONTIG_PAGE], 1);
+        /* The block too: a page can hold the end of a window buffer and the
+         * start of a heap block the title named, and only the block says
+         * which bytes the name covers (xbox_PhysRamNamedAt). A byte store
+         * under the shared lock: nothing moves the table meanwhile. */
+        AcquireSRWLockShared(&g_heap_lock);
+        i = heap_block_at(va);
+        if (i >= 0 && !g_heap_blocks[i].free)
+            g_heap_blocks[i].named = 1;
+        ReleaseSRWLockShared(&g_heap_lock);
+    }
+}
+
+/* Whether physical byte `pa` is RAM the title named, at byte precision.
+ *
+ * The page map says a heap page was named; a page is 4 KB and is shared.
+ * Def Jam: Fight for NY's six-channel mix buffer is a window allocation
+ * whose last 344 bytes share their physical page with a heap block that
+ * starts after them and that the title named (MmGetPhysicalAddress), so the
+ * page map sent those bytes to RAM: the last 28 frames of every lap of the
+ * buffer played whatever RAM held there, a click 20 times a second in the
+ * opening scene. Here a named page only counts for the bytes inside a live
+ * block that was named. Bytes the heap table does not place in a block keep
+ * the page's answer, as before. */
+int xbox_PhysRamNamedAt(uint32_t pa)
+{
+    int i, named;
+    if (pa >= XBOX_CONTIG_SIZE
+            || !bw_shared_u8_load(&g_phys_ram_named[pa / CONTIG_PAGE]))
+        return 0;
+    AcquireSRWLockShared(&g_heap_lock);
+    i = heap_block_at(pa);
+    named = i < 0 || (!g_heap_blocks[i].free && g_heap_blocks[i].named);
+    ReleaseSRWLockShared(&g_heap_lock);
+    return named;
 }
 
 /* Heap block m is free (and merged with any free neighbours): its pages name
@@ -4678,7 +4807,7 @@ static uint32_t heap_alloc_locked(uint32_t size, uint32_t alignment)
             if (g_heap_blocks[i].addr & (alignment - 1)) {
                 continue;   /* wrong alignment for this request */
             }
-            g_heap_blocks[i].free = 0;
+            g_heap_blocks[i].free = 0; g_heap_blocks[i].named = 0;
             result = g_heap_blocks[i].addr;
             memset((void *)((uintptr_t)result + g_memory_offset), 0, size);
             return result;
@@ -4732,7 +4861,7 @@ static uint32_t heap_alloc_locked(uint32_t size, uint32_t alignment)
     if (g_heap_block_count < XBOX_HEAP_MAX_BLOCKS) {
         g_heap_blocks[g_heap_block_count].addr = result;
         g_heap_blocks[g_heap_block_count].size = size;
-        g_heap_blocks[g_heap_block_count].free = 0;
+        g_heap_blocks[g_heap_block_count].free = 0; g_heap_blocks[g_heap_block_count].named = 0;
         g_heap_block_count++;
     }
 
@@ -4802,7 +4931,7 @@ void xbox_HeapFree(uint32_t xbox_va)
         if (g_heap_blocks[i].addr != xbox_va || g_heap_blocks[i].free) {
             continue;
         }
-        g_heap_blocks[i].free = 1;
+        g_heap_blocks[i].free = 1; g_heap_blocks[i].named = 0;
         if (++matched % 512 == 0) {
             fprintf(stderr, "  [HEAP] frees=%d matched=%d blocks=%d\n",
                     frees, matched, g_heap_block_count);

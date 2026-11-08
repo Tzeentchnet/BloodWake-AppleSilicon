@@ -3377,7 +3377,10 @@ static void kernel_vblank_arm(int raised)
 }
 
 
-/* RECOMP_VBLANK: unset, no vblanks. Set, the tick v0.14.0 had: a vblank
+/* RECOMP_VBLANK: unset, empty or 0, no vblanks: 0 is off as it is for
+ * RECOMP_FLIP_PACING and RECOMP_DISPATCH_GATE, so an A/B run's
+ * RECOMP_VBLANK=0 does not quietly get the 60 Hz schedule a title's other
+ * switches ask for. Any other value, the tick v0.14.0 had: a vblank
  * at most every 16 ms on GetTickCount64, checked on the timer thread's
  * 10 ms Sleep (about 50 Hz), raised with no regard for the enable registers
  * and acked by the nv2a-ack thread's passes. RECOMP_VBLANK=paced, or the
@@ -3391,7 +3394,7 @@ static void kernel_vblank_arm(int raised)
  * before. */
 int xbox_VblankMode(const char *env, int paced_wanted)
 {
-    if (!env)
+    if (!env || !*env || !strcmp(env, "0"))
         return XBOX_VBLANK_OFF;
     if (paced_wanted || !strcmp(env, "paced"))
         return XBOX_VBLANK_PACED;
@@ -5685,6 +5688,27 @@ static void bridge_NtDeviceIoControlFile(void)
             return;
         }
 
+        /* Any other command sent as IOCTL_SCSI_PASS_THROUGH_DIRECT (READ DVD
+         * STRUCTURE, INQUIRY, ...) is answered the same way: the drive reports
+         * GOOD and the DataBuffer holds defined bytes, not what the title's
+         * heap happened to contain. There is no disc to describe, so the
+         * contents are zero. */
+        if (ioctl == 0x4D014u && in_va && in_len >= 44) {
+            uint32_t data_va  = BRIDGE_MEM32(in_va + 20);
+            uint32_t data_len = BRIDGE_MEM32(in_va + 12);
+            uint32_t i;
+
+            fprintf(stderr, "  [FILE] DVD SCSI command 0x%02X, %u bytes "
+                            "-> zeroed\n", BRIDGE_MEM8(in_va + 28), data_len);
+            if (data_va)
+                for (i = 0; i < data_len; i++)
+                    BRIDGE_MEM8(data_va + i) = 0;
+            BRIDGE_MEM8(in_va + 2) = 0;              /* ScsiStatus = GOOD */
+            bridge_write_iostatus(ios_va, 0, in_len);
+            g_eax = 0;
+            return;
+        }
+
         fprintf(stderr, "  [FILE] DVD device IOCTL 0x%X (in=%u out=%u) "
                         "-> STATUS_SUCCESS\n", ioctl, in_len, out_len);
         if (out_va && out_len) {
@@ -6046,16 +6070,43 @@ static void bridge_KeDisconnectInterrupt(void)
 /* KeQueryBasePriorityThread (ordinal 124, 1 arg). The implementation has
  * existed in kernel_thread.c all along; only the bridge wrapper was
  * missing, so the thunk fell through to the fallback and returned 0. */
+/* The host thread behind a guest thread object: the KE shadow holds one for
+ * every spawned worker, and the calling thread's own object is itself. The
+ * object VA used to be passed on as if it were a host handle, so
+ * Get/SetThreadPriority failed on every call and no title's priorities ever
+ * took effect -- Kung Fu Chaos raises its loader thread, and without that the
+ * order between it and the main thread on the way out of GET READY was free
+ * to differ from the console's. */
+static HANDLE bridge_thread_host(uint32_t obj, int *owned)
+{
+#if defined(__APPLE__)
+    HANDLE h = ke_shadow_acquire(obj);
+    *owned = h != NULL;
+#else
+    HANDLE h = ke_shadow_lookup(obj);
+    *owned = 0;
+#endif
+    if (!h && obj && obj == g_thread_obj_va)
+        h = GetCurrentThread();
+    return h;
+}
+
 static void bridge_KeQueryBasePriorityThread(void)
 {
-    g_eax = (uint32_t)xbox_KeQueryBasePriorityThread(
-        XBOX_TO_NATIVE(STACK_ARG(0)));
+    int owned;
+    HANDLE h = bridge_thread_host(STACK_ARG(0), &owned);
+    g_eax = h ? (uint32_t)xbox_KeQueryBasePriorityThread(h) : 0;
+    if (owned)
+        CloseHandle(h);
 }
 
 static void bridge_KeSetBasePriorityThread(void)
 {
-    g_eax = (uint32_t)xbox_KeSetBasePriorityThread(
-        XBOX_TO_NATIVE(STACK_ARG(0)), (LONG)STACK_ARG(1));
+    int owned;
+    HANDLE h = bridge_thread_host(STACK_ARG(0), &owned);
+    g_eax = h ? (uint32_t)xbox_KeSetBasePriorityThread(h, (LONG)STACK_ARG(1)) : 0;
+    if (owned)
+        CloseHandle(h);
 }
 
 /* ── KeStallExecutionProcessor (ordinal 151, 1 arg) */
@@ -9647,16 +9698,22 @@ static void bridge_NtCreateIoCompletion(void)
 /* --- NtCreateTimer (ordinal 194, 3 args = 12 bytes)
  * NTSTATUS NtCreateTimer(PHANDLE TimerHandle, POBJECT_ATTRIBUTES
  *                        ObjectAttributes, TIMER_TYPE TimerType);
- * Creates a manual-reset waitable timer and hands its token out through the
- * handle table, matching the NtCreateEvent/NtCreateMutant pattern. */
+ * Creates a waitable timer of the asked type and hands its token out through
+ * the handle table, matching the NtCreateEvent/NtCreateMutant pattern. */
 static void bridge_NtCreateTimer(void)
 {
     HANDLE h;
 
     (void)STACK_ARG(1);
-    (void)STACK_ARG(2);
 
-    h = CreateWaitableTimerW(NULL, TRUE, NULL);
+    if (STACK_ARG(0) && !bridge_buf_ok(STACK_ARG(0), 4, "NtCreateTimer")) {
+        g_eax = 0xC0000005u;                /* STATUS_ACCESS_VIOLATION */
+        return;
+    }
+    /* TimerType 0 = NotificationTimer (stays signalled), 1 =
+     * SynchronizationTimer (released waiter resets it): XAPI's
+     * CreateWaitableTimer(bManualReset = FALSE) asks for the second. */
+    h = CreateWaitableTimerW(NULL, STACK_ARG(2) == 0, NULL);
     if (!h) {
         fprintf(stderr, "  [KERNEL] NtCreateTimer: CreateWaitableTimerW failed (error %u)\n",
                 GetLastError());
@@ -9816,17 +9873,43 @@ static void bridge_NtSetIoCompletion(void)
 }
 
 /* --- NtSetTimerEx (ordinal 229, 8 args = 32 bytes) --- */
+/* NTSTATUS NtSetTimerEx(HANDLE TimerHandle, PLARGE_INTEGER DueTime,
+ *                       PTIMER_APC_ROUTINE TimerApcRoutine, KPROCESSOR_MODE
+ *                       ApcMode, PVOID TimerContext, BOOLEAN WakeTimer,
+ *                       LONG Period, PBOOLEAN PreviousState);
+ * XAPI's SetWaitableTimer. It used to succeed without arming anything, so a
+ * title clocked by a waitable timer never ticked: SSX On Tour's 60 Hz frame
+ * clock thread (guest 0x00222E71) waits on one and re-arms it each time,
+ * and the "Saving..." screen waits on that clock for its 3 s minimum, so
+ * every save hung. A timer APC is not delivered (none seen yet). */
 static void bridge_NtSetTimerEx(void)
 {
-    (void)STACK_ARG(0);
-    (void)STACK_ARG(1);
-    (void)STACK_ARG(2);
-    (void)STACK_ARG(3);
-    (void)STACK_ARG(4);
-    (void)STACK_ARG(5);
-    (void)STACK_ARG(6);
-    (void)STACK_ARG(7);
-    g_eax = 0;
+    HANDLE   h       = bridge_resolve_handle(STACK_ARG(0));
+    uint32_t due_va  = STACK_ARG(1);
+    uint32_t apc     = STACK_ARG(2);
+    LONG     period  = (LONG)STACK_ARG(6);
+    uint32_t prev_va = STACK_ARG(7);
+    LARGE_INTEGER due;
+
+    if (!h) {
+        g_eax = 0xC0000008u;                /* STATUS_INVALID_HANDLE */
+        return;
+    }
+    if (!bridge_buf_ok(due_va, 8, "NtSetTimerEx")
+            || (prev_va && !bridge_buf_ok(prev_va, 1, "NtSetTimerEx"))) {
+        g_eax = 0xC0000005u;                /* STATUS_ACCESS_VIOLATION */
+        return;
+    }
+    due.QuadPart = (LONGLONG)((uint64_t)BRIDGE_MEM32(due_va)
+                              | ((uint64_t)BRIDGE_MEM32(due_va + 4) << 32));
+    if (apc) {
+        static int warned;
+        if (!warned++)
+            fprintf(stderr, "  [KERNEL] NtSetTimerEx: timer APC 0x%08X not delivered\n", apc);
+    }
+    if (prev_va)                    /* the prior state is not tracked: "was not signalled" */
+        BRIDGE_MEM8(prev_va) = 0;
+    g_eax = SetWaitableTimer(h, &due, period, NULL, NULL, FALSE) ? 0 : 0xC000000Du;
 }
 
 /* --- NtSignalAndWaitForSingleObjectEx (ordinal 230, 5 args = 20 bytes) --- */
@@ -11894,7 +11977,9 @@ void xbox_kernel_bridge_init(void)
             uint32_t current = BRIDGE_MEM32(va);
             int slot;
 
-            if (!(current & 0x80000000)) {
+            if (!(current & 0x80000000u) ||
+                (current & 0x7FFFFFFFu) == 0 ||
+                (current & 0x7FFFFFFFu) > XBOX_KERNEL_THUNK_TABLE_SIZE) {
                 continue;            /* NULL separator or ordinary data */
             }
             slot = g_thunk_table_count + i;   /* park these above the main run */

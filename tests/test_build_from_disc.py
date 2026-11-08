@@ -17,6 +17,20 @@ spec.loader.exec_module(build_from_disc)
 
 
 class BuildFromDiscTests(unittest.TestCase):
+    def test_xboxrecomp_v017_pin_and_archive_hashes(self):
+        self.assertEqual(
+            build_from_disc.TOOLKIT_COMMIT,
+            "343b6d8901723b37ce568b2418c5df4e1fe1d223",
+        )
+        self.assertEqual(
+            build_from_disc.TOOLKIT_ZIP_SHA256,
+            "ea40ee3402f55fbe344fb804736e97986dbf1399d1043770fb39ab87543ede33",
+        )
+        self.assertEqual(
+            build_from_disc.TOOLKIT_TREE_SHA256,
+            "19f7d25710718b92b2fe187a3ebe8e9d7caa0c83805d614639359f718ec3a2ab",
+        )
+
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)

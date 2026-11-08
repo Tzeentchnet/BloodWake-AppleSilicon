@@ -14,7 +14,7 @@ from collections import Counter
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-PINNED_TOOLKIT = "f0f8a461496a4f23d9b0aeaa284b8d70ba7ab82b"
+PINNED_TOOLKIT = "343b6d8901723b37ce568b2418c5df4e1fe1d223"
 PUBLISHED_GENERATED = "d2552e199cb8d94484ee589d151a41faf52b83c231aa7f241151d19c820689aa"
 SCHEMA = 1
 EXTENSIONS = {".c", ".h", ".m", ".mm", ".inc"}

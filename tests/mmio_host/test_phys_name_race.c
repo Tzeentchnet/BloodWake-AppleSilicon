@@ -4,6 +4,19 @@
 
 enum { ITERATIONS = 100000 };
 static int s_start, s_done;
+static pthread_rwlock_t s_test_srw = PTHREAD_RWLOCK_INITIALIZER;
+
+VOID AcquireSRWLockShared(PSRWLOCK lock)
+{
+    (void)lock;
+    pthread_rwlock_rdlock(&s_test_srw);
+}
+
+VOID ReleaseSRWLockShared(PSRWLOCK lock)
+{
+    (void)lock;
+    pthread_rwlock_unlock(&s_test_srw);
+}
 
 LONG InterlockedCompareExchange(volatile LONG *target, LONG exchange, LONG compare)
 {

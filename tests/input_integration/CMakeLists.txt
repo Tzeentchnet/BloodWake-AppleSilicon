@@ -20,7 +20,7 @@ function(check_input_source name expected)
         message(FATAL_ERROR "The ${name} wrapper must be reviewed for this xboxrecomp revision")
     endif()
 endfunction()
-check_input_source(xinput_device.c dba2708b822e5269748558e0d55898082d7478197324b52a56bd9224409ec05f)
+check_input_source(xinput_device.c 3a6192fbe452d89a695025c9ab86c0b49ffa69a00f2ce9ce7cf794ea95a99deb)
 check_input_source(keyboard_sdl.c 4c3d0c320f1e678fa3a1ae9db1052affe32f2ebe03489e14871a02af13e18bbe)
 check_input_source(keyboard.c cf4cc96718246341823e40e2ae276e49f1ec2fc550f2a115cabec81c1a1d1424)
 

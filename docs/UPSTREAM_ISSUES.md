@@ -9,57 +9,45 @@ The Blood Wake gameplay-fix and branch-sync baseline is tracked separately in
 
 ## xboxrecomp
 
-Baseline: commit `f0f8a461496a4f23d9b0aeaa284b8d70ba7ab82b`, macOS
-27.0.1 ARM64, Apple Clang 21. Using the installed macOS 26.5 SDK, Homebrew
-OpenSSL, SDL2 and libepoxy, its runtime libraries built successfully. Its
-synthetic ARM64 MMIO, POSIX memory-layout, POSIX kernel-memory and NV2A backend
-tests passed. These checks do not establish game compatibility.
+Baseline: v0.17.0, commit
+`343b6d8901723b37ce568b2418c5df4e1fe1d223`, macOS 27.0.1 ARM64,
+Apple Clang 21. Validation uses the installed macOS 26.5 SDK, Homebrew OpenSSL
+and SDL2. These checks do not establish game compatibility.
 
 ### MMX multiply-add signed overflow
 
-**Reproduced with synthetic input; candidate for an upstream fix.**
-[`MMX_PMADDWD`](https://github.com/sp00nznet/xboxrecomp/blob/f0f8a461496a4f23d9b0aeaa284b8d70ba7ab82b/templates/runtime/recomp_types.h)
-adds two signed 32-bit products. When both adjacent lanes of both operands
-are -32768, each product is 1073741824, and their sum overflows `int32_t`.
-Apple Clang's undefined-behavior sanitizer reports signed integer overflow
-at optimization level `-O1`; without the sanitizer, the same synthetic case
-produced the expected x86 result, `0x80000000`. That apparent result does not
-make the signed overflow defined, and this is not limited to Apple Silicon
-by the C language rules. Runtime impact on this game has not been established.
-
-An upstream regression should exercise both output lanes, ordinary signed
-inputs and the all-minimum edge case with UBSan enabled. One possible fix is
-to sum in `int64_t` and convert to the result's unsigned 32-bit lane, which
-gives the instruction's wrapping bit pattern without signed overflow.
+**Resolved upstream in v0.17.0 by
+[#284](https://github.com/sp00nznet/xboxrecomp/pull/284).**
+[`MMX_PMADDWD`](https://github.com/sp00nznet/xboxrecomp/blob/343b6d8901723b37ce568b2418c5df4e1fe1d223/templates/runtime/recomp_types.h)
+now sums through an unsigned 32-bit conversion, defining the instruction's
+wrapping result without signed C overflow. Upstream's regression exercises
+both result lanes, including the all-minimum edge case. No downstream patch is
+carried for this finding.
 
 ### MMX integer test cannot build on ARM64
 
-**Reproduced test configuration issue.** The toolkit's
-[`tests/mmx_integer/CMakeLists.txt`](https://github.com/sp00nznet/xboxrecomp/blob/f0f8a461496a4f23d9b0aeaa284b8d70ba7ab82b/tests/mmx_integer/CMakeLists.txt)
-adds `-mmmx -msse` for every non-MSVC compiler. Apple Clang rejects both flags
-for ARM64, so the test cannot build there. Its non-x86 fallback prints that
-it is skipped but returns zero, which CTest reports as a pass. Gate the
-intrinsic flags by architecture and mark the fallback as an actual CTest
-skip, or add architecture-independent lane-value tests. This is a test
-portability issue, not evidence that the game runtime fails.
+**Resolved upstream in v0.17.0 by
+[#283](https://github.com/sp00nznet/xboxrecomp/pull/283).** The toolkit's
+[`tests/mmx_integer/CMakeLists.txt`](https://github.com/sp00nznet/xboxrecomp/blob/343b6d8901723b37ce568b2418c5df4e1fe1d223/tests/mmx_integer/CMakeLists.txt)
+now adds the x86 intrinsic flags only on x86 hosts and reports the non-x86
+fallback as a CTest skip rather than a pass. No downstream patch is carried.
 
-### Metal integration: OpenGL is mandatory at configuration time
+### Metal integration: optional bundled D3D8 layer
 
-**Feature request, confirmed build constraint.** On non-Windows platforms
-[`src/d3d/CMakeLists.txt`](https://github.com/sp00nznet/xboxrecomp/blob/f0f8a461496a4f23d9b0aeaa284b8d70ba7ab82b/src/d3d/CMakeLists.txt)
-always requires libepoxy and builds the OpenGL D3D8 backend. Configuration
-failed when libepoxy was absent and succeeded after it was installed. Even a
-consumer intending to supply a Metal backend cannot omit this dependency with
-the current CMake options. Consider an explicit backend selection or a
-separable backend target; SDL2 is also used by other toolkit components.
+**Resolved upstream in v0.17.0 by
+[#304](https://github.com/sp00nznet/xboxrecomp/pull/304).**
+`XBOXRECOMP_BUILD_D3D8=OFF` now lets an embedding non-Windows project omit the
+bundled OpenGL D3D8 layer. The Apple build uses the normal top-level toolkit
+integration with that option disabled; its former dummy `xbox_d3d8` target has
+been removed.
 
 ### Render backend callbacks cannot return failure
 
 **Confirmed interface constraint; candidate for an upstream API proposal.**
 The pinned toolkit's
-[`Nv2aBackend`](https://github.com/sp00nznet/xboxrecomp/blob/f0f8a461496a4f23d9b0aeaa284b8d70ba7ab82b/src/kernel/nv2a_backend.h)
+[`Nv2aBackend`](https://github.com/sp00nznet/xboxrecomp/blob/343b6d8901723b37ce568b2418c5df4e1fe1d223/src/kernel/nv2a_backend.h)
 clear, draw and flip callbacks return `void`. After calling draw, the
-[`pushbuffer executor`](https://github.com/sp00nznet/xboxrecomp/blob/f0f8a461496a4f23d9b0aeaa284b8d70ba7ab82b/src/kernel/nv2a_pb_exec.c)
+[`pushbuffer executor`](https://github.com/sp00nznet/xboxrecomp/blob/343b6d8901723b37ce568b2418c5df4e1fe1d223/src/kernel/nv2a_pb_exec.c)
 counts and clears the batch without receiving a success or failure result.
 An unsupported operation or GPU error therefore cannot be propagated through
 this interface. The local Metal backend records a sticky error; its synthetic
@@ -71,24 +59,16 @@ failed frame. A per-draw CPU fallback would additionally need a defined
 surface ownership and synchronization contract; merely returning failure
 would not make such a fallback correct.
 
-### Framebuffer snapshot precedes backend flip
+### Framebuffer synchronization before snapshots
 
-**Reproduced with synthetic input; candidate for an upstream fix.** At
-`FLIP_STALL`, the pinned toolkit's pushbuffer executor calls
-`xbox_FramebufferWindowPresent` and, when enabled, writes the flip dump before
-calling the registered backend's `flip`. A backend that copies its finished
-frame into guest memory during `flip` therefore updates that memory after the
-window snapshot and dump have read it. A synthetic backend confirmed that the
-window callback saw the old value while guest memory contained the new value
-after `flip`. Backends that present independently or update guest memory
-earlier may not be affected.
-
-An upstream regression can use synthetic guest memory and a backend that
-writes a distinctive value during `flip`, then assert that the snapshot and
-dump observe the new value. Fixing the ordering must preserve CPU-renderer
-behavior and avoid presenting twice. The fork now carries an opt-in
-pre-snapshot synchronization hook and tests its ordering; the proposal is
-tracked upstream in [#285](https://github.com/sp00nznet/xboxrecomp/pull/285).
+**The ordering defect is resolved upstream in v0.17.0 by
+[#285](https://github.com/sp00nznet/xboxrecomp/pull/285); a downstream API
+extension remains.** The executor now offers an opt-in synchronization
+callback and invokes it before the framebuffer window or dump reads guest
+memory. The carried executor uses that upstream callback and also retains the
+Metal path's failure-returning prepare/publish hooks, frozen snapshot metadata,
+and indexed-capture diagnostics. Those error and ownership contracts are not
+provided by #285, so they are not duplicate patching.
 
 ### macOS video decoding
 
@@ -102,7 +82,7 @@ local testing before proposing a platform-independent or macOS solution.
 **Candidate only; runtime impact not established.** Apple Clang warned that
 the default one-element `menu_pushbuffer_data` placeholder is indexed at
 7455 in
-[`nv2a_pb_replay.c`](https://github.com/sp00nznet/xboxrecomp/blob/f0f8a461496a4f23d9b0aeaa284b8d70ba7ab82b/src/nv2a/nv2a_pb_replay.c).
+[`nv2a_pb_replay.c`](https://github.com/sp00nznet/xboxrecomp/blob/343b6d8901723b37ce568b2418c5df4e1fe1d223/src/nv2a/nv2a_pb_replay.c).
 The replay branch is guarded by a separate menu buffer's length, and the
 default menu buffers are empty. Before reporting this as a bug, reproduce
 the reachable case using synthetic buffers and check the intended replay API.
@@ -113,8 +93,21 @@ The upstream Blood Wake project already carries numerous toolkit fixes in
 [`src/toolkit_patches/`](../src/toolkit_patches/) and
 [`tools/xbr_patches.py`](../tools/xbr_patches.py). Assess each against the
 toolkit's current revision and prepare a minimal game-independent regression
-before proposing a separate PR. The patches have not all been validated on
-macOS.
+before proposing a separate PR.
+
+The v0.17.0 rebase assessed the Tzeentchnet changes explicitly:
+
+| Upstream change | v0.17.0 assessment and downstream action |
+|---|---|
+| [#283](https://github.com/sp00nznet/xboxrecomp/pull/283), ARM64 MMX test | Fully covers the test-portability finding; no duplicate retained. |
+| [#284](https://github.com/sp00nznet/xboxrecomp/pull/284), PMADDWD wraparound | Fully covers the scalar-helper finding; no duplicate retained. |
+| [#285](https://github.com/sp00nznet/xboxrecomp/pull/285), pre-snapshot backend sync | Retained and used. The downstream failure-returning Metal prepare/publish and frozen-snapshot contract remain. |
+| [#297](https://github.com/sp00nznet/xboxrecomp/pull/297), thunk ordinal validation | Accepted as upstream behavior; the kernel-bridge rebase carries no duplicate ordinal check. |
+| [#298](https://github.com/sp00nznet/xboxrecomp/pull/298), mono HRTF stereo preservation | Retained. Blood Wake's measured left/right bin routing and room-filter path remain because generic two-channel preservation does not select the title's bin mapping. |
+| [#299](https://github.com/sp00nznet/xboxrecomp/pull/299), unimplemented-call reporting | Accepted as upstream behavior; no duplicate reporter was present downstream. |
+| [#300](https://github.com/sp00nznet/xboxrecomp/pull/300), framebuffer snapshot locking | Retained and combined with downstream gamma, quincunx resolve, parent-window and backend-owned/no-copy behavior. |
+| [#304](https://github.com/sp00nznet/xboxrecomp/pull/304), optional D3D8 target | Fully covers the integration constraint; the Apple dummy target was removed. |
+| [#305](https://github.com/sp00nznet/xboxrecomp/pull/305), SDL controller hotplug | Retained and narrowed. Upstream now owns controller cleanup, slot refresh, joystick locking, and polling synchronization. On macOS, guest polling must still avoid enumerating SDL2-compat's device-list cache concurrently with virtual/host hotplug: the carried input patch defers discovery to the main-thread SDL event pump. The focused concurrent-hotplug test reproduced an invalid free without that downstream remainder and passes with it. |
 
 ## Blood Wake Recomp
 

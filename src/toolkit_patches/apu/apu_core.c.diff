@@ -1,6 +1,6 @@
 --- xboxrecomp/src/apu/apu_core.c
 +++ src/toolkit_patches/apu/apu_core.c
-@@ -25,7 +25,36 @@
+@@ -25,6 +25,9 @@
  #include "apu_wav.h"
  #include "fpconv.h"
  #include "../kernel/xbox_memory_layout.h"   /* XBOX_WORKER_STACK_TOP */
@@ -8,36 +8,9 @@
 +#include "bw_apu_sync.h"
 +#include <errno.h>
  
-+/* Blood Wake carried patch (TK-14, docs/TOOLKIT_ISSUES.md): the sequencer
-+ * sample-limit tick (ISTS bit 3) made switchable, and the title's sequencer
-+ * stops and the ticks raised are counted, so a restart loop shows in the log.
-+ * BW_APU_SSL_TICK=off (default)|once|periodic (the toolkit's behaviour); the
-+ * original file is at xboxrecomp/src/apu/apu_core.c (sha256 guarded in
-+ * CMakeLists.txt). Blood Wake initialises DirectSound without the tick. */
-+static int s_bw_tick_mode = -1;        /* 0 off, 1 once, 2 periodic */
-+static unsigned s_bw_ticks, s_bw_seq_stops;
-+
-+static int bw_ssl_tick_allowed(void)
-+{
-+    if (s_bw_tick_mode < 0) {
-+        const char *e = getenv("BW_APU_SSL_TICK");
-+        s_bw_tick_mode = e && !strcmp(e, "periodic") ? 2
-+                       : e && !strcmp(e, "once") ? 1 : 0;
-+        fprintf(stderr, "[APU] BW sequencer tick: %s\n",
-+                s_bw_tick_mode == 2 ? "periodic" : s_bw_tick_mode == 1 ? "once" : "off");
-+    }
-+    if (s_bw_tick_mode == 0 || (s_bw_tick_mode == 1 && s_bw_ticks))
-+        return 0;
-+    s_bw_ticks++;
-+    if (s_bw_ticks <= 3 || s_bw_ticks % 200 == 0)
-+        fprintf(stderr, "[APU] BW sequencer tick raised (%u so far)\n", s_bw_ticks);
-+    return 1;
-+}
-+
  /* ============================================================
   * Globals
-  * ============================================================ */
-@@ -33,7 +62,25 @@
+@@ -33,7 +36,25 @@
  uint8_t *g_apu_ram_ptr = NULL;
  
  MCPXAPUState *g_state = NULL;
@@ -63,7 +36,7 @@
  /* Forward declarations for software mixer */
  static void mixer_init(void);
  static void mixer_render(int16_t frame_buf[][2], int num_samples);
-@@ -89,9 +136,31 @@
+@@ -89,9 +110,31 @@
      return (uint32_t)(g_xbox_map_size ? g_xbox_map_size : g_xbox_total_ram);
  }
  
@@ -95,16 +68,7 @@
      /* RAM above the window's 64 MB. On a 128 MB layout (a devkit) most of
       * the heap sits above 0x04000000, and so do the sound buffers a title
       * malloc()s and hands to DirectSound as plain pointers, which
-@@ -113,7 +182,7 @@
-      * from the window, effects played whatever the window held there (white
-      * noise) and the stream played zeros. Only heap pages are recorded, so
-      * the voice-array case below still holds for the image. */
--    if (xbox_PhysRamNameMap()[a >> 12])
-+    if (bw_shared_u8_load(&xbox_PhysRamNameMap()[a >> 12]))
-         return g_apu_ram_ptr + a;
-     /* A page the contiguous allocator handed out is the window, even where
-      * it overlaps the image's physical range: an image whose BSS runs past
-@@ -122,7 +191,18 @@
+@@ -122,7 +165,18 @@
       * voice off its list and re-trapped it every frame. (The OHCI resolves
       * the image first: a USB driver can read its descriptors into .data on a
       * page the boot has also allocated as contiguous memory.) */
@@ -124,7 +88,7 @@
          return g_apu_ram_ptr + 0x80000000u + a;
      if (a >= g_xbox_image_lo && a < g_xbox_image_hi)
          return g_apu_ram_ptr + a;
-@@ -142,11 +222,19 @@
+@@ -142,11 +196,19 @@
  const char *mcpx_apu_phys_class(uint64_t addr)
  {
      uint32_t a = (uint32_t)addr & 0x0FFFFFFFu;
@@ -136,8 +100,7 @@
 +    }
      if (a >= (64u << 20))
          return a < apu_mapped_ram() ? "ram" : "wrap";
--    if (xbox_PhysRamNameMap()[a >> 12])
-+    if (bw_shared_u8_load(&xbox_PhysRamNameMap()[a >> 12]))
+     if (xbox_PhysRamNamedAt(a))
          return "named";
 -    if (xbox_ContiguousPageMap()[a >> 12])
 +    if (bw_apu_image_first() && a >= g_xbox_image_lo && a < g_xbox_image_hi)
@@ -146,7 +109,7 @@
          return "win";
      if (a >= g_xbox_image_lo && a < g_xbox_image_hi)
          return "img";
-@@ -159,8 +247,30 @@
+@@ -159,8 +221,30 @@
   * '0', as RECOMP_HEADLESS is read: =0 turns it off rather than on. */
  int apu_env_on(const char *name)
  {
@@ -179,7 +142,7 @@
  }
  
  /* RECOMP_APU_TRACE register lines, read once: every MMIO access tests it. */
-@@ -289,6 +399,9 @@
+@@ -289,6 +373,9 @@
      apu_call_isr();
  }
  
@@ -189,7 +152,7 @@
  static void apu_deliver_irq(MCPXAPUState *d)
  {
      /* Per thread, like the g_fs_base it guards: a new instance's frame
-@@ -327,6 +440,7 @@
+@@ -327,6 +414,7 @@
      if (xbox_IrqSafePointsOn()) {
          how = xbox_IrqPost(XBOX_IRQ_APU);
          if (how == XBOX_IRQ_POSTED) {
@@ -197,7 +160,7 @@
              qemu_mutex_lock(&d->lock);
              return;
          }
-@@ -334,7 +448,19 @@
+@@ -334,7 +422,19 @@
          /* No gate (the default): a hold-off while a guest thread sits at
           * raised IRQL, which is when the single-CPU console could not have
           * taken the interrupt, then delivered anyway. */
@@ -218,7 +181,7 @@
              qemu_mutex_lock(&d->lock);
              return;
          }
-@@ -357,6 +483,7 @@
+@@ -357,6 +457,7 @@
          g_esp = XBOX_WORKER_STACK_TOP(slot);
          g_eax = g_ecx = g_edx = g_ebx = g_esi = g_edi = 0;
          apu_call_isr();
@@ -226,7 +189,7 @@
          xbox_worker_stack_free(slot);
      }
      if (how == XBOX_IRQ_GATED)
-@@ -368,6 +495,12 @@
+@@ -368,6 +469,12 @@
   * MMIO Read / Write
   * ============================================================ */
  
@@ -239,7 +202,7 @@
  uint64_t mcpx_apu_read(void *opaque, hwaddr addr, unsigned int size)
  {
      MCPXAPUState *d = (MCPXAPUState *)opaque;
-@@ -379,11 +512,25 @@
+@@ -379,11 +486,25 @@
           * advanced by the frame thread while the sequencer runs. It used to
           * return the host clock divided by 100, which advances far too fast
           * and in the wrong units for a title comparing it against SSL. */
@@ -266,7 +229,7 @@
          }
          break;
      }
-@@ -404,21 +551,46 @@
+@@ -404,21 +525,33 @@
          fprintf(stderr, "[APU] write [0x%05llX] size=%u <- 0x%08llX\n",
                  (unsigned long long)addr, size, (unsigned long long)val);
      (void)size;
@@ -296,24 +259,11 @@
          break;
      case NV_PAPU_FECTL:
      case NV_PAPU_SECTL:
-+        if (addr == NV_PAPU_SECTL
-+                && (qatomic_read(&d->regs[addr]) & NV_PAPU_SECTL_XCNTMODE)
-+                       != NV_PAPU_SECTL_XCNTMODE_OFF
-+                && ((uint32_t)val & NV_PAPU_SECTL_XCNTMODE)
-+                       == NV_PAPU_SECTL_XCNTMODE_OFF) {
-+            /* TK-14 (Blood Wake carried patch): the title stopping a
-+             * running sequencer. */
-+            s_bw_seq_stops++;
-+            if (s_bw_seq_stops <= 3 || s_bw_seq_stops % 200 == 0)
-+                fprintf(stderr, "[APU] BW sequencer stopped by the title"
-+                                " (%u so far, %u ticks raised)\n",
-+                        s_bw_seq_stops, s_bw_ticks);
-+        }
 +        qemu_mutex_lock(&d->lock);
          qatomic_set(&d->regs[addr], (uint32_t)val);
          /* Starting the APU has to start the frame thread.
           *
-@@ -447,15 +619,33 @@
+@@ -447,15 +580,33 @@
              }
          }
          qemu_cond_broadcast(&d->cond);
@@ -348,7 +298,7 @@
          }
          break;
      }
-@@ -498,12 +688,273 @@
+@@ -498,12 +649,273 @@
      WAVEHDR  hdrs[WAVEOUT_NUM_BUFS];
      int16_t  bufs[WAVEOUT_NUM_BUFS][WAVEOUT_BUF_SAMPLES][2];
      int      next_buf;
@@ -377,7 +327,7 @@
 +#define BW_LIM_LA 48                         /* look-ahead, samples */
 +static int s_bwg_on = -1;
 +static float s_bwg_gain = 1.0f, s_bwg_ceiling = 0.891251f, s_bwg_rel;
- 
++
 +static int bw_gain_on(void)
 +{
 +    if (s_bwg_on < 0) {
@@ -590,7 +540,7 @@
 +{
 +    unsigned u = xa2_underruns();
 +    int high = d->monitor.queued_bytes_high / SAMPLE_BYTES, h = high;
-+
+ 
 +    if (s_bq_mode <= 0 || !s_bq_step)
 +        return;
 +    if (!s_bq_start) {
@@ -622,7 +572,7 @@
  void mcpx_apu_monitor_init(MCPXAPUState *d, Error **errp)
  {
      (void)errp;
-@@ -520,6 +971,20 @@
+@@ -520,6 +932,20 @@
              apu_wav_open(wav, secs ? atof(secs) : 0.0);
      }
  
@@ -643,7 +593,7 @@
      /* Try XAudio2 first (lower latency) */
      if (xa2_init()) {
          /* Pacing marks in samples (xa2_pacing_marks): high is all the
-@@ -528,16 +993,19 @@
+@@ -528,16 +954,19 @@
          int low, high;
          xa2_pacing_marks(xa2_get_buffer_size(), xa2_get_buffer_count(),
                           MIXER_FRAME_SAMPLES, &low, &high);
@@ -665,7 +615,7 @@
  
      WAVEFORMATEX wfx = { 0 };
      wfx.wFormatTag      = WAVE_FORMAT_PCM;
-@@ -552,6 +1020,7 @@
+@@ -552,6 +981,7 @@
      if (mr != MMSYSERR_NOERROR) {
          fprintf(stderr, "[APU] waveOutOpen failed (error %u)\n", mr);
          g_waveout.initialized = false;
@@ -673,7 +623,7 @@
          return;
      }
  
-@@ -564,11 +1033,17 @@
+@@ -564,11 +994,17 @@
      }
  
      g_waveout.next_buf = 0;
@@ -691,7 +641,7 @@
  }
  
  void mcpx_apu_monitor_finalize(MCPXAPUState *d)
-@@ -838,7 +1313,7 @@
+@@ -838,7 +1274,7 @@
   * written once, none is rendered twice. */
  static void waveout_submit(MCPXAPUState *d, const int16_t period[][2])
  {
@@ -700,7 +650,7 @@
      int idx = g_waveout.next_buf;
      WAVEHDR *hdr = &g_waveout.hdrs[idx];
  
-@@ -856,14 +1331,16 @@
+@@ -856,14 +1292,16 @@
      memcpy(g_waveout.bufs[idx][fill], period,
             MIXER_FRAME_SAMPLES * 2 * sizeof(int16_t));
      fill += MIXER_FRAME_SAMPLES;
@@ -719,7 +669,7 @@
  }
  
  /* Called once per 32-sample frame; acts on the last frame of each EP period
-@@ -907,6 +1384,8 @@
+@@ -907,6 +1345,8 @@
          }
          mixer_render(extra, MIXER_FRAME_SAMPLES);
          mix_into(period, (const int16_t (*)[2])extra, MIXER_FRAME_SAMPLES);
@@ -728,7 +678,7 @@
      }
  
      /* A period dropped while pacing is stalled never reaches the device,
-@@ -917,9 +1396,24 @@
+@@ -917,9 +1357,24 @@
      if (xa2_is_active()) {
          if (!d->pace_stalled) {
              int q = hs_poll();
@@ -755,10 +705,11 @@
          }
          return;
      }
-@@ -937,6 +1431,18 @@
+@@ -936,6 +1391,18 @@
+  * the default 512 samples) well inside this; the largest buffers the hosts
   * accept (4096 samples, 85 ms) still fit. */
  #define PACE_STALL_US 200000
- 
++
 +/* BW_APU_PACESTAT counters (see bw_pacestat_tick). */
 +typedef struct {
 +    int on;
@@ -770,11 +721,10 @@
 +    long q_n;
 +} BwPaceStat;
 +static BwPaceStat s_ps = { -1 };
-+
+ 
  /* One pacing decision, taken at an EP-period boundary. Returns 0 to render
   * the next period now, or how many microseconds to wait before asking again.
-  *
-@@ -982,6 +1488,7 @@
+@@ -982,6 +1449,7 @@
  
      if (xa2_is_active()) {
          int q    = xa2_queued_samples();
@@ -782,7 +732,7 @@
          int low  = d->monitor.queued_bytes_low / SAMPLE_BYTES;
          int high = d->monitor.queued_bytes_high / SAMPLE_BYTES;
  
-@@ -1018,8 +1525,11 @@
+@@ -1018,8 +1486,11 @@
      }
  
      if (d->next_frame_time_us == 0 ||
@@ -795,7 +745,7 @@
  
      /* In the band the lead a render-ahead built is already in the queue;
       * keeping it in the schedule as well would idle until the queue had
-@@ -1029,6 +1539,13 @@
+@@ -1029,6 +1500,13 @@
  
      if (d->next_frame_time_us - now_us > ahead_us)
          return d->next_frame_time_us - now_us - ahead_us;
@@ -809,7 +759,7 @@
      return 0;
  }
  
-@@ -1038,17 +1555,69 @@
+@@ -1038,17 +1516,69 @@
      d->next_frame_time_us += EP_FRAME_US;
  }
  
@@ -883,7 +833,7 @@
      }
  
      d->sleep_acc_us += (int)(qemu_clock_get_us(QEMU_CLOCK_REALTIME) - start_us);
-@@ -1103,6 +1672,41 @@
+@@ -1147,6 +1677,41 @@
   * advancing is the host, not the title. */
  static int s_irq_trace = -1;
  static uint64_t s_irq_next_ns;
@@ -925,7 +875,7 @@
  
  static void apu_irq_stats_line(void)
  {
-@@ -1122,13 +1726,50 @@
+@@ -1166,13 +1731,50 @@
      s_irq_next_ns = now + 5000000000ull;
  }
  
@@ -977,7 +927,7 @@
              d->is_idle = true;
              if (xa2_is_active())
                  xa2_expect_drain();     /* a pause, not an underrun */
-@@ -1143,6 +1784,9 @@
+@@ -1187,6 +1789,9 @@
           * need continuous frame delivery regardless of APU register state.
           * The VP/DSP pipeline (se_frame) only runs when registers allow it. */
          throttle(d);
@@ -987,7 +937,7 @@
          int div0 = d->ep_frame_div;
  
          /* The doorbell ack stands in for the GP DSP, which on hardware runs
-@@ -1191,8 +1835,10 @@
+@@ -1230,8 +1835,10 @@
              d->ep_frame_div++;
          }
  
@@ -999,28 +949,7 @@
  
          /* The SSL tick: the sequencer's periodic sample-limit interrupt.
           *
-@@ -1211,8 +1857,18 @@
-                     && (sectl & NV_PAPU_SECTL_XCNTMODE)
-                            != NV_PAPU_SECTL_XCNTMODE_OFF) {
-                 d->sample_count -= ssl;
--                qatomic_or(&d->regs[NV_PAPU_ISTS], NV_PAPU_ISTS_SSLINTSTS);
--                d->set_irq = true;
-+                /* Blood Wake carried patch (TK-14): Blood Wake's DirectSound
-+                 * answers bit 3 with a full hardware restart (0x000FC6CC ->
-+                 * 0x00102C98(0,0) + 0x00102630(1)), which stops the sequencer
-+                 * and zeroes XGSCNT, so a tick every SSL samples restarts the
-+                 * APU ~23 times a second and each restart leaves 256-768
-+                 * samples of silence in the output. BW_APU_SSL_TICK picks the
-+                 * tick: off (default), once (first crossing only), periodic
-+                 * (the toolkit's). */
-+                if (bw_ssl_tick_allowed()) {
-+                    qatomic_or(&d->regs[NV_PAPU_ISTS], NV_PAPU_ISTS_SSLINTSTS);
-+                    d->set_irq = true;
-+                }
-             }
-         }
- 
-@@ -1226,6 +1882,7 @@
+@@ -1265,6 +1872,7 @@
          }
          apu_deliver_irq(d);
          apu_irq_stats_line();
@@ -1028,7 +957,7 @@
  
          /* Let the guest in once per frame.
           *
-@@ -1237,9 +1894,22 @@
+@@ -1276,9 +1884,22 @@
           * thread starved there indefinitely: Burnout 3 froze on its vehicle
           * select, blocked in voice_lock at raised IRQL, which in turn held
           * off every USB interrupt. */
@@ -1051,12 +980,10 @@
          if (fe_trapped &&
              (qatomic_read(&d->regs[NV_PAPU_FECTL]) &
               NV_PAPU_FECTL_FEMETHMODE_TRAPPED)) {
-@@ -1307,18 +1977,43 @@
+@@ -1351,18 +1972,41 @@
      memset(&apu_irq_stats, 0, sizeof(apu_irq_stats));
      s_irq_trace = -1;
      s_irq_next_ns = 0;
-+    s_bw_tick_mode = -1;
-+    s_bw_ticks = s_bw_seq_stops = 0;
 +    s_bq_mode = -1;
 +    s_bq_base = s_bq_cap = s_bq_step = 0;
 +    s_bq_last_u = 0;
@@ -1098,7 +1025,7 @@
      d->ram_ptr = ram_ptr;
      /* A line left up by a previous instance would call the guest ISR
       * against this one's empty ISTS. */
-@@ -1358,22 +2053,45 @@
+@@ -1402,22 +2046,45 @@
      /* Init monitor (waveOut output) */
      Error *local_err = NULL;
      mcpx_apu_monitor_init(d, &local_err);
@@ -1148,7 +1075,7 @@
  }
  
  void mcpx_apu_shutdown(MCPXAPUState *d)
-@@ -1382,26 +2100,39 @@
+@@ -1426,26 +2093,39 @@
  
      fprintf(stderr, "[APU] Shutting down MCPX APU...\n");
  
@@ -1199,7 +1126,7 @@
      fprintf(stderr, "[APU] Shutdown complete\n");
  }
  
-@@ -1479,9 +2210,11 @@
+@@ -1523,9 +2203,11 @@
          return;
      }
  
@@ -1211,7 +1138,7 @@
          fprintf(stderr, "[APU-TEST] Test tone OFF\n");
          return;
      }
-@@ -1493,7 +2226,6 @@
+@@ -1537,7 +2219,6 @@
      g_test_tone.active = true;
  
      /* Make sure waveOut is running - enable SECTL and resume APU thread */
@@ -1219,7 +1146,7 @@
      d->regs[NV_PAPU_SECTL] = NV_PAPU_SECTL_XCNTMODE & ~NV_PAPU_SECTL_XCNTMODE_OFF;
      d->regs[NV_PAPU_FECTL] = NV_PAPU_FECTL_FEMETHMODE_FREE_RUNNING;
      /* Initialize empty voice lists so VP frame doesn't crash */
-@@ -1503,8 +2235,7 @@
+@@ -1547,8 +2228,7 @@
      mcpx_apu_resume(d);
      qemu_mutex_unlock(&d->lock);
  
@@ -1229,7 +1156,7 @@
  }
  
  /* ============================================================
-@@ -1517,15 +2248,18 @@
+@@ -1561,15 +2241,18 @@
  
  static void mixer_init(void)
  {
@@ -1253,7 +1180,7 @@
      EnterCriticalSection(&g_mixer_cs);
      for (int i = 0; i < APU_MIXER_MAX_VOICES; i++) {
          if (!g_mixer_voices[i].active && !g_mixer_voices[i].pcm_data) {
-@@ -1610,13 +2344,14 @@
+@@ -1654,13 +2337,14 @@
      LeaveCriticalSection(&g_mixer_cs);
  
      /* The frame thread takes the APU lock before the mixer lock. */

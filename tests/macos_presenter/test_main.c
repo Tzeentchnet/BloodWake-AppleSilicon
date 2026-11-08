@@ -658,6 +658,7 @@ void bw_InputRefreshControllers(void)
 {
     check_main();
 }
+
 #endif
 
 int bw_test_pthread_create(pthread_t *thread, const pthread_attr_t *attr,

@@ -72,9 +72,9 @@
   *
   * Only RR. Bit 0 is RPBM, run/pause bus master, which software owns.
   */
-@@ -659,96 +676,213 @@
- #if !defined(_WIN32) && defined(__aarch64__)
- #include "../platform/mmio_decode_a64.h"
+@@ -664,10 +681,196 @@
+ #include "../platform/mmio_decode_x86_64.h"
+ #endif
  #include <sys/mman.h>
 -static size_t g_ac97_hsize;    /* host page: 16 KB on arm64 Darwin */
 +
@@ -99,10 +99,7 @@
 +typedef struct __attribute__((packed, may_alias)) { uint64_t v; } Ac97U64;
  
  static uint64_t ac97_posix_rd(void *dev, uint32_t off, int size)
- {
--    uint64_t v = 0;
--    memcpy(&v, (char *)dev + off, size > 8 ? 8 : size);
--    return v;
++{
 +    uintptr_t p = ((Ac97PosixPage *)dev)->writable + off;
 +    switch (size) {
 +    case 1: return *(volatile uint8_t *)p;
@@ -111,11 +108,10 @@
 +    case 8: return ((volatile Ac97U64 *)p)->v;
 +    default: return 0;
 +    }
- }
- 
- static void ac97_posix_wr(void *dev, uint32_t off, uint64_t v, int size)
- {
--    memcpy((char *)dev + off, &v, size > 8 ? 8 : size);
++}
++
++static void ac97_posix_wr(void *dev, uint32_t off, uint64_t v, int size)
++{
 +    uintptr_t p = ((Ac97PosixPage *)dev)->writable + off;
 +    uint32_t control;
 +
@@ -131,42 +127,14 @@
 +    case 4: ((volatile Ac97U32 *)p)->v = (uint32_t)v; break;
 +    case 8: ((volatile Ac97U64 *)p)->v = v; break;
 +    }
- }
- 
--/* POSIX arm64 half of the AC'97 write trap: the page is PROT_READ, so a
-- * write arrives as SIGBUS/SIGSEGV; the title's fault handler reaches this
-- * through xbox_PosixMmioFault before reporting. The store is emulated onto
-- * the page (open for the moment), the controller's reaction applied, and the
-- * page closed again. Returns 1 when the fault was this trap and the access
-- * was serviced. */
--static volatile int g_ac97_posix_lock;
--
--int xbox_Ac97PosixFault(void *ucv, uintptr_t fault)
++}
++
 +static int64_t ac97_sign_extend(uint32_t value, unsigned bits)
- {
--    int ok;
++{
 +    int64_t v = value;
 +    return (value & (1u << (bits - 1))) ? v - (1LL << bits) : v;
 +}
- 
--    if (!g_ac97_page || fault < (uintptr_t)g_ac97_page
--            || fault >= (uintptr_t)g_ac97_page + g_ac97_hsize)
--        return 0;
--    /* One trap at a time. The page is open process-wide while the store is
--     * emulated, so a second thread trapping in that window would have its
--     * page closed under it by the first thread's mprotect and fault inside
--     * the emulation. Spin: the window is a few hundred instructions, and a
--     * plain store from another thread while the page is open is still
--     * caught by the sweep below if it lands before it; one landing between
--     * the sweep and the close keeps its RR bit until the next trap. That
--     * residual needs two threads resetting channels at once, which
--     * DirectSound's single-threaded init never does. */
--    while (__atomic_exchange_n(&g_ac97_posix_lock, 1, __ATOMIC_ACQUIRE))
--        ;
--    /* Not opened: the emulated store would fault again on this thread,
--     * which holds the lock it would then spin on. Let it be reported. */
--    if (mprotect(g_ac97_page, g_ac97_hsize, PROT_READ | PROT_WRITE) != 0) {
--        __atomic_store_n(&g_ac97_posix_lock, 0, __ATOMIC_RELEASE);
++
 +/* The shared decoder assumes si_addr is the start of the access. Verify that
 + * assumption and its entire span, especially for accesses crossing a page:
 + * si_addr may instead name the second part of a paired/unaligned store. */
@@ -259,28 +227,21 @@
 +        bytes = 2 * element;
 +        address = base + (mode == 1 ? 0 : (uint64_t)(imm * element));
 +    } else {
-         return 0;
-     }
--    ok = mmio_emulate_a64((ucontext_t *)ucv, (uint32_t)(fault - (uintptr_t)g_ac97_page),
--                          g_ac97_page, ac97_posix_rd, ac97_posix_wr);
--    if (ok)
--        ac97_clear_reset_bits();
--    mprotect(g_ac97_page, g_ac97_hsize, PROT_READ);
--    __atomic_store_n(&g_ac97_posix_lock, 0, __ATOMIC_RELEASE);
--    return ok;
++        return 0;
++    }
 +
 +    if (address != fault || address < page->guest || bytes > page->size
 +            || address - page->guest > page->size - bytes)
 +        return 0;
 +    *offset = (uint32_t)(address - page->guest);
 +    return 1;
- }
++}
 +
 +/* The guest mapping stays read-only. This separate shared mapping is never
 + * protected, so concurrent writes cannot slip through an mprotect window.
 + * The callback does not call libc, wait, allocate, or log in signal context. */
 +int xbox_Ac97PosixFault(void *ucv, uintptr_t fault)
-+{
+ {
 +    Ac97PosixPage *page = atomic_load_explicit(&g_ac97_posix_active,
 +                                                memory_order_acquire);
 +    ucontext_t *uc = (ucontext_t *)ucv;
@@ -302,12 +263,53 @@
 +    g_ac97_page = NULL;
 +}
 +#else
-+int xbox_Ac97PosixFault(void *ucv, uintptr_t fault)
++static size_t g_ac97_hsize;
++
++static uint64_t ac97_posix_rd(void *dev, uint32_t off, int size)
 +{
-+    (void)ucv;
-+    (void)fault;
-+    return 0;
-+}
+     uint64_t v = 0;
+     memcpy(&v, (char *)dev + off, size > 8 ? 8 : size);
+     return v;
+@@ -678,12 +881,9 @@
+     memcpy((char *)dev + off, &v, size > 8 ? 8 : size);
+ }
+ 
+-/* POSIX arm64 half of the AC'97 write trap: the page is PROT_READ, so a
+- * write arrives as SIGBUS/SIGSEGV; the title's fault handler reaches this
+- * through xbox_PosixMmioFault before reporting. The store is emulated onto
+- * the page (open for the moment), the controller's reaction applied, and the
+- * page closed again. Returns 1 when the fault was this trap and the access
+- * was serviced. */
++/* The generic Linux trap temporarily opens the page while it emulates one
++ * store. Apple uses the shared-alias implementation above so its signal
++ * handler never changes protections or takes a process-wide lock. */
+ static volatile int g_ac97_posix_lock;
+ 
+ int xbox_Ac97PosixFault(void *ucv, uintptr_t fault)
+@@ -693,19 +893,8 @@
+     if (!g_ac97_page || fault < (uintptr_t)g_ac97_page
+             || fault >= (uintptr_t)g_ac97_page + g_ac97_hsize)
+         return 0;
+-    /* One trap at a time. The page is open process-wide while the store is
+-     * emulated, so a second thread trapping in that window would have its
+-     * page closed under it by the first thread's mprotect and fault inside
+-     * the emulation. Spin: the window is a few hundred instructions, and a
+-     * plain store from another thread while the page is open is still
+-     * caught by the sweep below if it lands before it; one landing between
+-     * the sweep and the close keeps its RR bit until the next trap. That
+-     * residual needs two threads resetting channels at once, which
+-     * DirectSound's single-threaded init never does. */
+     while (__atomic_exchange_n(&g_ac97_posix_lock, 1, __ATOMIC_ACQUIRE))
+         ;
+-    /* Not opened: the emulated store would fault again on this thread,
+-     * which holds the lock it would then spin on. Let it be reported. */
+     if (mprotect(g_ac97_page, g_ac97_hsize, PROT_READ | PROT_WRITE) != 0) {
+         __atomic_store_n(&g_ac97_posix_lock, 0, __ATOMIC_RELEASE);
+         return 0;
+@@ -725,43 +914,21 @@
+     __atomic_store_n(&g_ac97_posix_lock, 0, __ATOMIC_RELEASE);
+     return ok;
+ }
 +#endif /* __APPLE__ */
  #endif
  
@@ -326,7 +328,8 @@
 -
 -    if (!g_mcpx_memory || g_ac97_page)
 -        return;
--#if !defined(_WIN32) && !defined(__aarch64__)
+-#if !defined(_WIN32) && !defined(__aarch64__) \
+-        && !(defined(__x86_64__) && defined(__linux__))
 -    /* No POSIX decoder for this host's stores: a trapped write would be a
 -     * fault nothing services. Leave the page writable. */
 -    (void)old;
@@ -354,7 +357,7 @@
      /* First, so it runs before the game target's own crash reporter, which
       * would otherwise print the write as an access violation. */
      g_ac97_veh = AddVectoredExceptionHandler(1, ac97_write_veh);
-@@ -762,11 +896,56 @@
+@@ -775,11 +942,77 @@
          g_ac97_page = NULL;
          fprintf(stderr, "  AC97: could not arm the bus-master write trap;"
                          " a channel reset will spin\n");
@@ -404,6 +407,27 @@
 +                    " (shared alias; channel reset completes on write)\n",
              XBOX_MCPX_BASE + AC97_NABM_OFFSET);
 +    return 1;
++#elif defined(__aarch64__) || (defined(__x86_64__) && defined(__linux__))
++    long host_page = sysconf(_SC_PAGESIZE);
++
++    if (host_page <= 0 || (uint64_t)host_page > UINT32_MAX) {
++        fprintf(stderr, "  AC97: cannot determine the host page size;"
++                        " refusing AC97 initialization\n");
++        return 0;
++    }
++    g_ac97_page = (char *)g_mcpx_memory + AC97_NABM_OFFSET;
++    g_ac97_hsize = (size_t)host_page < AC97_TRAP_BYTES
++                 ? AC97_TRAP_BYTES : (size_t)host_page;
++    if (mprotect(g_ac97_page, g_ac97_hsize, PROT_READ) != 0) {
++        g_ac97_page = NULL;
++        fprintf(stderr, "  AC97: could not arm the bus-master write trap;"
++                        " a channel reset will spin\n");
++        return 0;
++    }
++    fprintf(stderr, "  AC97: bus-master writes trapped at 0x%08X"
++                    " (POSIX; channel reset completes on write)\n",
++            XBOX_MCPX_BASE + AC97_NABM_OFFSET);
++    return 1;
 +#else
 +    fprintf(stderr, "  AC97: safe bus-master write trapping is unavailable"
 +                    " on this host\n");
@@ -412,23 +436,24 @@
  }
  
  /*
-@@ -836,11 +1015,10 @@
+@@ -849,11 +1082,11 @@
                                         uint32_t fault_xbox_va, int is_write);
  #endif
  
 -/* POSIX: call from the title's SIGBUS/SIGSEGV handler (SA_SIGINFO) with its
 - * ucontext_t * and si_addr; on 1, return from the handler and the thread
-- * resumes after the emulated instruction. APU, then AC'97, then OHCI. Only
-- * arm64 hosts have a decoder; elsewhere nothing is trapped and this returns
-- * 0. */
-+/* POSIX: service a captured fault in ordinary thread context. APU and OHCI
-+ * callbacks can use locks, condition variables and stdio, so this dispatcher
-+ * must not be called directly from a signal handler. AC'97 alone has a
-+ * signal-safe entry point, xbox_Ac97PosixFault. */
+- * resumes after the emulated instruction. APU, then AC'97, then OHCI. Linux
+- * arm64 and Linux x86-64 have decoders; elsewhere nothing is trapped and this
+- * returns 0. */
++/* POSIX fault dispatch: APU, then AC'97, then OHCI. Blood Wake's Apple
++ * handler services captured APU/OHCI faults in ordinary thread context
++ * because those callbacks use locks and stdio; its AC'97 alias callback is
++ * signal-safe. The upstream Linux arm64/x86-64 handlers call this entry from
++ * their SA_SIGINFO handler. */
  int xbox_PosixMmioFault(void *ucv, uintptr_t fault)
  {
- #if defined(__aarch64__)
-@@ -1390,6 +1568,8 @@
+ #if defined(__aarch64__) || (defined(__x86_64__) && defined(__linux__))
+@@ -1403,6 +1636,8 @@
   * and a level load, thousands of kickoffs long, looked frozen. Clearing them
   * from inside the walk answers the kickoff within a few hundred commands,
   * without a thread of its own spinning on a host core. */
@@ -437,7 +462,7 @@
  static void nv2a_ack_busy_bits(int flip_held)
  {
      volatile uint32_t *regs = (volatile uint32_t *)g_nv2a_memory;
-@@ -1416,8 +1596,14 @@
+@@ -1429,8 +1664,14 @@
          }
          /* Interlocked: the vblank-ack thread and the guest change other
           * bits of the same word meanwhile. */
@@ -453,7 +478,7 @@
      }
  }
  
-@@ -1436,9 +1622,15 @@
+@@ -1449,9 +1690,15 @@
      return (volatile uint32_t *)((char *)g_nv2a_memory + offset);
  }
  
@@ -469,7 +494,7 @@
      while (!InterlockedCompareExchange(&g_nv2a_ack_stop, 0, 0)) {
          /* A flip held for its vblank (nv2a_flip_hold.h): this pass walks
           * nothing, leaves DMA_GET where it is and acknowledges no PFB flush,
-@@ -1453,6 +1645,16 @@
+@@ -1466,6 +1713,16 @@
           * flips paces only the last. */
          extern int nv2a_pb_exec_flip_poll(void);
          int flip_held = nv2a_pb_exec_flip_poll();
@@ -486,7 +511,7 @@
          nv2a_ack_busy_bits(flip_held);
          for (size_t i = 0; i < sizeof(NV2A_IDLE) / sizeof(NV2A_IDLE[0]); i++) {
              volatile uint32_t *r =
-@@ -1502,8 +1704,14 @@
+@@ -1515,8 +1772,14 @@
              static uint32_t get_written = 0xFFFFFFFFu;  /* GET as we last left it */
              DWORD now_ms = GetTickCount();
              uint32_t put = *(volatile uint32_t *)((char *)regs + NV2A_USER_DMA_PUT);
@@ -501,7 +526,7 @@
                  /* Survey the segment the title just submitted, once. */
                  {
                      extern void nv2a_pb_scan(uint32_t);
-@@ -1526,6 +1734,7 @@
+@@ -1539,6 +1802,7 @@
                       * guess. */
                      extern void nv2a_pb_resync(uint32_t);
                      extern int  nv2a_pb_dma_walk(void);
@@ -509,7 +534,7 @@
                      extern void nv2a_pb_scan_segment(uint32_t, uint32_t);
  
                      if (nv2a_pb_dma_walk()) {
-@@ -1541,6 +1750,42 @@
+@@ -1554,6 +1818,42 @@
                              nv2a_pb_resync(get_now);
                          if (put != last_put)
                              nv2a_pb_scan(put);
@@ -552,7 +577,7 @@
                      } else {
                          /* The segment scan, the default: the bytes between
                           * the previous PUT and this one. The pushbuffer is a
-@@ -1548,6 +1793,8 @@
+@@ -1561,6 +1861,8 @@
                           * wrap, not a rewind; the ring's bounds are learned
                           * from the lowest and highest PUT seen. */
                          static uint32_t put_lo, put_hi;
@@ -561,7 +586,7 @@
                          if (!put_lo || put < put_lo) put_lo = put;
                          if (put > put_hi) put_hi = put;
                          if (last_put && put > last_put) {
-@@ -1587,10 +1834,14 @@
+@@ -1600,10 +1902,14 @@
                      volatile uint32_t *get =
                          (volatile uint32_t *)((char *)regs
                                                + NV2A_USER_DMA_GET);
@@ -576,7 +601,7 @@
                  /* GET as well as PUT. A title that stops submitting has either
                   * finished or is spinning on the GPU catching up, and only GET
                   * tells those apart -- D3D waits for GET to reach PUT before it
-@@ -1637,19 +1888,58 @@
+@@ -1650,19 +1956,58 @@
          *(volatile uint32_t *)((uintptr_t)(XBOX_KERNEL_DATA_BASE + KDATA_TICK_COUNT)
                                 + g_memory_offset) = GetTickCount();
  
@@ -636,7 +661,7 @@
          fprintf(stderr, "  NV2A busy-bit ack: %zu register(s) acknowledged\n",
                  sizeof(NV2A_ACK) / sizeof(NV2A_ACK[0]));
      }
-@@ -2003,9 +2293,7 @@
+@@ -2016,9 +2361,7 @@
          }
      }
  #else
@@ -647,7 +672,7 @@
      (void)ep;
      (void)watch_report;
      (void)s_watch_stepping;
-@@ -2014,182 +2302,11 @@
+@@ -2027,182 +2370,11 @@
  }
  
  #if !defined(_WIN32)
@@ -833,7 +858,7 @@
  }
  #endif /* !_WIN32 */
  
-@@ -2249,6 +2366,11 @@
+@@ -2262,6 +2434,11 @@
  void xbox_WatchInit(void)
  {
      const char *spec = getenv("RECOMP_WATCH");
@@ -845,7 +870,7 @@
      const char *q;
      char *endp;
  
-@@ -2270,6 +2392,7 @@
+@@ -2283,6 +2460,7 @@
          return;
      }
      watch_arm(g_watch_root + g_watch_off);
@@ -853,7 +878,7 @@
  }
  
  static int watch_arm(uint32_t va)
-@@ -3318,7 +3441,16 @@
+@@ -3331,7 +3509,16 @@
                      |= MCPX_AC97_CODEC_READY;
                  /* Before the trap is armed: this write would otherwise be
                   * the first thing to fault. */
@@ -871,7 +896,7 @@
                  fprintf(stderr, "  AC97: codec reported ready at 0x%08X"
                                  " (DirectSound will initialise)\n",
                          XBOX_MCPX_BASE + MCPX_AC97_CODEC_STATUS);
-@@ -3637,16 +3769,22 @@
+@@ -3650,16 +3837,22 @@
  
  void xbox_MemoryLayoutShutdown(void)
  {
@@ -894,7 +919,7 @@
      if (g_nv2a_memory) {
          VirtualFree(g_nv2a_memory, 0, MEM_RELEASE);
          g_nv2a_memory = NULL;
-@@ -3688,10 +3826,18 @@
+@@ -3701,10 +3894,18 @@
          g_contig_mapping = NULL;
      }
  #endif
@@ -913,7 +938,7 @@
      if (g_flash_memory) {
          VirtualFree(g_flash_memory, 0, MEM_RELEASE);
          g_flash_memory = NULL;
-@@ -3818,12 +3964,30 @@
+@@ -3833,12 +4034,30 @@
   * uses it. Fixing that changes which address every later allocation gets, in
   * every title that ever frees, so it is off unless asked for. Read once: the
   * heap is hit constantly and the answer does not change. */
@@ -944,7 +969,7 @@
  }
  
  /* Insert a free block at index `at`, keeping address order. Reuses an empty
-@@ -3933,6 +4097,29 @@
+@@ -3948,6 +4167,29 @@
      *(uint32_t *)TIB_VA(block)      = thread_data;   /* slot 0           */
      *(uint32_t *)TIB_VA(tib + 0x04) = block + total; /* fs:[4], see above*/
  
@@ -974,7 +999,7 @@
      return tib;
      #undef TIB_VA
  }
-@@ -4067,6 +4254,29 @@
+@@ -4082,6 +4324,29 @@
  static DWORD    g_contig_t0;
  static volatile LONG g_contig_lock;
  
@@ -1004,7 +1029,7 @@
  static void contig_lock(void)
  {
      while (InterlockedCompareExchange(&g_contig_lock, 1, 0) != 0)
-@@ -4098,7 +4308,7 @@
+@@ -4113,7 +4378,7 @@
              pages * (CONTIG_PAGE / 1024),
              g_contig_pages_in_use * (CONTIG_PAGE / 1024),
              g_contig_peak_pages * (CONTIG_PAGE / 1024),
@@ -1013,7 +1038,7 @@
      fflush(stderr);
  }
  
-@@ -4106,15 +4316,15 @@
+@@ -4121,15 +4386,15 @@
  {
      uint32_t end = (first + n) * CONTIG_PAGE;
  
@@ -1033,7 +1058,7 @@
          g_contig_first_free++;
  }
  
-@@ -4145,7 +4355,7 @@
+@@ -4160,7 +4425,7 @@
  
  static int contig_page_free(uint32_t q, int avoid_image)
  {
@@ -1042,7 +1067,7 @@
          return 0;
      return !(avoid_image && g_xbox_image_hi
               && q >= g_xbox_image_lo / CONTIG_PAGE
-@@ -4202,7 +4412,7 @@
+@@ -4217,7 +4482,7 @@
      } else {
          uint32_t best = 0, run = 0;
          for (q = 0; q < CONTIG_USABLE; q++) {
@@ -1051,7 +1076,7 @@
              if (run > best) best = run;
          }
          fprintf(stderr, "  [CONTIG] arena exhausted (%u requested, align %u, "
-@@ -4245,8 +4455,9 @@
+@@ -4260,8 +4525,9 @@
          return;
      contig_lock();
      for (q = first; q < first + n; q += run) {
@@ -1063,7 +1088,7 @@
              ;
          contig_take(q, run);
          g_contig_allocs++;
-@@ -4283,7 +4494,7 @@
+@@ -4298,7 +4564,7 @@
          }
          return 0;
      }
@@ -1072,7 +1097,7 @@
      g_contig_len[first] = 0;
      g_contig_pages_in_use -= n;
      if (first < g_contig_first_free)
-@@ -4306,7 +4517,7 @@
+@@ -4321,7 +4587,7 @@
          return 0;
      page = (va - XBOX_CONTIG_BASE) / CONTIG_PAGE;
      contig_lock();
@@ -1081,8 +1106,22 @@
          first = page;
          while (first > 0 && !g_contig_len[first])
              first--;
-@@ -4326,7 +4537,7 @@
-  * Never decreases, so a freed-and-reused texture stays addressable. */
+@@ -4332,16 +4598,16 @@
+     return result;
+ }
+ 
+-/* High-water mark of the window: everything below it was, at some point,
+- * memory a MmAllocateContiguousMemory call returned.
++/* High-water mark of the contiguous window. Ranges below it can include
++ * unallocated holes, freed blocks, or bytes still being initialized.
+  *
+  * Lets a caller holding a physical address decide whether it names contiguous
+- * memory this runtime allocated. The pushbuffer executor needs exactly that:
+- * a surface offset is physical, and only the window makes it addressable.
+- * Never decreases, so a freed-and-reused texture stays addressable. */
++ * memory this runtime might have allocated; this is only a compatibility
++ * heuristic, not evidence of live allocation identity or ownership. Never
++ * decreases, so a freed-and-reused texture stays addressable. */
  uint32_t xbox_ContiguousAllocatedBytes(void)
  {
 -    return g_contig_high;
@@ -1090,7 +1129,7 @@
  }
  
  /* The in-use map, one byte per 4 KB page of the window: for a device model
-@@ -4365,16 +4576,14 @@
+@@ -4380,10 +4646,8 @@
   * page holds live sound data in both copies, the APU picks RAM; this record
   * cannot tell them apart.
   *
@@ -1102,15 +1141,27 @@
 + * The marks alone do not pin a mapping for the duration of a device transfer. */
  static volatile uint8_t g_phys_ram_named[CONTIG_PAGES];
  
- void xbox_PhysNoteRamName(uint32_t va)
+ /* The heap block holding `va`, live or free, or -1 when none does. Index
+@@ -4414,7 +4678,7 @@
  {
-     if (va >= XBOX_HEAP_BASE && va < XBOX_HEAP_TOP && va < XBOX_CONTIG_SIZE)
+     if (va >= XBOX_HEAP_BASE && va < XBOX_HEAP_TOP && va < XBOX_CONTIG_SIZE) {
+         int i;
 -        g_phys_ram_named[va / CONTIG_PAGE] = 1;
 +        bw_shared_u8_store(&g_phys_ram_named[va / CONTIG_PAGE], 1);
- }
- 
- /* Heap block m is free (and merged with any free neighbours): its pages name
-@@ -4415,7 +4624,7 @@
+         /* The block too: a page can hold the end of a window buffer and the
+          * start of a heap block the title named, and only the block says
+          * which bytes the name covers (xbox_PhysRamNamedAt). A byte store
+@@ -4441,7 +4705,8 @@
+ int xbox_PhysRamNamedAt(uint32_t pa)
+ {
+     int i, named;
+-    if (pa >= XBOX_CONTIG_SIZE || !g_phys_ram_named[pa / CONTIG_PAGE])
++    if (pa >= XBOX_CONTIG_SIZE
++            || !bw_shared_u8_load(&g_phys_ram_named[pa / CONTIG_PAGE]))
+         return 0;
+     AcquireSRWLockShared(&g_heap_lock);
+     i = heap_block_at(pa);
+@@ -4488,7 +4753,7 @@
      if (last >= (int64_t)CONTIG_PAGES)
          last = (int64_t)CONTIG_PAGES - 1;
      for (int64_t p = first; p <= last; p++)

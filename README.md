@@ -203,7 +203,7 @@ python3.13 -m venv build/venv
 build/venv/bin/python -m pip install capstone==5.0.9
 
 git clone https://github.com/sp00nznet/xboxrecomp.git build/xboxrecomp
-git -C build/xboxrecomp checkout --detach f0f8a461496a4f23d9b0aeaa284b8d70ba7ab82b
+git -C build/xboxrecomp checkout --detach 343b6d8901723b37ce568b2418c5df4e1fe1d223
 
 build/venv/bin/python tools/build_from_disc.py \
   --disc "/path/to/your/disc.iso" \

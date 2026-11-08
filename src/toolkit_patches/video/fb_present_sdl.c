@@ -31,7 +31,8 @@
  * lifted code and its detached workers cannot be stopped mid-flight.
  *
  * Knobs: RECOMP_PRESENT_VSYNC=0 presents without waiting for the display;
- * RECOMP_WINDOW_SCALE=<n> sizes the window (default 2).
+ * RECOMP_WINDOW_SCALE=<n> sizes the window (default 2);
+ * RECOMP_FULLSCREEN=1 starts in borderless desktop fullscreen.
  */
 #if !defined(_WIN32)
 
@@ -50,6 +51,7 @@
 
 #include "video_player.h"
 #include "keyboard_sdl.h"     /* src/input: keys into the pad stand-in */
+#include "xinput_xbox.h"
 #include "../bw_runtime_lifecycle.h"
 #include "../../gpu/bw_gamma.h"
 #if defined(__APPLE__)
@@ -66,7 +68,6 @@
 extern ptrdiff_t xbox_GetMemoryOffset(void);
 extern void *xbox_GetMemoryBase(void);
 extern size_t xbox_GetMappedSize(void);
-extern void xbox_InputSetMainPump(int on);   /* src/input/xinput_device.c */
 
 #define FB_W 640u
 #define FB_H 480u
@@ -681,9 +682,14 @@ int xbox_HostWindowMain(int (*guest_main)(void))
                 driver ? driver : "unavailable");
         goto startup_failed;
     }
+    /* Honor the same fullscreen environment setting as the Windows presenter. */
+    Uint32 window_flags = SDL_WINDOW_RESIZABLE | SDL_WINDOW_ALLOW_HIGHDPI;
+    if (env_on("RECOMP_FULLSCREEN"))
+        window_flags |= SDL_WINDOW_FULLSCREEN_DESKTOP;
+
     win = SDL_CreateWindow(s_title, SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
                            (int)FB_W * scale, (int)FB_H * scale,
-                           SDL_WINDOW_RESIZABLE | SDL_WINDOW_ALLOW_HIGHDPI);
+                           window_flags);
     if (!win) {
         fprintf(stderr, "  [FBWIN] cannot create a visible SDL window: %s\n", SDL_GetError());
         goto startup_failed;

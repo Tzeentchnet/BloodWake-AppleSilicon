@@ -1,8 +1,6 @@
-diff --git a/src/usb/usb_gamepad.c b/src/toolkit_patches/usb/usb_gamepad.c
-index bd00f3f..f2ea748 100644
---- a/src/usb/usb_gamepad.c
-+++ b/src/toolkit_patches/usb/usb_gamepad.c
-@@ -316,6 +316,7 @@ typedef struct {
+--- xboxrecomp/src/usb/usb_gamepad.c
++++ src/toolkit_patches/usb/usb_gamepad.c
+@@ -316,6 +316,7 @@
      uint8_t stick;           /* full deflection: 1 L-left 2 L-right 4 L-up
                                  8 L-down, then the same four for the right */
      int announced;
@@ -10,7 +8,7 @@ index bd00f3f..f2ea748 100644
  } PadStep;
  
  static PadStep s_script[PAD_SCRIPT_MAX];
-@@ -485,17 +486,43 @@ static void pad_live_poll(unsigned long t)
+@@ -485,17 +486,43 @@
                   * report, which is a different input from "down, then a". */
                  /* Serialised per pad: pad 2's throttle must not wait out
                   * pad 1's -- split-screen players press at the same time. */

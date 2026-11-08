@@ -17,7 +17,7 @@ endif()
 file(READ "${PINNED_PRESENTER}" contents)
 string(REPLACE "\r\n" "\n" contents "${contents}")
 string(SHA256 actual_sha "${contents}")
-if(NOT actual_sha STREQUAL "0a047f77977654eed6e6dd9164f37102144aab234470bd0bf2362addc9f2a66c")
+if(NOT actual_sha STREQUAL "61fa4711b3965b65ef3b80bbb71fb47a4b50ecbef454009d340ec83e5eaf4b12")
     message(FATAL_ERROR "Pinned SDL presenter changed: ${actual_sha}")
 endif()
 
@@ -31,6 +31,7 @@ add_executable(bw_macos_presenter_test test_main.c fake_presenter.c)
 target_compile_definitions(bw_macos_presenter_test PRIVATE SDL_MAIN_HANDLED)
 target_include_directories(bw_macos_presenter_test PRIVATE
     ${SDL_INCLUDE_DIRS}
+    "${XBOXRECOMP_DIR}/src"
     "${XBOXRECOMP_DIR}/src/video"
     "${XBOXRECOMP_DIR}/src/input")
 target_link_libraries(bw_macos_presenter_test PRIVATE Threads::Threads)
@@ -62,7 +63,7 @@ function(check_input_source name expected)
         message(FATAL_ERROR "Pinned input source changed: ${name} (${actual})")
     endif()
 endfunction()
-check_input_source(xinput_device.c dba2708b822e5269748558e0d55898082d7478197324b52a56bd9224409ec05f)
+check_input_source(xinput_device.c 3a6192fbe452d89a695025c9ab86c0b49ffa69a00f2ce9ce7cf794ea95a99deb)
 check_input_source(keyboard_sdl.c 4c3d0c320f1e678fa3a1ae9db1052affe32f2ebe03489e14871a02af13e18bbe)
 check_input_source(keyboard.c cf4cc96718246341823e40e2ae276e49f1ec2fc550f2a115cabec81c1a1d1424)
 

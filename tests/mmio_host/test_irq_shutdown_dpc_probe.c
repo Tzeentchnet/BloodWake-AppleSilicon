@@ -53,6 +53,7 @@ static uint8_t s_page_map[(64u * 1024u * 1024u) / 4096u];
 ptrdiff_t xbox_GetMemoryOffset(void) { return g_xbox_mem_offset; }
 const volatile uint8_t *xbox_ContiguousPageMap(void) { return s_page_map; }
 const volatile uint8_t *xbox_PhysRamNameMap(void) { return s_page_map; }
+int xbox_PhysRamNamedAt(uint32_t pa) { return s_page_map[pa >> 12] != 0; }
 const volatile uint8_t *bw_PhysLastTranslationMap(void) { return s_page_map; }
 uint32_t xbox_ContiguousAllocatedBytes(void) { return 0; }
 int xbox_worker_stack_alloc(void) { return 0; }

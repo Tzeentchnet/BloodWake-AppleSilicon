@@ -64,12 +64,12 @@ import zipfile
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 FINGERPRINTS = os.path.join(REPO, "fingerprints")
 
-TOOLKIT_COMMIT = "f0f8a461496a4f23d9b0aeaa284b8d70ba7ab82b"      # xboxrecomp v0.16.0 (D-002)
+TOOLKIT_COMMIT = "343b6d8901723b37ce568b2418c5df4e1fe1d223"      # xboxrecomp v0.17.0 (D-002)
 TOOLKIT_URL = "https://github.com/sp00nznet/xboxrecomp/archive/%s.zip" % TOOLKIT_COMMIT
-TOOLKIT_ZIP_SHA256 = "64b27ee84e70d7fbbcce901716e8ca77b37f5c1c050a8455f376ecc2ee378cd5"
+TOOLKIT_ZIP_SHA256 = "ea40ee3402f55fbe344fb804736e97986dbf1399d1043770fb39ab87543ede33"
 # The archive's files (paths and contents), in case GitHub ever re-compresses
 # the same commit: see tree_digest().
-TOOLKIT_TREE_SHA256 = "5ee0e96d5cf95da95e0212afe32fdca7b535c7264c49fadd0e65724cfda0ca33"
+TOOLKIT_TREE_SHA256 = "19f7d25710718b92b2fe187a3ebe8e9d7caa0c83805d614639359f718ec3a2ab"
 TOOLKIT_MARKER = ".bw_toolkit.json"                              # read by tools/run_pipeline.py
 
 CAPSTONE = "5.0.9"
@@ -419,7 +419,7 @@ def get_toolkit(a, work, prog):
             with zf.open(info) as src, open(dest, "wb") as out:
                 shutil.copyfileobj(src, out, 1 << 20)
     with open(os.path.join(tk, TOOLKIT_MARKER), "w", encoding="utf-8") as f:
-        json.dump({"commit": TOOLKIT_COMMIT, "describe": "v0.16.0", "url": TOOLKIT_URL,
+        json.dump({"commit": TOOLKIT_COMMIT, "describe": "v0.17.0", "url": TOOLKIT_URL,
                    "archive_sha256": zsha, "tree_sha256": tree_digest(files),
                    "files": sorted(p for p, _ in files)}, f, indent=1)
     prog("toolkit", 1, "xboxrecomp %s (archive SHA-256 %s...)" % (TOOLKIT_COMMIT[:7], zsha[:12]))

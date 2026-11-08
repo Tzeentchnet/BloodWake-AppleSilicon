@@ -8,7 +8,7 @@
  
  extern ptrdiff_t xbox_GetMemoryOffset(void);
  
-@@ -47,6 +48,23 @@
+@@ -59,6 +60,23 @@
  static int s_exec_enabled = -1;
  static int s_scan_enabled = -1;
  
@@ -26,13 +26,13 @@
 +    } else if (m == 0x0100 && (param >> 16) == 0xB1D3u) {
 +        s_bw_nops_tagged++;
 +    }
-+    nv2a_pb_exec_method(subch, m, param);
++    exec_word(subch, m, param);
 +}
 +
  /* Clears the NV2A request bits (xbox_memory_layout.c); called every 256
   * words while executing, so kickoffs are answered mid-walk. */
  extern void xbox_Nv2aAckBusyBits(void);
-@@ -74,6 +92,13 @@
+@@ -86,6 +104,13 @@
  {
      uint16_t *slot = &s_seen_slot[subch & 7][(method & 0x1FFC) / 4];
  
@@ -46,16 +46,16 @@
      if (*slot) {
          s_seen[*slot - 1].count++;
          return;
-@@ -287,7 +312,7 @@
+@@ -299,7 +324,7 @@
           * acts. Keeping them on one decode means they can never
           * disagree about what the stream said. */
          if (s_exec_enabled)
--            nv2a_pb_exec_method(s_pend_subch, m, param);
+-            exec_word(s_pend_subch, m, param);
 +            bw_pb_exec(s_pend_subch, m, param);
          s_get = (s_get + 4) & PB_PHYS_MASK;
          s_pend_i++;
          s_pend_left--;
-@@ -507,13 +532,29 @@
+@@ -519,12 +544,29 @@
              uint32_t subch  = (w >> 13) & 7u;
              uint32_t method =  w & 0x1FFCu;
              int noninc = (w & 0xE0000000u) == 0x40000000u;
@@ -82,16 +82,16 @@
                  uint32_t m = noninc ? method : method + i * 4;
                  note(subch, m);
                  if (s_exec_enabled)
--                    nv2a_pb_exec_method(subch, m,
--                                        *(const uint32_t *)(mem + va));
+-                    exec_word(subch, m, *(const uint32_t *)(mem + va));
 +                    bw_pb_exec(subch, m, *(const uint32_t *)(mem + va));
                  va += 4;
                  words++;
              }
-@@ -544,3 +585,268 @@
+@@ -554,4 +596,269 @@
+     s_tot_unknown += unknown;
      s_tot_jumps += jumps;
      s_tot_segments++;
- }
++}
 +
 +
 +/* ==== Blood Wake carried patch (TK-38): the ring walk ======================
@@ -130,7 +130,7 @@
 +                on ? "on: follows the ring's JUMP, keeps split methods" : "off: two-piece segment scan");
 +    }
 +    return on;
-+}
+ }
 +
 +/* A new start (the title moved GET itself): nothing pending carries over. */
 +void nv2a_pb_ring_reset(void)

@@ -21,7 +21,7 @@ from typing import Optional
 
 
 ROOT = Path(__file__).resolve().parents[1]
-TOOLKIT_COMMIT = "f0f8a461496a4f23d9b0aeaa284b8d70ba7ab82b"
+TOOLKIT_COMMIT = "343b6d8901723b37ce568b2418c5df4e1fe1d223"
 MAX_LOG_BYTES = 32 * 1024 * 1024
 MAX_RELAUNCH_BYTES = 16 + 260 + 3072
 MAX_RELAUNCH_BOOTS = 16

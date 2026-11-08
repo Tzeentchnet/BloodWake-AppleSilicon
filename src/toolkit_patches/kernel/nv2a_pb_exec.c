@@ -37,6 +37,10 @@
 #include "xbox_memory_layout.h"   /* xbox_Nv2aFrameCounterFlip */
 #include "nv2a_flip_hold.h"
 #include "platform/host_time.h"   /* xbox_HostNowNs */
+#if !defined(_WIN32)
+#include <pthread.h>              /* the raster worker pool */
+#include <unistd.h>               /* sysconf(_SC_NPROCESSORS_ONLN) */
+#endif
 /* The swizzle decoder the D3D8 layer already uses -- one implementation of
  * Morton order, not a second one that can disagree with it. */
 #include "../d3d/d3d8_swizzle.h"
@@ -988,6 +992,7 @@ static void surface_apply_clip(void)
 /* ---- Render back end (nv2a_backend.h) ------------------------------- */
 
 static const Nv2aBackend *s_backend;
+static void (*s_backend_present_sync)(void);
 static void (*s_backend_flip_stall)(uint64_t);
 static void (*s_backend_flip_release)(uint64_t);
 
@@ -999,6 +1004,7 @@ void bw_backend_register_with_present_ops(
     s_backend = backend;
     s_backend_present_prepare = backend ? prepare_present : NULL;
     s_backend_snapshot_publish = backend ? publish_snapshot : NULL;
+    s_backend_present_sync = NULL;
     s_backend_flip_stall = NULL;
     s_backend_flip_release = NULL;
 }
@@ -1014,9 +1020,20 @@ void bw_backend_register_flip_timing(
     }
 }
 
+void nv2a_backend_register_with_present_sync(const Nv2aBackend *backend,
+                                             void (*present_sync)(void))
+{
+    s_backend = backend;
+    s_backend_present_sync = backend ? present_sync : NULL;
+    s_backend_present_prepare = NULL;
+    s_backend_snapshot_publish = NULL;
+    s_backend_flip_stall = NULL;
+    s_backend_flip_release = NULL;
+}
+
 void nv2a_backend_register(const Nv2aBackend *backend)
 {
-    bw_backend_register_with_present_ops(backend, NULL, NULL);
+    nv2a_backend_register_with_present_sync(backend, NULL);
 }
 
 void bw_backend_unregister_if_current(const Nv2aBackend *backend)
@@ -1028,6 +1045,8 @@ void bw_backend_unregister_if_current(const Nv2aBackend *backend)
 static int backend_prepare_snapshot(uint32_t *resolved, uint32_t *pitch, uint32_t *aa_sy)
 {
     uint32_t done;
+    if (s_backend_present_sync)
+        s_backend_present_sync();
     *resolved = 0;
     *pitch = 0;
     *aa_sy = s_gpu.aa_sy > 1.5f ? 2 : 1;
@@ -1421,8 +1440,8 @@ static void clear_surface(uint32_t param)
  * format samples nothing and the caller keeps the vertex colour, which is
  * visibly wrong rather than quietly wrong.
  *
- * ponytail: nearest texel, no filtering, whatever SET_TEXTURE_FILTER asked
- * for. Bilinear when a title's output actually depends on it.
+ * Nearest texel, whatever SET_TEXTURE_FILTER asked for, unless the title opts
+ * in to RECOMP_TEX_BILINEAR or RECOMP_TEX_ANISO (tex_filter_config below).
  */
 /* Off the edge of the texture, the way the title asked for.
  *
@@ -1887,6 +1906,115 @@ static void put_pixel(uint8_t *mem, uint32_t bpp, int x, int y, uint32_t argb)
     }
 }
 
+/* Texture filtering for the CPU rasteriser. Both switches are per-title
+ * opt-ins: off, the default, keeps the nearest texel for every title.
+ *
+ *   RECOMP_TEX_BILINEAR=1    four taps, blended
+ *   RECOMP_TEX_ANISO=8|16    up to that many bilinear taps along the longer
+ *                            texel gradient of the triangle; implies bilinear.
+ *                            Any other value leaves it off.
+ *
+ * ponytail: no mip levels, so a minified texture is not blurred by level, only
+ * averaged along its stretched axis. Add the level choice when a title needs it. */
+static void tex_filter_config(int *bilinear, int *aniso)
+{
+    static int b = -1, n = -1;
+
+    if (b < 0) {
+        const char *e = getenv("RECOMP_TEX_BILINEAR");
+        b = e && strcmp(e, "0") != 0;
+    }
+    if (n < 0) {
+        const char *e = getenv("RECOMP_TEX_ANISO");
+        int v = e ? atoi(e) : 0;
+        n = v >= 16 ? 16 : v >= 8 ? 8 : 0;
+    }
+    *aniso = n;
+    *bilinear = b || n;
+}
+
+/* Adds the bilinear blend around (su, sv), texel units, to acc[] (one sum per
+ * ARGB channel, 65536 per tap). 0: a tap sampled nothing, so the caller keeps
+ * the vertex colour. A tap off the edge goes through sample_tex, which wraps,
+ * mirrors, clamps or reads the border colour as the title asked. */
+static int bilinear_accum(float su, float sv, uint32_t acc[4])
+{
+    const Texture *t = &s_gpu.texs[0];
+    float fx = su - 0.5f, fy = sv - 0.5f;
+    int32_t x0 = (int32_t)floorf(fx), y0 = (int32_t)floorf(fy);
+    uint32_t wx = (uint32_t)((fx - (float)x0) * 256.0f);
+    uint32_t wy = (uint32_t)((fy - (float)y0) * 256.0f);
+    uint32_t c[4], w[4], i, ch;
+
+    if (wx > 255) wx = 255;
+    if (wy > 255) wy = 255;
+    if (!sample_tex(t, 0, (uint32_t)x0,       (uint32_t)y0,       &c[0])
+     || !sample_tex(t, 0, (uint32_t)(x0 + 1), (uint32_t)y0,       &c[1])
+     || !sample_tex(t, 0, (uint32_t)x0,       (uint32_t)(y0 + 1), &c[2])
+     || !sample_tex(t, 0, (uint32_t)(x0 + 1), (uint32_t)(y0 + 1), &c[3]))
+        return 0;
+    w[0] = (256 - wx) * (256 - wy);
+    w[1] = wx * (256 - wy);
+    w[2] = (256 - wx) * wy;
+    w[3] = wx * wy;
+    for (ch = 0; ch < 4; ch++)
+        for (i = 0; i < 4; i++)
+            acc[ch] += ((c[i] >> (8 * ch)) & 0xFFu) * w[i];
+    return 1;
+}
+
+/* The average of `taps` bilinear blends gathered in acc[]. */
+static uint32_t filter_result(const uint32_t acc[4], uint32_t taps)
+{
+    uint32_t total = taps << 16, out = 0, ch;
+
+    for (ch = 0; ch < 4; ch++)
+        out |= ((acc[ch] + total / 2) / total) << (8 * ch);
+    return out;
+}
+
+/* Taps for one pixel, from its texel gradients gx = (du, dv) per screen x and
+ * gy per screen y. The longer one is the major axis and the shorter one sets
+ * how stretched the footprint is. The taps spread over the major gradient,
+ * centred on the pixel: start + i * step for i < the returned count. */
+static uint32_t aniso_footprint(const float gx[2], const float gy[2],
+                                uint32_t max_taps, float start[2], float step[2])
+{
+    float lx = sqrtf(gx[0] * gx[0] + gx[1] * gx[1]);
+    float ly = sqrtf(gy[0] * gy[0] + gy[1] * gy[1]);
+    const float *major = lx >= ly ? gx : gy;
+    float longer = lx >= ly ? lx : ly, shorter = lx >= ly ? ly : lx;
+    uint32_t n = 1;
+
+    if (longer > 1e-6f) {
+        float ratio = shorter > 1e-6f ? longer / shorter : (float)max_taps;
+        n = ratio >= (float)max_taps ? max_taps : (uint32_t)ceilf(ratio);
+        if (n < 1) n = 1;
+    }
+    step[0] = major[0] / (float)n;
+    step[1] = major[1] / (float)n;
+    start[0] = -0.5f * major[0] + 0.5f * step[0];
+    start[1] = -0.5f * major[1] + 0.5f * step[1];
+    return n;
+}
+
+/* The same for a triangle whose screen-to-texel mapping is affine: the
+ * footprint is then the same everywhere in it, so it is worked out once.
+ * `area` is the triangle's signed edge-function area. */
+static uint32_t aniso_taps(const float a[2], const float b[2], const float c[2],
+                           const float uv[3][2], float area, uint32_t max_taps,
+                           float start[2], float step[2])
+{
+    float e1x = b[0] - a[0], e1y = b[1] - a[1];
+    float e2x = c[0] - a[0], e2y = c[1] - a[1];
+    float du1 = uv[1][0] - uv[0][0], du2 = uv[2][0] - uv[0][0];
+    float dv1 = uv[1][1] - uv[0][1], dv2 = uv[2][1] - uv[0][1];
+    float gx[2] = { (du1 * e2y - du2 * e1y) / area, (dv1 * e2y - dv2 * e1y) / area };
+    float gy[2] = { (du2 * e1x - du1 * e2x) / area, (dv2 * e1x - dv1 * e2x) / area };
+
+    return aniso_footprint(gx, gy, max_taps, start, step);
+}
+
 /* Half-space fill. Barycentric edge functions rather than scanline slopes:
  * the same test decides both windings, so a title that emits clockwise
  * triangles does not silently render nothing. */
@@ -1899,6 +2027,9 @@ static void raster_triangle(const float a[2], const float b[2],
     float area;
     int minx, maxx, miny, maxy, x, y;
     int textured = uv && s_gpu.texs[0].valid;
+    int bilinear = 0, aniso = 0;
+    uint32_t taps = 1;
+    float tap_start[2] = {0.0f, 0.0f}, tap_step[2] = {0.0f, 0.0f};
 
     if (bpp != 4 && bpp != 2)
         return;
@@ -1906,6 +2037,12 @@ static void raster_triangle(const float a[2], const float b[2],
     area = (b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0]);
     if (area == 0.0f)
         return;                            /* degenerate */
+
+    if (textured) {
+        tex_filter_config(&bilinear, &aniso);
+        if (aniso)
+            taps = aniso_taps(a, b, c, uv, area, (uint32_t)aniso, tap_start, tap_step);
+    }
 
     /* Where this batch writes. The same check the per-pixel path made, made
      * once: a surface address landing on the title's own image is no safer
@@ -1947,6 +2084,21 @@ static void raster_triangle(const float a[2], const float b[2],
                 uint32_t texel;
                 float su = (w1 * uv[0][0] + w2 * uv[1][0] + w0 * uv[2][0]) / area;
                 float sv = (w1 * uv[0][1] + w2 * uv[1][1] + w0 * uv[2][1]) / area;
+                if (bilinear) {
+                    /* Filtered: a negative coordinate is a tap off the edge
+                     * and must reach sample_tex's addressing, not be clamped. */
+                    uint32_t acc[4] = {0, 0, 0, 0}, i;
+                    for (i = 0; i < taps; i++)
+                        if (!bilinear_accum(su + tap_start[0] + (float)i * tap_step[0],
+                                            sv + tap_start[1] + (float)i * tap_step[1], acc))
+                            break;
+                    if (i == taps) {
+                        put_pixel(mem, bpp, x, y, filter_result(acc, taps));
+                        continue;
+                    }
+                    put_pixel(mem, bpp, x, y, argb);
+                    continue;
+                }
                 if (su < 0.0f) su = 0.0f;
                 if (sv < 0.0f) sv = 0.0f;
                 if (sample_texture((uint32_t)su, (uint32_t)sv, &texel)) {
@@ -2101,6 +2253,22 @@ static int batch_is_ffp(void)
  * spot cones, no back-face colours, no skinning. Add them when a mesh looks
  * wrong rather than dark. */
 #define NV_LIGHTS 8
+
+/* RECOMP_STRIP_ALT_WINDING, on by default downstream: emit every odd triangle of a
+ * triangle strip with its first two vertices swapped, so all of a strip's
+ * triangles wind the same way, as a strip does on hardware. Left alone the
+ * executor emits (i, i+1, i+2) for every i, so a back end that culls or lights
+ * two-sided from the winding drops or back-lights every second triangle. */
+static int strip_alt_winding(void)
+{
+    static int on = -1;
+
+    if (on < 0) {
+        const char *e = getenv("RECOMP_STRIP_ALT_WINDING");
+        on = !e || strcmp(e, "0") != 0;
+    }
+    return on;
+}
 
 /* RECOMP_FFP_FLIP_NORMALS: a compatibility option, off by default. See
  * lit_color(). */
@@ -2779,10 +2947,36 @@ static uint32_t tex_face_stride(const Texture *t)
 /* One texel at normalised (swizzled/DXT) or texel (linear) coordinates, as
  * floats. An unusable stage reads white, so a missing texture multiplies
  * through instead of blacking the pixel out. */
+static void rc_tent(const Texture *t, uint32_t face, float u, float v,
+                    float out[4])
+{
+    uint32_t texel;
+    float fu = u - 0.5f, fv = v - 0.5f, wu, wv, c[4][4];
+    int32_t iu = (int32_t)floorf(fu), iv = (int32_t)floorf(fv), k, j;
+
+    wu = fu - (float)iu;
+    wv = fv - (float)iv;
+    for (k = 0; k < 4; k++) {
+        if (sample_tex(t, face, (uint32_t)(iu + (k & 1)),
+                       (uint32_t)(iv + (k >> 1)), &texel))
+            nv2a_rc_unpack(texel, c[k]);
+        else
+            c[k][0] = c[k][1] = c[k][2] = c[k][3] = 1.0f;
+    }
+    for (j = 0; j < 4; j++)
+        out[j] = (c[0][j] * (1.0f - wu) + c[1][j] * wu) * (1.0f - wv)
+               + (c[2][j] * (1.0f - wu) + c[3][j] * wu) * wv;
+}
+
+/* `g`, when not NULL, is this pixel's gradient of (u, v): du/dx, dv/dx, du/dy,
+ * dv/dy, in the units u and v are given in. RECOMP_TEX_ANISO uses it. */
 static void rc_texel(const Texture *t, uint32_t face, float u, float v,
-                     float out[4])
+                     const float *g, float out[4])
 {
     uint32_t texel, mag = (t->filter >> 24) & 0xF, min = (t->filter >> 16) & 0xFF;
+    int bilinear, aniso;
+    float gs[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+
     /* Blood Wake carried patch (TK-51): CONVOLUTION_2D (MIN 7 / MAG 4), the
      * anti-aliasing resolve's filter, sampled the nearest texel. As xemu and
      * the GPU path (bw_rc_hlsl.c): a 3x3 Gaussian of bilinear taps one texel
@@ -2805,38 +2999,49 @@ static void rc_texel(const Texture *t, uint32_t face, float u, float v,
             for (dy = -1; dy <= 1; dy++)
                 for (dx = -1; dx <= 1; dx++) {
                     float wgt = (float)((2 - abs(dx)) * (2 - abs(dy))) / 16.0f;
-                    rc_texel(&lin, face, u + dx * du, v + dy * dv, c);
+                    rc_texel(&lin, face, u + dx * du, v + dy * dv, NULL, c);
                     for (j = 0; j < 4; j++)
                         out[j] += c[j] * wgt;
                 }
             return;
         }
     }
+    tex_filter_config(&bilinear, &aniso);
     if (tex_size_from_format(t->color)) {
         u *= (float)t->width;
         v *= (float)t->height;
+        if (g) {
+            gs[0] = g[0] * (float)t->width;  gs[1] = g[1] * (float)t->height;
+            gs[2] = g[2] * (float)t->width;  gs[3] = g[3] * (float)t->height;
+            g = gs;
+        }
+    }
+    /* RECOMP_TEX_ANISO (per-title opt-in): bilinear taps along the footprint,
+     * whatever filter the title asked for. */
+    if (aniso && g) {
+        float gx[2] = { g[0], g[1] }, gy[2] = { g[2], g[3] }, start[2], step[2];
+        float sum[4] = {0.0f, 0.0f, 0.0f, 0.0f}, tap[4];
+        uint32_t n = aniso_footprint(gx, gy, (uint32_t)aniso, start, step), i;
+        int j;
+        for (i = 0; i < n; i++) {
+            rc_tent(t, face, u + start[0] + (float)i * step[0],
+                    v + start[1] + (float)i * step[1], tap);
+            for (j = 0; j < 4; j++)
+                sum[j] += tap[j];
+        }
+        for (j = 0; j < 4; j++)
+            out[j] = sum[j] / (float)n;
+        return;
     }
     /* TENT (bilinear) when the title asks for it, magnifying or minifying:
      * a 64x32 sky gradient stretched over the screen is blocks with nearest
      * texels and a gradient with four. MAG 2 is tent; MIN 2 is tent at LOD 0
-     * and 4/6 the tent mip modes.
+     * and 4/6 the tent mip modes. RECOMP_TEX_BILINEAR (per-title opt-in)
+     * asks for it for every texture.
      * ponytail: level 0 only, no mip selection -- minified textures shimmer.
      * Add LOD from the screen-space derivative when that shows. */
-    if (mag == 2 || min == 2 || min == 4 || min == 6) {
-        float fu = u - 0.5f, fv = v - 0.5f, wu, wv, c[4][4];
-        int32_t iu = (int32_t)floorf(fu), iv = (int32_t)floorf(fv), k, j;
-        wu = fu - (float)iu;
-        wv = fv - (float)iv;
-        for (k = 0; k < 4; k++) {
-            if (sample_tex(t, face, (uint32_t)(iu + (k & 1)),
-                           (uint32_t)(iv + (k >> 1)), &texel))
-                nv2a_rc_unpack(texel, c[k]);
-            else
-                c[k][0] = c[k][1] = c[k][2] = c[k][3] = 1.0f;
-        }
-        for (j = 0; j < 4; j++)
-            out[j] = (c[0][j] * (1.0f - wu) + c[1][j] * wu) * (1.0f - wv)
-                   + (c[2][j] * (1.0f - wu) + c[3][j] * wu) * wv;
+    if (bilinear || mag == 2 || min == 2 || min == 4 || min == 6) {
+        rc_tent(t, face, u, v, out);
         return;
     }
     if (sample_tex(t, face, (uint32_t)(int32_t)floorf(u),
@@ -2862,7 +3067,7 @@ static void cube_texel(const Texture *t, float x, float y, float z, float out[4]
     if (ma == 0.0f)
         ma = 1.0f;
     rc_texel(t, face * tex_face_stride(t), (sc / ma + 1.0f) * 0.5f,
-             (tc / ma + 1.0f) * 0.5f, out);
+             (tc / ma + 1.0f) * 0.5f, NULL, out);
 }
 
 /* DOT_RGBMAPPING: an earlier stage's colour as a vector (xemu psh.c sign1/2/3).
@@ -2904,7 +3109,8 @@ static int dot_modes_on(void)
     return v;
 }
 
-static int rc_stage_fetch(int st, const float c[4], float out[4]);
+static int rc_stage_fetch(int st, const float c[4], const float *cx,
+                          const float *cy, float out[4]);
 
 /* Stage `st` with every stage's coordinates and the earlier stages' results at
  * hand: the dot-product modes (NV_texture_shader; xemu psh.c) need them.
@@ -2912,11 +3118,13 @@ static int rc_stage_fetch(int st, const float c[4], float out[4]);
  * normal N = (dot1, dot2, dot3), DOT_RFLCT_SPEC at N's reflection of the eye
  * vector (the three stages' q). Water in every mission (program 0x62E21,
  * seen 2026-10-27). BW_GPU_DOTMODES=0: read zero, as before. */
-static int rc_stage_fetch_all(int st, const float tcs[4][4], float t[4][4])
+static int rc_stage_fetch_all(int st, const float tcs[4][4],
+                              const float *cx, const float *cy,
+                              float t[4][4])
 {
     uint32_t mode = (s_gpu.rc.stage_program >> (st * 5)) & 0x1F;
     if (mode != 0x11 && mode != 0x0B && mode != 0x0C)
-        return rc_stage_fetch(st, tcs[st], t[st]);
+        return rc_stage_fetch(st, tcs[st], cx, cy, t[st]);
     t[st][0] = t[st][1] = t[st][2] = t[st][3] = 0.0f;
     if (!dot_modes_on() || st < 2 || mode == 0x11)
         return 1;
@@ -2945,7 +3153,8 @@ static int rc_stage_fetch_all(int st, const float tcs[4][4], float t[4][4])
 
 /* What texture stage `st` contributes, by its SHADER_STAGE_PROGRAM mode
  * (xemu psh.c). Returns 0 when a clip-plane stage kills the pixel. */
-static int rc_stage_fetch(int st, const float c[4], float out[4])
+static int rc_stage_fetch(int st, const float c[4], const float *cx,
+                          const float *cy, float out[4])
 {
     const Texture *t = &s_gpu.texs[st];
     uint32_t mode = (s_gpu.rc.stage_program >> (st * 5)) & 0x1F, j;
@@ -2956,11 +3165,19 @@ static int rc_stage_fetch(int st, const float c[4], float out[4])
         out[0] = out[1] = out[2] = 0.0f; out[3] = 1.0f;
         return 1;
     case 1: case 2:                               /* PROJECT2D / 3D */
-        rc_texel(t, 0, c[0] / q, c[1] / q, out);
+        if (cx && cy) {                           /* neighbours: the gradient */
+            float qx = cx[3] != 0.0f ? cx[3] : 1.0f, qy = cy[3] != 0.0f ? cy[3] : 1.0f;
+            float u = c[0] / q, v = c[1] / q;
+            float g[4] = { cx[0] / qx - u, cx[1] / qx - v,
+                           cy[0] / qy - u, cy[1] / qy - v };
+            rc_texel(t, 0, u, v, g, out);
+            return 1;
+        }
+        rc_texel(t, 0, c[0] / q, c[1] / q, NULL, out);
         return 1;
     case 3:                                       /* CUBEMAP */
         if (!t->cube) {
-            rc_texel(t, 0, c[0], c[1], out);
+            rc_texel(t, 0, c[0], c[1], NULL, out);
             return 1;
         }
         cube_texel(t, c[0], c[1], c[2], out);
@@ -3074,6 +3291,7 @@ typedef struct {
     const Nv2aVshOutput *va, *vb, *vc;
     const float *a, *b, *c;
     float iw[3], uv[3][2], stc[3][4][4], vfog[3], fogc[4], inv_area;
+    float dl[3][2];                  /* d(l0,l1,l2)/dx and /dy, for texel gradients */
     float zoff;                 /* Blood Wake: polygon offset (bw_poly_offset) */
     int persp;                  /* Blood Wake: colours/fog as xemu (bw_persp_on) */
     float *zb;
@@ -3082,13 +3300,47 @@ typedef struct {
 
 typedef struct { uint64_t depth_fail, pixels; uint32_t zpass; } XfCount;
 
+/* Perspective-correct 1/w at the barycentrics (l0, l1, l2) moved one pixel
+ * right (axis 0) or down (axis 1), and the matching barycentrics. */
+static float xf_step_l(const XfTri *T, float l0, float l1, float l2, int axis,
+                       float *m0, float *m1, float *m2)
+{
+    *m0 = l0 + T->dl[0][axis];
+    *m1 = l1 + T->dl[1][axis];
+    *m2 = l2 + T->dl[2][axis];
+    return *m0 * T->iw[0] + *m1 * T->iw[1] + *m2 * T->iw[2];
+}
+
+/* Texture coordinate of stage `st` one pixel over, as the pixel loop makes it. */
+static void xf_tc_step(const XfTri *T, int st, float l0, float l1, float l2,
+                       int axis, float out[4])
+{
+    float m0, m1, m2, pw = xf_step_l(T, l0, l1, l2, axis, &m0, &m1, &m2);
+    int j;
+
+    for (j = 0; j < 4; j++)
+        out[j] = (m0 * T->stc[0][st][j] + m1 * T->stc[1][st][j]
+                + m2 * T->stc[2][st][j]) / pw;
+}
+
+/* The same for the fixed-function uv. */
+static void xf_uv_step(const XfTri *T, float l0, float l1, float l2, int axis,
+                       float *u, float *v)
+{
+    float m0, m1, m2, pw = xf_step_l(T, l0, l1, l2, axis, &m0, &m1, &m2);
+
+    *u = (m0 * T->uv[0][0] + m1 * T->uv[1][0] + m2 * T->uv[2][0]) / pw;
+    *v = (m0 * T->uv[0][1] + m1 * T->uv[1][1] + m2 * T->uv[2][1]) / pw;
+}
+
 /* Rows y0, y0+step, ... < maxy of triangle T. */
 static void xf_rows(const XfTri *T, int y0, int step, XfCount *cnt)
 {
     const float *a = T->a, *b = T->b, *c = T->c;
     const Nv2aVshOutput *va = T->va, *vb = T->vb, *vc = T->vc;
-    int x, y, k;
+    int x, y, k, bilinear, aniso;
 
+    tex_filter_config(&bilinear, &aniso);
     for (y = y0; y < T->maxy; y += step) {
         for (x = T->minx; x < T->maxx; x++) {
             float px = (float)x + 0.5f, py = (float)y + 0.5f;
@@ -3147,7 +3399,18 @@ static void xf_rows(const XfTri *T, int y0, int step, XfCount *cnt)
                                 t[st][3] = 1.0f;
                                 continue;
                             }
-                            keep = rc_stage_fetch_all(st, (const float (*)[4])tcs, t);
+                            if (aniso) {
+                                /* The same coordinate one pixel right and one
+                                 * down: the difference is the gradient. */
+                                float tcx[4], tcy[4];
+                                xf_tc_step(T, st, l0, l1, l2, 0, tcx);
+                                xf_tc_step(T, st, l0, l1, l2, 1, tcy);
+                                keep = rc_stage_fetch_all(
+                                    st, (const float (*)[4])tcs, tcx, tcy, t);
+                            } else {
+                                keep = rc_stage_fetch_all(
+                                    st, (const float (*)[4])tcs, NULL, NULL, t);
+                            }
                         }
                         if (!keep)
                             continue;
@@ -3163,8 +3426,25 @@ static void xf_rows(const XfTri *T, int y0, int step, XfCount *cnt)
                             float tu, tv;
                             tu = (l0 * T->uv[0][0] + l1 * T->uv[1][0] + l2 * T->uv[2][0]) / pw;
                             tv = (l0 * T->uv[0][1] + l1 * T->uv[1][1] + l2 * T->uv[2][1]) / pw;
-                            if (sample_texture((uint32_t)(int32_t)floorf(tu),
-                                               (uint32_t)(int32_t)floorf(tv), &texel))
+                            if (bilinear) {
+                                uint32_t acc[4] = {0, 0, 0, 0}, n = 1, i;
+                                float tap0[2] = {0.0f, 0.0f}, dtap[2] = {0.0f, 0.0f};
+                                if (aniso) {
+                                    float ux, vx, uy, vy, gx[2], gy[2];
+                                    xf_uv_step(T, l0, l1, l2, 0, &ux, &vx);
+                                    xf_uv_step(T, l0, l1, l2, 1, &uy, &vy);
+                                    gx[0] = ux - tu; gx[1] = vx - tv;
+                                    gy[0] = uy - tu; gy[1] = vy - tv;
+                                    n = aniso_footprint(gx, gy, (uint32_t)aniso, tap0, dtap);
+                                }
+                                for (i = 0; i < n; i++)
+                                    if (!bilinear_accum(tu + tap0[0] + (float)i * dtap[0],
+                                                        tv + tap0[1] + (float)i * dtap[1], acc))
+                                        break;
+                                if (i == n)
+                                    argb = modulate(filter_result(acc, n), col);
+                            } else if (sample_texture((uint32_t)(int32_t)floorf(tu),
+                                                      (uint32_t)(int32_t)floorf(tv), &texel))
                                 argb = modulate(texel, col);
                         }
                         if (s_gpu.alpha_test
@@ -3200,16 +3480,6 @@ static void xf_rows(const XfTri *T, int y0, int step, XfCount *cnt)
 #define NV_RASTER_MAX_THREADS 16
 #define NV_RASTER_MT_MIN_PIXELS 8192
 
-#if defined(_WIN32)
-static struct {
-    int n;                                  /* threads incl. the caller */
-    HANDLE start[NV_RASTER_MAX_THREADS], done;
-    volatile LONG pending;
-    const XfTri *tris;
-    int ntris;
-    XfCount cnt[NV_RASTER_MAX_THREADS];
-} s_pool;
-
 /* Worker k owns the rows y with y % n == k, for every triangle of the run,
  * in submission order. Each pixel therefore sees its triangles in the order
  * the title drew them, whichever thread draws it. */
@@ -3222,6 +3492,22 @@ static void xf_rows_owned(const XfTri *tris, int ntris, int k, int n,
         xf_rows(&tris[i], y0, n, cnt);
     }
 }
+
+/* Workers that actually drew in the most recent batch, and the configured
+ * pool size. Diagnostics, and the only way a test can tell a pool that ran
+ * from a pool that was merely created -- tests/nv2a_raster_posix_pool. */
+static int s_raster_last_workers = 1;
+int nv2a_raster_last_workers(void) { return s_raster_last_workers; }
+
+#if defined(_WIN32)
+static struct {
+    int n;                                  /* threads incl. the caller */
+    HANDLE start[NV_RASTER_MAX_THREADS], done;
+    volatile LONG pending;
+    const XfTri *tris;
+    int ntris;
+    XfCount cnt[NV_RASTER_MAX_THREADS];
+} s_pool;
 
 static DWORD WINAPI raster_worker(LPVOID arg)
 {
@@ -3284,22 +3570,137 @@ static void xf_rows_parallel(const XfTri *T, int ntris, long px,
         total->pixels += mine.pixels;
         total->zpass += mine.zpass;
     }
-    for (k = 0; k < n - 1; k++) {
-        total->depth_fail += s_pool.cnt[k].depth_fail;
-        total->pixels += s_pool.cnt[k].pixels;
-        total->zpass += s_pool.cnt[k].zpass;
+    {
+        int ran = 1;                          /* the caller always draws */
+        for (k = 0; k < n - 1; k++) {
+            if (s_pool.cnt[k].pixels) ran++;
+            total->depth_fail += s_pool.cnt[k].depth_fail;
+            total->pixels += s_pool.cnt[k].pixels;
+            total->zpass += s_pool.cnt[k].zpass;
+        }
+        s_raster_last_workers = ran;
     }
 }
 #else
+/* The same pool on pthreads. One mutex and two conditions rather than a
+ * per-worker event: a generation counter, bumped under the lock, is what a
+ * worker waits on, so a batch that starts and finishes before a worker reaches
+ * its wait is still seen -- a plain signal there would be lost and the batch
+ * would hang on the join. */
+static struct {
+    int n;                                  /* threads incl. the caller */
+    pthread_mutex_t lock;
+    pthread_cond_t start, done;
+    unsigned long generation;
+    int pending;
+    const XfTri *tris;
+    int ntris;
+    XfCount cnt[NV_RASTER_MAX_THREADS];
+} s_pool;
+
+static void *raster_worker(void *arg)
+{
+    int k = (int)(intptr_t)arg;
+    unsigned long seen = 0;
+    for (;;) {
+        pthread_mutex_lock(&s_pool.lock);
+        while (s_pool.generation == seen)
+            pthread_cond_wait(&s_pool.start, &s_pool.lock);
+        seen = s_pool.generation;
+        pthread_mutex_unlock(&s_pool.lock);
+
+        memset(&s_pool.cnt[k], 0, sizeof s_pool.cnt[k]);
+        xf_rows_owned(s_pool.tris, s_pool.ntris, k, s_pool.n, &s_pool.cnt[k]);
+
+        pthread_mutex_lock(&s_pool.lock);
+        if (--s_pool.pending == 0)
+            pthread_cond_signal(&s_pool.done);
+        pthread_mutex_unlock(&s_pool.lock);
+    }
+    return NULL;
+}
+
+static int raster_pool_size(void)
+{
+    static int init;
+    if (!init) {
+        const char *e = getenv("RECOMP_RASTER_THREADS");
+        long cpus = sysconf(_SC_NPROCESSORS_ONLN);
+        int n, k;
+        init = 1;
+        /* Same policy as the Windows branch: leave a few cores for the title
+         * and the host unless the variable says otherwise. */
+        n = e ? atoi(e) : (int)(cpus > 0 ? cpus : 1) - 4;
+        if (n < 1) n = 1;
+        if (n > NV_RASTER_MAX_THREADS) n = NV_RASTER_MAX_THREADS;
+        s_pool.n = n;
+        if (n > 1) {
+            pthread_mutex_init(&s_pool.lock, NULL);
+            pthread_cond_init(&s_pool.start, NULL);
+            pthread_cond_init(&s_pool.done, NULL);
+            for (k = 0; k < n - 1; k++) {
+                pthread_t t;
+                if (pthread_create(&t, NULL, raster_worker,
+                                   (void *)(intptr_t)k) != 0) {
+                    /* Short pool rather than no drawing: the rows this worker
+                     * would have owned must still be drawn by someone, so fall
+                     * back to the size that did start. */
+                    s_pool.n = k + 1;
+                    break;
+                }
+                pthread_detach(t);
+            }
+        }
+    }
+    return s_pool.n;
+}
+
 static void xf_rows_parallel(const XfTri *T, int ntris, long px,
                              XfCount *total)
 {
-    int k;
-    (void)px;
-    for (k = 0; k < ntris; k++)
-        xf_rows(&T[k], T[k].miny, 1, total);
+    int n = raster_pool_size(), k;
+
+    if (n <= 1 || px < NV_RASTER_MT_MIN_PIXELS) {
+        s_raster_last_workers = 1;
+        for (k = 0; k < ntris; k++)
+            xf_rows(&T[k], T[k].miny, 1, total);
+        return;
+    }
+
+    pthread_mutex_lock(&s_pool.lock);
+    s_pool.tris = T;
+    s_pool.ntris = ntris;
+    s_pool.pending = n - 1;
+    s_pool.generation++;
+    pthread_cond_broadcast(&s_pool.start);
+    pthread_mutex_unlock(&s_pool.lock);
+
+    {
+        XfCount mine = {0, 0, 0};
+        xf_rows_owned(T, ntris, n - 1, n, &mine);   /* the caller's share */
+        pthread_mutex_lock(&s_pool.lock);
+        while (s_pool.pending != 0)
+            pthread_cond_wait(&s_pool.done, &s_pool.lock);
+        pthread_mutex_unlock(&s_pool.lock);
+        total->depth_fail += mine.depth_fail;
+        total->pixels += mine.pixels;
+        total->zpass += mine.zpass;
+    }
+
+    {
+        int ran = 1;                          /* the caller always draws */
+        for (k = 0; k < n - 1; k++) {
+            if (s_pool.cnt[k].pixels) ran++;
+            total->depth_fail += s_pool.cnt[k].depth_fail;
+            total->pixels += s_pool.cnt[k].pixels;
+            total->zpass += s_pool.cnt[k].zpass;
+        }
+        s_raster_last_workers = ran;
+    }
 }
 #endif
+
+int nv2a_raster_pool_size(void) { return raster_pool_size(); }
 
 /* Triangles waiting for the end of their batch.
  *
@@ -3492,6 +3893,11 @@ static void raster_xf_triangle(const Nv2aVshOutput *va, const Nv2aVshOutput *vb,
     s_gpu.xf_drawn++;
     T.inv_area = 1.0f / area;
     T.zoff = bw_poly_offset(a, b, c, area);
+    /* The edge functions are linear, so a barycentric moves by a constant per
+     * pixel step. l0 = w1/area, l1 = w2/area, l2 = w0/area as in xf_rows. */
+    T.dl[0][0] = -(c[1] - b[1]) * T.inv_area;  T.dl[0][1] = (c[0] - b[0]) * T.inv_area;
+    T.dl[1][0] = -(a[1] - c[1]) * T.inv_area;  T.dl[1][1] = (a[0] - c[0]) * T.inv_area;
+    T.dl[2][0] = -(b[1] - a[1]) * T.inv_area;  T.dl[2][1] = (b[0] - a[0]) * T.inv_area;
 
     xf_queue_push(&T);
     (void)cnt;
@@ -4727,7 +5133,7 @@ static void raster_batch_program(void)
          * back-face culling on the GPU path tests (bw_d3d11.c). The CPU
          * rasteriser draws both windings, so it sees no difference. */
         for (i = 0; i + 2 < n; i++) {
-            if (i & 1)
+            if ((i & 1) && strip_alt_winding())
                 raster_xf_clipped(&s_xf[i+1], &s_xf[i], &s_xf[i+2]);
             else
                 raster_xf_clipped(&s_xf[i], &s_xf[i+1], &s_xf[i+2]);
@@ -4811,7 +5217,7 @@ static void raster_batch(void)
     case NV_PRIM_TRIANGLE_STRIP:
         /* Blood Wake: one winding along the strip (see raster_batch_program). */
         for (i = 0; i + 2 < s_gpu.idx_count; i++) {
-            if (i & 1)
+            if ((i & 1) && strip_alt_winding())
                 raster_indexed(s_gpu.idx[i+1], s_gpu.idx[i], s_gpu.idx[i+2],
                                vertex_color(s_gpu.idx[i]));
             else
@@ -5954,7 +6360,7 @@ static void bw_mtrace(uint32_t subch, uint32_t method, uint32_t param)
  * appends its two indices if both fit. Returns 0 (the caller then goes word
  * by word) before the first method, or while a per-method trace or the GPU
  * audit wants every word. BW_PB_BULK=0 turns it off. */
-static int s_bw_exec_inited;
+static int s_exec_inited;
 static unsigned long long s_bw_idx16_bulk, s_bw_idx16_single;   /* words, for the report */
 int nv2a_pb_exec_idx16(const uint32_t *p, uint32_t n)
 {
@@ -5965,7 +6371,7 @@ int nv2a_pb_exec_idx16(const uint32_t *p, uint32_t n)
         const char *e = getenv("BW_PB_BULK");
         on = !(e && e[0] == '0');
     }
-    if (!on || !n || !s_bw_exec_inited || s_bw_mtrace_on != 0 || bw_audit_on()
+    if (!on || !n || !s_exec_inited || s_bw_mtrace_on != 0 || bw_audit_on()
 #if defined(BW_GPU_CAPTURE_FIXTURE)
         || capture_fixture_active()
 #endif
@@ -6058,7 +6464,7 @@ static void bw_present_immediate(void)
                         dump_surface_bmp_at(snapshot_va);
                 }
                 else
-                    dump_surface_bmp();
+                    dump_surface_bmp_at(0);
             }
         }
     }
@@ -6067,10 +6473,25 @@ static void bw_present_immediate(void)
         s_backend->flip();
 }
 
+/* v0.17's transform-constant fast path, sharing the executor's initialization
+ * flag with Blood Wake's ARRAY_ELEMENT16 fast path. */
+int nv2a_pb_exec_constant_word(uint32_t method, uint32_t param)
+{
+    static int on = -1;
+
+    if (on < 0) {
+        const char *e = getenv("RECOMP_PB_CONST_FAST");
+        on = !(e && e[0] == '0');
+    }
+    if (!on || !s_exec_inited)
+        return 0;
+    s_reg[(method & 0x1FFCu) / 4] = param;
+    nv2a_vsh_constant_word(param);
+    return 1;
+}
+
 void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
 {
-    static int inited;
-
 #if defined(BW_GPU_CAPTURE_FIXTURE)
     capture_fixture_method(subch, method, param);
 #endif
@@ -6089,9 +6510,8 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
             return;
         }
     }
-    if (!inited) {
-        inited = 1;
-        s_bw_exec_inited = 1;              /* Blood Wake P1: nv2a_pb_exec_idx16 */
+    if (!s_exec_inited) {
+        s_exec_inited = 1;
         s_gpu.aa_sx = s_gpu.aa_sy = 1.0f;
         /* Stencil state as the hardware resets it: GL_ALWAYS, masks 0xFF,
          * GL_KEEP, until the title says otherwise. */
@@ -6540,7 +6960,7 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
                             dump_surface_bmp_at(snapshot_va);
                     }
                     else
-                        dump_surface_bmp();
+                        dump_surface_bmp_at(0);
                 }
             }
         }
@@ -6549,7 +6969,7 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
             s_backend->flip();
         if (snapshot_ok && !synchronized && dump_now && dump_after &&
             s_backend && s_backend->flip)
-            dump_surface_bmp();             /* TK-39: the frame just presented */
+            dump_surface_bmp_at(0);         /* TK-39: the frame just presented */
 
         if (verbose) {
             static unsigned n;

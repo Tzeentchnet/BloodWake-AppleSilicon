@@ -13,6 +13,30 @@ RECOMP_TLS uint32_t g_ebx, g_esi, g_edi, g_seh_ebp;
 ptrdiff_t g_xbox_mem_offset;
 size_t g_xbox_map_size, g_xbox_total_ram;
 static RECOMP_TLS atomic_int *test_block_apc;
+static uint32_t priority_remove_va;
+static int priority_handle_valid;
+static LONG priority_increment;
+
+static LONG priority_handle_use(PVOID thread, LONG result)
+{
+    uint32_t va = priority_remove_va;
+    priority_remove_va = 0;
+    if (va)
+        ke_shadow_remove(va);
+    priority_handle_valid = SetEvent((HANDLE)thread);
+    return result;
+}
+
+LONG __stdcall xbox_KeQueryBasePriorityThread(PVOID thread)
+{
+    return priority_handle_use(thread, 7);
+}
+
+LONG __stdcall xbox_KeSetBasePriorityThread(PVOID thread, LONG increment)
+{
+    priority_increment = increment;
+    return priority_handle_use(thread, 3);
+}
 
 int bw_xbox_contiguous_memory_region(void **host, uint32_t *va, size_t *bytes)
 {
@@ -208,6 +232,32 @@ int main(void)
         CHECK(worker_result == NULL);
     }
     ke_shadow_remove(shadow_va);
+
+    /* The Apple bridge must retain a duplicate while the shadow table can
+     * concurrently remove its original thread handle. */
+    h = CreateEventW(NULL, TRUE, FALSE, NULL);
+    CHECK(h != NULL);
+    ke_shadow_insert(shadow_va, h);
+    priority_remove_va = shadow_va;
+    priority_handle_valid = 0;
+    a[0] = shadow_va;
+    args(base, a, 1);
+    bridge_KeQueryBasePriorityThread();
+    CHECK(g_eax == 7 && priority_handle_valid);
+    CHECK(ke_shadow_acquire(shadow_va) == NULL);
+
+    h = CreateEventW(NULL, TRUE, FALSE, NULL);
+    CHECK(h != NULL);
+    ke_shadow_insert(shadow_va, h);
+    priority_remove_va = shadow_va;
+    priority_handle_valid = 0;
+    a[0] = shadow_va;
+    a[1] = (uint32_t)-2;
+    args(base, a, 2);
+    bridge_KeSetBasePriorityThread();
+    CHECK(g_eax == 3 && priority_handle_valid && priority_increment == -2);
+    CHECK(ke_shadow_acquire(shadow_va) == NULL);
+
     CancelShadow cancel_shadow = {shadow_va, 0};
     CHECK(pthread_create(&workers[0], NULL, cancel_shadow_writer,
                          &cancel_shadow) == 0);

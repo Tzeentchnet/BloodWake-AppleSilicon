@@ -202,6 +202,12 @@ int nv2a_pb_exec_idx16(const uint32_t *p, uint32_t n)
     (void)n;
     return 0;
 }
+int nv2a_pb_exec_constant_word(uint32_t method, uint32_t param)
+{
+    (void)method;
+    (void)param;
+    return 0;
+}
 void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
 {
     check(subch == 0 && method == 0x1d70 && param == 0x12345678);
