@@ -254,6 +254,36 @@ Guided input and `--water-capture` are mutually exclusive because both own the
 framebuffer dump path. Frame dumps and interactive corrections make a guided
 run script-calibration evidence, not performance evidence.
 
+For a bounded framebuffer correctness companion, use
+`--indexed-frame-capture` on one direct seeded boot. It enables the
+exact-value, otherwise discarded `BW_INDEXED_FRAME_CAPTURE=1` diagnostic and
+writes only the presented frames at guest flips 300, 550, 800, and 1050:
+
+```sh
+python3 tools/macos_diagnostic.py \
+  --exe build/bloodwake-native-synthetic-input/bloodwake \
+  --prepared-tree game/prepare \
+  --toolkit build/xboxrecomp \
+  --output-dir /private/BWQ-XX-indexed-output \
+  --seconds 90 \
+  --edition remastered \
+  --quincunx-approx \
+  --experimental-keyboard-hook \
+  --indexed-frame-capture \
+  --save-seed /private/BWQ-XX-save \
+  --launch-seed /private/BWQ-XX-relaunch.bin
+```
+
+The runner accepts exactly four sequential owner-private 24-bit BMPs and four
+fixed-schema `bloodwake.indexed-frame-capture/v1` success records. A missing,
+extra, malformed, failed, symlinked, inconsistent, or incomplete capture
+fails explicitly. The executor reports snapshot, publication, backend, and
+write failures separately. Capture is single-boot and mutually exclusive with
+guided and water capture; it performs no readback and writes no record when
+disabled. Images and their hashes remain private. Compare hashes only when a
+same-executable repeat first proves that the seeded workload is deterministic
+at those flip indexes.
+
 For a PERF-037/038 sustained cell, use the synthetic-input production
 executable only to expose a connected neutral controller. Start directly from
 the validated private save/relaunch seed, and do not add a script or guided

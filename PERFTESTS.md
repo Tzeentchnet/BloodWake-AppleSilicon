@@ -895,6 +895,44 @@ Local review confirmed changing animation/simulation phase rather than a
 static aligned frame. Neither comparison is converted into an output-hash
 pass.
 
+The follow-up indexed capture removes host sampling time as a variable.
+`--indexed-frame-capture` privately sets the exact-value
+`BW_INDEXED_FRAME_CAPTURE=1` diagnostic for one boot. The executor publishes
+and writes only guest flips 300, 550, 800, and 1050, then emits four bounded
+`bloodwake.indexed-frame-capture/v1` events and one summary. Snapshot,
+unsupported-backend, publication, and file-write failures are explicit.
+Malformed, missing, extra, failed, symlinked, inconsistent, or incomplete
+records/files fail the runner. Guided/water capture and relaunch chaining are
+rejected because they share output ownership or change the boot identity.
+Disabled runs perform no capture readback or output.
+
+Four focused cases cover the environment allowlist/default-off contract,
+fixed bounds/schema/privacy/failure handling, and CLI propagation. The
+complete diagnostic-runner suite passes 66/66, the synthetic-input production
+target rebuilds, and a real default-off direct seeded boot produces no indexed
+record or file. An initial 600/1200/1800/2400 calibration failed closed after
+the cell requested relaunch at about 1,136 flips; the retained fixed set is
+fully inside the measured cell.
+
+The pre-PERF-037 source revision and current source revision were rebuilt with
+the same diagnostic-only capture patch. Both direct seeded runs completed all
+four 1280x480 captures:
+
+| Comparison run | Validated marked scopes | Rejected markers | Indexed captures |
+| --- | ---: | ---: | ---: |
+| Earlier-source executable | 275,406 | 0 | 4/4 |
+| Current executable, run 1 | 271,974 | 0 | 4/4 |
+| Current executable, repeat | 278,928 | 0 | 4/4 |
+
+Earlier-source versus current produced zero same-index or cross-index exact
+hash match. Crucially, the two runs of the identical current executable also
+produced zero same-index and zero cross-index exact hash match. Local private
+review showed materially different camera, boat, and simulation state in the
+same Retail Battle scene at the same guest flip indexes. The direct seed is
+therefore nondeterministic across boots; its exact framebuffer gate is
+`unavailable_nondeterministic_seed`, not a renderer mismatch or pass. No frame
+or frame hash is published.
+
 No physical controller was available. Guided-command timestamps and the
 neutral diagnostic bridge do not measure physical input-to-present latency,
 so input latency remains `unavailable_no_device`, not an inferred pass.

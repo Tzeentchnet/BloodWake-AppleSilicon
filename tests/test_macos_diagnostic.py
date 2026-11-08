@@ -1,6 +1,7 @@
 import contextlib
 import importlib.util
 import io
+import json
 import os
 from pathlib import Path
 import stat
@@ -107,6 +108,7 @@ class MacosDiagnosticTests(unittest.TestCase):
                                          "BW_METAL_WATER": "realistic",
                                          "BW_METAL_WATER_BENCHMARK": "1",
                                          "BW_METAL_WATER_CAPTURE_TRIGGER": "/unsafe",
+                                         "BW_INDEXED_FRAME_CAPTURE": "1",
                                          "BW_METAL_PIPELINE_WARMUP": "/unsafe",
                                          "BW_METAL_PIPELINE_TRACE_OUTPUT": "/unsafe",
                                          "RECOMP_FB_DUMP": "/unsafe",
@@ -132,6 +134,7 @@ class MacosDiagnosticTests(unittest.TestCase):
         self.assertNotIn("BW_METAL_WATER", env)
         self.assertNotIn("BW_METAL_WATER_BENCHMARK", env)
         self.assertNotIn("BW_METAL_WATER_CAPTURE_TRIGGER", env)
+        self.assertNotIn("BW_INDEXED_FRAME_CAPTURE", env)
         self.assertNotIn("BW_METAL_PIPELINE_WARMUP", env)
         self.assertNotIn("BW_METAL_PIPELINE_TRACE_OUTPUT", env)
         self.assertNotIn("RECOMP_FB_DUMP", env)
@@ -193,6 +196,15 @@ class MacosDiagnosticTests(unittest.TestCase):
             capture["BW_METAL_WATER_CAPTURE_TRIGGER"],
             capture["RECOMP_FB_DUMP_FLIPS"]
         )
+        indexed = diagnostic.diagnostic_env(
+            self.root, self.prepared, 15, False, False, 4, 5,
+            indexed_frame_capture=True)
+        self.assertEqual(indexed["BW_INDEXED_FRAME_CAPTURE"], "1")
+        self.assertEqual(
+            indexed["RECOMP_FB_DUMP"],
+            str(self.root / "indexed-frame-")
+        )
+        self.assertNotIn("RECOMP_FB_DUMP_FLIPS", indexed)
         guided = diagnostic.diagnostic_env(
             self.root, self.prepared, 15, False, False, 4, 5,
             guided_input=True)
@@ -323,6 +335,14 @@ class MacosDiagnosticTests(unittest.TestCase):
             diagnostic.diagnostic_env(
                 self.root, self.prepared, 15, False, True, 4, 5,
                 edition="remastered", water_capture=True, guided_input=True)
+        with self.assertRaisesRegex(ValueError, "mutually exclusive"):
+            diagnostic.diagnostic_env(
+                self.root, self.prepared, 15, False, False, 4, 5,
+                indexed_frame_capture=True, guided_input=True)
+        with self.assertRaisesRegex(ValueError, "stem is invalid"):
+            diagnostic.diagnostic_env(
+                self.root, self.prepared, 15, False, False, 4, 5,
+                indexed_frame_capture=True, indexed_capture_stem="../frames")
 
     def test_sandbox_preflight_fails_closed(self):
         failure = subprocess.CompletedProcess([], 1, "", "sandbox denied setup")
@@ -636,6 +656,39 @@ class MacosDiagnosticTests(unittest.TestCase):
         )
 
     @staticmethod
+    def indexed_frame_capture_records(statuses=None):
+        if statuses is None:
+            statuses = ["ok"] * diagnostic.INDEXED_FRAME_CAPTURE_IMAGES
+        records = [
+            json.dumps(
+                {
+                    "schema": diagnostic.INDEXED_FRAME_CAPTURE_SCHEMA,
+                    "record": "event",
+                    "sequence": sequence,
+                    "flip": flip,
+                    "status": statuses[sequence],
+                },
+                separators=(",", ":"),
+            ).encode("ascii")
+            for sequence, flip in enumerate(
+                diagnostic.INDEXED_FRAME_CAPTURE_FLIPS
+            )
+        ]
+        captured = statuses.count("ok")
+        records.append(json.dumps(
+            {
+                "schema": diagnostic.INDEXED_FRAME_CAPTURE_SCHEMA,
+                "record": "summary",
+                "requested": diagnostic.INDEXED_FRAME_CAPTURE_IMAGES,
+                "captured": captured,
+                "failed": diagnostic.INDEXED_FRAME_CAPTURE_IMAGES - captured,
+                "flips": list(diagnostic.INDEXED_FRAME_CAPTURE_FLIPS),
+            },
+            separators=(",", ":"),
+        ).encode("ascii"))
+        return b"\n".join(records) + b"\n"
+
+    @staticmethod
     def write_capture_bitmap(path, width=2, height=1):
         row_bytes = (width * 3 + 3) & ~3
         image_bytes = row_bytes * height
@@ -893,6 +946,25 @@ class MacosDiagnosticTests(unittest.TestCase):
             self.assertEqual(failure.exception.code, 2)
             self.assertIn(expected, errors.getvalue())
 
+    def test_indexed_frame_capture_cli_requires_single_owner(self):
+        arguments = self.main_arguments() + ["--indexed-frame-capture"]
+        cases = (
+            (["--guided-input-capture"], "mutually exclusive"),
+            (["--water-capture", "--edition", "remastered", "--gpu-audit",
+              "--experimental-keyboard-hook", "--synthetic-input-script",
+              "remastered-boot-menu-to-gameplay-v1"], "mutually exclusive"),
+            (["--follow-relaunches"], "requires a single boot"),
+        )
+        for extra, expected in cases:
+            errors = io.StringIO()
+            with self.subTest(extra=extra), \
+                 mock.patch.object(diagnostic.sys, "platform", "darwin"), \
+                 contextlib.redirect_stderr(errors), \
+                 self.assertRaises(SystemExit) as failure:
+                diagnostic.main(arguments + extra)
+            self.assertEqual(failure.exception.code, 2)
+            self.assertIn(expected, errors.getvalue())
+
     def test_script_cli_requires_hook_remastered_and_known_name(self):
         script = "remastered-boot-menu-to-gameplay-v1"
         arguments = self.main_arguments()
@@ -1117,6 +1189,86 @@ class MacosDiagnosticTests(unittest.TestCase):
         self.assertEqual(result, 0)
         self.assertIn("four private supported-frame BMPs", output.getvalue())
         self.assertIn("4 private retail frames each at 2x1", output.getvalue())
+
+    def test_indexed_frame_capture_is_bounded_private_and_strict(self):
+        output_dir = self.root / "indexed"
+        output_dir.mkdir()
+        log = output_dir / "guest.log"
+        log.write_bytes(self.indexed_frame_capture_records())
+        for image in range(diagnostic.INDEXED_FRAME_CAPTURE_IMAGES):
+            self.write_capture_bitmap(
+                output_dir / f"indexed-frame-{image:05d}.bmp"
+            )
+
+        report = io.StringIO()
+        with contextlib.redirect_stdout(report):
+            captures = diagnostic.report_indexed_frame_captures(
+                [log], output_dir, True
+            )
+        self.assertEqual(len(captures), 4)
+        self.assertIn(
+            "flips 300,550,800,1050, 2x1",
+            report.getvalue(),
+        )
+
+        failed_dir = self.root / "indexed-failed"
+        failed_dir.mkdir()
+        failed_log = failed_dir / "guest.log"
+        failed_log.write_bytes(self.indexed_frame_capture_records(
+            ["ok", "publish_failed", "ok", "ok"]
+        ))
+        with self.assertRaisesRegex(RuntimeError, "1 failed: publish_failed"):
+            diagnostic.report_indexed_frame_captures(
+                [failed_log], failed_dir, True
+            )
+
+        leaked = json.loads(
+            self.indexed_frame_capture_records().splitlines()[0]
+        )
+        leaked["texture_identity"] = "prohibited"
+        leaked_log = self.root / "indexed-leaked.log"
+        leaked_log.write_text(
+            json.dumps(leaked, separators=(",", ":")) + "\n",
+            encoding="ascii",
+        )
+        with self.assertRaisesRegex(RuntimeError, "invalid indexed.*event"):
+            diagnostic.read_indexed_frame_capture([leaked_log])
+
+        with self.assertRaisesRegex(RuntimeError, "without --indexed"):
+            diagnostic.report_indexed_frame_captures(
+                [log], output_dir, False
+            )
+
+    def test_indexed_frame_capture_cli_propagates_and_reports(self):
+        arguments = self.main_arguments() + ["--indexed-frame-capture"]
+
+        def guest(_executable, output, _game_dir, _profile, _seconds,
+                  _quincunx, _audit, **kwargs):
+            self.assertTrue(kwargs["indexed_frame_capture"])
+            (output / "guest.log").write_bytes(
+                self.indexed_frame_capture_records()
+            )
+            for image in range(diagnostic.INDEXED_FRAME_CAPTURE_IMAGES):
+                self.write_capture_bitmap(
+                    output / f"indexed-frame-{image:05d}.bmp"
+                )
+            return 0
+
+        output = io.StringIO()
+        with mock.patch.object(diagnostic.sys, "platform", "darwin"), \
+             mock.patch.object(diagnostic, "ROOT", self.repository), \
+             mock.patch.object(diagnostic, "verify_prepared"), \
+             mock.patch.object(diagnostic, "toolkit_revision", return_value="pinned"), \
+             mock.patch.object(diagnostic, "verify_sandbox"), \
+             mock.patch.object(diagnostic, "run_guest", side_effect=guest), \
+             contextlib.redirect_stdout(output):
+            result = diagnostic.main(arguments)
+        self.assertEqual(result, 0)
+        self.assertIn(
+            "four private presented BMPs at flips 300,550,800,1050",
+            output.getvalue(),
+        )
+        self.assertIn("Indexed frame captures: 4 private frames", output.getvalue())
 
     def test_cli_audio_disable_is_explicit_and_propagated(self):
         arguments = self.main_arguments() + ["--disable-audio"]

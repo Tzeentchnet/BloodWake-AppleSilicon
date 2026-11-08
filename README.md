@@ -88,7 +88,7 @@ This is still a development build:
   current WindowServer session), 35/35 MMIO host tests, 8/8 normal and ASan/UBSan
   macOS host tests, 11/11 input integration tests, 6/6 APU/audio tests,
   13/13 support tests, and 100/100 concurrent APU restore stress runs. The
-  complete Python suite passes 117/117.
+  complete Python suite passes 136/136.
 - A post-roadmap 30-second isolated retail boot reached its configured limit
   with direct Metal at 2560x1920, native audio/DSP activity, 1,490 audited
   flips, 4,503 draws, 1,252,771 vertices, unchanged input trees/executable,
@@ -128,9 +128,12 @@ This is still a development build:
   retroactive attribution. A warm repeat recovered to 59.95-60.03 FPS and
   15.39-15.40 ms GPU p95, but wall p95 reached 17.07 ms and submission p95
   remained 15.60-15.62 ms. Static exact hashes and complete Battle
-  draw-fingerprint overlap support rendering continuity, but dynamic captures
-  were not frame-aligned and no physical controller was available; those
-  strict correctness/latency gates remain incomplete.
+  draw-fingerprint overlap support rendering continuity. A bounded diagnostic
+  now captures exactly four presented guest-flip indexes, but identical-binary
+  repeats proved that the direct Battle seed itself changes camera/boat/
+  simulation state across boots. Its exact dynamic output hash is explicitly
+  unavailable rather than mislabeled a regression or pass. No physical
+  controller was available, so that latency gate also remains incomplete.
 - Refreshed presentation telemetry retained 509 actual presentation times per
   boot with exact fractional intervals. Drawable acquisition and the manual
   host hold were not the general 17 ms tail source; command completion and
@@ -158,8 +161,9 @@ executable continuation decisions are recorded:
    unreproduced historical cold band without inventing an old attribution.
    Retail-derived traces and archives remain private.
 2. PERF-033 and PERF-036 are bounded no-go results, not passes. Strict
-   wall/submission thresholds still miss, dynamic Battle output hashes are
-   not frame-aligned, and physical input latency is unavailable.
+   wall/submission thresholds still miss, the direct Battle seed is
+   nondeterministic under indexed same-binary capture, and physical input
+   latency is unavailable.
 3. Keep the explicit presenter as the default. PERF-035 found no measured
    basis for a `CAMetalDisplayLink` implementation; target-time causality
    remains explicitly unavailable instead of inferred.

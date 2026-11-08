@@ -818,13 +818,51 @@ static int s_flip_dumping;
  * back synchronously, so the dump is the frame presented). */
 int nv2a_pb_exec_flip_dumping(void) { return s_flip_dumping; }
 
+enum {
+    BW_INDEXED_FRAME_CAPTURE_COUNT = 4
+};
+
+static const uint32_t s_indexed_frame_capture_flips[
+    BW_INDEXED_FRAME_CAPTURE_COUNT] = {300, 550, 800, 1050};
+static int s_indexed_frame_capture_state = -1;
+static unsigned s_indexed_frame_capture_next;
+static unsigned s_indexed_frame_capture_ok;
+
+static int indexed_frame_capture_enabled(void)
+{
+    const char *enabled;
+    if (s_indexed_frame_capture_state >= 0)
+        return s_indexed_frame_capture_state;
+    enabled = getenv("BW_INDEXED_FRAME_CAPTURE");
+    if (!enabled) {
+        s_indexed_frame_capture_state = 0;
+        return 0;
+    }
+    if (strcmp(enabled, "1") != 0) {
+        fprintf(stderr,
+                "{\"schema\":\"bloodwake.indexed-frame-capture/v1\","
+                "\"record\":\"config\",\"status\":\"invalid_switch\"}\n");
+        s_indexed_frame_capture_state = 0;
+        return 0;
+    }
+    if (getenv("RECOMP_FB_DUMP_FLIPS")) {
+        fprintf(stderr,
+                "{\"schema\":\"bloodwake.indexed-frame-capture/v1\","
+                "\"record\":\"config\",\"status\":\"capture_conflict\"}\n");
+        s_indexed_frame_capture_state = 0;
+        return 0;
+    }
+    s_indexed_frame_capture_state = 1;
+    return 1;
+}
+
 static int flip_dump_sequence_configured(void)
 {
     const char *spec = getenv("RECOMP_FB_DUMP_FLIPS");
-    return spec && *spec;
+    return (spec && *spec) || indexed_frame_capture_enabled();
 }
 
-static void dump_surface_bmp_at(uint32_t resolved)
+static int dump_surface_bmp_at(uint32_t resolved)
 {
     const char *prefix = getenv("RECOMP_FB_DUMP");
     const uint8_t *mem = (const uint8_t *)xbox_GetMemoryOffset();
@@ -841,18 +879,19 @@ static void dump_surface_bmp_at(uint32_t resolved)
     uint32_t row_bytes, pad, filesz;
     uint8_t hdr[54];
     FILE *f;
+    int ok = 1;
 
     if (!prefix || !w || !h || (bpp != 2 && bpp != 4) || !offset)
-        return;
+        return 0;
 
     row_bytes = w * 3;
     pad = (4 - (row_bytes & 3)) & 3;
     filesz = 54 + (row_bytes + pad) * h;
 
-    snprintf(path, sizeof path, "%s%05d.bmp", prefix, seq++);
+    snprintf(path, sizeof path, "%s%05d.bmp", prefix, seq);
     f = fopen(path, "wb");
     if (!f)
-        return;
+        return 0;
 
     memset(hdr, 0, sizeof hdr);
     hdr[0] = 'B'; hdr[1] = 'M';
@@ -863,7 +902,8 @@ static void dump_surface_bmp_at(uint32_t resolved)
     memcpy(hdr + 22, &h, 4);
     hdr[26] = 1;
     hdr[28] = 24;
-    fwrite(hdr, 1, sizeof hdr, f);
+    if (fwrite(hdr, 1, sizeof hdr, f) != sizeof hdr)
+        ok = 0;
 
     /* BMP rows run bottom-up. */
     for (y = h; y-- > 0; ) {
@@ -882,29 +922,38 @@ static void dump_surface_bmp_at(uint32_t resolved)
                 bgr[1] = (uint8_t)(((v >>  5) & 0x3F) << 2);
                 bgr[2] = (uint8_t)(((v >> 11) & 0x1F) << 3);
             }
-            fwrite(bgr, 1, 3, f);
+            if (fwrite(bgr, 1, 3, f) != 3)
+                ok = 0;
         }
         if (pad) {
             static const uint8_t zero[3] = {0, 0, 0};
-            fwrite(zero, 1, pad, f);
+            if (fwrite(zero, 1, pad, f) != pad)
+                ok = 0;
         }
     }
-    fclose(f);
+    if (fclose(f) != 0)
+        ok = 0;
+    if (!ok) {
+        remove(path);
+        return 0;
+    }
+    seq++;
     if (seq == 1)
         fprintf(stderr, "  [GPU] framebuffer dump: %s (%ux%u from 0x%08X %ubpp)\n",
                 path, w, h, s_gpu.color_offset, bpp);
+    return 1;
 }
 
-static void dump_surface_bmp(void)
+static int dump_surface_bmp(void)
 {
     uint32_t resolved, pitch, aa_sy;
     if (!s_backend_present_prepare) {
-        dump_surface_bmp_at(0);
-        return;
+        return dump_surface_bmp_at(0);
     }
     if (backend_prepare_snapshot(&resolved, &pitch, &aa_sy) &&
         backend_publish_snapshot(resolved, pitch))
-        dump_surface_bmp_at(resolved);
+        return dump_surface_bmp_at(resolved);
+    return 0;
 }
 
 /* Defined below, next to the rest of the rasteriser; the clear path uses it
@@ -2314,7 +2363,7 @@ static int batch_is_screen_space(void)
 #define FB_DUMP_AFTER_DRAW 8
 static int s_drawn_dumps;
 
-static void dump_surface_bmp(void);
+static int dump_surface_bmp(void);
 
 /* A fixed-function batch without texture coordinates is drawn untextured, as
  * the screen-space path does, whatever stale texture the stage still holds. */
@@ -5836,6 +5885,54 @@ static void flip_hold_report(void)
  * executor receives between those flips (at most 6000 lines). */
 static uint32_t s_bw_flipno;
 
+static int indexed_frame_capture_due(uint32_t flip)
+{
+    return indexed_frame_capture_enabled() &&
+           s_indexed_frame_capture_next < BW_INDEXED_FRAME_CAPTURE_COUNT &&
+           flip == s_indexed_frame_capture_flips[s_indexed_frame_capture_next];
+}
+
+static void indexed_frame_capture_finish(uint32_t flip, const char *status)
+{
+    unsigned sequence = s_indexed_frame_capture_next++;
+    int ok = strcmp(status, "ok") == 0;
+    if (ok)
+        s_indexed_frame_capture_ok++;
+    fprintf(stderr,
+            "{\"schema\":\"bloodwake.indexed-frame-capture/v1\","
+            "\"record\":\"event\",\"sequence\":%u,\"flip\":%u,"
+            "\"status\":\"%s\"}\n",
+            sequence, flip, status);
+    if (s_indexed_frame_capture_next == BW_INDEXED_FRAME_CAPTURE_COUNT) {
+        fprintf(stderr,
+                "{\"schema\":\"bloodwake.indexed-frame-capture/v1\","
+                "\"record\":\"summary\",\"requested\":%u,\"captured\":%u,"
+                "\"failed\":%u,\"flips\":[300,550,800,1050]}\n",
+                BW_INDEXED_FRAME_CAPTURE_COUNT, s_indexed_frame_capture_ok,
+                BW_INDEXED_FRAME_CAPTURE_COUNT - s_indexed_frame_capture_ok);
+    }
+    fflush(stderr);
+    s_flip_dumping = 0;
+}
+
+static void indexed_frame_capture_snapshot(uint32_t flip, int snapshot_ok,
+                                           uint32_t snapshot_va,
+                                           uint32_t snapshot_pitch)
+{
+    const char *status;
+    if (!snapshot_ok)
+        status = "snapshot_unavailable";
+    else if (!s_backend_present_prepare)
+        status = "unsupported_backend";
+    else if (!backend_publish_snapshot(snapshot_va, snapshot_pitch))
+        status = "publish_failed";
+    else if (!dump_surface_bmp_at(snapshot_va))
+        status = "write_failed";
+    else
+        status = "ok";
+    indexed_frame_capture_finish(flip, status);
+}
+
 static int s_bw_mtrace_on = -1;
 static void bw_mtrace(uint32_t subch, uint32_t method, uint32_t param)
 {
@@ -5909,8 +6006,8 @@ static void bw_present_immediate(void)
 {
     static int on = -1;
     static unsigned shown;
-    int snapshot_ok;
-    uint32_t snapshot_va, snapshot_pitch, snapshot_aa_sy;
+    int snapshot_ok, indexed_dump;
+    uint32_t snapshot_va = 0, snapshot_pitch = 0, snapshot_aa_sy = 0;
     if (on < 0) {
         const char *e = getenv("BW_IMMEDIATE_PRESENT");
         on = !(e && e[0] == '0');
@@ -5924,6 +6021,9 @@ static void bw_present_immediate(void)
         fflush(stderr);
     }
     s_bw_flipno++;
+    indexed_dump = indexed_frame_capture_due(s_bw_flipno);
+    if (indexed_dump)
+        s_flip_dumping = 1;
     snapshot_ok = backend_prepare_snapshot(&snapshot_va, &snapshot_pitch, &snapshot_aa_sy);
     if (snapshot_ok && (s_gpu.pitch || (s_backend_present_prepare &&
                                        s_gpu.drawn_offset && s_gpu.drawn_pitch))) {
@@ -5938,6 +6038,9 @@ static void bw_present_immediate(void)
             xbox_FramebufferWindowPresent(s_backend_present_prepare ? snapshot_va : dma_resolve(done), pitch);
         }
     }
+    if (indexed_dump)
+        indexed_frame_capture_snapshot(s_bw_flipno, snapshot_ok, snapshot_va,
+                                       snapshot_pitch);
     {
         static const char *spec = (const char *)-1;
         if (spec == (const char *)-1)
@@ -6346,8 +6449,8 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
          * host frame, and that time counts against the hold. */
         uint64_t stall_ns = xbox_HostNowNs();
         int clock_ok;
-        int snapshot_ok, synchronized;
-        uint32_t snapshot_va, snapshot_pitch, snapshot_aa_sy;
+        int snapshot_ok, synchronized, indexed_dump;
+        uint32_t snapshot_va = 0, snapshot_pitch = 0, snapshot_aa_sy = 0;
         uint32_t stall_vbl;
         if (s_backend_flip_stall)
             s_backend_flip_stall(stall_ns);
@@ -6367,6 +6470,9 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
          * counter counts -- see xbox_Nv2aFrameCounterFlip. */
         xbox_Nv2aFrameCounterFlip();
         s_bw_flipno++;
+        indexed_dump = indexed_frame_capture_due(s_bw_flipno);
+        if (indexed_dump)
+            s_flip_dumping = 1;
         synchronized = s_backend_present_prepare != NULL;
         snapshot_ok = backend_prepare_snapshot(&snapshot_va, &snapshot_pitch, &snapshot_aa_sy);
         /* Hand the window a copy of the frame just finished.
@@ -6397,6 +6503,9 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
                 xbox_FramebufferWindowPresent(synchronized ? snapshot_va : dma_resolve(done), pitch);
             }
         }
+        if (indexed_dump)
+            indexed_frame_capture_snapshot(s_bw_flipno, snapshot_ok, snapshot_va,
+                                           snapshot_pitch);
         /* Legacy GPU backends read back in flip, so TK-39 keeps their dump
          * after flip unless BW_DUMP_AFTER_FLIP=0. An opt-in sync callback has
          * already populated guest memory, so its dump precedes flip. */

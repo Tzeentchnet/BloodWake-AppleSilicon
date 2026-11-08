@@ -89,6 +89,16 @@ WATER_CAPTURE_PATTERN = re.compile(
     rb"width=([0-9]{1,5}) height=([0-9]{1,5})\r?$"
 )
 WATER_CAPTURE_IMAGES = 4
+INDEXED_FRAME_CAPTURE_SCHEMA = "bloodwake.indexed-frame-capture/v1"
+INDEXED_FRAME_CAPTURE_PREFIX = (
+    b'{"schema":"bloodwake.indexed-frame-capture/v1"'
+)
+INDEXED_FRAME_CAPTURE_FLIPS = (300, 550, 800, 1050)
+INDEXED_FRAME_CAPTURE_IMAGES = len(INDEXED_FRAME_CAPTURE_FLIPS)
+INDEXED_FRAME_CAPTURE_STATUSES = {
+    "ok", "snapshot_unavailable", "unsupported_backend",
+    "publish_failed", "write_failed",
+}
 
 
 @dataclass(frozen=True)
@@ -321,7 +331,8 @@ def diagnostic_env(output, game_dir, seconds, quincunx, audit, input_fd, output_
                    edition="original", disable_audio=False, synthetic_input_script=None,
                    audio_audit=False, water_preset="retail",
                    water_benchmark=False, water_capture=False,
-                   capture_stem="water-capture", guided_input=False,
+                   capture_stem="water-capture", indexed_frame_capture=False,
+                   indexed_capture_stem="indexed-frame", guided_input=False,
                    frame_timing=False, pipeline_timing=False,
                    profile_name=None, profile_from=None,
                    profile_to=None, profile_callers=False, render_scale=None,
@@ -356,12 +367,20 @@ def diagnostic_env(output, game_dir, seconds, quincunx, audit, input_fd, output_
         raise ValueError("water capture and benchmark are mutually exclusive")
     if guided_input and water_capture:
         raise ValueError("guided input and water capture are mutually exclusive")
+    if indexed_frame_capture and (guided_input or water_capture):
+        raise ValueError(
+            "indexed frame capture is mutually exclusive with guided and water capture"
+        )
     if (water_capture and
             synthetic_input_script != SYNTHETIC_INPUT_SCRIPTS[0]):
         raise ValueError("water capture requires the deterministic synthetic input script")
     if water_capture and (
             not capture_stem or "/" in capture_stem or "\\" in capture_stem):
         raise ValueError("water capture stem is invalid")
+    if indexed_frame_capture and (
+            not indexed_capture_stem or
+            "/" in indexed_capture_stem or "\\" in indexed_capture_stem):
+        raise ValueError("indexed frame capture stem is invalid")
     if synthetic_input_script and edition != "remastered":
         raise ValueError("the synthetic input script requires the remastered edition")
     if disable_audio and audio_audit:
@@ -437,6 +456,9 @@ def diagnostic_env(output, game_dir, seconds, quincunx, audit, input_fd, output_
         env["RECOMP_FB_DUMP"] = str(prefix)
         env["RECOMP_FB_DUMP_FLIPS"] = str(trigger)
         env["BW_METAL_WATER_CAPTURE_TRIGGER"] = str(trigger)
+    if indexed_frame_capture:
+        env["BW_INDEXED_FRAME_CAPTURE"] = "1"
+        env["RECOMP_FB_DUMP"] = str(output / f"{indexed_capture_stem}-")
     if guided_input:
         env["BW_MACOS_KEYBOARD_HOOK"] = "1"
         env["BW_MACOS_GUIDED_INPUT"] = str(output / "guided-pad.txt")
@@ -539,7 +561,8 @@ def run_guest_once(executable, output, game_dir, profile, seconds, quincunx, aud
                    edition="original", disable_audio=False, synthetic_input_script=None,
                    audio_audit=False, water_preset="retail",
                    water_benchmark=False, water_capture=False,
-                   capture_stem="water-capture", guided_input=False,
+                   capture_stem="water-capture", indexed_frame_capture=False,
+                   indexed_capture_stem="indexed-frame", guided_input=False,
                    frame_timing=False, pipeline_timing=False,
                    profile_name=None, profile_from=None,
                    profile_to=None, profile_callers=False, render_scale=None,
@@ -567,7 +590,8 @@ def run_guest_once(executable, output, game_dir, profile, seconds, quincunx, aud
         env = diagnostic_env(output, game_dir, seconds, quincunx, audit, input_read, output_write,
                              audit_name, keyboard_hook, synthetic_input, edition, disable_audio,
                              synthetic_input_script, audio_audit, water_preset,
-                             water_benchmark, water_capture, capture_stem, guided_input,
+                             water_benchmark, water_capture, capture_stem,
+                             indexed_frame_capture, indexed_capture_stem, guided_input,
                              frame_timing, pipeline_timing, profile_name,
                              profile_from, profile_to,
                              profile_callers, render_scale, frame_cap,
@@ -604,7 +628,8 @@ def run_guest(executable, output, game_dir, profile, seconds, quincunx, audit,
               keyboard_hook=False, synthetic_input=False, edition="original",
               disable_audio=False, synthetic_input_script=None, audio_audit=False,
               water_preset="retail", water_benchmark=False,
-              water_capture=False, guided_input=False, frame_timing=False,
+              water_capture=False, indexed_frame_capture=False,
+              guided_input=False, frame_timing=False,
               pipeline_timing=False,
               profile_enabled=False, profile_from=None, profile_to=None,
               profile_callers=False, render_scale=None, frame_cap=None,
@@ -620,6 +645,7 @@ def run_guest(executable, output, game_dir, profile, seconds, quincunx, audit,
                                          water_preset=water_preset,
                                          water_benchmark=water_benchmark,
                                          water_capture=water_capture,
+                                         indexed_frame_capture=indexed_frame_capture,
                                          guided_input=guided_input,
                                          frame_timing=frame_timing,
                                          pipeline_timing=pipeline_timing,
@@ -960,13 +986,14 @@ def report_water_benchmarks(log_paths, requested):
     )
 
 
-def validate_water_capture_bitmap(path, width=None, height=None):
+def validate_water_capture_bitmap(path, width=None, height=None,
+                                  label="water capture"):
     if path.is_symlink() or not path.is_file():
-        raise RuntimeError(f"water capture is not a regular file: {path.name}")
+        raise RuntimeError(f"{label} is not a regular file: {path.name}")
     with open(path, "rb") as stream:
         header = stream.read(54)
     if len(header) != 54 or header[:2] != b"BM":
-        raise RuntimeError(f"water capture has an invalid BMP header: {path.name}")
+        raise RuntimeError(f"{label} has an invalid BMP header: {path.name}")
     file_size = struct.unpack_from("<I", header, 2)[0]
     data_offset = struct.unpack_from("<I", header, 10)[0]
     dib_size, bitmap_width, bitmap_height = struct.unpack_from("<III", header, 14)
@@ -977,19 +1004,19 @@ def validate_water_capture_bitmap(path, width=None, height=None):
         not 1 <= bitmap_width <= 16384 or
         not 1 <= bitmap_height <= 16384
     ):
-        raise RuntimeError(f"water capture BMP metadata is invalid: {path.name}")
+        raise RuntimeError(f"{label} BMP metadata is invalid: {path.name}")
     row_bytes = (bitmap_width * 3 + 3) & ~3
     expected_size = 54 + row_bytes * bitmap_height
     if (
         (width is not None and bitmap_width != width) or
         (height is not None and bitmap_height != height)
     ):
-        raise RuntimeError(f"water capture BMP metadata is inconsistent: {path.name}")
+        raise RuntimeError(f"{label} BMP metadata is inconsistent: {path.name}")
     if (
         data_offset != 54 or file_size != expected_size or
         path.stat().st_size != expected_size
     ):
-        raise RuntimeError(f"water capture BMP size is inconsistent: {path.name}")
+        raise RuntimeError(f"{label} BMP size is inconsistent: {path.name}")
     return bitmap_width, bitmap_height
 
 
@@ -1092,6 +1119,132 @@ def report_water_captures(log_paths, output, requested, water_preset,
         f"validated and excluded"
     )
     return captures
+
+
+def read_indexed_frame_capture(log_paths):
+    events = []
+    summary = None
+    for path in log_paths:
+        with open(path, "rb") as stream:
+            for raw_line in stream:
+                if INDEXED_FRAME_CAPTURE_PREFIX not in raw_line:
+                    continue
+                try:
+                    record = json.loads(raw_line)
+                except (UnicodeDecodeError, json.JSONDecodeError) as error:
+                    raise RuntimeError(
+                        f"malformed indexed frame capture record in {path.name}"
+                    ) from error
+                if record.get("schema") != INDEXED_FRAME_CAPTURE_SCHEMA:
+                    raise RuntimeError(
+                        f"invalid indexed frame capture schema in {path.name}"
+                    )
+                kind = record.get("record")
+                if kind == "config":
+                    if set(record) != {"schema", "record", "status"}:
+                        raise RuntimeError(
+                            f"invalid indexed frame capture config in {path.name}"
+                        )
+                    raise RuntimeError(
+                        "indexed frame capture configuration failed: " +
+                        str(record["status"])
+                    )
+                if kind == "event":
+                    if set(record) != {
+                            "schema", "record", "sequence", "flip", "status"}:
+                        raise RuntimeError(
+                            f"invalid indexed frame capture event in {path.name}"
+                        )
+                    events.append(record)
+                    if len(events) > INDEXED_FRAME_CAPTURE_IMAGES:
+                        raise RuntimeError(
+                            f"too many indexed frame capture events in {path.name}"
+                        )
+                    continue
+                if kind == "summary":
+                    if set(record) != {
+                            "schema", "record", "requested", "captured",
+                            "failed", "flips"}:
+                        raise RuntimeError(
+                            f"invalid indexed frame capture summary in {path.name}"
+                        )
+                    if summary is not None:
+                        raise RuntimeError(
+                            f"duplicate indexed frame capture summary in {path.name}"
+                        )
+                    summary = record
+                    continue
+                raise RuntimeError(
+                    f"unknown indexed frame capture record in {path.name}"
+                )
+    return events, summary
+
+
+def report_indexed_frame_captures(log_paths, output, requested):
+    events, summary = read_indexed_frame_capture(log_paths)
+    files = sorted(output.glob("indexed-frame-*.bmp"))
+    if not requested:
+        if events or summary is not None or files:
+            raise RuntimeError(
+                "indexed frame capture evidence appeared without "
+                "--indexed-frame-capture"
+            )
+        return []
+    if len(log_paths) != 1:
+        raise RuntimeError("indexed frame capture requires exactly one guest boot")
+    if summary is None:
+        raise RuntimeError("indexed frame capture did not complete")
+    if len(events) != INDEXED_FRAME_CAPTURE_IMAGES:
+        raise RuntimeError("indexed frame capture event sequence is incomplete")
+
+    for sequence, (event, flip) in enumerate(
+            zip(events, INDEXED_FRAME_CAPTURE_FLIPS)):
+        if (
+            type(event["sequence"]) is not int or
+            type(event["flip"]) is not int or
+            event["sequence"] != sequence or event["flip"] != flip or
+            type(event["status"]) is not str or
+            event["status"] not in INDEXED_FRAME_CAPTURE_STATUSES
+        ):
+            raise RuntimeError("indexed frame capture event sequence is invalid")
+        if event["status"] != "ok":
+            raise RuntimeError(
+                f"indexed frame capture {sequence} failed: {event['status']}"
+            )
+
+    if (
+        type(summary["requested"]) is not int or
+        type(summary["captured"]) is not int or
+        type(summary["failed"]) is not int or
+        summary["requested"] != INDEXED_FRAME_CAPTURE_IMAGES or
+        summary["captured"] != INDEXED_FRAME_CAPTURE_IMAGES or
+        summary["failed"] != 0 or
+        summary["flips"] != list(INDEXED_FRAME_CAPTURE_FLIPS)
+    ):
+        raise RuntimeError("indexed frame capture summary is inconsistent")
+
+    expected = [
+        output / f"indexed-frame-{image:05d}.bmp"
+        for image in range(INDEXED_FRAME_CAPTURE_IMAGES)
+    ]
+    if files != expected:
+        raise RuntimeError("indexed frame capture file sequence is incomplete")
+    dimensions = {
+        validate_water_capture_bitmap(
+            capture, label="indexed frame capture"
+        )
+        for capture in expected
+    }
+    if len(dimensions) != 1:
+        raise RuntimeError("indexed frame capture dimensions changed")
+    width, height = dimensions.pop()
+    print(
+        f"Indexed frame captures: {INDEXED_FRAME_CAPTURE_IMAGES} private "
+        f"frames at flips "
+        f"{','.join(str(flip) for flip in INDEXED_FRAME_CAPTURE_FLIPS)}, "
+        f"{width}x{height}"
+    )
+    return expected
 
 
 def gpu_audit_paths(output, follow_relaunches, completed_boots, max_boots):
@@ -1233,6 +1386,10 @@ def main(argv=None):
         "--water-capture", action="store_true",
         help="write four private fixed-offset supported-water BMP frames"
     )
+    parser.add_argument(
+        "--indexed-frame-capture", action="store_true",
+        help="write private presented BMPs at guest flips 300, 550, 800, and 1050"
+    )
     parser.add_argument("--disable-audio", action="store_true",
                         help="disable native audio for an isolated non-audio diagnostic")
     parser.add_argument("--headless-audio-audit", action="store_true",
@@ -1323,6 +1480,15 @@ def main(argv=None):
         parser.error("--water-capture and --water-benchmark are mutually exclusive")
     if args.guided_input_capture and args.water_capture:
         parser.error("--guided-input-capture and --water-capture are mutually exclusive")
+    if args.indexed_frame_capture and (
+            args.guided_input_capture or args.water_capture):
+        parser.error(
+            "--indexed-frame-capture is mutually exclusive with guided and water capture"
+        )
+    if args.indexed_frame_capture and args.follow_relaunches:
+        parser.error(
+            "--indexed-frame-capture requires a single boot"
+        )
     if (args.water_capture and
             args.synthetic_input_script != SYNTHETIC_INPUT_SCRIPTS[0]):
         parser.error(
@@ -1407,6 +1573,11 @@ def main(argv=None):
             print("Diagnostic water benchmark: Retail/Realistic/Realistic/Retail")
         if args.water_capture:
             print("Diagnostic water capture: four private supported-frame BMPs")
+        if args.indexed_frame_capture:
+            print(
+                "Diagnostic indexed frame capture: four private presented BMPs "
+                "at flips 300,550,800,1050"
+            )
         if args.guided_input_capture:
             print("Guided input:", output / "guided-pad.txt")
             print("Guided game frames:", output / "guided-frame-NNNNN.bmp")
@@ -1475,6 +1646,7 @@ def main(argv=None):
                                    water_preset=args.water_preset,
                                    water_benchmark=args.water_benchmark,
                                    water_capture=args.water_capture,
+                                   indexed_frame_capture=args.indexed_frame_capture,
                                    guided_input=args.guided_input_capture,
                                    frame_timing=args.frame_timing,
                                    pipeline_timing=args.pipeline_timing,
@@ -1505,6 +1677,9 @@ def main(argv=None):
         report_water_captures(
             logs, output, args.water_capture, args.water_preset,
             args.follow_relaunches
+        )
+        report_indexed_frame_captures(
+            logs, output, args.indexed_frame_capture
         )
         if args.gpu_audit:
             report_ocean_fingerprint_counts(

@@ -193,12 +193,17 @@ test coverage are in [VALIDATION.md](VALIDATION.md).
   the general wall-tail cause. Because direct presentation exposes no target
   timestamp and pacing was not shown material, `CAMetalDisplayLink` remains a
   documented no-go and the explicit presenter is unchanged.
+- Added a fail-closed, single-boot indexed framebuffer diagnostic that writes
+  only guest flips 300/550/800/1050 to owner-private storage. Same-binary
+  repeats proved the current direct Battle seed changes simulation/camera
+  state across boots, so its exact dynamic output-hash gate is explicitly
+  unavailable rather than misreported as a rendering regression.
 - Defined the six-slot cold/warm/30-minute/60-minute broader qualification
   matrix and extended fixed timing storage through one exact-default hour.
   Runtime collection remains blocked by strict wall/submission, physical
   input, workload-seed, hardware, and privileged-telemetry gaps.
 - Passed 376/376 Metal backend tests after the latest implementation changes,
-  focused pipeline/presentation sanitizer coverage, and 63/63 isolated
+  focused pipeline/presentation sanitizer coverage, and 66/66 isolated
   diagnostic-runner tests.
 
 ## Input

@@ -43,7 +43,8 @@ trace captured all 25 observed states, and two clean exact-default seeded
 boots preloaded all 25 with zero cache misses, asynchronous work, or
 post-frame-zero pipeline creation. The current executable still misses the
 strict wall/submission gates, physical input latency is unavailable, and
-dynamic Battle captures are not frame-aligned for an exact output-hash pass.
+same-binary indexed captures prove that the direct Battle seed is
+nondeterministic across boots, so its exact output-hash gate is unavailable.
 PERF-034 is complete at the instrumentation/decision level. Representative
 actual-presentation evidence found no general drawable-wait or manual-hold
 cause, the explicit presenter still exposes no display target timestamp, and
@@ -545,9 +546,17 @@ metadata fingerprints appeared in the current run, which added one observed
 fingerprint; both runs had zero fingerprint overflow or within-scope mismatch.
 That is draw-semantics evidence, not a framebuffer-hash substitute. Four
 bounded supported-frame captures per executable also remained time-evolving
-title-demo frames and produced no exact hash match. Physical-controller
-latency is unavailable because no physical controller was present. No private
-hash, fingerprint, frame, trace, save, relaunch record, or log is checked in.
+title-demo frames and produced no exact hash match.
+
+A new disabled-by-default indexed diagnostic captures only presented guest
+flips 300/550/800/1050 and fails on any missing, extra, malformed, failed, or
+inconsistent record/file. Earlier-source and current executables completed
+4/4 private 1280x480 captures with zero marker rejection, but two identical
+current-executable runs also produced zero exact match at the same indexes.
+Private review showed different camera/boat/simulation states. The seed is
+therefore `unavailable_nondeterministic_seed`, not a rendering mismatch.
+Physical-controller latency is `unavailable_no_device`. No private hash,
+fingerprint, frame, trace, save, relaunch record, or log is checked in.
 
 PERF-033 exit gates:
 
@@ -557,8 +566,9 @@ PERF-033 exit gates:
   retroactively attributing it; no current preloaded maximum contains runtime
   library, specialization, pipeline, archive, miss, or cache-reset work.
 - [!] Steady-state FPS/GPU and marker/Metal-error gates pass, but strict
-  wall/submission thresholds, physical input latency, and an aligned dynamic
-  Battle framebuffer-hash comparison do not.
+  wall/submission thresholds and physical input latency do not; the dynamic
+  Battle framebuffer gate is explicitly unavailable because same-binary
+  indexed repeats are nondeterministic.
 - [x] Missing, stale, corrupt, and unsupported artifacts take the tested
   explicit fallback.
 
