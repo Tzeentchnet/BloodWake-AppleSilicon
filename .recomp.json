@@ -1,0 +1,33 @@
+{
+  "$schema": "https://recomp.fyi/schema/v1.json",
+  "game": "Blood Wake",
+  "system": "Xbox",
+  "type": "recomp",
+  "original": {
+    "region": "USA"
+  },
+  "project": "Blood Wake Recomp for Apple Silicon",
+  "status": "in-progress",
+  "targets": [
+    "macOS"
+  ],
+  "toolchain": "Xboxrecomp",
+  "approach": "Static recompilation of Xbox x86 game code with xboxrecomp and a native Metal renderer.",
+  "maintainers": [
+    {
+      "name": "Tzeentchnet",
+      "link": "https://github.com/Tzeentchnet"
+    }
+  ],
+  "links": [
+    {
+      "label": "Current status",
+      "url": "https://github.com/Tzeentchnet/BloodWake-AppleSilicon/blob/apple-silicon/docs/CURRENT_STATUS.md"
+    },
+    {
+      "label": "Upstream project",
+      "url": "https://github.com/minimalice92/bloodwake-recomp"
+    }
+  ],
+  "notes": "The arm64 development build boots the supported North American retail release and has validated menu navigation and interactive gameplay; broader compatibility remains in progress."
+}
